@@ -13,14 +13,13 @@ import uuid
 HOST = "0.0.0.0"
 PORT = 8080
 
-DATASET_FILE = Path(
-    "data/tess-rr-lyr.json"
-)
+DATASET_FILE = Path("data/tess-rr-lyr.json")
 
 PROJECT_ID = "openstar.tess-rr-lyr"
 WORKLOAD_ID = "openstar.tess-period-search.v1"
 
 WORK_LEASE_SECONDS = 300
+RETRY_DELAY_SECONDS = 2.0
 
 nodes = {}
 work_units = {}
@@ -30,9 +29,7 @@ lock = threading.Lock()
 
 
 def canonical_uuid(value):
-    return str(
-        uuid.UUID(value)
-    ).lower()
+    return str(uuid.UUID(value)).lower()
 
 
 def load_dataset():
@@ -41,10 +38,7 @@ def load_dataset():
             f"Dataset not found: {DATASET_FILE}"
         )
 
-    with DATASET_FILE.open(
-        "r",
-        encoding="utf-8"
-    ) as file:
+    with DATASET_FILE.open("r", encoding="utf-8") as file:
         return json.load(file)
 
 
@@ -53,39 +47,24 @@ dataset = load_dataset()
 
 def create_project_queue():
     search = dataset["search"]
-    reference_chunks = dataset[
-        "reference"
-    ]["chunks"]
+    reference_chunks = dataset["reference"]["chunks"]
 
-    minimum_frequency = float(
-        search["minimumFrequency"]
-    )
-
-    frequency_step = float(
-        search["frequencyStep"]
-    )
+    minimum_frequency = float(search["minimumFrequency"])
+    frequency_step = float(search["frequencyStep"])
 
     with lock:
         work_units.clear()
         results.clear()
 
         for reference_chunk in reference_chunks:
-            start_index = int(
-                reference_chunk["startIndex"]
-            )
+            start_index = int(reference_chunk["startIndex"])
+            frequency_count = int(reference_chunk["frequencyCount"])
 
-            frequency_count = int(
-                reference_chunk["frequencyCount"]
-            )
-
-            work_id = str(
-                uuid.uuid4()
-            ).lower()
+            work_id = str(uuid.uuid4()).lower()
 
             start_frequency = (
                 minimum_frequency +
-                start_index *
-                frequency_step
+                start_index * frequency_step
             )
 
             work_units[work_id] = {
@@ -94,28 +73,21 @@ def create_project_queue():
                     "projectID": PROJECT_ID,
                     "workloadID": WORKLOAD_ID,
                     "datasetID": dataset["id"],
-                    "frequencyStartIndex":
-                        start_index,
-                    "startFrequency":
-                        start_frequency,
-                    "frequencyStep":
-                        frequency_step,
-                    "frequencyCount":
-                        frequency_count
+                    "frequencyStartIndex": start_index,
+                    "startFrequency": start_frequency,
+                    "frequencyStep": frequency_step,
+                    "frequencyCount": frequency_count
                 },
                 "referenceBestFrequency": float(
-                    reference_chunk[
-                        "bestFrequency"
-                    ]
+                    reference_chunk["bestFrequency"]
                 ),
                 "referenceBestPower": float(
-                    reference_chunk[
-                        "bestPower"
-                    ]
+                    reference_chunk["bestPower"]
                 ),
                 "state": "pending",
                 "nodeID": None,
                 "assignedAt": None,
+                "retryAfter": 0.0,
                 "attempts": 0,
                 "result": None
             }
@@ -133,24 +105,16 @@ def requeue_expired_assignments_locked():
         if assigned_at is None:
             continue
 
-        if (
-            now - assigned_at
-            >= WORK_LEASE_SECONDS
-        ):
+        if now - assigned_at >= WORK_LEASE_SECONDS:
             print()
             print("♻️ Work lease expired")
-            print(
-                f"   work: "
-                f"{entry['work']['id']}"
-            )
-            print(
-                f"   node: "
-                f"{entry['nodeID']}"
-            )
+            print(f"   work: {entry['work']['id']}")
+            print(f"   node: {entry['nodeID']}")
 
             entry["state"] = "pending"
             entry["nodeID"] = None
             entry["assignedAt"] = None
+            entry["retryAfter"] = 0.0
 
 
 def get_project_status():
@@ -167,10 +131,8 @@ def get_project_status():
 
             if state == "pending":
                 pending += 1
-
             elif state == "assigned":
                 assigned += 1
-
             elif state == "completed":
                 completed += 1
 
@@ -181,45 +143,51 @@ def get_project_status():
 
         return {
             "projectID": PROJECT_ID,
-            "targetName":
-                dataset["targetName"],
+            "targetName": dataset["targetName"],
             "workloadID": WORKLOAD_ID,
-            "totalWorkUnits":
-                len(work_units),
-            "pendingWorkUnits":
-                pending,
-            "assignedWorkUnits":
-                assigned,
-            "completedWorkUnits":
-                completed,
-            "retryCount":
-                retries
+            "totalWorkUnits": len(work_units),
+            "pendingWorkUnits": pending,
+            "assignedWorkUnits": assigned,
+            "completedWorkUnits": completed,
+            "retryCount": retries
         }
 
 
 def public_dataset():
     return {
         "id": dataset["id"],
-        "targetName":
-            dataset["targetName"],
-        "mission":
-            dataset["mission"],
-        "timeUnit":
-            dataset["timeUnit"],
-        "fluxUnit":
-            dataset["fluxUnit"],
-        "times":
-            dataset["times"],
-        "flux":
-            dataset["flux"]
+        "targetName": dataset["targetName"],
+        "mission": dataset["mission"],
+        "timeUnit": dataset["timeUnit"],
+        "fluxUnit": dataset["fluxUnit"],
+        "times": dataset["times"],
+        "flux": dataset["flux"]
     }
+
+
+def verification_tolerance(frequency_step):
+    times = dataset["times"]
+
+    baseline_days = (
+        float(times[-1]) -
+        float(times[0])
+    )
+
+    if baseline_days <= 0:
+        return frequency_step * 4.0
+
+    peak_width = 1.0 / baseline_days
+
+    return max(
+        frequency_step * 4.0,
+        peak_width * 0.005
+    )
 
 
 def print_final_result():
     completed = [
         entry
-        for entry
-        in work_units.values()
+        for entry in work_units.values()
         if entry["state"] == "completed"
     ]
 
@@ -265,12 +233,9 @@ def print_final_result():
 
     print()
     print("🌟 SCIENCE PROJECT COMPLETE")
-    print(
-        f"   target: "
-        f"{dataset['targetName']}"
-    )
-    print()
+    print(f"   target: {dataset['targetName']}")
 
+    print()
     print("🔭 OpenStar network")
     print(
         f"   frequency: "
@@ -308,15 +273,10 @@ def print_final_result():
     )
 
 
-class OpenStarCoordinator(
-    BaseHTTPRequestHandler
-):
+class OpenStarCoordinator(BaseHTTPRequestHandler):
 
     def do_GET(self):
-        if (
-            self.path ==
-            "/v1/projects/current/status"
-        ):
+        if self.path == "/v1/projects/current/status":
             self.send_json(
                 200,
                 get_project_status()
@@ -329,16 +289,13 @@ class OpenStarCoordinator(
         )
 
         if dataset_match:
-            dataset_id = (
-                dataset_match.group(1)
-            )
+            dataset_id = dataset_match.group(1)
 
             if dataset_id != dataset["id"]:
                 self.send_json(
                     404,
                     {
-                        "error":
-                            "Unknown dataset."
+                        "error": "Unknown dataset."
                     }
                 )
                 return
@@ -357,17 +314,11 @@ class OpenStarCoordinator(
         )
 
     def do_POST(self):
-        if (
-            self.path ==
-            "/v1/nodes/register"
-        ):
+        if self.path == "/v1/nodes/register":
             self.register_node()
             return
 
-        if (
-            self.path ==
-            "/v1/work/claim"
-        ):
+        if self.path == "/v1/work/claim":
             self.claim_work()
             return
 
@@ -396,16 +347,12 @@ class OpenStarCoordinator(
             node_id = canonical_uuid(
                 body["nodeID"]
             )
-        except (
-            ValueError,
-            KeyError
-        ):
+        except (ValueError, KeyError):
             self.send_json(
                 400,
                 {
                     "accepted": False,
-                    "message":
-                        "Invalid node ID."
+                    "message": "Invalid node ID."
                 }
             )
             return
@@ -422,9 +369,7 @@ class OpenStarCoordinator(
 
         print()
         print("⭐ Node registered")
-        print(
-            f"   id: {node_id}"
-        )
+        print(f"   id: {node_id}")
         print(
             f"   platform: "
             f"{capabilities.get('platform')}"
@@ -442,8 +387,7 @@ class OpenStarCoordinator(
             200,
             {
                 "accepted": True,
-                "message":
-                    "Node registered."
+                "message": "Node registered."
             }
         )
 
@@ -454,15 +398,11 @@ class OpenStarCoordinator(
             node_id = canonical_uuid(
                 body["nodeID"]
             )
-        except (
-            ValueError,
-            KeyError
-        ):
+        except (ValueError, KeyError):
             self.send_json(
                 400,
                 {
-                    "error":
-                        "Invalid node ID."
+                    "error": "Invalid node ID."
                 }
             )
             return
@@ -476,39 +416,27 @@ class OpenStarCoordinator(
 
                 requeue_expired_assignments_locked()
 
+                now = time.time()
+
                 assignment = next(
                     (
                         entry
-                        for entry
-                        in work_units.values()
+                        for entry in work_units.values()
                         if (
-                            entry["state"]
-                            == "pending"
+                            entry["state"] == "pending"
+                            and entry["retryAfter"] <= now
                         )
                     ),
                     None
                 )
 
                 if assignment:
-                    assignment[
-                        "state"
-                    ] = "assigned"
+                    assignment["state"] = "assigned"
+                    assignment["nodeID"] = node_id
+                    assignment["assignedAt"] = time.time()
+                    assignment["attempts"] += 1
 
-                    assignment[
-                        "nodeID"
-                    ] = node_id
-
-                    assignment[
-                        "assignedAt"
-                    ] = time.time()
-
-                    assignment[
-                        "attempts"
-                    ] += 1
-
-                    work = assignment[
-                        "work"
-                    ]
+                    work = assignment["work"]
                 else:
                     work = None
 
@@ -516,8 +444,7 @@ class OpenStarCoordinator(
             self.send_json(
                 400,
                 {
-                    "error":
-                        "Node must register first."
+                    "error": "Node must register first."
                 }
             )
             return
@@ -529,14 +456,8 @@ class OpenStarCoordinator(
 
         print()
         print("📦 Science work assigned")
-        print(
-            f"   work: "
-            f"{work['id']}"
-        )
-        print(
-            f"   node: "
-            f"{node_id}"
-        )
+        print(f"   work: {work['id']}")
+        print(f"   node: {node_id}")
         print(
             f"   frequency start: "
             f"{work['startFrequency']:.6f}"
@@ -551,10 +472,7 @@ class OpenStarCoordinator(
             work
         )
 
-    def submit_result(
-        self,
-        work_id
-    ):
+    def submit_result(self, work_id):
         body = self.read_json()
 
         try:
@@ -562,21 +480,15 @@ class OpenStarCoordinator(
                 work_id
             )
 
-            submitted_node_id = (
-                canonical_uuid(
-                    body["nodeID"]
-                )
+            submitted_node_id = canonical_uuid(
+                body["nodeID"]
             )
-        except (
-            ValueError,
-            KeyError
-        ):
+        except (ValueError, KeyError):
             self.send_json(
                 400,
                 {
                     "accepted": False,
-                    "message":
-                        "Invalid identifiers."
+                    "message": "Invalid identifiers."
                 }
             )
             return
@@ -591,32 +503,23 @@ class OpenStarCoordinator(
                     404,
                     {
                         "accepted": False,
-                        "message":
-                            "Unknown work unit."
+                        "message": "Unknown work unit."
                     }
                 )
-            elif (
-                assignment["state"]
-                == "completed"
-            ):
+            elif assignment["state"] == "completed":
                 response = (
                     200,
                     {
                         "accepted": True,
-                        "message":
-                            "Result was already accepted."
+                        "message": "Result was already accepted."
                     }
                 )
-            elif (
-                assignment["nodeID"]
-                != submitted_node_id
-            ):
+            elif assignment["nodeID"] != submitted_node_id:
                 response = (
                     200,
                     {
                         "accepted": False,
-                        "message":
-                            "Work belongs to another node."
+                        "message": "Work belongs to another node."
                     }
                 )
             else:
@@ -629,29 +532,21 @@ class OpenStarCoordinator(
             )
             return
 
-        if (
-            body.get("status")
-            != "completed"
-        ):
+        if body.get("status") != "completed":
             with lock:
-                assignment[
-                    "state"
-                ] = "pending"
-
-                assignment[
-                    "nodeID"
-                ] = None
-
-                assignment[
-                    "assignedAt"
-                ] = None
+                assignment["state"] = "pending"
+                assignment["nodeID"] = None
+                assignment["assignedAt"] = None
+                assignment["retryAfter"] = (
+                    time.time() +
+                    RETRY_DELAY_SECONDS
+                )
 
             self.send_json(
                 200,
                 {
                     "accepted": False,
-                    "message":
-                        "Work unit requeued."
+                    "message": "Work unit requeued."
                 }
             )
             return
@@ -689,47 +584,48 @@ class OpenStarCoordinator(
         )
 
         if not valid:
+            with lock:
+                assignment["state"] = "pending"
+                assignment["nodeID"] = None
+                assignment["assignedAt"] = None
+                assignment["retryAfter"] = (
+                    time.time() +
+                    RETRY_DELAY_SECONDS
+                )
+
             self.send_json(
                 200,
                 {
                     "accepted": False,
-                    "message":
-                        "Invalid result values."
+                    "message": "Invalid result values."
                 }
             )
             return
 
-        reference_frequency = (
-            assignment[
-                "referenceBestFrequency"
-            ]
-        )
+        reference_frequency = assignment[
+            "referenceBestFrequency"
+        ]
 
-        frequency_step = (
-            assignment[
-                "work"
-            ]["frequencyStep"]
-        )
+        frequency_step = assignment[
+            "work"
+        ]["frequencyStep"]
 
         frequency_error = abs(
             best_frequency -
             reference_frequency
         )
 
-        allowed_error = (
-            frequency_step * 3.0
+        allowed_error = verification_tolerance(
+            frequency_step
         )
 
-        if (
-            frequency_error >
-            allowed_error
-        ):
+        if frequency_error > allowed_error:
             print()
+            print("❌ Science result rejected")
+            print(f"   work: {work_id}")
             print(
-                "❌ Science result rejected"
-            )
-            print(
-                f"   work: {work_id}"
+                f"   node: "
+                f"{submitted_node_id}"
             )
             print(
                 f"   OpenStar: "
@@ -739,62 +635,49 @@ class OpenStarCoordinator(
                 f"   reference: "
                 f"{reference_frequency:.8f}"
             )
+            print(
+                f"   difference: "
+                f"{frequency_error:.8f}"
+            )
+            print(
+                f"   allowed: "
+                f"{allowed_error:.8f}"
+            )
 
             with lock:
-                assignment[
-                    "state"
-                ] = "pending"
-
-                assignment[
-                    "nodeID"
-                ] = None
-
-                assignment[
-                    "assignedAt"
-                ] = None
+                assignment["state"] = "pending"
+                assignment["nodeID"] = None
+                assignment["assignedAt"] = None
+                assignment["retryAfter"] = (
+                    time.time() +
+                    RETRY_DELAY_SECONDS
+                )
 
             self.send_json(
                 200,
                 {
                     "accepted": False,
-                    "message":
-                        "Frequency verification failed."
+                    "message": "Frequency verification failed."
                 }
             )
             return
 
-        body["nodeID"] = (
-            submitted_node_id
-        )
-
-        body["workUnitID"] = (
-            work_id
-        )
+        body["nodeID"] = submitted_node_id
+        body["workUnitID"] = work_id
 
         with lock:
-            assignment[
-                "state"
-            ] = "completed"
+            assignment["state"] = "completed"
+            assignment["assignedAt"] = None
+            assignment["retryAfter"] = 0.0
+            assignment["result"] = body
 
-            assignment[
-                "assignedAt"
-            ] = None
-
-            assignment[
-                "result"
-            ] = body
-
-            results[
-                work_id
-            ] = body
+            results[work_id] = body
 
         status = get_project_status()
 
         print()
         print("✅ Science result accepted")
-        print(
-            f"   work: {work_id}"
-        )
+        print(f"   work: {work_id}")
         print(
             f"   node: "
             f"{submitted_node_id}"
@@ -833,8 +716,7 @@ class OpenStarCoordinator(
             200,
             {
                 "accepted": True,
-                "message":
-                    "Science result accepted."
+                "message": "Science result accepted."
             }
         )
 
@@ -851,22 +733,14 @@ class OpenStarCoordinator(
         )
 
         return json.loads(
-            data.decode(
-                "utf-8"
-            )
+            data.decode("utf-8")
         )
 
-    def send_json(
-        self,
-        status,
-        value
-    ):
+    def send_json(self, status, value):
         data = json.dumps(
             value,
             separators=(",", ":")
-        ).encode(
-            "utf-8"
-        )
+        ).encode("utf-8")
 
         self.send_response(
             status
@@ -901,14 +775,10 @@ if __name__ == "__main__":
 
     print()
     print("⭐ OpenStar Coordinator")
-    print(
-        f"Listening on port {PORT}"
-    )
+    print(f"Listening on port {PORT}")
     print()
 
-    print(
-        f"Project: {PROJECT_ID}"
-    )
+    print(f"Project: {PROJECT_ID}")
     print(
         f"Target: "
         f"{dataset['targetName']}"
@@ -927,13 +797,9 @@ if __name__ == "__main__":
     )
     print()
 
-    reference = dataset[
-        "reference"
-    ]
+    reference = dataset["reference"]
 
-    print(
-        "Astropy reference:"
-    )
+    print("Astropy reference:")
     print(
         f"   period: "
         f"{reference['bestPeriodDays']:.8f} days"
