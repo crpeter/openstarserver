@@ -64,7 +64,6 @@ def download_light_curve():
 
 def prepare_samples(light_curve):
     light_curve = light_curve.remove_nans()
-    light_curve = light_curve.normalize()
 
     times = np.asarray(
         light_curve.time.value,
@@ -89,12 +88,8 @@ def prepare_samples(light_curve):
             "No valid samples remained after cleaning."
         )
 
-    # Keep time values close to zero. This will matter when
-    # the Metal implementation performs trig using Float.
+    # Keep times close to zero for Float precision on Metal.
     times = times - times[0]
-
-    # Mean-center the normalized brightness measurements.
-    flux = flux - np.mean(flux)
 
     original_count = len(times)
 
@@ -109,11 +104,27 @@ def prepare_samples(light_curve):
         times = times[indices]
         flux = flux[indices]
 
+    # Mean-center and scale the signal instead of calling
+    # Lightkurve.normalize(), which warned about this curve.
+    flux_mean = np.mean(flux)
+    flux = flux - flux_mean
+
+    flux_stddev = np.std(flux)
+
+    if not np.isfinite(flux_stddev) or flux_stddev <= 0:
+        raise RuntimeError(
+            "Light curve has invalid flux variance."
+        )
+
+    flux = flux / flux_stddev
+
     print()
     print("✨ Light curve prepared")
     print(f"   original samples: {original_count}")
     print(f"   distributed samples: {len(times)}")
     print(f"   baseline: {times[-1]:.4f} days")
+    print(f"   flux mean: {np.mean(flux):.8f}")
+    print(f"   flux stddev: {np.std(flux):.8f}")
 
     return times, flux
 
@@ -187,16 +198,71 @@ def calculate_reference_period(times, flux):
 
     return (
         frequency_step,
+        frequencies,
+        powers,
         best_frequency,
         best_period,
         best_power
     )
 
 
+def build_reference_chunks(
+    frequencies,
+    powers
+):
+    chunks = []
+
+    for start_index in range(
+        0,
+        TOTAL_FREQUENCIES,
+        FREQUENCIES_PER_WORK_UNIT
+    ):
+        end_index = min(
+            start_index + FREQUENCIES_PER_WORK_UNIT,
+            TOTAL_FREQUENCIES
+        )
+
+        chunk_powers = powers[
+            start_index:end_index
+        ]
+
+        local_index = int(
+            np.argmax(chunk_powers)
+        )
+
+        global_index = (
+            start_index +
+            local_index
+        )
+
+        chunks.append(
+            {
+                "startIndex": start_index,
+                "frequencyCount":
+                    end_index - start_index,
+                "bestFrequency":
+                    float(
+                        frequencies[
+                            global_index
+                        ]
+                    ),
+                "bestPower":
+                    float(
+                        powers[
+                            global_index
+                        ]
+                    )
+            }
+        )
+
+    return chunks
+
+
 def save_dataset(
     times,
     flux,
     frequency_step,
+    reference_chunks,
     reference_frequency,
     reference_period,
     reference_power
@@ -206,19 +272,13 @@ def save_dataset(
         exist_ok=True
     )
 
-    work_unit_count = (
-        TOTAL_FREQUENCIES +
-        FREQUENCIES_PER_WORK_UNIT -
-        1
-    ) // FREQUENCIES_PER_WORK_UNIT
-
     dataset = {
         "id": DATASET_ID,
         "targetName": TARGET,
         "mission": "TESS",
         "source": "MAST",
         "timeUnit": "day",
-        "fluxUnit": "normalized",
+        "fluxUnit": "standardized",
         "times": times.astype(
             np.float32
         ).tolist(),
@@ -226,18 +286,28 @@ def save_dataset(
             np.float32
         ).tolist(),
         "search": {
-            "minimumFrequency": MIN_FREQUENCY,
-            "maximumFrequency": MAX_FREQUENCY,
-            "frequencyStep": frequency_step,
-            "totalFrequencies": TOTAL_FREQUENCIES,
+            "minimumFrequency":
+                MIN_FREQUENCY,
+            "maximumFrequency":
+                MAX_FREQUENCY,
+            "frequencyStep":
+                frequency_step,
+            "totalFrequencies":
+                TOTAL_FREQUENCIES,
             "frequenciesPerWorkUnit":
                 FREQUENCIES_PER_WORK_UNIT,
-            "workUnitCount": work_unit_count
+            "workUnitCount":
+                len(reference_chunks)
         },
         "reference": {
-            "bestFrequency": reference_frequency,
-            "bestPeriodDays": reference_period,
-            "bestPower": reference_power
+            "bestFrequency":
+                reference_frequency,
+            "bestPeriodDays":
+                reference_period,
+            "bestPower":
+                reference_power,
+            "chunks":
+                reference_chunks
         }
     }
 
@@ -256,7 +326,7 @@ def save_dataset(
     print(f"   file: {OUTPUT_FILE}")
     print(
         f"   work units: "
-        f"{work_unit_count}"
+        f"{len(reference_chunks)}"
     )
 
 
@@ -269,6 +339,8 @@ def main():
 
     (
         frequency_step,
+        frequencies,
+        powers,
         reference_frequency,
         reference_period,
         reference_power
@@ -277,10 +349,16 @@ def main():
         flux
     )
 
+    reference_chunks = build_reference_chunks(
+        frequencies,
+        powers
+    )
+
     save_dataset(
         times,
         flux,
         frequency_step,
+        reference_chunks,
         reference_frequency,
         reference_period,
         reference_power
