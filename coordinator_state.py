@@ -10,6 +10,9 @@ from pathlib import Path
 LEASE_SECONDS = 120.0
 RETRY_COOLDOWN_SECONDS = 1.0
 EXECUTION_FAILURE_NODE_AVOID_SECONDS = 30.0
+SCIENTIFIC_FAILURE_NODE_AVOID_SECONDS = 30.0
+CROSS_NODE_FREQUENCY_TOLERANCE_STEPS = 2.0
+CROSS_NODE_POWER_RELATIVE_TOLERANCE = 0.005
 
 # Chunk verification is reduction-first:
 #
@@ -73,6 +76,7 @@ class CoordinatorState:
         self.verification_failure_counts = {}
         self.execution_failure_counts = {}
         self.execution_avoid_until = {}
+        self.scientific_rejections = {}
 
         self.nodes = {}
 
@@ -617,11 +621,11 @@ class CoordinatorState:
                     deferred.append(work_id)
                     continue
 
-                # Execution failures are operational, not scientific. If this
-                # node recently failed to execute this exact work unit, defer
-                # it so another registered node gets a chance. The avoidance
-                # expires automatically so a single-node project cannot
-                # deadlock forever.
+                # Retry avoidance applies to both operational execution
+                # failures and scientific verification failures. If this node
+                # recently failed this exact work unit, defer it so another
+                # registered node gets a chance. Avoidance expires
+                # automatically so a single-node project cannot deadlock.
                 avoid_by_node = self.execution_avoid_until.get(work_id)
                 if avoid_by_node:
                     expired_nodes = [
@@ -913,6 +917,134 @@ class CoordinatorState:
             details,
         )
 
+    def _try_cross_node_consensus_locked(
+            self,
+            work_id,
+            work_unit,
+            assignment,
+            result,
+            verification,
+    ):
+        # Cross-node consensus is only a fallback for a result that already
+        # failed strict Astropy verification but still lies inside Astropy's
+        # narrow ambiguity-frequency band. It never broadens that band.
+        current_frequency_error = verification.get("frequencyError")
+        ambiguity_tolerance = verification.get("ambiguityFrequencyTolerance")
+
+        if (
+                current_frequency_error is None
+                or ambiguity_tolerance is None
+                or float(current_frequency_error) > float(ambiguity_tolerance)
+        ):
+            return False, None, None
+
+        try:
+            current_frequency = float(result["bestFrequency"])
+            current_power = float(result["bestPower"])
+        except (KeyError, TypeError, ValueError):
+            return False, None, None
+
+        current_node_key = normalize_id(assignment.get("nodeID"))
+        frequency_step = abs(float(work_unit["frequencyStep"]))
+        device_frequency_tolerance = max(
+            frequency_step * CROSS_NODE_FREQUENCY_TOLERANCE_STEPS,
+            1.0e-7,
+            )
+
+        for prior in self.scientific_rejections.get(work_id, []):
+            prior_node_key = normalize_id(prior.get("nodeID"))
+
+            # Consensus must come from a genuinely different registered node.
+            if prior_node_key is None or prior_node_key == current_node_key:
+                continue
+
+            prior_verification = prior.get("verification", {})
+            prior_frequency_error = prior_verification.get("frequencyError")
+            prior_ambiguity_tolerance = prior_verification.get(
+                "ambiguityFrequencyTolerance"
+            )
+
+            if (
+                    prior_frequency_error is None
+                    or prior_ambiguity_tolerance is None
+                    or float(prior_frequency_error)
+                    > float(prior_ambiguity_tolerance)
+            ):
+                continue
+
+            try:
+                prior_frequency = float(prior["bestFrequency"])
+                prior_power = float(prior["bestPower"])
+            except (KeyError, TypeError, ValueError):
+                continue
+
+            device_frequency_error = abs(
+                current_frequency - prior_frequency
+            )
+            device_power_error = abs(current_power - prior_power)
+            device_power_tolerance = max(
+                POWER_ABSOLUTE_TOLERANCE,
+                max(abs(current_power), abs(prior_power))
+                * CROSS_NODE_POWER_RELATIVE_TOLERANCE,
+                )
+
+            if (
+                    device_frequency_error <= device_frequency_tolerance
+                    and device_power_error <= device_power_tolerance
+            ):
+                consensus = dict(verification)
+                consensus.update(
+                    {
+                        "method": "cross-node-consensus",
+                        "consensusNodeID": prior.get("nodeID"),
+                        "consensusFrequency": prior_frequency,
+                        "consensusPower": prior_power,
+                        "crossNodeFrequencyError": device_frequency_error,
+                        "crossNodeFrequencyTolerance": (
+                            device_frequency_tolerance
+                        ),
+                        "crossNodePowerError": device_power_error,
+                        "crossNodePowerTolerance": device_power_tolerance,
+                    }
+                )
+
+                return (
+                    True,
+                    "Result accepted by cross-node consensus: a different "
+                    "node independently reproduced the same ambiguous "
+                    "frequency/power result inside the existing Astropy "
+                    "ambiguity-frequency band.",
+                    consensus,
+                )
+
+        return False, None, None
+
+    def _record_scientific_rejection_locked(
+            self,
+            work_id,
+            assignment,
+            result,
+            verification,
+    ):
+        rejections = self.scientific_rejections.setdefault(work_id, [])
+        node_key = normalize_id(assignment.get("nodeID"))
+
+        # Keep only the latest rejected scientific result per node.
+        rejections[:] = [
+            item
+            for item in rejections
+            if normalize_id(item.get("nodeID")) != node_key
+        ]
+        rejections.append(
+            {
+                "nodeID": assignment.get("nodeID"),
+                "bestFrequency": result.get("bestFrequency"),
+                "bestPower": result.get("bestPower"),
+                "verification": dict(verification),
+                "recordedAt": time.time(),
+            }
+        )
+
     @staticmethod
     def _print_optional_float(label, value, digits=8):
         if value is None:
@@ -984,7 +1116,10 @@ class CoordinatorState:
         if hard_failed:
             print("   action: HARD FAILED - not requeued")
         else:
-            print("   action: requeued")
+            print(
+                "   action: requeued; failing node temporarily avoided for "
+                "this work unit"
+            )
 
     def _print_execution_failure(
             self,
@@ -1104,9 +1239,33 @@ class CoordinatorState:
                     result,
                 )
 
+                if not accepted:
+                    (
+                        consensus_accepted,
+                        consensus_message,
+                        consensus_verification,
+                    ) = self._try_cross_node_consensus_locked(
+                        work_id,
+                        work_unit,
+                        assignment,
+                        result,
+                        verification,
+                    )
+
+                    if consensus_accepted:
+                        accepted = True
+                        message = consensus_message
+                        verification = consensus_verification
+
             if execution_failed:
                 rejection_args = None
             elif not accepted:
+                self._record_scientific_rejection_locked(
+                    work_id,
+                    assignment,
+                    result,
+                    verification,
+                )
                 self.assigned.pop(work_id, None)
 
                 self.retry_counts[work_id] = (
@@ -1124,6 +1283,8 @@ class CoordinatorState:
 
                 if hard_failed:
                     self.retry_after.pop(work_id, None)
+                    self.execution_avoid_until.pop(work_id, None)
+                    self.scientific_rejections.pop(work_id, None)
                     self.failed[work_id] = {
                         "datasetID": work_unit["datasetID"],
                         "nodeID": assignment["nodeID"],
@@ -1133,10 +1294,28 @@ class CoordinatorState:
                         "failedAt": time.time(),
                     }
                 else:
+                    now = time.time()
+
+                    # A deterministic scientific retry should be useful. Do
+                    # not immediately hand the same rejected work unit back to
+                    # the same device; give another registered node a chance
+                    # to reproduce or disagree with the result. This expires
+                    # so single-node projects continue after a short delay.
+                    failing_node_key = normalize_id(assignment["nodeID"])
+                    avoid_by_node = self.execution_avoid_until.setdefault(
+                        work_id,
+                        {},
+                    )
+                    avoid_by_node[failing_node_key] = (
+                            now + SCIENTIFIC_FAILURE_NODE_AVOID_SECONDS
+                    )
+
                     self.retry_after[work_id] = (
-                            time.time() + RETRY_COOLDOWN_SECONDS
+                            now + RETRY_COOLDOWN_SECONDS
                     )
                     self.pending.append(work_id)
+
+                self._mark_node_seen_locked(assignment["nodeID"])
 
                 rejection_args = {
                     "work_unit": dict(work_unit),
@@ -1165,6 +1344,7 @@ class CoordinatorState:
                 self.assigned.pop(work_id, None)
                 self.retry_after.pop(work_id, None)
                 self.execution_avoid_until.pop(work_id, None)
+                self.scientific_rejections.pop(work_id, None)
                 self._mark_node_seen_locked(assignment["nodeID"])
 
                 completed_count = len(self.completed)
@@ -1548,7 +1728,7 @@ class CoordinatorState:
 
         print()
         print("⭐ OpenStar Coordinator")
-        print("Build: multi-target-v11-execution-requeue-verification")
+        print("Build: multi-target-v13-cross-node-consensus")
         print(f"File: {Path(__file__).resolve()}")
         print(f"Listening on {host}:{port}")
         print()
@@ -1557,7 +1737,7 @@ class CoordinatorState:
         print(f"Datasets: {len(self.datasets)}")
         print(f"Work units: {len(self.work_units)}")
         print(
-            "Verification: frequency OR equivalent chunk-max power, with nearby-peak fallback"
+            "Verification: frequency OR equivalent chunk-max power, with nearby-peak and cross-node consensus fallbacks"
         )
         print(
             "Primary match: frequency agreement; secondary match: strict "
@@ -1582,6 +1762,14 @@ class CoordinatorState:
         print(
             "Execution failure handling: requeue without scientific failure; "
             f"avoid same node for {EXECUTION_FAILURE_NODE_AVOID_SECONDS:.0f}s"
+        )
+        print(
+            "Scientific retry handling: requeue verification failures; "
+            f"avoid same node for {SCIENTIFIC_FAILURE_NODE_AVOID_SECONDS:.0f}s"
+        )
+        print(
+            "Cross-node consensus: different nodes may confirm the same "
+            "Astropy-ambiguous result without widening Astropy tolerances"
         )
 
         for dataset_id, dataset in self.datasets.items():
