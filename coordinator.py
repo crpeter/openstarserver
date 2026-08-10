@@ -12,7 +12,7 @@ from urllib.parse import unquote, urlparse
 
 LEASE_SECONDS = 120.0
 RETRY_COOLDOWN_SECONDS = 1.0
-BUILD = "multi-target-v4"
+BUILD = "multi-target-v5-reference-validation"
 DEFAULT_PROJECT_PATH = "data/projects/openstar.tess-multi-target-v1.json"
 
 
@@ -21,9 +21,13 @@ def normalize_id(value):
 
 
 def first_value(mapping, *keys, default=None):
+    if not isinstance(mapping, dict):
+        return default
+
     for key in keys:
         if key in mapping and mapping[key] is not None:
             return mapping[key]
+
     return default
 
 
@@ -84,7 +88,10 @@ class CoordinatorState:
     def _load_datasets(self):
         for entry in self.project.get("datasets", []):
             dataset_id = entry["id"]
-            dataset = self._load_json(self._resolve_dataset_path(entry))
+
+            dataset = self._load_json(
+                self._resolve_dataset_path(entry)
+            )
 
             self.datasets[dataset_id] = dataset
             self.dataset_manifest_entries[dataset_id] = entry
@@ -157,22 +164,20 @@ class CoordinatorState:
             minimum_frequency = search["minimumFrequency"]
             frequency_step = search["frequencyStep"]
             total_frequencies = search["totalFrequencies"]
-            frequencies_per_work_unit = search[
-                "frequenciesPerWorkUnit"
-            ]
+            chunk_size = search["frequenciesPerWorkUnit"]
 
             for start_index in range(
                     0,
                     total_frequencies,
-                    frequencies_per_work_unit,
+                    chunk_size,
             ):
                 frequency_count = min(
-                    frequencies_per_work_unit,
+                    chunk_size,
                     total_frequencies - start_index,
                     )
 
                 work_id = str(uuid.uuid4())
-                normalized_work_id = normalize_id(work_id)
+                normalized = normalize_id(work_id)
 
                 work_unit = {
                     "id": work_id,
@@ -188,20 +193,14 @@ class CoordinatorState:
                     "frequencyCount": frequency_count,
                 }
 
-                self.work_units[
-                    normalized_work_id
-                ] = work_unit
+                self.work_units[normalized] = work_unit
 
                 self.work_ids_by_dataset.setdefault(
                     dataset_id,
                     [],
-                ).append(
-                    normalized_work_id
-                )
+                ).append(normalized)
 
-                self.pending.append(
-                    normalized_work_id
-                )
+                self.pending.append(normalized)
 
     def register_node(self, payload):
         node_id = str(payload["nodeID"])
@@ -223,7 +222,7 @@ class CoordinatorState:
             f"{capabilities.get('platform', 'unknown')}"
         )
         print(
-            "   hardware: "
+            f"   hardware: "
             f"{capabilities.get('hardwareIdentifier', 'unknown')}"
         )
         print(
@@ -236,21 +235,15 @@ class CoordinatorState:
 
         expired = [
             work_id
-            for work_id, assignment
-            in self.assigned.items()
+            for work_id, assignment in self.assigned.items()
             if assignment["leaseExpiresAt"] <= now
         ]
 
         for work_id in expired:
-            self.assigned.pop(
-                work_id,
-                None,
-            )
+            self.assigned.pop(work_id, None)
 
             if work_id not in self.completed:
-                self.pending.append(
-                    work_id
-                )
+                self.pending.append(work_id)
 
     def claim_work(self, node_id):
         node_key = normalize_id(node_id)
@@ -259,9 +252,7 @@ class CoordinatorState:
             self._requeue_expired_locked()
 
             if node_key in self.nodes:
-                self.nodes[node_key][
-                    "lastSeenAt"
-                ] = time.time()
+                self.nodes[node_key]["lastSeenAt"] = time.time()
 
             now = time.time()
 
@@ -274,21 +265,11 @@ class CoordinatorState:
                 if work_id in self.completed:
                     continue
 
-                if (
-                        self.retry_after.get(
-                            work_id,
-                            0.0,
-                        )
-                        > now
-                ):
-                    deferred.append(
-                        work_id
-                    )
+                if self.retry_after.get(work_id, 0.0) > now:
+                    deferred.append(work_id)
                     continue
 
-                candidate = self.work_units.get(
-                    work_id
-                )
+                candidate = self.work_units.get(work_id)
 
                 if candidate is None:
                     continue
@@ -296,37 +277,21 @@ class CoordinatorState:
                 self.assigned[work_id] = {
                     "nodeID": str(node_id),
                     "assignedAt": now,
-                    "leaseExpiresAt": (
-                            now + LEASE_SECONDS
-                    ),
+                    "leaseExpiresAt": now + LEASE_SECONDS,
                 }
 
-                work_unit = dict(
-                    candidate
-                )
-
+                work_unit = dict(candidate)
                 break
 
             for work_id in deferred:
-                self.pending.append(
-                    work_id
-                )
+                self.pending.append(work_id)
 
         if work_unit is not None:
             print()
             print("📦 Science work assigned")
-            print(
-                f"   work: "
-                f"{work_unit['id']}"
-            )
-            print(
-                f"   node: "
-                f"{node_id}"
-            )
-            print(
-                f"   dataset: "
-                f"{work_unit['datasetID']}"
-            )
+            print(f"   work: {work_unit['id']}")
+            print(f"   node: {node_id}")
+            print(f"   dataset: {work_unit['datasetID']}")
             print(
                 "   frequency start: "
                 f"{work_unit['startFrequency']:.6f}"
@@ -338,46 +303,357 @@ class CoordinatorState:
 
         return work_unit
 
+    # -------------------------------------------------------------------------
+    # Astropy reference parsing
+    # -------------------------------------------------------------------------
+
     @staticmethod
-    def _chunk_references(dataset):
-        reference = dataset.get(
-            "reference",
-            {},
-        )
+    def _reference_roots(dataset):
+        roots = []
 
         for key in (
-                "chunks",
-                "chunkReferences",
-                "workUnits",
-                "workUnitReferences",
+                "reference",
+                "references",
+                "astropyReference",
+                "astropy",
+                "validation",
         ):
-            value = reference.get(key)
+            value = dataset.get(key)
 
-            if isinstance(
-                    value,
-                    list,
+            if isinstance(value, (dict, list)):
+                roots.append(value)
+
+        search = dataset.get("frequencySearch")
+
+        if isinstance(search, dict):
+            for key in (
+                    "reference",
+                    "references",
+                    "astropyReference",
+                    "astropy",
+                    "validation",
             ):
+                value = search.get(key)
+
+                if isinstance(value, (dict, list)):
+                    roots.append(value)
+
+        return roots
+
+    @staticmethod
+    def _direct_reference_triplet(mapping):
+        if not isinstance(mapping, dict):
+            return None
+
+        frequency = first_value(
+            mapping,
+            "bestFrequency",
+            "frequency",
+            "best_frequency",
+            "peakFrequency",
+            "peak_frequency",
+        )
+
+        period = first_value(
+            mapping,
+            "bestPeriodDays",
+            "periodDays",
+            "period",
+            "best_period_days",
+            "period_days",
+            "bestPeriod",
+        )
+
+        power = first_value(
+            mapping,
+            "bestPower",
+            "power",
+            "best_power",
+            "peakPower",
+            "peak_power",
+        )
+
+        if (
+                frequency is None
+                and period is None
+                and power is None
+        ):
+            return None
+
+        return frequency, period, power
+
+    @classmethod
+    def _find_global_reference(cls, value):
+        if not isinstance(value, dict):
+            return None
+
+        direct = cls._direct_reference_triplet(value)
+
+        if direct is not None:
+            return direct
+
+        for key in (
+                "global",
+                "globalBest",
+                "globalReference",
+                "overall",
+                "best",
+                "result",
+                "astropy",
+                "lombScargle",
+                "lomb_scargle",
+        ):
+            child = value.get(key)
+
+            if isinstance(child, dict):
+                found = cls._find_global_reference(child)
+
+                if found is not None:
+                    return found
+
+        for key, child in value.items():
+            lowered = str(key).lower()
+
+            if any(
+                    token in lowered
+                    for token in (
+                            "chunk",
+                            "workunit",
+                            "work_unit",
+                            "perunit",
+                            "per_unit",
+                    )
+            ):
+                continue
+
+            if isinstance(child, dict):
+                found = cls._find_global_reference(child)
+
+                if found is not None:
+                    return found
+
+        return None
+
+    @staticmethod
+    def _chunk_start_value(mapping):
+        return first_value(
+            mapping,
+            "frequencyStartIndex",
+            "startIndex",
+            "frequency_start_index",
+            "start_index",
+            "offset",
+        )
+
+    @classmethod
+    def _reference_frequency(cls, mapping):
+        if not isinstance(mapping, dict):
+            return None
+
+        direct = first_value(
+            mapping,
+            "bestFrequency",
+            "frequency",
+            "best_frequency",
+            "peakFrequency",
+            "peak_frequency",
+        )
+
+        if direct is not None:
+            return direct
+
+        for key in (
+                "reference",
+                "astropy",
+                "best",
+                "result",
+                "global",
+        ):
+            child = mapping.get(key)
+
+            if isinstance(child, dict):
+                found = cls._reference_frequency(child)
+
+                if found is not None:
+                    return found
+
+        for child in mapping.values():
+            if isinstance(child, dict):
+                found = cls._reference_frequency(child)
+
+                if found is not None:
+                    return found
+
+        return None
+
+    @classmethod
+    def _looks_like_reference_list(cls, value):
+        if not isinstance(value, list) or not value:
+            return False
+
+        dict_items = [
+            item
+            for item in value
+            if isinstance(item, dict)
+        ]
+
+        if not dict_items:
+            return False
+
+        sample = dict_items[
+            :min(len(dict_items), 8)
+        ]
+
+        return any(
+            cls._reference_frequency(item) is not None
+            for item in sample
+        )
+
+    @classmethod
+    def _raw_chunk_references(cls, dataset):
+        preferred_keys = (
+            "chunks",
+            "chunkReferences",
+            "chunkResults",
+            "chunk_results",
+            "workUnits",
+            "workUnitReferences",
+            "workUnitResults",
+            "work_units",
+            "perWorkUnit",
+            "per_work_unit",
+        )
+
+        def search(value):
+            if isinstance(value, dict):
+                for key in preferred_keys:
+                    child = value.get(key)
+
+                    if cls._looks_like_reference_list(child):
+                        return child
+
+                    if isinstance(child, dict) and child:
+                        converted = []
+
+                        for raw_key, item in child.items():
+                            if not isinstance(item, dict):
+                                continue
+
+                            candidate = dict(item)
+
+                            if cls._chunk_start_value(candidate) is None:
+                                try:
+                                    candidate[
+                                        "frequencyStartIndex"
+                                    ] = int(raw_key)
+
+                                except (
+                                        TypeError,
+                                        ValueError,
+                                ):
+                                    pass
+
+                            if (
+                                    cls._reference_frequency(candidate)
+                                    is not None
+                            ):
+                                converted.append(candidate)
+
+                        if converted:
+                            return converted
+
+                for child in value.values():
+                    if cls._looks_like_reference_list(child):
+                        return child
+
+                    if isinstance(child, dict):
+                        found = search(child)
+
+                        if found:
+                            return found
+
+            elif cls._looks_like_reference_list(value):
                 return value
 
+            return []
+
+        for root in cls._reference_roots(dataset):
+            found = search(root)
+
+            if found:
+                return found
+
         return []
+
+    @classmethod
+    def _chunk_references(cls, dataset):
+        raw = cls._raw_chunk_references(dataset)
+
+        if not raw:
+            return []
+
+        search = cls._frequency_search(dataset)
+
+        chunk_size = search[
+            "frequenciesPerWorkUnit"
+        ]
+
+        total_frequencies = search[
+            "totalFrequencies"
+        ]
+
+        expected_starts = set(
+            range(
+                0,
+                total_frequencies,
+                chunk_size,
+            )
+        )
+
+        normalized = []
+
+        for position, item in enumerate(raw):
+            if not isinstance(item, dict):
+                continue
+
+            candidate = dict(item)
+
+            start = cls._chunk_start_value(
+                candidate
+            )
+
+            if start is None:
+                start = position * chunk_size
+
+            else:
+                start = int(start)
+
+                # Some reference structures use the chunk ordinal
+                # instead of the actual frequency start index.
+                if (
+                        start not in expected_starts
+                        and 0 <= start < len(raw)
+                ):
+                    start *= chunk_size
+
+            candidate[
+                "frequencyStartIndex"
+            ] = start
+
+            normalized.append(candidate)
+
+        return normalized
 
     def _chunk_reference(
             self,
             dataset_id,
             start_index,
     ):
-        dataset = self.datasets[
-            dataset_id
-        ]
-
         for chunk in self._chunk_references(
-                dataset
+                self.datasets[dataset_id]
         ):
-            chunk_start = first_value(
-                chunk,
-                "frequencyStartIndex",
-                "startIndex",
-                "index",
+            chunk_start = self._chunk_start_value(
+                chunk
             )
 
             if (
@@ -388,6 +664,102 @@ class CoordinatorState:
                 return chunk
 
         return None
+
+    @classmethod
+    def _global_reference(cls, dataset):
+        for root in cls._reference_roots(dataset):
+            found = cls._find_global_reference(root)
+
+            if found is not None:
+                return found
+
+        return None, None, None
+
+    def _validate_reference_data(self):
+        problems = []
+
+        for dataset_id, dataset in self.datasets.items():
+            (
+                reference_frequency,
+                _,
+                _,
+            ) = self._global_reference(dataset)
+
+            chunks = self._chunk_references(
+                dataset
+            )
+
+            expected_work_ids = (
+                self.work_ids_by_dataset.get(
+                    dataset_id,
+                    [],
+                )
+            )
+
+            expected_starts = {
+                int(
+                    self.work_units[
+                        work_id
+                    ][
+                        "frequencyStartIndex"
+                    ]
+                )
+                for work_id
+                in expected_work_ids
+            }
+
+            valid_starts = {
+                int(
+                    self._chunk_start_value(
+                        chunk
+                    )
+                )
+                for chunk in chunks
+                if (
+                        self._chunk_start_value(
+                            chunk
+                        )
+                        is not None
+                        and self._reference_frequency(
+                    chunk
+                )
+                        is not None
+                )
+            }
+
+            if reference_frequency is None:
+                problems.append(
+                    f"{dataset_id}: "
+                    "global Astropy frequency reference "
+                    "not found"
+                )
+
+            missing = (
+                    expected_starts
+                    - valid_starts
+            )
+
+            if missing:
+                problems.append(
+                    f"{dataset_id}: only "
+                    f"{len(valid_starts)}/"
+                    f"{len(expected_starts)} "
+                    "work-unit Astropy references "
+                    "were found"
+                )
+
+        if problems:
+            details = "\n".join(
+                f" - {problem}"
+                for problem in problems
+            )
+
+            raise RuntimeError(
+                "Astropy reference validation failed. "
+                "OpenStar will not run unverified "
+                "science work:\n"
+                f"{details}"
+            )
 
     def verification_tolerance(
             self,
@@ -514,7 +886,8 @@ class CoordinatorState:
         ):
             return (
                 False,
-                "Best frequency is outside work-unit range.",
+                "Best frequency is outside "
+                "work-unit range.",
             )
 
         reference = self._chunk_reference(
@@ -526,20 +899,22 @@ class CoordinatorState:
 
         if reference is None:
             return (
-                True,
-                "Result accepted.",
+                False,
+                "Astropy work-unit reference "
+                "is missing.",
             )
 
-        reference_frequency = first_value(
-            reference,
-            "bestFrequency",
-            "frequency",
+        reference_frequency = (
+            self._reference_frequency(
+                reference
+            )
         )
 
         if reference_frequency is None:
             return (
-                True,
-                "Result accepted.",
+                False,
+                "Astropy reference frequency "
+                "is missing.",
             )
 
         tolerance = (
@@ -578,8 +953,10 @@ class CoordinatorState:
         )
 
         with self.lock:
-            work_unit = self.work_units.get(
-                work_id
+            work_unit = (
+                self.work_units.get(
+                    work_id
+                )
             )
 
             if work_unit is None:
@@ -596,11 +973,12 @@ class CoordinatorState:
                     200,
                 )
 
-            accepted, message = (
-                self._verify_result(
-                    work_unit,
-                    result,
-                )
+            (
+                accepted,
+                message,
+            ) = self._verify_result(
+                work_unit,
+                result,
             )
 
             if not accepted:
@@ -673,7 +1051,7 @@ class CoordinatorState:
             f"{work_unit['datasetID']}"
         )
         print(
-            "   frequency: "
+            f"   frequency: "
             f"{float(result['bestFrequency']):.8f}"
         )
 
@@ -684,12 +1062,12 @@ class CoordinatorState:
                 is not None
         ):
             print(
-                "   period: "
+                f"   period: "
                 f"{float(result['bestPeriodDays']):.8f} days"
             )
 
         print(
-            "   power: "
+            f"   power: "
             f"{float(result['bestPower']):.8f}"
         )
 
@@ -698,7 +1076,7 @@ class CoordinatorState:
                 is not None
         ):
             print(
-                "   duration: "
+                f"   duration: "
                 f"{float(result['duration']):.4f}s"
             )
 
@@ -715,6 +1093,10 @@ class CoordinatorState:
             200,
         )
 
+    # -------------------------------------------------------------------------
+    # Status
+    # -------------------------------------------------------------------------
+
     def _dataset_counts_locked(
             self,
             dataset_id,
@@ -726,38 +1108,32 @@ class CoordinatorState:
             )
         )
 
-        work_id_set = set(
+        work_set = set(
             work_ids
         )
 
-        pending_count = sum(
+        pending = sum(
             1
-            for work_id
-            in self.pending
-            if work_id
-            in work_id_set
+            for work_id in self.pending
+            if work_id in work_set
         )
 
-        assigned_count = sum(
+        assigned = sum(
             1
-            for work_id
-            in self.assigned
-            if work_id
-            in work_id_set
+            for work_id in self.assigned
+            if work_id in work_set
         )
 
-        completed_count = sum(
+        completed = sum(
             1
-            for work_id
-            in self.completed
-            if work_id
-            in work_id_set
+            for work_id in self.completed
+            if work_id in work_set
         )
 
         return (
-            pending_count,
-            assigned_count,
-            completed_count,
+            pending,
+            assigned,
+            completed,
             len(work_ids),
         )
 
@@ -773,8 +1149,10 @@ class CoordinatorState:
                     [],
                 )
         ):
-            result = self.completed.get(
-                work_id
+            result = (
+                self.completed.get(
+                    work_id
+                )
             )
 
             if (
@@ -809,10 +1187,8 @@ class CoordinatorState:
                 assigned,
                 completed,
                 total,
-            ) = (
-                self._dataset_counts_locked(
-                    dataset_id
-                )
+            ) = self._dataset_counts_locked(
+                dataset_id
             )
 
             best = (
@@ -868,11 +1244,15 @@ class CoordinatorState:
                 ),
                 "ticID": manifest.get(
                     "ticID",
-                    metadata.get("ticID"),
+                    metadata.get(
+                        "ticID"
+                    ),
                 ),
                 "sector": manifest.get(
                     "sector",
-                    metadata.get("sector"),
+                    metadata.get(
+                        "sector"
+                    ),
                 ),
                 "pendingWorkUnits": pending,
                 "assignedWorkUnits": assigned,
@@ -923,10 +1303,8 @@ class CoordinatorState:
                 _,
                 completed,
                 total,
-            ) = (
-                self._dataset_counts_locked(
-                    dataset_id
-                )
+            ) = self._dataset_counts_locked(
+                dataset_id
             )
 
             if completed < total:
@@ -966,10 +1344,7 @@ class CoordinatorState:
                 self._current_dataset_id_locked()
             )
 
-            if (
-                    current_dataset_id
-                    is None
-            ):
+            if current_dataset_id is None:
                 current = {
                     "id": "",
                     "targetName": "",
@@ -1070,12 +1445,15 @@ class CoordinatorState:
                 "projectPendingWorkUnits": (
                     project_pending
                 ),
+
                 "projectAssignedWorkUnits": (
                     project_assigned
                 ),
+
                 "projectCompletedWorkUnits": (
                     project_completed
                 ),
+
                 "projectRetryCount": sum(
                     1
                     for work_id
@@ -1083,9 +1461,11 @@ class CoordinatorState:
                     if work_id
                     not in self.completed
                 ),
+
                 "projectTotalWorkUnits": (
                     project_total
                 ),
+
                 "projectProgress": (
                     project_completed
                     / project_total
@@ -1098,33 +1478,9 @@ class CoordinatorState:
                 ),
             }
 
-    @staticmethod
-    def _global_reference(
-            dataset
-    ):
-        reference = dataset.get(
-            "reference",
-            {},
-        )
-
-        return (
-            first_value(
-                reference,
-                "bestFrequency",
-                "frequency",
-            ),
-            first_value(
-                reference,
-                "bestPeriodDays",
-                "periodDays",
-                "period",
-            ),
-            first_value(
-                reference,
-                "bestPower",
-                "power",
-            ),
-        )
+    # -------------------------------------------------------------------------
+    # Completion reporting
+    # -------------------------------------------------------------------------
 
     def _report_dataset_complete(
             self,
@@ -1142,10 +1498,8 @@ class CoordinatorState:
                 _,
                 completed,
                 total,
-            ) = (
-                self._dataset_counts_locked(
-                    dataset_id
-                )
+            ) = self._dataset_counts_locked(
+                dataset_id
             )
 
             if (
@@ -1213,7 +1567,7 @@ class CoordinatorState:
         (
             reference_frequency,
             reference_period,
-            _,
+            reference_power,
         ) = self._global_reference(
             dataset
         )
@@ -1256,6 +1610,12 @@ class CoordinatorState:
                 f"{abs(float(best_period) - reference_period):.8f} days"
             )
 
+        if reference_power is not None:
+            print(
+                "   Astropy power: "
+                f"{float(reference_power):.8f}"
+            )
+
     def _report_project_complete(
             self
     ):
@@ -1278,10 +1638,7 @@ class CoordinatorState:
                     dataset_id,
                     self.datasets[
                         dataset_id
-                    ].get(
-                        "targetName",
-                        dataset_id,
-                    ),
+                    ],
                     self._dataset_best_locked(
                         dataset_id
                     ),
@@ -1299,39 +1656,100 @@ class CoordinatorState:
 
         for (
                 dataset_id,
-                target_name,
+                dataset,
                 best,
         ) in results:
             print()
             print(
                 f"   target: "
-                f"{target_name}"
+                f"{dataset.get('targetName', dataset_id)}"
             )
             print(
                 f"   dataset: "
                 f"{dataset_id}"
             )
 
-            if best is not None:
+            if best is None:
+                continue
+
+            best_frequency = float(
+                best["bestFrequency"]
+            )
+
+            best_period = best.get(
+                "bestPeriodDays"
+            )
+
+            best_power = float(
+                best["bestPower"]
+            )
+
+            print(
+                "   OpenStar frequency: "
+                f"{best_frequency:.8f}"
+            )
+
+            if best_period is not None:
                 print(
-                    "   best frequency: "
-                    f"{float(best['bestFrequency']):.8f}"
+                    "   OpenStar period: "
+                    f"{float(best_period):.8f} days"
                 )
 
-                if (
-                        best.get(
-                            "bestPeriodDays"
-                        )
-                        is not None
-                ):
-                    print(
-                        "   best period: "
-                        f"{float(best['bestPeriodDays']):.8f} days"
-                    )
+            print(
+                "   OpenStar power: "
+                f"{best_power:.8f}"
+            )
+
+            (
+                reference_frequency,
+                reference_period,
+                reference_power,
+            ) = self._global_reference(
+                dataset
+            )
+
+            if (
+                    reference_frequency
+                    is not None
+            ):
+                reference_frequency = float(
+                    reference_frequency
+                )
 
                 print(
-                    "   best power: "
-                    f"{float(best['bestPower']):.8f}"
+                    "   Astropy frequency: "
+                    f"{reference_frequency:.8f}"
+                )
+
+                print(
+                    "   frequency error: "
+                    f"{abs(best_frequency - reference_frequency):.8f}"
+                )
+
+            if (
+                    reference_period
+                    is not None
+                    and best_period
+                    is not None
+            ):
+                reference_period = float(
+                    reference_period
+                )
+
+                print(
+                    "   Astropy period: "
+                    f"{reference_period:.8f} days"
+                )
+
+                print(
+                    "   period error: "
+                    f"{abs(float(best_period) - reference_period):.8f} days"
+                )
+
+            if reference_power is not None:
+                print(
+                    "   Astropy power: "
+                    f"{float(reference_power):.8f}"
                 )
 
     def _report_completions(
@@ -1355,6 +1773,12 @@ class CoordinatorState:
             f"File: "
             f"{Path(__file__).resolve()}"
         )
+
+        # Do not start the server unless every dataset has
+        # an Astropy global reference and a reference for
+        # every distributed work unit.
+        self._validate_reference_data()
+
         print(
             f"Listening on port "
             f"{port}"
@@ -1385,9 +1809,22 @@ class CoordinatorState:
             (
                 reference_frequency,
                 reference_period,
-                _,
+                reference_power,
             ) = self._global_reference(
                 dataset
+            )
+
+            reference_chunks = (
+                self._chunk_references(
+                    dataset
+                )
+            )
+
+            expected_chunks = len(
+                self.work_ids_by_dataset.get(
+                    dataset_id,
+                    [],
+                )
             )
 
             print()
@@ -1408,22 +1845,29 @@ class CoordinatorState:
                 f"{len(dataset.get('times', []))}"
             )
 
-            if (
-                    reference_period
-                    is not None
-            ):
+            print(
+                "Astropy work-unit references: "
+                f"{len(reference_chunks)}/"
+                f"{expected_chunks}"
+            )
+
+            print(
+                "Astropy reference frequency: "
+                f"{float(reference_frequency):.8f} "
+                "cycles/day"
+            )
+
+            if reference_period is not None:
                 print(
                     "Astropy reference period: "
-                    f"{float(reference_period):.8f} days"
+                    f"{float(reference_period):.8f} "
+                    "days"
                 )
 
-            if (
-                    reference_frequency
-                    is not None
-            ):
+            if reference_power is not None:
                 print(
-                    "Astropy reference frequency: "
-                    f"{float(reference_frequency):.8f} cycles/day"
+                    "Astropy reference power: "
+                    f"{float(reference_power):.8f}"
                 )
 
 
@@ -1733,13 +2177,11 @@ class RequestHandler(
                 accepted,
                 message,
                 status_code,
-            ) = (
-                STATE.submit_result(
-                    unquote(
-                        work_id
-                    ),
-                    payload,
-                )
+            ) = STATE.submit_result(
+                unquote(
+                    work_id
+                ),
+                payload,
             )
 
             self._send_json(
