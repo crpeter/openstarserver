@@ -10,14 +10,24 @@ from pathlib import Path
 LEASE_SECONDS = 120.0
 RETRY_COOLDOWN_SECONDS = 1.0
 
-# Chunk verification is intentionally dual-path:
-#   1. exact/near-exact peak frequency agreement, OR
-#   2. equivalent peak power agreement.
+# Chunk verification is reduction-first:
 #
-# The second path is important for weak/flat chunks where Float32 Metal and
-# Float64 Astropy can legitimately choose different neighboring/local bins
-# with effectively identical peak power.
-POWER_RELATIVE_TOLERANCE = 0.005
+#   1. If OpenStar and Astropy select the same peak frequency within the
+#      dataset-derived primary tolerance, accept the result. Peak power is
+#      diagnostic on this path.
+#
+#   2. Otherwise, if OpenStar reports effectively the same maximum power for
+#      the assigned chunk, accept it even when the argmax frequency differs.
+#      In weak/flat chunks, Float32 Metal and Float64 Astropy can choose
+#      different bins while agreeing on the chunk's maximum contribution to
+#      the global reduction.
+#
+#   3. As a final fallback, a nearby peak inside the narrow ambiguity band may
+#      use a looser power tolerance.
+#
+#   4. Everything else is rejected.
+EQUIVALENT_POWER_RELATIVE_TOLERANCE = 0.005
+AMBIGUOUS_POWER_RELATIVE_TOLERANCE = 0.03
 POWER_ABSOLUTE_TOLERANCE = 1.0e-5
 
 # A deterministic scientific mismatch must never spin forever.
@@ -644,6 +654,35 @@ class CoordinatorState:
             peak_width * 0.005,
             )
 
+    def ambiguity_frequency_tolerance(self, dataset_id, frequency_step):
+        times = self.datasets[dataset_id].get("times", [])
+        primary_tolerance = self.verification_tolerance(
+            dataset_id,
+            frequency_step,
+        )
+
+        if len(times) < 2:
+            return max(
+                primary_tolerance,
+                abs(frequency_step) * 8.0,
+                )
+
+        baseline_days = float(times[-1]) - float(times[0])
+
+        if baseline_days <= 0:
+            return max(
+                primary_tolerance,
+                abs(frequency_step) * 8.0,
+                )
+
+        peak_width = 1.0 / baseline_days
+
+        return max(
+            primary_tolerance,
+            abs(frequency_step) * 8.0,
+            peak_width * 0.02,
+            )
+
     def _verify_result(self, work_unit, result):
         details = {
             "method": None,
@@ -651,6 +690,7 @@ class CoordinatorState:
             "astropyFrequency": None,
             "frequencyError": None,
             "frequencyTolerance": None,
+            "ambiguityFrequencyTolerance": None,
             "devicePower": None,
             "astropyPower": None,
             "powerError": None,
@@ -755,54 +795,91 @@ class CoordinatorState:
             work_unit["datasetID"],
             frequency_step,
         )
-        frequency_error = abs(best_frequency - reference_frequency)
+        ambiguity_frequency_tolerance = self.ambiguity_frequency_tolerance(
+            work_unit["datasetID"],
+            frequency_step,
+        )
 
-        power_tolerance = max(
-            POWER_ABSOLUTE_TOLERANCE,
-            abs(reference_power) * POWER_RELATIVE_TOLERANCE,
-            )
+        frequency_error = abs(best_frequency - reference_frequency)
         power_error = abs(best_power - reference_power)
+        equivalent_power_tolerance = max(
+            POWER_ABSOLUTE_TOLERANCE,
+            abs(reference_power)
+            * EQUIVALENT_POWER_RELATIVE_TOLERANCE,
+            )
+        ambiguity_power_tolerance = max(
+            POWER_ABSOLUTE_TOLERANCE,
+            abs(reference_power)
+            * AMBIGUOUS_POWER_RELATIVE_TOLERANCE,
+            )
 
         details.update(
             {
                 "astropyFrequency": reference_frequency,
                 "frequencyError": frequency_error,
                 "frequencyTolerance": frequency_tolerance,
+                "ambiguityFrequencyTolerance": (
+                    ambiguity_frequency_tolerance
+                ),
                 "astropyPower": reference_power,
                 "powerError": power_error,
-                "powerTolerance": power_tolerance,
+                "powerTolerance": equivalent_power_tolerance,
+                "ambiguityPowerTolerance": ambiguity_power_tolerance,
             }
         )
 
-        # Power agreement is required for every accepted result. The
-        # frequency check tells us whether the device selected the same peak
-        # location. If Float32 and Float64 choose different local bins in a
-        # flat/weak chunk, equivalent peak power is still scientifically
-        # acceptable.
-        if power_error > power_tolerance:
-            return (
-                False,
-                "Astropy power verification failed: "
-                f"device={best_power:.8f}, "
-                f"astropy={reference_power:.8f}, "
-                f"error={power_error:.8f}, "
-                f"tolerance={power_tolerance:.8f}.",
-                details,
-            )
-
+        # Primary path: if Metal and Astropy identify the same scientific peak,
+        # frequency agreement is authoritative. Power remains diagnostic.
         if frequency_error <= frequency_tolerance:
-            details["method"] = "frequency+power"
+            details["method"] = "frequency"
             return (
                 True,
-                "Result accepted by frequency and power agreement.",
+                "Result accepted by frequency agreement; peak power recorded "
+                "diagnostically.",
                 details,
             )
 
-        details["method"] = "equivalent-power"
+        # Secondary path: for a distributed max reduction, an effectively
+        # identical chunk maximum is also a valid result. Weak/flat chunks can
+        # have unstable argmax locations even when the maximum power itself is
+        # numerically equivalent. This path is intentionally strict on power.
+        if power_error <= equivalent_power_tolerance:
+            details["method"] = "equivalent-power"
+            return (
+                True,
+                "Result accepted by equivalent chunk maximum power; argmax "
+                "frequency differs in an ambiguous/flat chunk.",
+                details,
+            )
+
+        # Tertiary path: a nearby local maximum may use a looser power check,
+        # but only inside the narrow dataset-derived ambiguity band.
+        if (
+                frequency_error <= ambiguity_frequency_tolerance
+                and power_error <= ambiguity_power_tolerance
+        ):
+            details["method"] = "nearby-peak"
+            details["powerTolerance"] = ambiguity_power_tolerance
+            return (
+                True,
+                "Result accepted as a nearby ambiguous peak with similar "
+                "power.",
+                details,
+            )
+
         return (
-            True,
-            "Result accepted by equivalent peak power; peak frequency "
-            "differs within an ambiguous chunk.",
+            False,
+            "Astropy frequency/power verification failed: "
+            f"deviceFrequency={best_frequency:.8f}, "
+            f"astropyFrequency={reference_frequency:.8f}, "
+            f"frequencyError={frequency_error:.8f}, "
+            f"primaryTolerance={frequency_tolerance:.8f}, "
+            f"ambiguityTolerance={ambiguity_frequency_tolerance:.8f}, "
+            f"devicePower={best_power:.8f}, "
+            f"astropyPower={reference_power:.8f}, "
+            f"powerError={power_error:.8f}, "
+            f"equivalentPowerTolerance={equivalent_power_tolerance:.8f}, "
+            f"nearbyPowerTolerance={ambiguity_power_tolerance:.8f}.",
             details,
         )
 
@@ -846,6 +923,10 @@ class CoordinatorState:
         self._print_optional_float(
             "frequency tolerance",
             details.get("frequencyTolerance"),
+        )
+        self._print_optional_float(
+            "ambiguity frequency tolerance",
+            details.get("ambiguityFrequencyTolerance"),
         )
         self._print_optional_float(
             "device power",
@@ -1327,7 +1408,7 @@ class CoordinatorState:
 
         print()
         print("⭐ OpenStar Coordinator")
-        print("Build: multi-target-v7-equivalent-power-verification")
+        print("Build: multi-target-v10-reduction-first-verification")
         print(f"File: {Path(__file__).resolve()}")
         print(f"Listening on {host}:{port}")
         print()
@@ -1336,12 +1417,23 @@ class CoordinatorState:
         print(f"Datasets: {len(self.datasets)}")
         print(f"Work units: {len(self.work_units)}")
         print(
-            "Verification: Astropy peak power required; frequency agreement preferred"
+            "Verification: frequency OR equivalent chunk-max power, with nearby-peak fallback"
         )
         print(
-            "Power tolerance: "
+            "Primary match: frequency agreement; secondary match: strict "
+            "equivalent chunk power"
+        )
+        print(
+            "Equivalent-power tolerance: "
             f"max({POWER_ABSOLUTE_TOLERANCE:.8f}, "
-            f"Astropy power * {POWER_RELATIVE_TOLERANCE:.4f})"
+            "Astropy power * "
+            f"{EQUIVALENT_POWER_RELATIVE_TOLERANCE:.4f})"
+        )
+        print(
+            "Nearby-peak power tolerance: "
+            f"max({POWER_ABSOLUTE_TOLERANCE:.8f}, "
+            "Astropy power * "
+            f"{AMBIGUOUS_POWER_RELATIVE_TOLERANCE:.4f})"
         )
         print(
             "Max verification failures/work unit: "

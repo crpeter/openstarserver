@@ -366,16 +366,13 @@ def preflight_targets():
             search_result, author, cadence_seconds = search_light_curve(target)
 
             if len(search_result) == 0:
-                raise RuntimeError(
-                    "empty search result"
-                )
+                raise RuntimeError("empty search result")
 
             print(
                 "   preflight ready: "
                 f"{target['targetName']} -> "
                 f"{author}, {cadence_seconds:.0f}s"
             )
-
         except Exception as error:
             failures.append(
                 f"{target['targetName']}: {error}"
@@ -390,10 +387,7 @@ def preflight_targets():
 
     print()
     print("✅ TESS target preflight complete")
-    print(
-        f"   usable targets: "
-        f"{len(TARGETS)}/{len(TARGETS)}"
-    )
+    print(f"   usable targets: {len(TARGETS)}/{len(TARGETS)}")
 
 
 def _extract_sector(
@@ -479,56 +473,59 @@ def download_light_curve(target: dict):
 def prepare_light_curve(light_curve):
     original_samples = len(light_curve)
 
-    times = np.asarray(
+    # Start with the highest precision supplied by Lightkurve while we clean,
+    # sort, downsample, and normalize the source light curve.
+    times64 = np.asarray(
         light_curve.time.value,
         dtype=np.float64,
     )
 
-    flux = np.asarray(
+    flux64 = np.asarray(
         light_curve.flux.value,
         dtype=np.float64,
     )
 
     finite = (
-            np.isfinite(times)
-            & np.isfinite(flux)
+            np.isfinite(times64)
+            & np.isfinite(flux64)
     )
 
-    times = times[finite]
-    flux = flux[finite]
+    times64 = times64[finite]
+    flux64 = flux64[finite]
 
-    if len(times) == 0:
+    if len(times64) == 0:
         raise RuntimeError(
             "Light curve contains no finite samples."
         )
 
-    order = np.argsort(times)
+    order = np.argsort(times64)
 
-    times = times[order]
-    flux = flux[order]
+    times64 = times64[order]
+    flux64 = flux64[order]
 
-    finite_samples = len(times)
+    finite_samples = len(times64)
 
-    # Preserve the full time baseline. If we need to cap the payload,
-    # select evenly spaced samples across the entire light curve instead
-    # of truncating the end of the sector.
-    if len(times) > MAX_SAMPLES:
+    # Preserve the complete observing baseline. If the light curve is larger
+    # than the payload limit, select evenly spaced samples across the entire
+    # time span instead of chopping samples from the end.
+    if len(times64) > MAX_SAMPLES:
         indices = np.linspace(
             0,
-            len(times) - 1,
+            len(times64) - 1,
             MAX_SAMPLES,
             dtype=np.int64,
             )
 
-        times = times[indices]
-        flux = flux[indices]
+        times64 = times64[indices]
+        flux64 = flux64[indices]
 
+    # Normalize while still in Float64 so the normalization itself is stable.
     flux_mean = float(
-        np.mean(flux)
+        np.mean(flux64)
     )
 
     flux_stddev = float(
-        np.std(flux)
+        np.std(flux64)
     )
 
     if (
@@ -539,9 +536,42 @@ def prepare_light_curve(light_curve):
             "Light curve flux has invalid standard deviation."
         )
 
-    flux = (
-                   flux - flux_mean
-           ) / flux_stddev
+    flux64 = (
+                     flux64 - flux_mean
+             ) / flux_stddev
+
+    # Swift decodes AstronomyDataset.times and .flux as [Float], and the Metal
+    # workload consumes Float32 values. Absolute TESS timestamps are large
+    # enough that converting them directly to Float32 throws away meaningful
+    # timing precision. Shift time to zero before quantizing.
+    time_origin_days = float(times64[0])
+    times64 = times64 - time_origin_days
+
+    # THIS IS THE VALIDATION BOUNDARY:
+    # Quantize the distributed dataset to the exact numeric representation the
+    # Apple clients receive BEFORE computing the Astropy answer key.
+    times = np.asarray(
+        times64,
+        dtype=np.float32,
+    )
+    flux = np.asarray(
+        flux64,
+        dtype=np.float32,
+    )
+
+    # Defensive checks after Float32 conversion.
+    if not np.all(np.isfinite(times)):
+        raise RuntimeError(
+            "Float32 time conversion produced non-finite values."
+        )
+
+    if not np.all(np.isfinite(flux)):
+        raise RuntimeError(
+            "Float32 flux conversion produced non-finite values."
+        )
+
+    if len(times) > 0:
+        times[0] = np.float32(0.0)
 
     baseline_days = (
         float(times[-1] - times[0])
@@ -564,25 +594,48 @@ def prepare_light_curve(light_curve):
         f"{len(times)}"
     )
     print(
+        f"   original time origin: "
+        f"{time_origin_days:.8f} days"
+    )
+    print(
+        "   distributed time origin: "
+        f"{float(times[0]):.8f} days"
+    )
+    print(
         f"   baseline: "
         f"{baseline_days:.4f} days"
     )
+    print("   distributed precision: Float32")
     print(
         f"   flux mean: "
-        f"{float(np.mean(flux)):.8f}"
+        f"{float(np.mean(flux, dtype=np.float64)):.8f}"
     )
     print(
         f"   flux stddev: "
-        f"{float(np.std(flux)):.8f}"
+        f"{float(np.std(flux, dtype=np.float64)):.8f}"
     )
 
-    return times, flux
+    return times, flux, time_origin_days
 
 
 def calculate_astropy_reference(
         times: np.ndarray,
         flux: np.ndarray,
 ):
+    # The distributed arrays are intentionally Float32. Convert those exact
+    # quantized values back to Float64 for Astropy's numerical calculation.
+    # This preserves Astropy's precision while ensuring both implementations
+    # begin from exactly the same samples.
+    astropy_times = np.asarray(
+        times,
+        dtype=np.float32,
+    ).astype(np.float64)
+
+    astropy_flux = np.asarray(
+        flux,
+        dtype=np.float32,
+    ).astype(np.float64)
+
     step = frequency_step()
 
     frequencies = (
@@ -604,10 +657,11 @@ def calculate_astropy_reference(
         f"   frequencies: "
         f"{len(frequencies)}"
     )
+    print("   input samples: exact distributed Float32 values")
 
     periodogram = LombScargle(
-        times,
-        flux,
+        astropy_times,
+        astropy_flux,
     )
 
     powers = periodogram.power(
@@ -800,6 +854,7 @@ def build_dataset(
         flux: np.ndarray,
         reference: dict,
         source_metadata: dict,
+        time_origin_days: float,
 ):
     science = validate_science_metadata(
         target
@@ -831,9 +886,12 @@ def build_dataset(
             "cadenceSeconds": source_metadata[
                 "cadenceSeconds"
             ],
+            "originalTimeOriginDays": time_origin_days,
         },
         "science": science,
         "timeUnit": "days",
+        "timeReference": "relative-to-first-distributed-sample",
+        "numericRepresentation": "Float32",
         "fluxUnit": "normalized",
         "times": [
             float(value)
@@ -906,7 +964,11 @@ def prepare_target(target: dict):
         target
     )
 
-    times, flux = prepare_light_curve(
+    (
+        times,
+        flux,
+        time_origin_days,
+    ) = prepare_light_curve(
         light_curve
     )
 
@@ -921,6 +983,7 @@ def prepare_target(target: dict):
         flux,
         reference,
         source_metadata,
+        time_origin_days,
     )
 
     output_path = write_dataset(
@@ -1054,6 +1117,9 @@ def main():
         "Work units per target: "
         f"{expected_work_unit_count()}"
     )
+    print("Distributed numeric representation: Float32")
+    print("Time representation: relative to first distributed sample")
+    print("Astropy reference input: exact distributed Float32 samples")
 
     preflight_targets()
 
