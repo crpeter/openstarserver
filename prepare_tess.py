@@ -1,7 +1,5 @@
 import json
 import math
-import re
-from datetime import datetime, timezone
 from pathlib import Path
 
 import lightkurve as lk
@@ -9,80 +7,477 @@ import numpy as np
 from astropy.timeseries import LombScargle
 
 
-TARGETS_FILE = Path("targets.json")
+# ============================================================
+# OpenStar TESS scientific validation project
+# ============================================================
+
+PROJECT_ID = "openstar.tess-validation-v1"
+PROJECT_NAME = "OpenStar TESS Scientific Validation v1"
+WORKLOAD_ID = "openstar.tess-period-search.v1"
 
 DATA_DIR = Path("data")
 PROJECTS_DIR = DATA_DIR / "projects"
 
 MAX_SAMPLES = 18_000
 
-MIN_FREQUENCY = 0.5
-MAX_FREQUENCY = 5.0
+# The previous 0.5 cycles/day lower bound could not detect periods
+# longer than 2 days. This range covers periods up to 10 days.
+MINIMUM_FREQUENCY = 0.1
+MAXIMUM_FREQUENCY = 5.0
 
 TOTAL_FREQUENCIES = 4_194_304
 FREQUENCIES_PER_WORK_UNIT = 4_096
 
+PREFERRED_AUTHOR = "SPOC"
+FALLBACK_AUTHOR = "TESS-SPOC"
+PREFERRED_EXPTIME_SECONDS = 120
 
-def load_targets():
-    with TARGETS_FILE.open(
-            "r",
-            encoding="utf-8",
-    ) as file:
-        return json.load(file)
+# Product selections are populated by the startup preflight so expensive
+# Astropy work never begins until every target has a usable TESS product.
+SEARCH_SELECTION_CACHE = {}
 
 
-def json_number(value):
-    if value is None:
+# ============================================================
+# Targets
+# ============================================================
+
+TARGETS = [
+    {
+        "id": "tess-rr-lyr",
+        "targetName": "RR Lyr",
+        "query": "TIC 159717514",
+        "ticID": 159717514,
+        "sector": None,
+        "science": {
+            "role": "known",
+            "classification": "RRab",
+            "publishedPeriodDays": 0.5668,
+            "answerKeySource": "published/catalog RR Lyr period",
+        },
+    },
+    {
+        "id": "tess-v473-lyr",
+        "targetName": "V473 Lyr",
+        "query": "TIC 403786081",
+        "ticID": 403786081,
+        "sector": 14,
+        "science": {
+            "role": "known",
+            "classification": "DCEP (second overtone)",
+            "publishedPeriodDays": 1.490780,
+            "answerKeySource": "published V473 Lyr pulsation period",
+        },
+    },
+    {
+        "id": "tess-au-mic",
+        "targetName": "AU Mic",
+        "query": "TIC 441420236",
+        "ticID": 441420236,
+        "sector": 1,
+        "science": {
+            "role": "known",
+            "classification": "rotational variable",
+            "publishedPeriodDays": 4.848,
+            "answerKeySource": "catalog stellar rotation period",
+        },
+    },
+    {
+        "id": "tess-tic-199716496",
+        "targetName": "TIC 199716496",
+        "query": "TIC 199716496",
+        "ticID": 199716496,
+        "sector": 14,
+        "science": {
+            "role": "known",
+            "classification": "EA eclipsing binary",
+            "publishedPeriodDays": 1.04583737,
+            "answerKeySource": "published eclipsing-binary orbital period",
+        },
+    },
+    {
+        "id": "tess-pi-men",
+        "targetName": "Pi Mensae",
+        "query": "TIC 261136679",
+        "ticID": 261136679,
+        "sector": 1,
+        "science": {
+            "role": "control",
+        },
+    },
+    {
+        "id": "tess-toi-1080",
+        "targetName": "TOI-1080",
+        "query": "TIC 161032923",
+        "ticID": 161032923,
+        "sector": 13,
+        "science": {
+            "role": "control",
+        },
+    },
+    {
+        "id": "tess-toi-561",
+        "targetName": "TOI-561",
+        "query": "TIC 377064495",
+        "ticID": 377064495,
+        "sector": 8,
+        "science": {
+            "role": "control",
+        },
+    },
+    {
+        "id": "tess-blind-a",
+        "targetName": "Blind A",
+        "query": "TIC 25165839",
+        "ticID": 25165839,
+        "sector": 1,
+        "science": {
+            "role": "blind",
+        },
+    },
+]
+
+
+def frequency_step() -> float:
+    return (
+            MAXIMUM_FREQUENCY - MINIMUM_FREQUENCY
+    ) / TOTAL_FREQUENCIES
+
+
+def expected_work_unit_count() -> int:
+    return math.ceil(
+        TOTAL_FREQUENCIES / FREQUENCIES_PER_WORK_UNIT
+    )
+
+
+def _search_products(
+        target: dict,
+        *,
+        author: str,
+        exptime: int | None,
+):
+    kwargs = {
+        "mission": "TESS",
+        "author": author,
+    }
+
+    if target.get("sector") is not None:
+        kwargs["sector"] = int(target["sector"])
+
+    if exptime is not None:
+        kwargs["exptime"] = exptime
+
+    return lk.search_lightcurve(
+        target["query"],
+        **kwargs,
+    )
+
+
+def _select_shortest_cadence(search_result):
+    if len(search_result) == 0:
+        return search_result
+
+    exposures = np.asarray(
+        search_result.exptime,
+        dtype=np.float64,
+    )
+
+    finite_indices = np.flatnonzero(
+        np.isfinite(exposures)
+    )
+
+    if len(finite_indices) == 0:
+        return search_result[0:1]
+
+    shortest_local_index = int(
+        np.argmin(exposures[finite_indices])
+    )
+
+    selected_index = int(
+        finite_indices[shortest_local_index]
+    )
+
+    return search_result[
+        selected_index:selected_index + 1
+    ]
+
+
+def _selected_exptime_seconds(search_result) -> float:
+    if len(search_result) == 0:
+        raise RuntimeError(
+            "Cannot read cadence from an empty search result."
+        )
+
+    value = search_result.exptime[0]
+
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        if hasattr(value, "value"):
+            return float(value.value)
+        raise
+
+
+def _diagnostic_search(target: dict):
+    kwargs = {
+        "mission": "TESS",
+    }
+
+    if target.get("sector") is not None:
+        kwargs["sector"] = int(target["sector"])
+
+    return lk.search_lightcurve(
+        target["query"],
+        **kwargs,
+    )
+
+
+def search_light_curve(target: dict):
+    cached = SEARCH_SELECTION_CACHE.get(target["id"])
+
+    if cached is not None:
+        print()
+        print("🔭 Using preflight MAST selection")
+        print(f"   target: {target['targetName']}")
+        print(f"   author: {cached[1]}")
+        print(f"   cadence: {cached[2]:.0f}s")
+        return cached
+
+    print()
+    print("🔭 Searching MAST")
+    print(f"   target: {target['targetName']}")
+    print(f"   query: {target['query']}")
+
+    if target.get("sector") is not None:
+        print(f"   requested sector: {target['sector']}")
+
+    print(f"   preferred author: {PREFERRED_AUTHOR}")
+    print(
+        "   preferred cadence: "
+        f"{PREFERRED_EXPTIME_SECONDS}s"
+    )
+
+    preferred = _search_products(
+        target,
+        author=PREFERRED_AUTHOR,
+        exptime=PREFERRED_EXPTIME_SECONDS,
+    )
+
+    if len(preferred) > 0:
+        print(
+            f"   preferred products found: "
+            f"{len(preferred)}"
+        )
+
+        selected = _select_shortest_cadence(
+            preferred
+        )
+
+        cadence_seconds = (
+            _selected_exptime_seconds(selected)
+        )
+
+        print(
+            f"   selected author: "
+            f"{PREFERRED_AUTHOR}"
+        )
+        print(
+            "   selected cadence: "
+            f"{cadence_seconds:.0f}s"
+        )
+
+        selection = (
+            selected,
+            PREFERRED_AUTHOR,
+            cadence_seconds,
+        )
+
+        SEARCH_SELECTION_CACHE[target["id"]] = selection
+        return selection
+
+    print(
+        "   no 120s SPOC product; "
+        "trying TESS-SPOC FFI light curves"
+    )
+
+    fallback = _search_products(
+        target,
+        author=FALLBACK_AUTHOR,
+        exptime=None,
+    )
+
+    if len(fallback) > 0:
+        print(
+            f"   fallback products found: "
+            f"{len(fallback)}"
+        )
+
+        selected = _select_shortest_cadence(
+            fallback
+        )
+
+        cadence_seconds = (
+            _selected_exptime_seconds(selected)
+        )
+
+        print(
+            f"   selected author: "
+            f"{FALLBACK_AUTHOR}"
+        )
+        print(
+            "   selected cadence: "
+            f"{cadence_seconds:.0f}s"
+        )
+
+        selection = (
+            selected,
+            FALLBACK_AUTHOR,
+            cadence_seconds,
+        )
+
+        SEARCH_SELECTION_CACHE[target["id"]] = selection
+        return selection
+
+    available = _diagnostic_search(target)
+
+    print()
+    print("❌ No usable SPOC-family product")
+    print(f"   target: {target['targetName']}")
+
+    if len(available) > 0:
+        print()
+        print("Available TESS light-curve products:")
+        print(available)
+
+    raise RuntimeError(
+        "No SPOC or TESS-SPOC TESS light curve "
+        f"found for {target['targetName']}."
+    )
+
+
+def preflight_targets():
+    print()
+    print("🔎 Preflighting all TESS targets")
+    print("   no downloads or Astropy calculations yet")
+
+    failures = []
+
+    for target in TARGETS:
+        try:
+            search_result, author, cadence_seconds = search_light_curve(target)
+
+            if len(search_result) == 0:
+                raise RuntimeError(
+                    "empty search result"
+                )
+
+            print(
+                "   preflight ready: "
+                f"{target['targetName']} -> "
+                f"{author}, {cadence_seconds:.0f}s"
+            )
+
+        except Exception as error:
+            failures.append(
+                f"{target['targetName']}: {error}"
+            )
+
+    if failures:
+        raise RuntimeError(
+            "TESS target preflight failed. "
+            "No datasets were processed:\n - "
+            + "\n - ".join(failures)
+        )
+
+    print()
+    print("✅ TESS target preflight complete")
+    print(
+        f"   usable targets: "
+        f"{len(TARGETS)}/{len(TARGETS)}"
+    )
+
+
+def _extract_sector(
+        light_curve,
+        target: dict,
+):
+    sector = getattr(
+        light_curve,
+        "sector",
+        None,
+    )
+
+    if sector is None:
+        meta = getattr(
+            light_curve,
+            "meta",
+            {},
+        )
+
+        sector = meta.get(
+            "SECTOR"
+        )
+
+    if sector is None:
+        sector = target.get(
+            "sector"
+        )
+
+    if sector is None:
         return None
 
-    if isinstance(value, np.generic):
-        return value.item()
+    try:
+        return int(sector)
+    except (TypeError, ValueError):
+        return sector
 
-    return value
 
+def download_light_curve(target: dict):
+    (
+        search_result,
+        source_author,
+        cadence_seconds,
+    ) = search_light_curve(target)
 
-def extract_tic_id(*values):
-    for value in values:
-        if value is None:
-            continue
+    print()
+    print("⬇️ Downloading selected light curve")
+    print(f"   author: {source_author}")
+    print(
+        "   cadence: "
+        f"{cadence_seconds:.0f}s"
+    )
 
-        match = re.search(
-            r"\bTIC\s+(\d+)\b",
-            str(value),
-            flags=re.IGNORECASE,
+    light_curve = search_result.download(
+        quality_bitmask="default"
+    )
+
+    if light_curve is None:
+        raise RuntimeError(
+            "Download failed for "
+            f"{target['targetName']}."
         )
 
-        if match:
-            return int(match.group(1))
+    actual_sector = _extract_sector(
+        light_curve,
+        target,
+    )
 
-    return None
-
-
-def evenly_downsample(
-        times,
-        flux,
-        max_samples,
-):
-    if len(times) <= max_samples:
-        return times, flux
-
-    indices = np.linspace(
-        0,
-        len(times) - 1,
-        max_samples,
-        dtype=np.int64,
-        )
+    print(
+        "   selected sector: "
+        f"{actual_sector if actual_sector is not None else 'unknown'}"
+    )
 
     return (
-        times[indices],
-        flux[indices],
+        light_curve,
+        {
+            "author": source_author,
+            "cadenceSeconds": cadence_seconds,
+            "sector": actual_sector,
+        },
     )
 
 
 def prepare_light_curve(light_curve):
     original_samples = len(light_curve)
-
-    light_curve = light_curve.remove_nans()
 
     times = np.asarray(
         light_curve.time.value,
@@ -102,9 +497,9 @@ def prepare_light_curve(light_curve):
     times = times[finite]
     flux = flux[finite]
 
-    if len(times) < 2:
+    if len(times) == 0:
         raise RuntimeError(
-            "Light curve has too few finite samples."
+            "Light curve contains no finite samples."
         )
 
     order = np.argsort(times)
@@ -112,14 +507,21 @@ def prepare_light_curve(light_curve):
     times = times[order]
     flux = flux[order]
 
-    times, flux = evenly_downsample(
-        times,
-        flux,
-        MAX_SAMPLES,
-    )
+    finite_samples = len(times)
 
-    # Shift the observation timeline to zero.
-    times = times - times[0]
+    # Preserve the full time baseline. If we need to cap the payload,
+    # select evenly spaced samples across the entire light curve instead
+    # of truncating the end of the sector.
+    if len(times) > MAX_SAMPLES:
+        indices = np.linspace(
+            0,
+            len(times) - 1,
+            MAX_SAMPLES,
+            dtype=np.int64,
+            )
+
+        times = times[indices]
+        flux = flux[indices]
 
     flux_mean = float(
         np.mean(flux)
@@ -134,107 +536,110 @@ def prepare_light_curve(light_curve):
             or flux_stddev <= 0
     ):
         raise RuntimeError(
-            "Light curve flux has zero or invalid variance."
+            "Light curve flux has invalid standard deviation."
         )
 
-    # Center and standardize the light curve.
     flux = (
                    flux - flux_mean
            ) / flux_stddev
 
-    baseline_days = float(
-        times[-1] - times[0]
+    baseline_days = (
+        float(times[-1] - times[0])
+        if len(times) > 1
+        else 0.0
     )
 
-    return {
-        "times": times,
-        "flux": flux,
-        "originalSamples": original_samples,
-        "distributedSamples": len(times),
-        "baselineDays": baseline_days,
-        "originalFluxMean": flux_mean,
-        "originalFluxStddev": flux_stddev,
-    }
+    print()
+    print("✨ Light curve prepared")
+    print(
+        f"   original samples: "
+        f"{original_samples}"
+    )
+    print(
+        f"   finite samples: "
+        f"{finite_samples}"
+    )
+    print(
+        f"   distributed samples: "
+        f"{len(times)}"
+    )
+    print(
+        f"   baseline: "
+        f"{baseline_days:.4f} days"
+    )
+    print(
+        f"   flux mean: "
+        f"{float(np.mean(flux)):.8f}"
+    )
+    print(
+        f"   flux stddev: "
+        f"{float(np.std(flux)):.8f}"
+    )
+
+    return times, flux
 
 
-def build_frequency_grid():
-    frequency_step = (
-                             MAX_FREQUENCY - MIN_FREQUENCY
-                     ) / TOTAL_FREQUENCIES
+def calculate_astropy_reference(
+        times: np.ndarray,
+        flux: np.ndarray,
+):
+    step = frequency_step()
 
     frequencies = (
-            MIN_FREQUENCY
+            MINIMUM_FREQUENCY
             + np.arange(
         TOTAL_FREQUENCIES,
         dtype=np.float64,
+    ) * step
     )
-            * frequency_step
-    )
 
-    return frequencies, frequency_step
-
-
-def calculate_reference(
-        times,
-        flux,
-):
     print()
     print("🧪 Calculating Astropy reference")
     print(
         "   frequency range: "
-        f"{MIN_FREQUENCY:.3f} - "
-        f"{MAX_FREQUENCY:.3f} cycles/day"
+        f"{MINIMUM_FREQUENCY:.3f} - "
+        f"{MAXIMUM_FREQUENCY:.3f} cycles/day"
     )
     print(
         f"   frequencies: "
-        f"{TOTAL_FREQUENCIES}"
+        f"{len(frequencies)}"
     )
 
-    frequencies, frequency_step = (
-        build_frequency_grid()
-    )
-
-    model = LombScargle(
+    periodogram = LombScargle(
         times,
         flux,
     )
 
-    powers = model.power(
+    powers = periodogram.power(
         frequencies
     )
 
-    powers = np.asarray(
-        powers,
-        dtype=np.float64,
-    )
-
-    finite = np.isfinite(powers)
-
-    if not np.any(finite):
+    if len(powers) != TOTAL_FREQUENCIES:
         raise RuntimeError(
-            "Astropy produced no finite powers."
+            "Astropy returned unexpected frequency count."
         )
 
-    safe_powers = np.where(
-        finite,
-        powers,
-        -np.inf,
-    )
+    finite_power = np.isfinite(powers)
+
+    if not np.any(finite_power):
+        raise RuntimeError(
+            "Astropy returned no finite Lomb-Scargle powers."
+        )
 
     global_index = int(
-        np.argmax(safe_powers)
+        np.nanargmax(powers)
     )
 
     best_frequency = float(
         frequencies[global_index]
     )
 
-    best_period_days = float(
-        1.0 / best_frequency
-    )
-
     best_power = float(
         powers[global_index]
+    )
+
+    best_period_days = (
+            1.0 / best_frequency
     )
 
     chunks = []
@@ -250,17 +655,24 @@ def calculate_reference(
             TOTAL_FREQUENCIES,
             )
 
-        chunk_powers = safe_powers[
+        chunk_powers = powers[
             start_index:end_index
         ]
 
-        relative_index = int(
-            np.argmax(chunk_powers)
+        if not np.any(
+                np.isfinite(chunk_powers)
+        ):
+            raise RuntimeError(
+                "Astropy returned no finite power values for "
+                f"frequency chunk starting at {start_index}."
+            )
+
+        local_index = int(
+            np.nanargmax(chunk_powers)
         )
 
         absolute_index = (
-                start_index
-                + relative_index
+                start_index + local_index
         )
 
         chunk_frequency = float(
@@ -273,35 +685,24 @@ def calculate_reference(
 
         chunks.append(
             {
-                "frequencyStartIndex": (
-                    start_index
-                ),
+                "frequencyStartIndex": start_index,
                 "frequencyCount": (
-                        end_index
-                        - start_index
+                        end_index - start_index
                 ),
-                "bestFrequency": (
-                    chunk_frequency
+                "bestFrequency": chunk_frequency,
+                "bestPeriodDays": (
+                        1.0 / chunk_frequency
                 ),
-                "bestPeriodDays": float(
-                    1.0 / chunk_frequency
-                ),
-                "bestPower": (
-                    chunk_power
-                ),
+                "bestPower": chunk_power,
             }
         )
 
-    expected_chunks = math.ceil(
-        TOTAL_FREQUENCIES
-        / FREQUENCIES_PER_WORK_UNIT
-    )
+    expected_chunks = expected_work_unit_count()
 
     if len(chunks) != expected_chunks:
         raise RuntimeError(
-            "Astropy chunk reference generation "
-            f"failed: {len(chunks)}/"
-            f"{expected_chunks}"
+            "Astropy chunk-reference count mismatch: "
+            f"{len(chunks)}/{expected_chunks}"
         )
 
     print()
@@ -324,366 +725,144 @@ def calculate_reference(
     )
 
     return {
-        "bestFrequency": (
-            best_frequency
-        ),
-        "bestPeriodDays": (
-            best_period_days
-        ),
-        "bestPower": (
-            best_power
-        ),
+        "bestFrequency": best_frequency,
+        "bestPeriodDays": best_period_days,
+        "bestPower": best_power,
         "chunks": chunks,
-    }, frequency_step
-
-
-def search_light_curve(
-        target,
-):
-    query = target["query"]
-
-    author = target.get(
-        "author",
-        "SPOC",
-    )
-
-    sector = target.get(
-        "sector"
-    )
-
-    print()
-    print("🔭 Searching MAST")
-    print(
-        f"   target: "
-        f"{target['targetName']}"
-    )
-    print(
-        f"   query: "
-        f"{query}"
-    )
-    print(
-        f"   author: "
-        f"{author}"
-    )
-
-    if sector is not None:
-        print(
-            f"   sector: "
-            f"{sector}"
-        )
-
-    search_kwargs = {
-        "mission": "TESS",
-        "author": author,
     }
 
-    if sector is not None:
-        search_kwargs[
-            "sector"
-        ] = sector
 
-    search_result = (
-        lk.search_lightcurve(
-            query,
-            **search_kwargs,
-        )
-    )
-
-    print(
-        f"   products found: "
-        f"{len(search_result)}"
-    )
-
-    if len(search_result) == 0:
-        raise RuntimeError(
-            "No TESS light curves found."
-        )
-
-    product_index = int(
+def validate_science_metadata(
+        target: dict,
+):
+    science = dict(
         target.get(
-            "productIndex",
-            0,
+            "science",
+            {},
         )
     )
 
-    if (
-            product_index < 0
-            or product_index
-            >= len(search_result)
+    role = science.get("role")
+
+    if role not in (
+            "known",
+            "control",
+            "blind",
     ):
         raise RuntimeError(
-            f"productIndex {product_index} "
-            f"is outside 0..{len(search_result) - 1}"
+            "Invalid science role for "
+            f"{target['targetName']}: {role}"
         )
 
-    print()
-    print(
-        "⬇️ Downloading selected light curve"
-    )
-    print(
-        f"   product index: "
-        f"{product_index}"
-    )
+    if role == "known":
+        if not science.get(
+                "classification"
+        ):
+            raise RuntimeError(
+                "Known target is missing classification: "
+                f"{target['targetName']}"
+            )
 
-    selected = search_result[
-        product_index
-    ]
+        if science.get(
+                "publishedPeriodDays"
+        ) is None:
+            raise RuntimeError(
+                "Known target is missing published period: "
+                f"{target['targetName']}"
+            )
 
-    light_curve = selected.download()
-
-    if light_curve is None:
-        raise RuntimeError(
-            "Lightkurve download returned no light curve."
+    if role == "blind":
+        forbidden = (
+            "classification",
+            "publishedPeriodDays",
+            "publishedFrequency",
+            "answerKeySource",
         )
 
-    return (
-        search_result,
-        selected,
-        light_curve,
-    )
+        leaked = [
+            key
+            for key in forbidden
+            if science.get(key) is not None
+        ]
+
+        if leaked:
+            raise RuntimeError(
+                "Blind target contains answer-key metadata: "
+                + ", ".join(leaked)
+            )
+
+    return science
 
 
-def selected_product_metadata(
-        selected,
+def build_dataset(
+        target: dict,
+        times: np.ndarray,
+        flux: np.ndarray,
+        reference: dict,
+        source_metadata: dict,
 ):
-    metadata = {}
-
-    try:
-        table = selected.table
-
-        if len(table) > 0:
-            row = table[0]
-
-            for key in (
-                    "target_name",
-                    "sequence_number",
-                    "author",
-                    "mission",
-                    "exptime",
-                    "distance",
-            ):
-                if key not in row.colnames:
-                    continue
-
-                value = row[key]
-
-                try:
-                    if np.ma.is_masked(value):
-                        continue
-                except TypeError:
-                    pass
-
-                metadata[key] = (
-                    json_number(value)
-                )
-
-    except Exception:
-        # Search-table metadata is useful but is not
-        # required for the distributed science work.
-        pass
-
-    return metadata
-
-
-def prepare_target(
-        project,
-        target,
-):
-    dataset_id = target[
-        "datasetID"
-    ]
-
-    target_name = target[
-        "targetName"
-    ]
-
-    (
-        _,
-        selected,
-        light_curve,
-    ) = search_light_curve(
+    science = validate_science_metadata(
         target
     )
 
-    prepared = prepare_light_curve(
-        light_curve
-    )
-
-    times = prepared[
-        "times"
-    ]
-
-    flux = prepared[
-        "flux"
-    ]
-
-    print()
-    print("✨ Light curve prepared")
-    print(
-        "   original samples: "
-        f"{prepared['originalSamples']}"
-    )
-    print(
-        "   distributed samples: "
-        f"{prepared['distributedSamples']}"
-    )
-    print(
-        "   baseline: "
-        f"{prepared['baselineDays']:.4f} days"
-    )
-    print(
-        "   flux mean: "
-        f"{float(np.mean(flux)):.8f}"
-    )
-    print(
-        "   flux stddev: "
-        f"{float(np.std(flux)):.8f}"
-    )
-
-    (
-        reference,
-        frequency_step,
-    ) = calculate_reference(
-        times,
-        flux,
-    )
-
-    product_metadata = (
-        selected_product_metadata(
-            selected
-        )
-    )
-
-    tic_id = target.get(
-        "ticID"
-    )
-
-    if tic_id is None:
-        tic_id = extract_tic_id(
-            target_name,
-            target.get("query"),
-            product_metadata.get(
-                "target_name"
-            ),
+    if len(times) != len(flux):
+        raise RuntimeError(
+            "Time/flux sample count mismatch."
         )
 
-    sector = target.get(
-        "sector"
-    )
-
-    if sector is None:
-        sector = product_metadata.get(
-            "sequence_number"
+    if len(times) == 0:
+        raise RuntimeError(
+            "Cannot build an empty dataset."
         )
 
-    if sector is not None:
-        try:
-            sector = int(
-                sector
-            )
-        except (
-                TypeError,
-                ValueError,
-        ):
-            sector = None
-
-    work_unit_count = (
-        len(
-            reference["chunks"]
-        )
-    )
-
-    dataset_payload = {
-        # ------------------------------------------------------------------
-        # Swift AstronomyDataset contract
-        # ------------------------------------------------------------------
-        "id": dataset_id,
-        "targetName": target_name,
+    return {
+        "id": target["id"],
+        "targetName": target["targetName"],
         "mission": "TESS",
+        "source": {
+            "archive": "MAST",
+            "author": source_metadata[
+                "author"
+            ],
+            "ticID": target["ticID"],
+            "sector": source_metadata[
+                "sector"
+            ],
+            "cadenceSeconds": source_metadata[
+                "cadenceSeconds"
+            ],
+        },
+        "science": science,
         "timeUnit": "days",
-        "fluxUnit": "standardized normalized flux",
-
+        "fluxUnit": "normalized",
         "times": [
             float(value)
-            for value
-            in times.astype(
-                np.float32
-            )
+            for value in times
         ],
-
         "flux": [
             float(value)
-            for value
-            in flux.astype(
-                np.float32
-            )
+            for value in flux
         ],
-
-        # ------------------------------------------------------------------
-        # Server/science metadata
-        # ------------------------------------------------------------------
-        "metadata": {
-            "query": target[
-                "query"
-            ],
-            "author": target.get(
-                "author",
-                "SPOC",
-            ),
-            "ticID": tic_id,
-            "sector": sector,
-            "sampleCount": (
-                prepared[
-                    "distributedSamples"
-                ]
-            ),
-            "originalSampleCount": (
-                prepared[
-                    "originalSamples"
-                ]
-            ),
-            "baselineDays": (
-                prepared[
-                    "baselineDays"
-                ]
-            ),
-        },
-
-        # ------------------------------------------------------------------
-        # Distributed frequency-search definition
-        # ------------------------------------------------------------------
         "frequencySearch": {
-            "minimumFrequency": (
-                MIN_FREQUENCY
-            ),
-            "maximumFrequency": (
-                MAX_FREQUENCY
-            ),
-            "frequencyStep": (
-                frequency_step
-            ),
-            "totalFrequencies": (
-                TOTAL_FREQUENCIES
-            ),
+            "minimumFrequency": MINIMUM_FREQUENCY,
+            "maximumFrequency": MAXIMUM_FREQUENCY,
+            "frequencyStep": frequency_step(),
+            "totalFrequencies": TOTAL_FREQUENCIES,
             "frequenciesPerWorkUnit": (
                 FREQUENCIES_PER_WORK_UNIT
             ),
-            "workUnitCount": (
-                work_unit_count
-            ),
         },
-
-        # ------------------------------------------------------------------
-        # Canonical Astropy validation data.
-        #
-        # coordinator_v5 reads THIS exact object.
-        # ------------------------------------------------------------------
         "reference": reference,
     }
 
+
+def write_dataset(
+        target: dict,
+        dataset: dict,
+):
     output_path = (
             DATA_DIR
-            / f"{dataset_id}.json"
+            / f"{target['id']}.json"
     )
 
     with output_path.open(
@@ -691,78 +870,134 @@ def prepare_target(
             encoding="utf-8",
     ) as file:
         json.dump(
-            dataset_payload,
+            dataset,
             file,
-            separators=(",", ":"),
+            indent=2,
             allow_nan=False,
         )
 
+    reference_count = len(
+        dataset["reference"]["chunks"]
+    )
+
     print()
     print("💾 Dataset saved")
+    print(f"   file: {output_path}")
     print(
-        f"   file: "
-        f"{output_path}"
-    )
-    print(
-        f"   work units: "
-        f"{work_unit_count}"
+        "   work units: "
+        f"{expected_work_unit_count()}"
     )
     print(
         "   Astropy references: "
-        f"{len(reference['chunks'])}/"
-        f"{work_unit_count}"
+        f"{reference_count}/"
+        f"{expected_work_unit_count()}"
     )
 
-    return {
-        "id": dataset_id,
-        "targetName": target_name,
-        "mission": "TESS",
-        "ticID": tic_id,
-        "sector": sector,
-        "path": str(
-            output_path
-        ),
-        "sampleCount": (
-            prepared[
-                "distributedSamples"
-            ]
-        ),
-        "workUnitCount": (
-            work_unit_count
-        ),
-    }
+    return output_path
+
+
+def prepare_target(target: dict):
+    validate_science_metadata(target)
+
+    (
+        light_curve,
+        source_metadata,
+    ) = download_light_curve(
+        target
+    )
+
+    times, flux = prepare_light_curve(
+        light_curve
+    )
+
+    reference = calculate_astropy_reference(
+        times,
+        flux,
+    )
+
+    dataset = build_dataset(
+        target,
+        times,
+        flux,
+        reference,
+        source_metadata,
+    )
+
+    output_path = write_dataset(
+        target,
+        dataset,
+    )
+
+    print()
+    print("🌟 Target ready for OpenStar")
+    print(
+        f"   target: "
+        f"{target['targetName']}"
+    )
+    print(
+        "   source: "
+        f"{source_metadata['author']}"
+    )
+    print(
+        "   cadence: "
+        f"{source_metadata['cadenceSeconds']:.0f}s"
+    )
+    print(
+        "   sector: "
+        f"{source_metadata['sector']}"
+    )
+
+    return dataset, output_path
 
 
 def write_project_manifest(
-        project,
-        datasets,
+        prepared_targets,
 ):
+    datasets = []
+
+    for (
+            target,
+            dataset,
+            output_path,
+    ) in prepared_targets:
+        datasets.append(
+            {
+                "id": target["id"],
+                "path": str(output_path),
+                "targetName": target[
+                    "targetName"
+                ],
+                "ticID": target["ticID"],
+                "sector": dataset[
+                    "source"
+                ].get("sector"),
+                "author": dataset[
+                    "source"
+                ].get("author"),
+                "cadenceSeconds": dataset[
+                    "source"
+                ].get("cadenceSeconds"),
+                "role": dataset[
+                    "science"
+                ].get("role"),
+            }
+        )
+
+    total_work_units = (
+            len(datasets)
+            * expected_work_unit_count()
+    )
+
     manifest = {
-        "id": project[
-            "projectID"
-        ],
-        "name": project.get(
-            "projectName",
-            project["projectID"],
-        ),
-        "workloadID": project[
-            "workloadID"
-        ],
-        "createdAt": (
-            datetime.now(
-                timezone.utc
-            )
-            .isoformat()
-        ),
+        "id": PROJECT_ID,
+        "name": PROJECT_NAME,
+        "workloadID": WORKLOAD_ID,
         "datasets": datasets,
     }
 
     output_path = (
             PROJECTS_DIR
-            / (
-                f"{project['projectID']}"
-                ".json"
-            )
+            / f"{PROJECT_ID}.json"
     )
 
     with output_path.open(
@@ -778,17 +1013,11 @@ def write_project_manifest(
 
     print()
     print("📦 Project manifest saved")
-    print(
-        f"   file: "
-        f"{output_path}"
-    )
-    print(
-        f"   datasets: "
-        f"{len(datasets)}"
-    )
+    print(f"   file: {output_path}")
+    print(f"   datasets: {len(datasets)}")
     print(
         "   total work units: "
-        f"{sum(item['workUnitCount'] for item in datasets)}"
+        f"{total_work_units}"
     )
 
     return output_path
@@ -805,131 +1034,60 @@ def main():
         exist_ok=True,
     )
 
-    project = load_targets()
-
-    required_project_fields = (
-        "projectID",
-        "workloadID",
-        "targets",
-    )
-
-    for field in required_project_fields:
-        if field not in project:
-            raise RuntimeError(
-                f"targets.json missing "
-                f"required field: {field}"
-            )
-
-    datasets = []
-    failures = []
+    for target in TARGETS:
+        validate_science_metadata(target)
 
     print()
     print("⭐ OpenStar TESS Preprocessor")
+    print(f"Project: {PROJECT_ID}")
+    print(f"Targets: {len(TARGETS)}")
     print(
-        f"Project: "
-        f"{project['projectID']}"
+        "Frequency range: "
+        f"{MINIMUM_FREQUENCY:.3f} - "
+        f"{MAXIMUM_FREQUENCY:.3f} cycles/day"
     )
     print(
-        f"Targets: "
-        f"{len(project['targets'])}"
+        "Frequencies per target: "
+        f"{TOTAL_FREQUENCIES}"
+    )
+    print(
+        "Work units per target: "
+        f"{expected_work_unit_count()}"
     )
 
-    for target in project[
-        "targets"
-    ]:
-        try:
-            dataset_entry = (
-                prepare_target(
-                    project,
-                    target,
-                )
-            )
+    preflight_targets()
 
-            datasets.append(
-                dataset_entry
-            )
+    prepared_targets = []
 
-            print()
-            print(
-                "🌟 Target ready for OpenStar"
-            )
-            print(
-                f"   target: "
-                f"{target['targetName']}"
-            )
-
-        except Exception as error:
-            dataset_id = target.get(
-                "datasetID",
-                "unknown",
-            )
-
-            target_name = target.get(
-                "targetName",
-                dataset_id,
-            )
-
-            failures.append(
-                (
-                    target_name,
-                    str(error),
-                )
-            )
-
-            print()
-            print(
-                "❌ Target preparation failed"
-            )
-            print(
-                f"   target: "
-                f"{target_name}"
-            )
-            print(
-                f"   error: "
-                f"{error}"
-            )
-
-    if not datasets:
-        raise RuntimeError(
-            "All TESS targets failed."
+    for target in TARGETS:
+        dataset, output_path = prepare_target(
+            target
         )
 
-    manifest_path = (
-        write_project_manifest(
-            project,
-            datasets,
+        prepared_targets.append(
+            (
+                target,
+                dataset,
+                output_path,
+            )
         )
+
+    manifest_path = write_project_manifest(
+        prepared_targets
     )
 
     print()
-    print("✅ OpenStar TESS project ready")
+    print("✅ OpenStar TESS validation project ready")
+    print(f"   project: {PROJECT_ID}")
+    print(f"   manifest: {manifest_path}")
     print(
-        f"   project: "
-        f"{project['projectID']}"
+        "   datasets prepared: "
+        f"{len(prepared_targets)}"
     )
     print(
-        f"   manifest: "
-        f"{manifest_path}"
+        "   total work units: "
+        f"{len(prepared_targets) * expected_work_unit_count()}"
     )
-    print(
-        f"   datasets prepared: "
-        f"{len(datasets)}"
-    )
-
-    if failures:
-        print(
-            f"   datasets failed: "
-            f"{len(failures)}"
-        )
-
-        for (
-                target_name,
-                error,
-        ) in failures:
-            print(
-                f"      {target_name}: "
-                f"{error}"
-            )
 
 
 if __name__ == "__main__":
