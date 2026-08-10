@@ -9,6 +9,7 @@ from pathlib import Path
 
 LEASE_SECONDS = 120.0
 RETRY_COOLDOWN_SECONDS = 1.0
+EXECUTION_FAILURE_NODE_AVOID_SECONDS = 30.0
 
 # Chunk verification is reduction-first:
 #
@@ -70,6 +71,8 @@ class CoordinatorState:
         self.retry_after = {}
         self.retry_counts = {}
         self.verification_failure_counts = {}
+        self.execution_failure_counts = {}
+        self.execution_avoid_until = {}
 
         self.nodes = {}
 
@@ -553,6 +556,12 @@ class CoordinatorState:
             for work_id in self.work_ids_by_dataset.get(dataset_id, [])
         )
 
+    def _dataset_execution_failure_count_locked(self, dataset_id):
+        return sum(
+            self.execution_failure_counts.get(work_id, 0)
+            for work_id in self.work_ids_by_dataset.get(dataset_id, [])
+        )
+
     def _dataset_failed_count_locked(self, dataset_id):
         work_ids = set(self.work_ids_by_dataset.get(dataset_id, []))
         return sum(1 for work_id in self.failed if work_id in work_ids)
@@ -607,6 +616,27 @@ class CoordinatorState:
                 if self.retry_after.get(work_id, 0.0) > now:
                     deferred.append(work_id)
                     continue
+
+                # Execution failures are operational, not scientific. If this
+                # node recently failed to execute this exact work unit, defer
+                # it so another registered node gets a chance. The avoidance
+                # expires automatically so a single-node project cannot
+                # deadlock forever.
+                avoid_by_node = self.execution_avoid_until.get(work_id)
+                if avoid_by_node:
+                    expired_nodes = [
+                        avoided_node
+                        for avoided_node, avoid_until in avoid_by_node.items()
+                        if avoid_until <= now
+                    ]
+                    for avoided_node in expired_nodes:
+                        avoid_by_node.pop(avoided_node, None)
+
+                    if not avoid_by_node:
+                        self.execution_avoid_until.pop(work_id, None)
+                    elif avoid_by_node.get(node_key, 0.0) > now:
+                        deferred.append(work_id)
+                        continue
 
                 self.assigned[work_id] = {
                     "nodeID": str(node_id),
@@ -956,6 +986,44 @@ class CoordinatorState:
         else:
             print("   action: requeued")
 
+    def _print_execution_failure(
+            self,
+            *,
+            work_unit,
+            assignment,
+            result,
+            execution_failure_count,
+    ):
+        result_status = str(result.get("status", "unknown"))
+        client_reason = first_value(
+            result,
+            "error",
+            "message",
+            "failureReason",
+            "reason",
+        )
+
+        print()
+        print("⚠️ Work execution failed")
+        print(f"   work: {work_unit['id']}")
+        print(f"   node: {assignment.get('nodeID', 'unknown')}")
+        print(f"   dataset: {work_unit['datasetID']}")
+        print(
+            "   frequency start index: "
+            f"{work_unit['frequencyStartIndex']}"
+        )
+        print(f"   status: {result_status}")
+        if client_reason is not None:
+            print(f"   client reason: {client_reason}")
+        print(
+            "   execution failures for work unit: "
+            f"{execution_failure_count}"
+        )
+        print(
+            "   action: requeued; failing node temporarily avoided for this "
+            "work unit"
+        )
+
     def submit_result(self, route_work_id, result):
         work_id = normalize_id(route_work_id)
 
@@ -981,12 +1049,64 @@ class CoordinatorState:
             if assignment is None:
                 return False, "Work unit is not currently assigned.", 409
 
-            accepted, message, verification = self._verify_result(
-                work_unit,
-                result,
-            )
+            # A client that explicitly reports status != completed did not
+            # produce a scientific result. Treat this as an operational
+            # execution failure, not an Astropy verification failure.
+            #
+            # Requeue it, do not increment verification_failure_counts, and
+            # temporarily prevent the same node from reclaiming this exact
+            # work unit so another device can try it.
+            if result.get("status") != "completed":
+                self.assigned.pop(work_id, None)
 
-            if not accepted:
+                now = time.time()
+                self.retry_counts[work_id] = (
+                        self.retry_counts.get(work_id, 0) + 1
+                )
+                execution_failure_count = (
+                        self.execution_failure_counts.get(work_id, 0) + 1
+                )
+                self.execution_failure_counts[work_id] = (
+                    execution_failure_count
+                )
+
+                failing_node_key = normalize_id(assignment["nodeID"])
+                avoid_by_node = self.execution_avoid_until.setdefault(
+                    work_id,
+                    {},
+                )
+                avoid_by_node[failing_node_key] = (
+                        now + EXECUTION_FAILURE_NODE_AVOID_SECONDS
+                )
+
+                self.retry_after[work_id] = now + RETRY_COOLDOWN_SECONDS
+                self.pending.append(work_id)
+                self._mark_node_seen_locked(assignment["nodeID"])
+
+                execution_failure_args = {
+                    "work_unit": dict(work_unit),
+                    "assignment": dict(assignment),
+                    "result": dict(result),
+                    "execution_failure_count": execution_failure_count,
+                }
+                execution_failure_message = "Work unit did not complete."
+                execution_failed = True
+            else:
+                execution_failed = False
+
+            if execution_failed:
+                accepted = False
+                message = execution_failure_message
+                verification = None
+            else:
+                accepted, message, verification = self._verify_result(
+                    work_unit,
+                    result,
+                )
+
+            if execution_failed:
+                rejection_args = None
+            elif not accepted:
                 self.assigned.pop(work_id, None)
 
                 self.retry_counts[work_id] = (
@@ -1044,10 +1164,20 @@ class CoordinatorState:
                 self.completed[work_id] = stored_result
                 self.assigned.pop(work_id, None)
                 self.retry_after.pop(work_id, None)
+                self.execution_avoid_until.pop(work_id, None)
                 self._mark_node_seen_locked(assignment["nodeID"])
 
                 completed_count = len(self.completed)
                 total_count = len(self.work_units)
+
+        if execution_failed:
+            self._print_execution_failure(**execution_failure_args)
+
+            # The client reported that execution itself did not complete.
+            # Returning 200 acknowledges the report so the networking layer
+            # does not immediately repost the same failed payload. The work
+            # unit has already been requeued for another claim.
+            return False, message, 200
 
         if not accepted:
             self._print_rejection(**rejection_args)
@@ -1148,6 +1278,9 @@ class CoordinatorState:
             verification_failure_count = (
                 self._dataset_verification_failure_count_locked(dataset_id)
             )
+            execution_failure_count = (
+                self._dataset_execution_failure_count_locked(dataset_id)
+            )
             failed_count = self._dataset_failed_count_locked(dataset_id)
 
             return {
@@ -1166,6 +1299,7 @@ class CoordinatorState:
                 "progress": completed / total if total else 1.0,
                 "retryCount": retry_count,
                 "verificationFailureCount": verification_failure_count,
+                "executionFailureCount": execution_failure_count,
                 "failedWorkUnits": failed_count,
                 "bestFrequency": best.get("bestFrequency") if best else None,
                 "bestPeriodDays": best.get("bestPeriodDays") if best else None,
@@ -1183,6 +1317,9 @@ class CoordinatorState:
             project_assigned = len(self.assigned)
             project_completed = len(self.completed)
             project_failed = len(self.failed)
+            project_execution_failures = sum(
+                self.execution_failure_counts.values()
+            )
             project_total = len(self.work_units)
 
             dataset_statuses = [
@@ -1204,6 +1341,7 @@ class CoordinatorState:
                     "progress": 1.0,
                     "retryCount": 0,
                     "verificationFailureCount": 0,
+                    "executionFailureCount": 0,
                     "failedWorkUnits": 0,
                     "bestFrequency": None,
                     "bestPeriodDays": None,
@@ -1243,6 +1381,7 @@ class CoordinatorState:
                 "verificationFailureCount": current[
                     "verificationFailureCount"
                 ],
+                "executionFailureCount": current["executionFailureCount"],
                 "failedWorkUnits": current["failedWorkUnits"],
                 "activeNodes": len(self.nodes),
                 "bestFrequency": current["bestFrequency"],
@@ -1254,6 +1393,7 @@ class CoordinatorState:
                 "projectAssignedWorkUnits": project_assigned,
                 "projectCompletedWorkUnits": project_completed,
                 "projectFailedWorkUnits": project_failed,
+                "projectExecutionFailureCount": project_execution_failures,
                 "projectTotalWorkUnits": project_total,
                 "projectProgress": (
                     project_completed / project_total
@@ -1408,7 +1548,7 @@ class CoordinatorState:
 
         print()
         print("⭐ OpenStar Coordinator")
-        print("Build: multi-target-v10-reduction-first-verification")
+        print("Build: multi-target-v11-execution-requeue-verification")
         print(f"File: {Path(__file__).resolve()}")
         print(f"Listening on {host}:{port}")
         print()
@@ -1438,6 +1578,10 @@ class CoordinatorState:
         print(
             "Max verification failures/work unit: "
             f"{MAX_VERIFICATION_FAILURES_PER_WORK_UNIT}"
+        )
+        print(
+            "Execution failure handling: requeue without scientific failure; "
+            f"avoid same node for {EXECUTION_FAILURE_NODE_AVOID_SECONDS:.0f}s"
         )
 
         for dataset_id, dataset in self.datasets.items():
