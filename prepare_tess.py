@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
 
-from pathlib import Path
 import json
+import math
+from datetime import datetime, timezone
+from pathlib import Path
 
 import lightkurve as lk
 import numpy as np
 from astropy.timeseries import LombScargle
 
 
-TARGET = "RR Lyr"
-DATASET_ID = "tess-rr-lyr"
+TARGETS_FILE = Path("targets.json")
 
-OUTPUT_DIRECTORY = Path("data")
-OUTPUT_FILE = OUTPUT_DIRECTORY / f"{DATASET_ID}.json"
+DATA_DIR = Path("data")
+PROJECTS_DIR = DATA_DIR / "projects"
 
 MAX_SAMPLES = 18_000
 
@@ -23,146 +24,228 @@ TOTAL_FREQUENCIES = 4_194_304
 FREQUENCIES_PER_WORK_UNIT = 4_096
 
 
-def download_light_curve():
-    print()
-    print("🔭 Searching MAST")
-    print(f"   target: {TARGET}")
+def load_target_catalog():
+    with TARGETS_FILE.open("r", encoding="utf-8") as file:
+        catalog = json.load(file)
 
-    search = lk.search_lightcurve(
-        TARGET,
-        mission="TESS",
-        author="SPOC",
-        exptime=120
+    required = (
+        "projectID",
+        "projectName",
+        "workloadID",
+        "targets",
     )
 
-    if len(search) == 0:
-        print("   no 120-second SPOC result; trying any cadence")
+    missing = [
+        key
+        for key in required
+        if key not in catalog
+    ]
 
-        search = lk.search_lightcurve(
-            TARGET,
-            mission="TESS",
-            author="SPOC"
+    if missing:
+        raise ValueError(
+            f"targets.json is missing: {', '.join(missing)}"
         )
 
-    if len(search) == 0:
-        raise RuntimeError(
-            f"No TESS light curves found for {TARGET}"
+    if not catalog["targets"]:
+        raise ValueError(
+            "targets.json contains no targets"
         )
 
-    print(f"   products found: {len(search)}")
+    return catalog
+
+
+def search_light_curve(target):
+    query = target["query"]
+    author = target.get("author", "SPOC")
+    sector = target.get("sector")
+
+    search_kwargs = {
+        "mission": "TESS",
+        "author": author,
+    }
+
+    if sector is not None:
+        search_kwargs["sector"] = sector
+
     print()
-    print("⬇️ Downloading first light curve")
+    print("🔭 Searching MAST")
+    print(f"   target: {target['targetName']}")
+    print(f"   query: {query}")
 
-    light_curve = search[0].download()
+    result = lk.search_lightcurve(
+        query,
+        **search_kwargs,
+    )
+
+    print(f"   products found: {len(result)}")
+
+    if len(result) == 0:
+        raise RuntimeError(
+            f"No TESS light curves found for {query}"
+        )
+
+    product_index = int(
+        target.get("productIndex", 0)
+    )
+
+    if (
+            product_index < 0
+            or product_index >= len(result)
+    ):
+        raise RuntimeError(
+            f"productIndex {product_index} is invalid "
+            f"for {query}; {len(result)} products were found"
+        )
+
+    print(
+        f"⬇️ Downloading product {product_index}"
+    )
+
+    light_curve = result[
+        product_index
+    ].download()
 
     if light_curve is None:
         raise RuntimeError(
-            "MAST returned no downloadable light curve."
+            f"Failed to download TESS light curve for {query}"
         )
 
-    return light_curve
+    return light_curve, product_index
 
 
-def prepare_samples(light_curve):
+def prepare_light_curve(light_curve):
     light_curve = light_curve.remove_nans()
 
     times = np.asarray(
         light_curve.time.value,
-        dtype=np.float64
+        dtype=np.float64,
     )
 
     flux = np.asarray(
         light_curve.flux.value,
-        dtype=np.float64
+        dtype=np.float64,
     )
 
     finite = (
-        np.isfinite(times) &
-        np.isfinite(flux)
+            np.isfinite(times)
+            & np.isfinite(flux)
     )
 
     times = times[finite]
     flux = flux[finite]
 
-    if len(times) == 0:
+    if len(times) < 3:
         raise RuntimeError(
-            "No valid samples remained after cleaning."
+            "Light curve has fewer than 3 usable samples"
         )
 
-    # Keep times close to zero for Float precision on Metal.
+    order = np.argsort(times)
+
+    times = times[order]
+    flux = flux[order]
+
+    original_sample_count = len(times)
+
+    # Keep values near zero so Float precision remains
+    # good on the Apple-device Metal implementation.
     times = times - times[0]
 
-    original_count = len(times)
-
-    if original_count > MAX_SAMPLES:
+    if len(times) > MAX_SAMPLES:
         indices = np.linspace(
             0,
-            original_count - 1,
+            len(times) - 1,
             MAX_SAMPLES,
-            dtype=np.int64
-        )
+            dtype=np.int64,
+            )
 
         times = times[indices]
         flux = flux[indices]
 
-    # Mean-center and scale the signal instead of calling
-    # Lightkurve.normalize(), which warned about this curve.
-    flux_mean = np.mean(flux)
-    flux = flux - flux_mean
+    flux = flux - np.mean(flux)
 
-    flux_stddev = np.std(flux)
+    flux_stddev = float(
+        np.std(flux)
+    )
 
-    if not np.isfinite(flux_stddev) or flux_stddev <= 0:
+    if (
+            not math.isfinite(flux_stddev)
+            or flux_stddev <= 0
+    ):
         raise RuntimeError(
-            "Light curve has invalid flux variance."
+            "Light curve flux has zero or invalid standard deviation"
         )
 
     flux = flux / flux_stddev
 
-    print()
-    print("✨ Light curve prepared")
-    print(f"   original samples: {original_count}")
-    print(f"   distributed samples: {len(times)}")
-    print(f"   baseline: {times[-1]:.4f} days")
-    print(f"   flux mean: {np.mean(flux):.8f}")
-    print(f"   flux stddev: {np.std(flux):.8f}")
-
-    return times, flux
-
-
-def calculate_reference_period(times, flux):
-    frequency_step = (
-        MAX_FREQUENCY - MIN_FREQUENCY
-    ) / TOTAL_FREQUENCIES
-
-    frequencies = (
-        MIN_FREQUENCY +
-        np.arange(
-            TOTAL_FREQUENCIES,
-            dtype=np.float64
-        ) * frequency_step
+    baseline_days = float(
+        times[-1] - times[0]
     )
 
-    print()
-    print("🧪 Calculating reference period")
+    print("✨ Light curve prepared")
     print(
-        f"   frequency range: "
+        f"   original samples: "
+        f"{original_sample_count}"
+    )
+    print(
+        f"   distributed samples: "
+        f"{len(times)}"
+    )
+    print(
+        f"   baseline: "
+        f"{baseline_days:.4f} days"
+    )
+    print(
+        f"   flux mean: "
+        f"{np.mean(flux):.8f}"
+    )
+    print(
+        f"   flux stddev: "
+        f"{np.std(flux):.8f}"
+    )
+
+    return (
+        times,
+        flux,
+        original_sample_count,
+        baseline_days,
+    )
+
+
+def calculate_reference(
+        times,
+        flux,
+):
+    frequency_step = (
+                             MAX_FREQUENCY
+                             - MIN_FREQUENCY
+                     ) / TOTAL_FREQUENCIES
+
+    frequencies = (
+            MIN_FREQUENCY
+            + np.arange(
+        TOTAL_FREQUENCIES,
+        dtype=np.float64,
+    ) * frequency_step
+    )
+
+    print(
+        "🧪 Calculating reference periodogram"
+    )
+    print(
+        "   frequency range: "
         f"{MIN_FREQUENCY:.3f} - "
         f"{MAX_FREQUENCY:.3f} cycles/day"
     )
-    print(f"   frequencies: {TOTAL_FREQUENCIES}")
-
-    periodogram = LombScargle(
-        times,
-        flux,
-        center_data=False,
-        fit_mean=False
+    print(
+        f"   frequencies: "
+        f"{TOTAL_FREQUENCIES}"
     )
 
-    powers = periodogram.power(
-        frequencies,
-        method="fast",
-        normalization="standard"
+    powers = LombScargle(
+        times,
+        flux,
+    ).power(
+        frequencies
     )
 
     best_index = int(
@@ -173,16 +256,59 @@ def calculate_reference_period(times, flux):
         frequencies[best_index]
     )
 
+    best_period_days = (
+            1.0 / best_frequency
+    )
+
     best_power = float(
         powers[best_index]
     )
 
-    best_period = (
-        1.0 /
-        best_frequency
-    )
+    chunk_references = []
 
-    print()
+    for start_index in range(
+            0,
+            TOTAL_FREQUENCIES,
+            FREQUENCIES_PER_WORK_UNIT,
+    ):
+        end_index = min(
+            start_index
+            + FREQUENCIES_PER_WORK_UNIT,
+            TOTAL_FREQUENCIES,
+            )
+
+        local_powers = powers[
+            start_index:end_index
+        ]
+
+        local_offset = int(
+            np.argmax(local_powers)
+        )
+
+        local_index = (
+                start_index
+                + local_offset
+        )
+
+        chunk_references.append(
+            {
+                "frequencyStartIndex":
+                    start_index,
+                "bestFrequency":
+                    float(
+                        frequencies[
+                            local_index
+                        ]
+                    ),
+                "bestPower":
+                    float(
+                        powers[
+                            local_index
+                        ]
+                    ),
+            }
+        )
+
     print("⭐ Reference result")
     print(
         f"   frequency: "
@@ -190,184 +316,395 @@ def calculate_reference_period(times, flux):
     )
     print(
         f"   period: "
-        f"{best_period:.8f} days"
+        f"{best_period_days:.8f} days"
     )
     print(
         f"   power: "
         f"{best_power:.8f}"
     )
 
-    return (
-        frequency_step,
-        frequencies,
-        powers,
-        best_frequency,
-        best_period,
-        best_power
-    )
-
-
-def build_reference_chunks(
-    frequencies,
-    powers
-):
-    chunks = []
-
-    for start_index in range(
-        0,
-        TOTAL_FREQUENCIES,
-        FREQUENCIES_PER_WORK_UNIT
-    ):
-        end_index = min(
-            start_index + FREQUENCIES_PER_WORK_UNIT,
-            TOTAL_FREQUENCIES
-        )
-
-        chunk_powers = powers[
-            start_index:end_index
-        ]
-
-        local_index = int(
-            np.argmax(chunk_powers)
-        )
-
-        global_index = (
-            start_index +
-            local_index
-        )
-
-        chunks.append(
-            {
-                "startIndex": start_index,
-                "frequencyCount":
-                    end_index - start_index,
-                "bestFrequency":
-                    float(
-                        frequencies[
-                            global_index
-                        ]
-                    ),
-                "bestPower":
-                    float(
-                        powers[
-                            global_index
-                        ]
-                    )
-            }
-        )
-
-    return chunks
-
-
-def save_dataset(
-    times,
-    flux,
-    frequency_step,
-    reference_chunks,
-    reference_frequency,
-    reference_period,
-    reference_power
-):
-    OUTPUT_DIRECTORY.mkdir(
-        parents=True,
-        exist_ok=True
-    )
-
-    dataset = {
-        "id": DATASET_ID,
-        "targetName": TARGET,
-        "mission": "TESS",
-        "source": "MAST",
-        "timeUnit": "day",
-        "fluxUnit": "standardized",
-        "times": times.astype(
-            np.float32
-        ).tolist(),
-        "flux": flux.astype(
-            np.float32
-        ).tolist(),
-        "search": {
-            "minimumFrequency":
-                MIN_FREQUENCY,
-            "maximumFrequency":
-                MAX_FREQUENCY,
-            "frequencyStep":
-                frequency_step,
-            "totalFrequencies":
-                TOTAL_FREQUENCIES,
-            "frequenciesPerWorkUnit":
-                FREQUENCIES_PER_WORK_UNIT,
-            "workUnitCount":
-                len(reference_chunks)
-        },
-        "reference": {
-            "bestFrequency":
-                reference_frequency,
-            "bestPeriodDays":
-                reference_period,
-            "bestPower":
-                reference_power,
-            "chunks":
-                reference_chunks
-        }
+    return {
+        "frequencyStep":
+            frequency_step,
+        "globalBestFrequency":
+            best_frequency,
+        "globalBestPeriodDays":
+            best_period_days,
+        "globalBestPower":
+            best_power,
+        "chunks":
+            chunk_references,
     }
 
-    with OUTPUT_FILE.open(
-        "w",
-        encoding="utf-8"
+
+def metadata_value(
+        light_curve,
+        *keys,
+):
+    for key in keys:
+        value = light_curve.meta.get(
+            key
+        )
+
+        if value is None:
+            continue
+
+        if isinstance(
+                value,
+                np.generic,
+        ):
+            value = value.item()
+
+        if isinstance(
+                value,
+                (
+                        str,
+                        int,
+                        float,
+                        bool,
+                ),
+        ):
+            return value
+
+    return None
+
+
+def build_dataset(target):
+    (
+        light_curve,
+        product_index,
+    ) = search_light_curve(
+        target
+    )
+
+    (
+        times,
+        flux,
+        original_sample_count,
+        baseline_days,
+    ) = prepare_light_curve(
+        light_curve
+    )
+
+    reference = calculate_reference(
+        times,
+        flux,
+    )
+
+    dataset_id = target[
+        "datasetID"
+    ]
+
+    tic_id = target.get(
+        "ticID"
+    )
+
+    if tic_id is None:
+        tic_id = metadata_value(
+            light_curve,
+            "TICID",
+            "TIC_ID",
+            "TARGETID",
+            "TARGET_ID",
+        )
+
+    sector = target.get(
+        "sector"
+    )
+
+    if sector is None:
+        sector = metadata_value(
+            light_curve,
+            "SECTOR",
+        )
+
+    dataset = {
+        "id":
+            dataset_id,
+
+        "targetName":
+            target["targetName"],
+
+        "mission":
+            "TESS",
+
+        "timeUnit":
+            "days",
+
+        "fluxUnit":
+            "standardized relative flux",
+
+        "times":
+            times.astype(
+                np.float32
+            ).tolist(),
+
+        "flux":
+            flux.astype(
+                np.float32
+            ).tolist(),
+
+        "metadata": {
+            "query":
+                target["query"],
+
+            "ticID":
+                tic_id,
+
+            "sector":
+                sector,
+
+            "author":
+                target.get(
+                    "author",
+                    "SPOC",
+                ),
+
+            "productIndex":
+                product_index,
+
+            "originalSampleCount":
+                original_sample_count,
+
+            "distributedSampleCount":
+                len(times),
+
+            "baselineDays":
+                baseline_days,
+        },
+
+        "frequencySearch": {
+            "minimumFrequency":
+                MIN_FREQUENCY,
+
+            "maximumFrequency":
+                MAX_FREQUENCY,
+
+            "totalFrequencies":
+                TOTAL_FREQUENCIES,
+
+            "frequenciesPerWorkUnit":
+                FREQUENCIES_PER_WORK_UNIT,
+
+            "frequencyStep":
+                reference[
+                    "frequencyStep"
+                ],
+        },
+
+        "reference": {
+            "globalBestFrequency":
+                reference[
+                    "globalBestFrequency"
+                ],
+
+            "globalBestPeriodDays":
+                reference[
+                    "globalBestPeriodDays"
+                ],
+
+            "globalBestPower":
+                reference[
+                    "globalBestPower"
+                ],
+
+            "chunks":
+                reference["chunks"],
+        },
+    }
+
+    DATA_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    dataset_path = (
+            DATA_DIR
+            / f"{dataset_id}.json"
+    )
+
+    with dataset_path.open(
+            "w",
+            encoding="utf-8",
     ) as file:
         json.dump(
             dataset,
             file,
-            separators=(",", ":")
+            separators=(",", ":"),
+        )
+
+    work_unit_count = math.ceil(
+        TOTAL_FREQUENCIES
+        / FREQUENCIES_PER_WORK_UNIT
+    )
+
+    print("💾 Dataset saved")
+    print(
+        f"   file: "
+        f"{dataset_path}"
+    )
+    print(
+        f"   work units: "
+        f"{work_unit_count}"
+    )
+
+    return {
+        "id":
+            dataset_id,
+
+        "targetName":
+            target["targetName"],
+
+        "mission":
+            "TESS",
+
+        "ticID":
+            tic_id,
+
+        "sector":
+            sector,
+
+        "path":
+            str(dataset_path),
+
+        "sampleCount":
+            len(times),
+
+        "workUnitCount":
+            work_unit_count,
+    }
+
+
+def build_project_manifest(
+        catalog,
+        dataset_entries,
+):
+    PROJECTS_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    manifest = {
+        "id":
+            catalog["projectID"],
+
+        "name":
+            catalog["projectName"],
+
+        "workloadID":
+            catalog["workloadID"],
+
+        "createdAt":
+            datetime.now(
+                timezone.utc
+            ).isoformat(),
+
+        "datasets":
+            dataset_entries,
+    }
+
+    project_path = (
+            PROJECTS_DIR
+            / f"{catalog['projectID']}.json"
+    )
+
+    with project_path.open(
+            "w",
+            encoding="utf-8",
+    ) as file:
+        json.dump(
+            manifest,
+            file,
+            indent=2,
         )
 
     print()
-    print("💾 Dataset saved")
-    print(f"   file: {OUTPUT_FILE}")
     print(
-        f"   work units: "
-        f"{len(reference_chunks)}"
+        "📋 Project manifest saved"
     )
+    print(
+        f"   file: "
+        f"{project_path}"
+    )
+    print(
+        f"   datasets: "
+        f"{len(dataset_entries)}"
+    )
+    print(
+        "   work units: "
+        f"{sum(
+            entry['workUnitCount']
+            for entry
+            in dataset_entries
+        )}"
+    )
+
+    return project_path
 
 
 def main():
-    light_curve = download_light_curve()
+    catalog = load_target_catalog()
 
-    times, flux = prepare_samples(
-        light_curve
+    print(
+        "⭐ OpenStar TESS Multi-Target Preprocessor"
+    )
+    print(
+        f"   project: "
+        f"{catalog['projectID']}"
+    )
+    print(
+        f"   targets: "
+        f"{len(catalog['targets'])}"
     )
 
-    (
-        frequency_step,
-        frequencies,
-        powers,
-        reference_frequency,
-        reference_period,
-        reference_power
-    ) = calculate_reference_period(
-        times,
-        flux
-    )
+    dataset_entries = []
 
-    reference_chunks = build_reference_chunks(
-        frequencies,
-        powers
-    )
+    for target in catalog[
+        "targets"
+    ]:
+        try:
+            dataset_entries.append(
+                build_dataset(
+                    target
+                )
+            )
 
-    save_dataset(
-        times,
-        flux,
-        frequency_step,
-        reference_chunks,
-        reference_frequency,
-        reference_period,
-        reference_power
+        except Exception as error:
+            print()
+            print("❌ Target failed")
+            print(
+                "   target: "
+                f"{target.get(
+                    'targetName',
+                    target.get('query')
+                )}"
+            )
+            print(
+                f"   error: "
+                f"{error}"
+            )
+
+    if not dataset_entries:
+        raise RuntimeError(
+            "No datasets were successfully prepared"
+        )
+
+    project_path = (
+        build_project_manifest(
+            catalog,
+            dataset_entries,
+        )
     )
 
     print()
-    print("🌟 TESS dataset ready for OpenStar")
-    print()
+    print(
+        "🌟 Multi-target TESS project ready"
+    )
+    print(
+        "   start with: "
+        "python3 coordinator.py "
+        f"--project {project_path}"
+    )
 
 
 if __name__ == "__main__":

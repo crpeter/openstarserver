@@ -1,0 +1,22 @@
+{
+  "projectID": "openstar.tess-multi-target-v1",
+  "projectName": "OpenStar TESS Multi-Target Period Search",
+  "workloadID": "openstar.tess-period-search.v1",
+  "targets": [
+    {
+      "datasetID": "tess-rr-lyr",
+      "targetName": "RR Lyr",
+      "query": "RR Lyr",
+      "author": "SPOC",
+      "productIndex": 0
+    },
+    {
+      "datasetID": "tess-tic-307210830",
+      "targetName": "TIC 307210830",
+      "query": "TIC 307210830",
+      "author": "SPOC",
+      "sector": 2,
+      "productIndex": 0
+    }
+  ]
+}
