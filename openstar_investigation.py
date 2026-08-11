@@ -212,6 +212,52 @@ class InvestigationStore:
         self.save(updated)
         return updated
 
+    def restart_current_running_stage(
+        self,
+        investigation: Investigation,
+    ) -> tuple[Investigation, InvestigationStage]:
+        """
+        Remove only the current non-terminal RUNNING stage from the mutable
+        investigation snapshot and return it as the stage to execute again.
+
+        Terminal stage files remain immutable. This is intended for explicit
+        recovery after process interruption (for example Ctrl+C or host loss)
+        while a handler was still running.
+        """
+        if investigation.status != "RUNNING":
+            raise ValueError(
+                "Only a RUNNING investigation can restart an interrupted stage."
+            )
+
+        if not investigation.stages:
+            raise ValueError("Investigation has no stage to resume.")
+
+        current = investigation.stages[-1]
+        if current.status != "RUNNING":
+            raise ValueError(
+                "Investigation has no interrupted RUNNING stage to resume."
+            )
+
+        stage_path = self.stage_path_for(investigation.id, current.id)
+        if stage_path.exists():
+            raise RuntimeError(
+                "Cannot restart a RUNNING snapshot whose immutable terminal "
+                f"stage file already exists: {stage_path}"
+            )
+
+        updated = Investigation(
+            id=investigation.id,
+            workflow_id=investigation.workflow_id,
+            workflow_version=investigation.workflow_version,
+            status=investigation.status,
+            created_at=investigation.created_at,
+            updated_at=utc_now_iso(),
+            metadata=investigation.metadata,
+            stages=investigation.stages[:-1],
+        )
+        self.save(updated)
+        return updated, current
+
     def set_status(self, investigation: Investigation, status: str) -> Investigation:
         updated = Investigation(
             id=investigation.id,

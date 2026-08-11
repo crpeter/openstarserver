@@ -346,6 +346,24 @@ def _query_gaia_variability(source_id: int) -> dict[str, Any]:
     return output
 
 
+
+
+def _sector_from_row(table: Any, index: int) -> int | None:
+    colnames = set(getattr(table, "colnames", []))
+
+    if "sequence_number" in colnames:
+        value = _int(table["sequence_number"][index])
+        if value is not None and value > 0:
+            return value
+
+    if "mission" in colnames:
+        text = str(_python_value(table["mission"][index]) or "")
+        match = re.search(r"sector\s*0*(\d+)", text, flags=re.IGNORECASE)
+        if match:
+            return int(match.group(1))
+
+    return None
+
 def _query_tess_products(tic_id: int) -> dict[str, Any]:
     import lightkurve as lk
 

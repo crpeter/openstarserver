@@ -1,5 +1,6 @@
 import argparse
 import json
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlparse
@@ -14,9 +15,29 @@ from coordinator_state import first_value
 DEFAULT_PROJECT_PATH = "data/projects/openstar.tess-validation-v1.json"
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8080
-COORDINATOR_BUILD = "openstar-coordinator-v20.0-workflow-control"
+COORDINATOR_BUILD = "openstar-coordinator-v20.2-workflow-control"
 
 RUNTIME = CoordinatorRuntime()
+_STATUS_LOG_LOCK = threading.Lock()
+_QUIET_STATUS_SIGNATURES: set[tuple[str, str]] = set()
+
+
+def _should_log_project_status(status):
+    state = str(status.get("status") or "")
+    project_id = str(status.get("projectID") or "")
+
+    # Workers intentionally keep polling after a project is terminal so they
+    # can immediately receive the next workflow project. Repeated COMPLETE/IDLE
+    # status lines are operational noise, so log each quiet-state signature once.
+    if state not in {"COMPLETE", "IDLE"}:
+        return True
+
+    signature = (project_id, state)
+    with _STATUS_LOG_LOCK:
+        if signature in _QUIET_STATUS_SIGNATURES:
+            return False
+        _QUIET_STATUS_SIGNATURES.add(signature)
+    return True
 
 
 class RequestHandler(BaseHTTPRequestHandler):
@@ -70,9 +91,9 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = urlparse(self.path).path
-        print(f"🌐 GET {path}")
 
         if path == "/v1/health":
+            print(f"🌐 GET {path}")
             self._send_json(
                 200,
                 {
@@ -85,13 +106,16 @@ class RequestHandler(BaseHTTPRequestHandler):
 
         if path == "/v1/projects/current/status":
             status = RUNTIME.project_status()
-            print(f"   status projectID: {status.get('projectID')}")
-            print(f"   status targetName: {status.get('targetName')}")
-            print(f"   status datasetID: {status.get('datasetID')}")
-            print(f"   status: {status.get('status')}")
+            if _should_log_project_status(status):
+                print(f"🌐 GET {path}")
+                print(f"   status projectID: {status.get('projectID')}")
+                print(f"   status targetName: {status.get('targetName')}")
+                print(f"   status datasetID: {status.get('datasetID')}")
+                print(f"   status: {status.get('status')}")
             self._send_json(200, status)
             return
 
+        print(f"🌐 GET {path}")
         dataset_prefix = "/v1/datasets/"
         if path.startswith(dataset_prefix):
             dataset_id = unquote(path[len(dataset_prefix):]).strip("/")

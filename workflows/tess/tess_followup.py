@@ -122,16 +122,64 @@ def build_low_frequency_followup(
     source_dataset_entry: dict[str, Any],
     output_dir: str | Path,
     investigation_id: str,
+    trigger_reason: str | None = None,
+    primary_period_days: float | None = None,
 ) -> dict[str, Any]:
     source_project_path = Path(source_project_path).expanduser().resolve()
     source_dataset_path = Path(source_dataset_path).expanduser().resolve()
     project = _load_json(source_project_path)
     dataset = _load_json(source_dataset_path)
 
+    source_times = dataset.get("times") or []
+    source_baseline_days = (
+        float(source_times[-1]) - float(source_times[0])
+        if len(source_times) > 1
+        else None
+    )
+
     original_search = dataset.get("frequencySearch") or {}
     original_min = float(original_search.get("minimumFrequency") or 0.1)
-    maximum_frequency = max(0.03, original_min * 1.25)
-    minimum_frequency = max(0.01, maximum_frequency / 10.0)
+
+    period_value = None
+    try:
+        period_value = float(primary_period_days)
+    except (TypeError, ValueError):
+        period_value = None
+    if period_value is not None and period_value <= 0:
+        period_value = None
+
+    expected_frequency = (1.0 / period_value) if period_value else None
+
+    if trigger_reason == "harmonic-cycle-preferred" and expected_frequency is not None:
+        # Test the proposed longer physical cycle around its own frequency,
+        # deliberately excluding the already-known primary peak when possible.
+        minimum_frequency = max(0.005, expected_frequency * 0.65)
+        maximum_frequency = expected_frequency * 1.35
+        if maximum_frequency >= original_min:
+            maximum_frequency = original_min * 0.98
+        followup_mode = "targeted-harmonic-cycle"
+        target_period_days = period_value
+    elif (
+        trigger_reason == "primary-period-rotation-physically-disfavored"
+        and expected_frequency is not None
+    ):
+        # Search only periods longer than the physically disfavored candidate.
+        maximum_frequency = expected_frequency * 0.95
+        minimum_frequency = max(0.005, maximum_frequency / 8.0)
+        followup_mode = "longer-period-extension"
+        target_period_days = None
+    else:
+        maximum_frequency = max(0.03, original_min * 0.95)
+        minimum_frequency = max(0.005, maximum_frequency / 10.0)
+        followup_mode = "lower-frequency-extension"
+        target_period_days = None
+
+    if maximum_frequency <= minimum_frequency:
+        raise ValueError(
+            "Follow-up frequency window is invalid: "
+            f"{minimum_frequency}..{maximum_frequency}."
+        )
+
     total_frequencies = 262144
     per_work_unit = int(original_search.get("frequenciesPerWorkUnit") or 4096)
     per_work_unit = max(4096, min(per_work_unit, total_frequencies))
@@ -153,7 +201,10 @@ def build_low_frequency_followup(
     follow_dataset["reference"] = {}
     science = dict(follow_dataset.get("science") or {})
     science["role"] = "follow-up"
-    science["followupReason"] = "lower-frequency-extension"
+    science["followupReason"] = str(trigger_reason or "lower-frequency-extension")
+    science["followupMode"] = followup_mode
+    if target_period_days is not None:
+        science["targetPeriodDays"] = target_period_days
     follow_dataset["science"] = science
 
     output_dir = Path(output_dir)
@@ -187,4 +238,8 @@ def build_low_frequency_followup(
         "datasetID": follow_dataset_id,
         "datasetPath": str(dataset_path.resolve()),
         "frequencySearch": follow_dataset["frequencySearch"],
+        "triggerReason": str(trigger_reason or "lower-frequency-extension"),
+        "followupMode": followup_mode,
+        "targetPeriodDays": target_period_days,
+        "sourceBaselineDays": source_baseline_days,
     }
