@@ -28,6 +28,7 @@ from .tess_hypotheses import (
     plan_independent_contradiction_resolution,
 )
 from .tess_identity import collect_identity
+from .tess_morphology import analyze_morphology
 from .tess_multisector import (
     build_broad_independent_sector_project,
     build_independent_sector_project,
@@ -37,7 +38,7 @@ from .tess_multisector import (
 WORKFLOW_ID = "openstar.workflow.tess-investigation.v1"
 WORKFLOW_VERSION = "20.2"
 SOFTWARE_ID = "openstar.tess-investigation-plugin"
-SOFTWARE_VERSION = "20.3.3"
+SOFTWARE_VERSION = "20.4"
 
 
 def _stage(investigation: Investigation, stage_id: str):
@@ -297,6 +298,34 @@ def _render_report(conclusion: dict[str, Any]) -> str:
             f"- Possible 2x physical cycle: {family.get('possibleDoubleCycleDays')} days",
             f"- Physical cycle resolved: {family.get('physicalCycleResolved')}",
         ])
+
+    morphology = conclusion.get("morphology")
+    if morphology is not None:
+        lines.extend([
+            "",
+            "## Morphology / physical-cycle discrimination",
+            "",
+            f"- Morphology class: {morphology.get('morphologyClass')}",
+            f"- Phenomenology: {morphology.get('phenomenology')}",
+            f"- Eligible sectors: {morphology.get('eligibleSectorCount')}",
+            f"- Independent eligible sectors: {morphology.get('independentEligibleSectorCount')}",
+            f"- Required independent support: {morphology.get('requiredIndependentSupportCount')}",
+            f"- Raw-cycle supporters: {morphology.get('rawCycleSupportingSectors')}",
+            f"- Double-cycle supporters: {morphology.get('doubleCycleSupportingSectors')}",
+            f"- Physical cycle resolved: {morphology.get('physicalCycleResolved')}",
+            f"- Resolved physical period: {morphology.get('resolvedPhysicalPeriodDays')} days",
+        ])
+        for item in morphology.get("sectorResults") or []:
+            double_metrics = item.get("doubleWaveMetrics") or {}
+            lines.append(
+                "- Sector "
+                f"{item.get('sector')}: rawEV={(item.get('rawProfile') or {}).get('explainedVariance')}, "
+                f"doubleEV={(item.get('doubleProfile') or {}).get('explainedVariance')}, "
+                f"doubleGain={item.get('doubleExplainedVarianceImprovement')}, "
+                f"halfDiff={double_metrics.get('halfCycleDifferenceRatio')}, "
+                f"rawSupport={item.get('supportsRawCycle')}, "
+                f"doubleSupport={item.get('supportsDoubleCycle')}"
+            )
 
     lines.extend([
         "",
@@ -927,6 +956,93 @@ def build_engine(
             input_hashes={"broadIndependentProjectResult": sha256_json(run)},
         )
 
+    def morphology_stage(investigation, request):
+        prepared = _result(investigation, "001-prepare-target")
+        independent_prepare = _latest_result_for_handler(
+            investigation,
+            "openstar.tess.independent.prepare",
+        )
+        harmonic = _latest_result_for_handler(
+            investigation,
+            "openstar.tess.independent.harmonic-family.interpret",
+        )
+        broad = _latest_result_for_handler(
+            investigation,
+            "openstar.tess.independent.broad.interpret",
+        )
+        family = ((harmonic or broad or {}).get("harmonicFamily") or {})
+        raw_period = family.get("representativeRawPeriodDays")
+        double_period = family.get("possibleDoubleCycleDays")
+        if independent_prepare is None:
+            raise RuntimeError(
+                "Morphology analysis requires the frozen independent-sector preparation."
+            )
+        if raw_period is None or double_period is None:
+            raise RuntimeError(
+                "Morphology analysis requires a recurrent raw period and possible doubled cycle."
+            )
+
+        print("🧬 Analyzing folded light-curve morphology across frozen TESS sectors")
+        print(f"   recurrent raw family: {raw_period} days")
+        print(f"   possible 2x physical cycle: {double_period} days")
+        print("   no MAST download; no distributed compute")
+
+        morphology = analyze_morphology(
+            primary_dataset_path=prepared["datasetPath"],
+            independent_spec=independent_prepare,
+            raw_period_days=float(raw_period),
+            possible_double_cycle_days=float(double_period),
+        )
+
+        for item in morphology.get("sectorResults") or []:
+            double_metrics = item.get("doubleWaveMetrics") or {}
+            print(
+                "   sector "
+                f"{item.get('sector')}: "
+                f"double gain={item.get('doubleExplainedVarianceImprovement'):.4f}, "
+                f"half difference={double_metrics.get('halfCycleDifferenceRatio')}, "
+                f"raw={item.get('supportsRawCycle')}, "
+                f"double={item.get('supportsDoubleCycle')}"
+            )
+        print(f"   morphology class: {morphology.get('morphologyClass')}")
+        print(f"   phenomenology: {morphology.get('phenomenology')}")
+        print(f"   physical cycle resolved: {morphology.get('physicalCycleResolved')}")
+        if morphology.get("resolvedPhysicalPeriodDays") is not None:
+            print(
+                "   resolved physical period: "
+                f"{morphology.get('resolvedPhysicalPeriodDays')} days"
+            )
+
+        artifact_path = (
+            store.directory_for(investigation.id)
+            / "artifacts"
+            / "morphology"
+            / "morphology-v20.4.json"
+        )
+        _write_json(artifact_path, morphology)
+
+        input_hashes = {
+            "periodFamily": sha256_json(family),
+            "primaryDataset": sha256_file(Path(prepared["datasetPath"])),
+        }
+        for item in independent_prepare.get("preparedSectors") or []:
+            sector = item.get("sector")
+            path = item.get("datasetPath")
+            if path:
+                input_hashes[f"independentSector{sector}"] = sha256_file(Path(path))
+
+        return StageOutcome(
+            result=morphology,
+            next_stage=StageRequest(
+                id=_next_stage_id(request.id, "finalize"),
+                handler_id="openstar.tess.finalize",
+                parameters={"outputSuffix": "v20.4"},
+                triggered_by_stage_id=request.id,
+            ),
+            input_hashes=input_hashes,
+            artifacts=(_artifact(artifact_path, "application/json"),),
+        )
+
     def period_semantics_stage(investigation, request):
         broad = _latest_result_for_handler(
             investigation,
@@ -994,6 +1110,10 @@ def build_engine(
             investigation,
             "openstar.tess.independent.broad.prepare",
         )
+        morphology_interpretation = _latest_result_for_handler(
+            investigation,
+            "openstar.tess.morphology.analyze",
+        )
 
         if harmonic_family_interpretation is not None:
             claim_decision = harmonic_family_interpretation["claimDecision"]
@@ -1020,6 +1140,27 @@ def build_engine(
             raise RuntimeError("Finalization reached without a claim decision.")
         validate_claim(claim_decision["claim"])
 
+        if morphology_interpretation is not None and morphology_interpretation.get(
+            "physicalCycleResolved"
+        ):
+            resolved_period = morphology_interpretation.get("resolvedPhysicalPeriodDays")
+            morphology_class = morphology_interpretation.get("morphologyClass")
+            claim_decision = {
+                "claim": claim_decision["claim"],
+                "rationale": [
+                    (
+                        "Multi-sector folded-light-curve morphology resolves the harmonic "
+                        f"interpretation as {morphology_class} at approximately "
+                        f"{resolved_period} days."
+                    ),
+                    (
+                        "The claim level is not automatically upgraded by morphology alone; "
+                        "independent recurrence promotion remains governed by the existing "
+                        "sector-count, cluster-width, prominence, boundary, and coverage rules."
+                    ),
+                ],
+            }
+
         period_evidence = _build_period_evidence(
             claim_decision=claim_decision,
             selected_period=selected_period,
@@ -1030,6 +1171,16 @@ def build_engine(
             broad_interpretation=broad_interpretation,
             harmonic_family_interpretation=harmonic_family_interpretation,
         )
+        if morphology_interpretation is not None:
+            period_evidence["morphologyClass"] = morphology_interpretation.get("morphologyClass")
+            period_evidence["phenomenology"] = morphology_interpretation.get("phenomenology")
+            if morphology_interpretation.get("physicalCycleResolved"):
+                period_evidence["physicalCycleResolved"] = True
+                period_evidence["physicalPeriodDays"] = morphology_interpretation.get(
+                    "resolvedPhysicalPeriodDays"
+                )
+                period_evidence["interpretation"] = "morphology-resolved-physical-cycle"
+                period_evidence["candidateSource"] = "multi-sector-morphology-discrimination"
 
         conclusion = {
             "investigationID": investigation.id,
@@ -1057,6 +1208,7 @@ def build_engine(
             "independentBroadPreparation": broad_prepare,
             "independentBroadVerification": broad_interpretation,
             "independentHarmonicFamilyVerification": harmonic_family_interpretation,
+            "morphology": morphology_interpretation,
             "automaticDiscoveryClaim": False,
         }
 
@@ -1133,6 +1285,10 @@ def build_engine(
     engine.register_handler(
         "openstar.tess.independent.harmonic-family.interpret",
         reinterpret_harmonic_family,
+    )
+    engine.register_handler(
+        "openstar.tess.morphology.analyze",
+        morphology_stage,
     )
     engine.register_handler(
         "openstar.tess.period-semantics.reinterpret",

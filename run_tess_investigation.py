@@ -19,7 +19,7 @@ from workflows.tess.tess_investigation import (
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "Run the OpenStar v20.3.3 deterministic TESS investigation plugin. "
+            "Run the OpenStar v20.4 deterministic TESS investigation plugin. "
             "It derives a single-target project from an existing frozen project, "
             "runs distributed compute, resolves catalogs, evaluates hypotheses, "
             "and conditionally launches same-sector and independent multi-sector follow-ups."
@@ -67,6 +67,14 @@ def parse_args():
         help=(
             "Append the v20.3.3 period-evidence semantic correction to an "
             "existing harmonic-family investigation without rerunning compute."
+        ),
+    )
+    recovery.add_argument(
+        "--continue-morphology",
+        action="store_true",
+        help=(
+            "Append v20.4 local folded-light-curve morphology and physical-cycle "
+            "discrimination using already-frozen primary and independent sectors."
         ),
     )
     return parser.parse_args()
@@ -201,6 +209,39 @@ def _can_continue_period_semantics(investigation) -> None:
             "Investigation already contains the v20.3.3 period-semantic correction."
         )
 
+
+def _can_continue_morphology(investigation) -> None:
+    if any(stage.status == "RUNNING" for stage in investigation.stages):
+        raise RuntimeError(
+            "Investigation contains a RUNNING stage. Use --resume before morphology continuation."
+        )
+    if investigation.status not in {"COMPLETE", "HUMAN_REVIEW_REQUIRED"}:
+        raise RuntimeError("--continue-morphology requires a terminal investigation.")
+    has_semantics = any(
+        stage.handler_id == "openstar.tess.period-semantics.reinterpret"
+        and stage.status == "COMPLETE"
+        for stage in investigation.stages
+    )
+    has_independent_prepare = any(
+        stage.handler_id == "openstar.tess.independent.prepare"
+        and stage.status == "COMPLETE"
+        for stage in investigation.stages
+    )
+    already_done = any(
+        stage.handler_id == "openstar.tess.morphology.analyze"
+        for stage in investigation.stages
+    )
+    if not has_semantics:
+        raise RuntimeError(
+            "Run --continue-period-semantics first so v20.4 starts from the corrected period-evidence model."
+        )
+    if not has_independent_prepare:
+        raise RuntimeError(
+            "Morphology continuation requires already-frozen independent TESS sectors."
+        )
+    if already_done:
+        raise RuntimeError("Investigation already contains v20.4 morphology analysis.")
+
 def main():
     args = parse_args()
     store = InvestigationStore(args.store)
@@ -211,7 +252,7 @@ def main():
     # Every other path may need coordinator access, so verify connectivity
     # before mutating the investigation snapshot.
     health = None
-    if not (args.continue_harmonic_family or args.continue_period_semantics):
+    if not (args.continue_harmonic_family or args.continue_period_semantics or args.continue_morphology):
         health = coordinator.health()
 
     recovered_orphaned_status = False
@@ -274,6 +315,23 @@ def main():
             parameters={},
             triggered_by_stage_id=last_stage_id,
         )
+    elif args.continue_morphology:
+        investigation = store.load(args.investigation_id)
+        if investigation.workflow_id != WORKFLOW_ID:
+            raise RuntimeError(
+                "Cannot continue investigation with a different workflow: "
+                f"{investigation.workflow_id}"
+            )
+        _can_continue_morphology(investigation)
+        last_stage_id = investigation.stages[-1].id if investigation.stages else None
+        next_number = _next_stage_number(investigation)
+        investigation = store.set_status(investigation, "RUNNING")
+        initial_stage = StageRequest(
+            id=f"{next_number:03d}-morphology",
+            handler_id="openstar.tess.morphology.analyze",
+            parameters={},
+            triggered_by_stage_id=last_stage_id,
+        )
     elif args.continue_contradiction:
         investigation = store.load(args.investigation_id)
         if investigation.workflow_id != WORKFLOW_ID:
@@ -316,8 +374,8 @@ def main():
     print("⭐ OpenStar TESS Investigation")
     print(f"Investigation: {investigation.id}")
     print(f"Workflow: {WORKFLOW_ID}")
-    if args.continue_harmonic_family or args.continue_period_semantics:
-        print("Coordinator: not required for zero-compute reinterpretation")
+    if args.continue_harmonic_family or args.continue_period_semantics or args.continue_morphology:
+        print("Coordinator: not required for local/zero-distributed-compute continuation")
     else:
         print(f"Coordinator: {args.coordinator}")
         print(f"Coordinator build: {(health or {}).get('build', 'unknown')}")
@@ -338,6 +396,11 @@ def main():
         print(f"   stage: {initial_stage.id}")
         print(f"   handler: {initial_stage.handler_id}")
         print("   evidence and distributed compute will not be changed")
+    elif args.continue_morphology:
+        print("🧬 Continuing terminal investigation with v20.4 morphology analysis")
+        print(f"   stage: {initial_stage.id}")
+        print(f"   handler: {initial_stage.handler_id}")
+        print("   reusing frozen sector light curves; no MAST and no distributed compute")
     elif args.continue_contradiction:
         print("🔁 Continuing terminal investigation with v20.3 contradiction resolution")
         print(f"   stage: {initial_stage.id}")
@@ -355,7 +418,7 @@ def main():
         initial_stage,
         software_id=SOFTWARE_ID,
         software_version=SOFTWARE_VERSION,
-        max_stages=24,
+        max_stages=28,
     )
 
     print()
