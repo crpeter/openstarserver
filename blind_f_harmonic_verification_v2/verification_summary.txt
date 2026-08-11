@@ -1,0 +1,27 @@
+OpenStar Blind-F harmonic verification
+
+Target: TIC 404927661 / HD 38600
+Sectors: 1, 27, 35, 61, 87
+Total samples: 78786
+Samples after eclipse mask: 67124
+Combined time span: 2364.6414 d
+
+Known EB period: 18.536282847200 d
+Orbital frequency: 0.053948248861 c/d
+Fourth harmonic: 0.215792995444 c/d = 4.634070711800 d
+Blind-F Astropy: 0.21384606 c/d = 4.67626104 d
+
+Blind-F fixed frequency
+  LS power: 0.00063660 -> 0.00284320
+  sine semi-amplitude: 0.222623 -> 0.066334 ppt
+  amplitude reduction: 70.20%
+
+Exact fourth orbital harmonic
+  LS power: 0.04580066 -> 0.00553907
+  sine semi-amplitude: 1.902986 -> 0.099876 ppt
+  amplitude reduction: 94.75%
+
+Interpretation:
+  The ~4.67-day Blind-F feature is tested against the known eclipsing-binary ephemeris.
+  A harmonic origin is supported when the integer harmonic comb is present before masking
+  and the 4f / ~4.67-day component collapses after the primary and secondary eclipses are removed.

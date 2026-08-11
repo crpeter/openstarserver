@@ -1,0 +1,546 @@
+{
+  "investigation": "Blind C identity reconnaissance v1",
+  "blindTarget": {
+    "blindName": "Blind C",
+    "ticID": 41460085,
+    "ra": 93.1958004904196,
+    "dec": -65.9664002504526,
+    "tmag": 8.9905,
+    "sector": 62,
+    "author": "TESS-SPOC",
+    "cadenceSeconds": 200.0,
+    "selectionMetrics": {
+      "finiteSamples": 9430,
+      "baselineDays": 24.22452009488825,
+      "robustFractionalRange": 0.006781129699269077,
+      "coarsePeakPower": 0.14654410997209277
+    }
+  },
+  "frozenResult": {
+    "openstar": {
+      "frequencyCyclesPerDay": 0.133801,
+      "periodDays": 7.47378546,
+      "power": 0.40587783
+    },
+    "astropy": {
+      "frequencyCyclesPerDay": 0.13425896,
+      "periodDays": 7.44829237,
+      "power": 0.41856196
+    }
+  },
+  "tic": {
+    "found": true,
+    "aliases": {
+      "TIC": 41460085,
+      "GAIA_field": 5284296180663629056,
+      "2MASS": "06124698-6557590",
+      "HIP": null,
+      "TYC": "8905-00536-1",
+      "UCAC": "121-009645",
+      "ALLWISE": "J061246.99-655758.9",
+      "APASS": "31811783",
+      "KIC": null
+    },
+    "metadata": {
+      "raDeg": 93.1958004904196,
+      "decDeg": -65.9664002504526,
+      "tmag": 8.9905,
+      "teffK": 4073.0,
+      "logg": null,
+      "radiusRsun": 37.8057,
+      "massMsun": null,
+      "luminosity": null,
+      "distancePc": 1486.74,
+      "contaminationRatio": null,
+      "objectType": "STAR"
+    }
+  },
+  "simbad": {
+    "found": true,
+    "mainID": "TYC 8905-536-1",
+    "objectType": null,
+    "spectralType": null,
+    "identifiers": [
+      "2MASS J06124698-6557590",
+      "Gaia DR1 5284296176362353536",
+      "Gaia DR2 5284296180663629056",
+      "Gaia DR3 5284296180663629056",
+      "PPM 776201",
+      "RAVE J061247.0-655759",
+      "TIC 41460085",
+      "TYC 8905-536-1"
+    ]
+  },
+  "vsx": {
+    "found": false
+  },
+  "gaiaDR3": {
+    "found": true,
+    "nearest": {
+      "sourceID": 5284296180663629056,
+      "separationArcsec": 0.137,
+      "raDeg": 93.195799773,
+      "decDeg": -65.96636799713,
+      "gMag": 9.840433,
+      "bpMag": 10.686159,
+      "rpMag": 8.939936,
+      "bpRp": 1.746223,
+      "parallaxMas": 0.655,
+      "ruwe": 0.881
+    },
+    "sourcesWithin5Arcsec": [
+      {
+        "sourceID": 5284296180663629056,
+        "separationArcsec": 0.137,
+        "raDeg": 93.195799773,
+        "decDeg": -65.96636799713,
+        "gMag": 9.840433,
+        "bpMag": 10.686159,
+        "rpMag": 8.939936,
+        "bpRp": 1.746223,
+        "parallaxMas": 0.655,
+        "ruwe": 0.881
+      },
+      {
+        "sourceID": 5284296180665402496,
+        "separationArcsec": 4.101,
+        "raDeg": 93.19331416804,
+        "decDeg": -65.96588533625,
+        "gMag": 19.79922,
+        "bpMag": null,
+        "rpMag": null,
+        "bpRp": null,
+        "parallaxMas": null,
+        "ruwe": null
+      }
+    ]
+  },
+  "gaiaVariability": {
+    "classification": null,
+    "tablesFound": [],
+    "periodCandidates": []
+  },
+  "tess": {
+    "found": true,
+    "products": [
+      {
+        "sector": 1,
+        "author": "GSFC-ELEANOR-LITE",
+        "exptimeSeconds": 1800.0,
+        "mission": "TESS Sector 01"
+      },
+      {
+        "sector": 1,
+        "author": "QLP",
+        "exptimeSeconds": 1800.0,
+        "mission": "TESS Sector 01"
+      },
+      {
+        "sector": 1,
+        "author": "T16",
+        "exptimeSeconds": 1800.0,
+        "mission": "TESS Sector 01"
+      },
+      {
+        "sector": 1,
+        "author": "TASOC",
+        "exptimeSeconds": 1800.0,
+        "mission": "TESS Sector 01"
+      },
+      {
+        "sector": 1,
+        "author": "TGLC",
+        "exptimeSeconds": 1800.0,
+        "mission": "TESS Sector 01"
+      },
+      {
+        "sector": 3,
+        "author": "GSFC-ELEANOR-LITE",
+        "exptimeSeconds": 1800.0,
+        "mission": "TESS Sector 03"
+      },
+      {
+        "sector": 3,
+        "author": "QLP",
+        "exptimeSeconds": 1800.0,
+        "mission": "TESS Sector 03"
+      },
+      {
+        "sector": 3,
+        "author": "T16",
+        "exptimeSeconds": 1800.0,
+        "mission": "TESS Sector 03"
+      },
+      {
+        "sector": 3,
+        "author": "TASOC",
+        "exptimeSeconds": 1800.0,
+        "mission": "TESS Sector 03"
+      },
+      {
+        "sector": 3,
+        "author": "TGLC",
+        "exptimeSeconds": 1800.0,
+        "mission": "TESS Sector 03"
+      },
+      {
+        "sector": 4,
+        "author": "GSFC-ELEANOR-LITE",
+        "exptimeSeconds": 1800.0,
+        "mission": "TESS Sector 04"
+      },
+      {
+        "sector": 4,
+        "author": "QLP",
+        "exptimeSeconds": 1800.0,
+        "mission": "TESS Sector 04"
+      },
+      {
+        "sector": 4,
+        "author": "T16",
+        "exptimeSeconds": 1800.0,
+        "mission": "TESS Sector 04"
+      },
+      {
+        "sector": 4,
+        "author": "TASOC",
+        "exptimeSeconds": 1800.0,
+        "mission": "TESS Sector 04"
+      },
+      {
+        "sector": 4,
+        "author": "TGLC",
+        "exptimeSeconds": 1800.0,
+        "mission": "TESS Sector 04"
+      },
+      {
+        "sector": 6,
+        "author": "GSFC-ELEANOR-LITE",
+        "exptimeSeconds": 1800.0,
+        "mission": "TESS Sector 06"
+      },
+      {
+        "sector": 6,
+        "author": "QLP",
+        "exptimeSeconds": 1800.0,
+        "mission": "TESS Sector 06"
+      },
+      {
+        "sector": 6,
+        "author": "T16",
+        "exptimeSeconds": 1800.0,
+        "mission": "TESS Sector 06"
+      },
+      {
+        "sector": 6,
+        "author": "TASOC",
+        "exptimeSeconds": 1800.0,
+        "mission": "TESS Sector 06"
+      },
+      {
+        "sector": 6,
+        "author": "TGLC",
+        "exptimeSeconds": 1800.0,
+        "mission": "TESS Sector 06"
+      },
+      {
+        "sector": 7,
+        "author": "GSFC-ELEANOR-LITE",
+        "exptimeSeconds": 1800.0,
+        "mission": "TESS Sector 07"
+      },
+      {
+        "sector": 7,
+        "author": "QLP",
+        "exptimeSeconds": 1800.0,
+        "mission": "TESS Sector 07"
+      },
+      {
+        "sector": 7,
+        "author": "T16",
+        "exptimeSeconds": 1800.0,
+        "mission": "TESS Sector 07"
+      },
+      {
+        "sector": 7,
+        "author": "TGLC",
+        "exptimeSeconds": 1800.0,
+        "mission": "TESS Sector 07"
+      },
+      {
+        "sector": 9,
+        "author": "GSFC-ELEANOR-LITE",
+        "exptimeSeconds": 1800.0,
+        "mission": "TESS Sector 09"
+      },
+      {
+        "sector": 9,
+        "author": "QLP",
+        "exptimeSeconds": 1800.0,
+        "mission": "TESS Sector 09"
+      },
+      {
+        "sector": 9,
+        "author": "T16",
+        "exptimeSeconds": 1800.0,
+        "mission": "TESS Sector 09"
+      },
+      {
+        "sector": 9,
+        "author": "TGLC",
+        "exptimeSeconds": 1800.0,
+        "mission": "TESS Sector 09"
+      },
+      {
+        "sector": 10,
+        "author": "GSFC-ELEANOR-LITE",
+        "exptimeSeconds": 1800.0,
+        "mission": "TESS Sector 10"
+      },
+      {
+        "sector": 10,
+        "author": "QLP",
+        "exptimeSeconds": 1800.0,
+        "mission": "TESS Sector 10"
+      },
+      {
+        "sector": 10,
+        "author": "TGLC",
+        "exptimeSeconds": 1800.0,
+        "mission": "TESS Sector 10"
+      },
+      {
+        "sector": 11,
+        "author": "GSFC-ELEANOR-LITE",
+        "exptimeSeconds": 1800.0,
+        "mission": "TESS Sector 11"
+      },
+      {
+        "sector": 11,
+        "author": "QLP",
+        "exptimeSeconds": 1800.0,
+        "mission": "TESS Sector 11"
+      },
+      {
+        "sector": 11,
+        "author": "TGLC",
+        "exptimeSeconds": 1800.0,
+        "mission": "TESS Sector 11"
+      },
+      {
+        "sector": 13,
+        "author": "GSFC-ELEANOR-LITE",
+        "exptimeSeconds": 1800.0,
+        "mission": "TESS Sector 13"
+      },
+      {
+        "sector": 13,
+        "author": "QLP",
+        "exptimeSeconds": 1800.0,
+        "mission": "TESS Sector 13"
+      },
+      {
+        "sector": 27,
+        "author": "QLP",
+        "exptimeSeconds": 600.0,
+        "mission": "TESS Sector 27"
+      },
+      {
+        "sector": 28,
+        "author": "QLP",
+        "exptimeSeconds": 600.0,
+        "mission": "TESS Sector 28"
+      },
+      {
+        "sector": 30,
+        "author": "QLP",
+        "exptimeSeconds": 600.0,
+        "mission": "TESS Sector 30"
+      },
+      {
+        "sector": 31,
+        "author": "QLP",
+        "exptimeSeconds": 600.0,
+        "mission": "TESS Sector 31"
+      },
+      {
+        "sector": 33,
+        "author": "QLP",
+        "exptimeSeconds": 600.0,
+        "mission": "TESS Sector 33"
+      },
+      {
+        "sector": 34,
+        "author": "QLP",
+        "exptimeSeconds": 600.0,
+        "mission": "TESS Sector 34"
+      },
+      {
+        "sector": 36,
+        "author": "QLP",
+        "exptimeSeconds": 600.0,
+        "mission": "TESS Sector 36"
+      },
+      {
+        "sector": 37,
+        "author": "QLP",
+        "exptimeSeconds": 600.0,
+        "mission": "TESS Sector 37"
+      },
+      {
+        "sector": 38,
+        "author": "QLP",
+        "exptimeSeconds": 600.0,
+        "mission": "TESS Sector 38"
+      },
+      {
+        "sector": 62,
+        "author": "QLP",
+        "exptimeSeconds": 200.0,
+        "mission": "TESS Sector 62"
+      },
+      {
+        "sector": 62,
+        "author": "TESS-SPOC",
+        "exptimeSeconds": 200.0,
+        "mission": "TESS Sector 62"
+      },
+      {
+        "sector": 63,
+        "author": "QLP",
+        "exptimeSeconds": 200.0,
+        "mission": "TESS Sector 63"
+      },
+      {
+        "sector": 63,
+        "author": "TESS-SPOC",
+        "exptimeSeconds": 200.0,
+        "mission": "TESS Sector 63"
+      },
+      {
+        "sector": 64,
+        "author": "QLP",
+        "exptimeSeconds": 200.0,
+        "mission": "TESS Sector 64"
+      },
+      {
+        "sector": 64,
+        "author": "TESS-SPOC",
+        "exptimeSeconds": 200.0,
+        "mission": "TESS Sector 64"
+      },
+      {
+        "sector": 65,
+        "author": "QLP",
+        "exptimeSeconds": 200.0,
+        "mission": "TESS Sector 65"
+      },
+      {
+        "sector": 65,
+        "author": "TESS-SPOC",
+        "exptimeSeconds": 200.0,
+        "mission": "TESS Sector 65"
+      },
+      {
+        "sector": 66,
+        "author": "QLP",
+        "exptimeSeconds": 200.0,
+        "mission": "TESS Sector 66"
+      },
+      {
+        "sector": 66,
+        "author": "TESS-SPOC",
+        "exptimeSeconds": 200.0,
+        "mission": "TESS Sector 66"
+      },
+      {
+        "sector": 67,
+        "author": "QLP",
+        "exptimeSeconds": 200.0,
+        "mission": "TESS Sector 67"
+      },
+      {
+        "sector": 67,
+        "author": "TESS-SPOC",
+        "exptimeSeconds": 200.0,
+        "mission": "TESS Sector 67"
+      },
+      {
+        "sector": 89,
+        "author": "QLP",
+        "exptimeSeconds": 200.0,
+        "mission": "TESS Sector 89"
+      },
+      {
+        "sector": 90,
+        "author": "QLP",
+        "exptimeSeconds": 200.0,
+        "mission": "TESS Sector 90"
+      },
+      {
+        "sector": 93,
+        "author": "QLP",
+        "exptimeSeconds": 200.0,
+        "mission": "TESS Sector 93"
+      },
+      {
+        "sector": 94,
+        "author": "QLP",
+        "exptimeSeconds": 200.0,
+        "mission": "TESS Sector 94"
+      },
+      {
+        "sector": 97,
+        "author": "QLP",
+        "exptimeSeconds": 200.0,
+        "mission": "TESS Sector 97"
+      }
+    ],
+    "officialProducts": [
+      {
+        "sector": 62,
+        "author": "TESS-SPOC",
+        "exptimeSeconds": 200.0,
+        "mission": "TESS Sector 62"
+      },
+      {
+        "sector": 63,
+        "author": "TESS-SPOC",
+        "exptimeSeconds": 200.0,
+        "mission": "TESS Sector 63"
+      },
+      {
+        "sector": 64,
+        "author": "TESS-SPOC",
+        "exptimeSeconds": 200.0,
+        "mission": "TESS Sector 64"
+      },
+      {
+        "sector": 65,
+        "author": "TESS-SPOC",
+        "exptimeSeconds": 200.0,
+        "mission": "TESS Sector 65"
+      },
+      {
+        "sector": 66,
+        "author": "TESS-SPOC",
+        "exptimeSeconds": 200.0,
+        "mission": "TESS Sector 66"
+      },
+      {
+        "sector": 67,
+        "author": "TESS-SPOC",
+        "exptimeSeconds": 200.0,
+        "mission": "TESS Sector 67"
+      }
+    ],
+    "officialSectors": [
+      62,
+      63,
+      64,
+      65,
+      66,
+      67
+    ]
+  }
+}

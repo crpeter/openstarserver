@@ -10,6 +10,8 @@ from pathlib import Path
 LEASE_SECONDS = 120.0
 RETRY_COOLDOWN_SECONDS = 1.0
 EXECUTION_FAILURE_NODE_AVOID_SECONDS = 30.0
+NODE_EXECUTION_FAILURE_STREAK_LIMIT = 3
+NODE_EXECUTION_COOLDOWN_SECONDS = 60.0
 SCIENTIFIC_FAILURE_NODE_AVOID_SECONDS = 30.0
 CROSS_NODE_FREQUENCY_TOLERANCE_STEPS = 2.0
 CROSS_NODE_POWER_RELATIVE_TOLERANCE = 0.005
@@ -36,6 +38,22 @@ POWER_ABSOLUTE_TOLERANCE = 1.0e-5
 
 # A deterministic scientific mismatch must never spin forever.
 MAX_VERIFICATION_FAILURES_PER_WORK_UNIT = 3
+
+# Dataset-level interpretation. These do NOT change chunk verification.
+#
+# The purpose is to stop a mathematically largest but scientifically weak
+# Lomb-Scargle peak from automatically becoming an authoritative period.
+PERIOD_RELIABLE_MIN_POWER = 0.01
+PERIOD_RELIABLE_MIN_FOLD_COHERENCE = 0.02
+PERIOD_LOW_CONFIDENCE_POWER = 0.02
+PERIOD_LOW_CONFIDENCE_FOLD_COHERENCE = 0.05
+
+# A doubled/halved period is only promoted above the raw LS period when its
+# folded light curve is materially more coherent.
+HARMONIC_PREFERENCE_MIN_COHERENCE_GAIN = 0.15
+PERIOD_FOLD_BINS = 100
+PERIOD_MIN_POINTS_PER_BIN = 3
+PERIOD_INDEPENDENT_CANDIDATE_COUNT = 5
 
 
 def normalize_id(value):
@@ -74,14 +92,26 @@ class CoordinatorState:
         self.retry_after = {}
         self.retry_counts = {}
         self.verification_failure_counts = {}
+        self.reference_mismatch_counts = {}
         self.execution_failure_counts = {}
+        self.execution_failure_history = {}
+        self.environment_unavailable_counts = {}
+        self.environment_unavailable_history = {}
+        self.transport_unavailable_counts = {}
+        self.transport_unavailable_history = {}
         self.execution_avoid_until = {}
+        self.node_execution_failure_streaks = {}
+        self.node_execution_cooldown_until = {}
         self.scientific_rejections = {}
 
         self.nodes = {}
 
         self.reported_completed_datasets = set()
         self.reported_project_complete = False
+
+        # Dataset interpretation is calculated only after a dataset becomes
+        # terminal, then cached. Status polling therefore stays cheap.
+        self.dataset_diagnostic_cache = {}
 
         self._load_datasets()
         self._index_chunk_references()
@@ -274,13 +304,29 @@ class CoordinatorState:
                 work_id = str(uuid.uuid4())
                 normalized_work_id = normalize_id(work_id)
 
+                start_frequency = (
+                        minimum_frequency + start_index * frequency_step
+                )
+
+                # Generic workload envelope. New worker implementations read
+                # workload-specific parameters from payload. The flattened
+                # frequency fields remain temporarily for v18 client/server
+                # compatibility and can be removed after migration.
+                workload_payload = {
+                    "frequencyStartIndex": start_index,
+                    "startFrequency": start_frequency,
+                    "frequencyStep": frequency_step,
+                    "frequencyCount": frequency_count,
+                }
+
                 work_unit = {
                     "id": work_id,
                     "projectID": self.project_id,
                     "workloadID": self.workload_id,
                     "datasetID": dataset_id,
+                    "payload": workload_payload,
                     "frequencyStartIndex": start_index,
-                    "startFrequency": minimum_frequency + start_index * frequency_step,
+                    "startFrequency": start_frequency,
                     "frequencyStep": frequency_step,
                     "frequencyCount": frequency_count,
                 }
@@ -290,6 +336,7 @@ class CoordinatorState:
                 self.pending.append(normalized_work_id)
                 self.retry_counts[normalized_work_id] = 0
                 self.verification_failure_counts[normalized_work_id] = 0
+                self.reference_mismatch_counts[normalized_work_id] = 0
 
     @staticmethod
     def _global_reference(dataset):
@@ -307,6 +354,13 @@ class CoordinatorState:
         )
 
     def _validate_reference_data(self):
+        """
+        Astropy/reference data is optional.
+
+        Production/discovery projects may contain no reference data at all.
+        When reference data is present, validate only the supplied values so
+        they can be used as diagnostics. Missing references never block a run.
+        """
         errors = []
 
         for dataset_id, dataset in self.datasets.items():
@@ -322,7 +376,6 @@ class CoordinatorState:
                     ("global Astropy power reference", global_power),
             ):
                 if value is None:
-                    errors.append(f"{dataset_id}: {field_name} not found")
                     continue
 
                 try:
@@ -334,7 +387,7 @@ class CoordinatorState:
                 if not math.isfinite(numeric_value):
                     errors.append(f"{dataset_id}: {field_name} is not finite")
 
-            expected_starts = list(
+            expected_starts = set(
                 range(
                     0,
                     search["totalFrequencies"],
@@ -343,30 +396,17 @@ class CoordinatorState:
             )
 
             indexed = self.chunk_references_by_dataset.get(dataset_id, {})
-
-            if len(indexed) != len(expected_starts):
-                errors.append(
-                    f"{dataset_id}: Astropy work-unit references incomplete "
-                    f"({len(indexed)}/{len(expected_starts)})"
-                )
-
-            expected_start_set = set(expected_starts)
-            extra_starts = sorted(set(indexed.keys()) - expected_start_set)
+            extra_starts = sorted(set(indexed.keys()) - expected_starts)
 
             if extra_starts:
                 errors.append(
-                    f"{dataset_id}: unexpected Astropy chunk reference start indexes: "
+                    f"{dataset_id}: unexpected Astropy chunk reference start "
+                    "indexes: "
                     + ", ".join(str(value) for value in extra_starts[:10])
                 )
 
-            for start_index in expected_starts:
-                chunk = indexed.get(start_index)
-
-                if chunk is None:
-                    errors.append(
-                        f"{dataset_id}: missing Astropy chunk reference at "
-                        f"frequencyStartIndex={start_index}"
-                    )
+            for start_index, chunk in indexed.items():
+                if start_index not in expected_starts:
                     continue
 
                 expected_count = min(
@@ -381,11 +421,19 @@ class CoordinatorState:
                     default=expected_count,
                 )
 
-                if int(chunk_count) != expected_count:
+                try:
+                    chunk_count = int(chunk_count)
+                except (TypeError, ValueError):
                     errors.append(
                         f"{dataset_id}: chunk {start_index} frequencyCount "
-                        f"is {chunk_count}, expected {expected_count}"
+                        "is not an integer"
                     )
+                else:
+                    if chunk_count != expected_count:
+                        errors.append(
+                            f"{dataset_id}: chunk {start_index} frequencyCount "
+                            f"is {chunk_count}, expected {expected_count}"
+                        )
 
                 for field_name, keys in (
                         ("bestFrequency", ("bestFrequency", "frequency")),
@@ -396,7 +444,8 @@ class CoordinatorState:
 
                     if value is None:
                         errors.append(
-                            f"{dataset_id}: chunk {start_index} missing {field_name}"
+                            f"{dataset_id}: chunk {start_index} missing "
+                            f"{field_name}"
                         )
                         continue
 
@@ -417,8 +466,8 @@ class CoordinatorState:
 
         if errors:
             raise RuntimeError(
-                "Astropy reference validation failed. OpenStar will not run "
-                "unverified science work:\n - " + "\n - ".join(errors)
+                "Optional Astropy reference data is malformed:\n - "
+                + "\n - ".join(errors)
             )
 
     def _validate_science_metadata(self):
@@ -428,9 +477,10 @@ class CoordinatorState:
             science = dataset.get("science", {})
             role = science.get("role")
 
-            if role not in ("known", "control", "blind"):
+            if role not in (None, "known", "control", "blind", "discovery"):
                 errors.append(
-                    f"{dataset_id}: science.role must be known, control, or blind"
+                    f"{dataset_id}: science.role must be known, control, blind, "
+                    "discovery, or omitted"
                 )
                 continue
 
@@ -506,10 +556,98 @@ class CoordinatorState:
         )
         print(f"   gpu: {capabilities.get('gpuName', 'unknown')}")
 
+        advertised = capabilities.get("workloads", [])
+        if isinstance(advertised, list) and advertised:
+            workload_ids = []
+            for item in advertised:
+                if isinstance(item, str):
+                    workload_ids.append(item)
+                elif isinstance(item, dict) and item.get("workloadID"):
+                    workload_ids.append(str(item["workloadID"]))
+
+            if workload_ids:
+                print("   workloads: " + ", ".join(workload_ids))
+
     def _mark_node_seen_locked(self, node_id):
         node_key = normalize_id(node_id)
         if node_key in self.nodes:
             self.nodes[node_key]["lastSeenAt"] = time.time()
+
+    def _node_supported_workload_ids_locked(self, node_id):
+        """Return advertised workload ids, or None for a legacy unrestricted node."""
+        node = self.nodes.get(normalize_id(node_id))
+        if node is None:
+            return set()
+
+        capabilities = node.get("capabilities", {})
+        advertised = capabilities.get("workloads")
+
+        # Backward compatibility: nodes registered before workload capability
+        # advertisement are allowed to claim work exactly as before.
+        if not isinstance(advertised, list) or not advertised:
+            return None
+
+        workload_ids = set()
+
+        for item in advertised:
+            if isinstance(item, str):
+                workload_id = item
+            elif isinstance(item, dict):
+                workload_id = item.get("workloadID")
+            else:
+                workload_id = None
+
+            if workload_id is not None:
+                workload_ids.add(str(workload_id))
+
+        return workload_ids
+
+    def _node_supports_workload_locked(self, node_id, workload_id):
+        supported = self._node_supported_workload_ids_locked(node_id)
+
+        if supported is None:
+            return True
+
+        return str(workload_id) in supported
+
+    def _node_execution_cooldown_remaining_locked(self, node_id, now=None):
+        node_key = normalize_id(node_id)
+        if now is None:
+            now = time.time()
+
+        cooldown_until = self.node_execution_cooldown_until.get(
+            node_key,
+            0.0,
+        )
+
+        if cooldown_until <= now:
+            self.node_execution_cooldown_until.pop(node_key, None)
+            return 0.0
+
+        return cooldown_until - now
+
+    def _record_node_execution_failure_locked(self, node_id, now=None):
+        node_key = normalize_id(node_id)
+        if now is None:
+            now = time.time()
+
+        streak = self.node_execution_failure_streaks.get(node_key, 0) + 1
+        self.node_execution_failure_streaks[node_key] = streak
+
+        cooldown_applied = False
+
+        if streak >= NODE_EXECUTION_FAILURE_STREAK_LIMIT:
+            self.node_execution_cooldown_until[node_key] = (
+                    now + NODE_EXECUTION_COOLDOWN_SECONDS
+            )
+            cooldown_applied = True
+
+        return streak, cooldown_applied
+
+    def _record_node_execution_success_locked(self, node_id):
+        node_key = normalize_id(node_id)
+        self.node_execution_failure_streaks.pop(node_key, None)
+        self.node_execution_cooldown_until.pop(node_key, None)
 
     def _requeue_expired_locked(self):
         now = time.time()
@@ -560,9 +698,39 @@ class CoordinatorState:
             for work_id in self.work_ids_by_dataset.get(dataset_id, [])
         )
 
+    def _dataset_reference_mismatch_count_locked(self, dataset_id):
+        return sum(
+            self.reference_mismatch_counts.get(work_id, 0)
+            for work_id in self.work_ids_by_dataset.get(dataset_id, [])
+        )
+
     def _dataset_execution_failure_count_locked(self, dataset_id):
         return sum(
             self.execution_failure_counts.get(work_id, 0)
+            for work_id in self.work_ids_by_dataset.get(dataset_id, [])
+        )
+
+    def _dataset_execution_failure_kinds_locked(self, dataset_id):
+        counts = {}
+
+        for work_id in self.work_ids_by_dataset.get(dataset_id, []):
+            for record in self.execution_failure_history.get(work_id, []):
+                failure_kind = str(
+                    record.get("failureKind") or "unknown"
+                )
+                counts[failure_kind] = counts.get(failure_kind, 0) + 1
+
+        return counts
+
+    def _dataset_environment_unavailable_count_locked(self, dataset_id):
+        return sum(
+            self.environment_unavailable_counts.get(work_id, 0)
+            for work_id in self.work_ids_by_dataset.get(dataset_id, [])
+        )
+
+    def _dataset_transport_unavailable_count_locked(self, dataset_id):
+        return sum(
+            self.transport_unavailable_counts.get(work_id, 0)
             for work_id in self.work_ids_by_dataset.get(dataset_id, [])
         )
 
@@ -578,7 +746,10 @@ class CoordinatorState:
 
         for dataset_id in dataset_ids:
             _, _, completed, total = self._dataset_counts_locked(dataset_id)
-            if completed < total:
+            failed = self._dataset_failed_count_locked(dataset_id)
+
+            # Hard-failed work is terminal for scheduling, but remains failed.
+            if completed + failed < total:
                 return dataset_id
 
         return dataset_ids[-1]
@@ -593,11 +764,24 @@ class CoordinatorState:
             if node_key not in self.nodes:
                 return None
 
+            now = time.time()
+
+            # A node that repeatedly fails to execute work is temporarily
+            # quarantined from ALL work, not just the individual chunks it
+            # already failed. This prevents a broken/flaky device from
+            # burning through hundreds of unique work units while healthy
+            # nodes are available. After cooldown, one new claim acts as a
+            # probe; a successful completed execution clears the streak.
+            if self._node_execution_cooldown_remaining_locked(
+                    node_id,
+                    now,
+            ) > 0.0:
+                return None
+
             current_dataset_id = self._current_dataset_id_locked()
             if current_dataset_id is None:
                 return None
 
-            now = time.time()
             deferred = []
             work_unit = None
 
@@ -611,6 +795,13 @@ class CoordinatorState:
 
                 candidate = self.work_units.get(work_id)
                 if candidate is None:
+                    continue
+
+                if not self._node_supports_workload_locked(
+                        node_id,
+                        candidate.get("workloadID"),
+                ):
+                    deferred.append(work_id)
                     continue
 
                 if candidate["datasetID"] != current_dataset_id:
@@ -656,12 +847,11 @@ class CoordinatorState:
 
         if work_unit is not None:
             print()
-            print("📦 Science work assigned")
+            print("📦 Work assigned")
             print(f"   work: {work_unit['id']}")
             print(f"   node: {node_id}")
-            print(f"   dataset: {work_unit['datasetID']}")
-            print(f"   frequency start: {work_unit['startFrequency']:.6f}")
-            print(f"   frequencies: {work_unit['frequencyCount']}")
+            print(f"   workload: {work_unit['workloadID']}")
+            print(f"   dataset: {work_unit.get('datasetID', '[none]')}")
 
         return work_unit
 
@@ -716,6 +906,95 @@ class CoordinatorState:
             abs(frequency_step) * 8.0,
             peak_width * 0.02,
             )
+
+    def _validate_metal_result(self, work_unit, result):
+        """
+        Validate the result itself, independent of any external reference.
+
+        These checks are production execution checks: completed status,
+        numeric finite values, and a winning frequency inside the assigned
+        frequency range.
+        """
+        details = {
+            "deviceFrequency": None,
+            "devicePower": None,
+        }
+
+        if result.get("status") != "completed":
+            return False, "Work unit did not complete.", details
+
+        if result.get("bestFrequency") is None:
+            return False, "Missing best frequency.", details
+
+        if result.get("bestPower") is None:
+            return False, "Missing best power.", details
+
+        try:
+            best_frequency = float(result["bestFrequency"])
+            best_power = float(result["bestPower"])
+        except (TypeError, ValueError):
+            return False, "Best frequency/power must be numeric.", details
+
+        details["deviceFrequency"] = best_frequency
+        details["devicePower"] = best_power
+
+        if not math.isfinite(best_frequency):
+            return False, "Best frequency is not finite.", details
+
+        if not math.isfinite(best_power):
+            return False, "Best power is not finite.", details
+
+        start_frequency = float(work_unit["startFrequency"])
+        frequency_step = float(work_unit["frequencyStep"])
+        frequency_count = int(work_unit["frequencyCount"])
+
+        end_frequency = (
+                start_frequency
+                + max(frequency_count - 1, 0) * frequency_step
+        )
+
+        grid_tolerance = max(abs(frequency_step) * 2.0, 1e-7)
+
+        if (
+                best_frequency < start_frequency - grid_tolerance
+                or best_frequency > end_frequency + grid_tolerance
+        ):
+            return False, "Best frequency is outside work-unit range.", details
+
+        return True, "Metal result is structurally valid.", details
+
+    def _reference_comparison(self, work_unit, result):
+        """
+        Optional diagnostic comparison against a frozen Astropy chunk result.
+
+        This function never decides whether the Metal result is accepted.
+        """
+        reference = self._chunk_reference(
+            work_unit["datasetID"],
+            work_unit["frequencyStartIndex"],
+        )
+
+        if reference is None:
+            return {
+                "status": "not-available",
+                "matched": None,
+                "method": None,
+                "message": "No Astropy chunk reference supplied.",
+                "details": {},
+            }
+
+        matched, message, details = self._verify_result(
+            work_unit,
+            result,
+        )
+
+        return {
+            "status": "match" if matched else "mismatch",
+            "matched": matched,
+            "method": details.get("method"),
+            "message": message,
+            "details": dict(details),
+        }
 
     def _verify_result(self, work_unit, result):
         details = {
@@ -1121,6 +1400,76 @@ class CoordinatorState:
                 "this work unit"
             )
 
+    def _print_environment_unavailable(
+            self,
+            *,
+            work_unit,
+            assignment,
+            result,
+            interruption_count,
+    ):
+        client_reason = first_value(
+            result,
+            "errorMessage",
+            "error",
+            "message",
+            "failureReason",
+            "reason",
+        )
+
+        print()
+        print("⏸️ Work returned - node environment unavailable")
+        print(f"   work: {work_unit['id']}")
+        print(f"   node: {assignment.get('nodeID', 'unknown')}")
+        print(f"   workload: {work_unit.get('workloadID', 'unknown')}")
+        print(f"   dataset: {work_unit.get('datasetID', 'none')}")
+        print("   failure kind: environment-unavailable")
+        if client_reason is not None:
+            print(f"   client reason: {client_reason}")
+        print(
+            "   environment interruptions for work unit: "
+            f"{interruption_count}"
+        )
+        print(
+            "   action: requeued with no retry penalty, no execution-failure "
+            "count, and no node cooldown penalty"
+        )
+
+    def _print_transport_unavailable(
+            self,
+            *,
+            work_unit,
+            assignment,
+            result,
+            interruption_count,
+    ):
+        client_reason = first_value(
+            result,
+            "errorMessage",
+            "error",
+            "message",
+            "failureReason",
+            "reason",
+        )
+
+        print()
+        print("📡 Work returned - coordinator transport unavailable")
+        print(f"   work: {work_unit['id']}")
+        print(f"   node: {assignment.get('nodeID', 'unknown')}")
+        print(f"   workload: {work_unit.get('workloadID', 'unknown')}")
+        print(f"   dataset: {work_unit.get('datasetID', 'none')}")
+        print("   failure kind: transport-unavailable")
+        if client_reason is not None:
+            print(f"   client reason: {client_reason}")
+        print(
+            "   transport interruptions for work unit: "
+            f"{interruption_count}"
+        )
+        print(
+            "   action: requeued with no retry penalty, no execution-failure "
+            "count, and no node cooldown penalty"
+        )
+
     def _print_execution_failure(
             self,
             *,
@@ -1128,10 +1477,20 @@ class CoordinatorState:
             assignment,
             result,
             execution_failure_count,
+            node_execution_failure_streak,
+            node_cooldown_applied,
     ):
         result_status = str(result.get("status", "unknown"))
+        failure_kind = str(
+            first_value(
+                result,
+                "failureKind",
+                default="unknown",
+            )
+        )
         client_reason = first_value(
             result,
+            "errorMessage",
             "error",
             "message",
             "failureReason",
@@ -1142,11 +1501,9 @@ class CoordinatorState:
         print("⚠️ Work execution failed")
         print(f"   work: {work_unit['id']}")
         print(f"   node: {assignment.get('nodeID', 'unknown')}")
-        print(f"   dataset: {work_unit['datasetID']}")
-        print(
-            "   frequency start index: "
-            f"{work_unit['frequencyStartIndex']}"
-        )
+        print(f"   workload: {work_unit.get('workloadID', 'unknown')}")
+        print(f"   dataset: {work_unit.get('datasetID', 'none')}")
+        print(f"   failure kind: {failure_kind}")
         print(f"   status: {result_status}")
         if client_reason is not None:
             print(f"   client reason: {client_reason}")
@@ -1155,12 +1512,39 @@ class CoordinatorState:
             f"{execution_failure_count}"
         )
         print(
-            "   action: requeued; failing node temporarily avoided for this "
-            "work unit"
+            "   consecutive execution failures for node: "
+            f"{node_execution_failure_streak}"
         )
+
+        if node_cooldown_applied:
+            print(
+                "   node action: all work paused for "
+                f"{NODE_EXECUTION_COOLDOWN_SECONDS:.0f}s; "
+                "one probe claim allowed after cooldown"
+            )
+        else:
+            print(
+                "   action: requeued; failing node temporarily avoided for "
+                "this work unit"
+            )
 
     def submit_result(self, route_work_id, result):
         work_id = normalize_id(route_work_id)
+        result = dict(result)
+
+        # Generic result envelope. Current Lomb-Scargle reduction still reads
+        # the historical flattened fields, so mirror them from payload during
+        # the transition. OpenStar Core does not require other workloads to
+        # use these keys.
+        result_payload = result.get("payload")
+        if isinstance(result_payload, dict):
+            for key in (
+                    "bestFrequency",
+                    "bestPeriodDays",
+                    "bestPower",
+            ):
+                if result.get(key) is None and result_payload.get(key) is not None:
+                    result[key] = result_payload[key]
 
         with self.lock:
             work_unit = self.work_units.get(work_id)
@@ -1174,8 +1558,7 @@ class CoordinatorState:
             if work_id in self.failed:
                 return (
                     False,
-                    "Work unit is hard-failed and requires coordinator restart "
-                    "after investigation.",
+                    "Work unit is hard-failed and terminal.",
                     200,
                 )
 
@@ -1185,77 +1568,255 @@ class CoordinatorState:
                 return False, "Work unit is not currently assigned.", 409
 
             # A client that explicitly reports status != completed did not
-            # produce a scientific result. Treat this as an operational
-            # execution failure, not an Astropy verification failure.
-            #
-            # Requeue it, do not increment verification_failure_counts, and
-            # temporarily prevent the same node from reclaiming this exact
-            # work unit so another device can try it.
+            # produce a scientific result. Failure provenance determines
+            # whether this is a real execution failure or only a temporary
+            # environment availability interruption.
             if result.get("status") != "completed":
                 self.assigned.pop(work_id, None)
 
                 now = time.time()
-                self.retry_counts[work_id] = (
-                        self.retry_counts.get(work_id, 0) + 1
+                failure_kind = str(
+                    first_value(
+                        result,
+                        "failureKind",
+                        default="unknown",
+                    )
                 )
-                execution_failure_count = (
-                        self.execution_failure_counts.get(work_id, 0) + 1
-                )
-                self.execution_failure_counts[work_id] = (
-                    execution_failure_count
-                )
-
-                failing_node_key = normalize_id(assignment["nodeID"])
-                avoid_by_node = self.execution_avoid_until.setdefault(
-                    work_id,
-                    {},
-                )
-                avoid_by_node[failing_node_key] = (
-                        now + EXECUTION_FAILURE_NODE_AVOID_SECONDS
+                client_reason = first_value(
+                    result,
+                    "errorMessage",
+                    "error",
+                    "message",
+                    "failureReason",
+                    "reason",
                 )
 
-                self.retry_after[work_id] = now + RETRY_COOLDOWN_SECONDS
-                self.pending.append(work_id)
-                self._mark_node_seen_locked(assignment["nodeID"])
+                if failure_kind == "environment-unavailable":
+                    interruption_count = (
+                            self.environment_unavailable_counts.get(work_id, 0) + 1
+                    )
+                    self.environment_unavailable_counts[work_id] = (
+                        interruption_count
+                    )
+                    self.environment_unavailable_history.setdefault(
+                        work_id,
+                        [],
+                    ).append({
+                        "workID": work_unit["id"],
+                        "projectID": work_unit.get("projectID"),
+                        "workloadID": work_unit.get("workloadID"),
+                        "datasetID": work_unit.get("datasetID"),
+                        "nodeID": assignment["nodeID"],
+                        "failureKind": failure_kind,
+                        "errorMessage": client_reason,
+                        "interruptionCount": interruption_count,
+                        "returnedAt": now,
+                    })
 
-                execution_failure_args = {
-                    "work_unit": dict(work_unit),
-                    "assignment": dict(assignment),
-                    "result": dict(result),
-                    "execution_failure_count": execution_failure_count,
-                }
-                execution_failure_message = "Work unit did not complete."
-                execution_failed = True
+                    # Immediate lease return. This deliberately does NOT touch
+                    # retry_counts, execution_failure_counts, node failure
+                    # streaks, execution avoidance, or cooldown state.
+                    self.retry_after.pop(work_id, None)
+                    self.pending.appendleft(work_id)
+                    self._mark_node_seen_locked(assignment["nodeID"])
+
+                    environment_unavailable_args = {
+                        "work_unit": dict(work_unit),
+                        "assignment": dict(assignment),
+                        "result": dict(result),
+                        "interruption_count": interruption_count,
+                    }
+                    transport_unavailable_args = None
+                    execution_failure_args = None
+                    execution_failure_message = (
+                        "Work requeued because node environment is temporarily "
+                        "unavailable."
+                    )
+                    execution_failed = True
+                elif failure_kind == "transport-unavailable":
+                    interruption_count = (
+                            self.transport_unavailable_counts.get(work_id, 0) + 1
+                    )
+                    self.transport_unavailable_counts[work_id] = (
+                        interruption_count
+                    )
+                    self.transport_unavailable_history.setdefault(
+                        work_id,
+                        [],
+                    ).append({
+                        "workID": work_unit["id"],
+                        "projectID": work_unit.get("projectID"),
+                        "workloadID": work_unit.get("workloadID"),
+                        "datasetID": work_unit.get("datasetID"),
+                        "nodeID": assignment["nodeID"],
+                        "failureKind": failure_kind,
+                        "errorMessage": client_reason,
+                        "interruptionCount": interruption_count,
+                        "returnedAt": now,
+                    })
+
+                    # Transport loss is not evidence of bad compute. Return the
+                    # lease immediately without touching retry/failure/cooldown
+                    # accounting.
+                    self.retry_after.pop(work_id, None)
+                    self.pending.appendleft(work_id)
+                    self._mark_node_seen_locked(assignment["nodeID"])
+
+                    transport_unavailable_args = {
+                        "work_unit": dict(work_unit),
+                        "assignment": dict(assignment),
+                        "result": dict(result),
+                        "interruption_count": interruption_count,
+                    }
+                    environment_unavailable_args = None
+                    execution_failure_args = None
+                    execution_failure_message = (
+                        "Work requeued because coordinator transport is "
+                        "temporarily unavailable."
+                    )
+                    execution_failed = True
+                else:
+                    self.retry_counts[work_id] = (
+                            self.retry_counts.get(work_id, 0) + 1
+                    )
+                    execution_failure_count = (
+                            self.execution_failure_counts.get(work_id, 0) + 1
+                    )
+                    self.execution_failure_counts[work_id] = (
+                        execution_failure_count
+                    )
+
+                    failure_record = {
+                        "workID": work_unit["id"],
+                        "projectID": work_unit.get("projectID"),
+                        "workloadID": work_unit.get("workloadID"),
+                        "datasetID": work_unit.get("datasetID"),
+                        "nodeID": assignment["nodeID"],
+                        "failureKind": failure_kind,
+                        "errorMessage": client_reason,
+                        "workUnitFailureCount": execution_failure_count,
+                        "failedAt": now,
+                    }
+                    self.execution_failure_history.setdefault(
+                        work_id,
+                        [],
+                    ).append(failure_record)
+
+                    failing_node_key = normalize_id(assignment["nodeID"])
+                    avoid_by_node = self.execution_avoid_until.setdefault(
+                        work_id,
+                        {},
+                    )
+                    avoid_by_node[failing_node_key] = (
+                            now + EXECUTION_FAILURE_NODE_AVOID_SECONDS
+                    )
+
+                    (
+                        node_execution_failure_streak,
+                        node_cooldown_applied,
+                    ) = self._record_node_execution_failure_locked(
+                        assignment["nodeID"],
+                        now,
+                    )
+
+                    self.retry_after[work_id] = now + RETRY_COOLDOWN_SECONDS
+                    self.pending.append(work_id)
+                    self._mark_node_seen_locked(assignment["nodeID"])
+
+                    execution_failure_args = {
+                        "work_unit": dict(work_unit),
+                        "assignment": dict(assignment),
+                        "result": dict(result),
+                        "execution_failure_count": execution_failure_count,
+                        "node_execution_failure_streak": (
+                            node_execution_failure_streak
+                        ),
+                        "node_cooldown_applied": node_cooldown_applied,
+                    }
+                    environment_unavailable_args = None
+                    transport_unavailable_args = None
+                    execution_failure_message = "Work unit did not complete."
+                    execution_failed = True
             else:
                 execution_failed = False
+                execution_failure_args = None
+                environment_unavailable_args = None
+                transport_unavailable_args = None
+                self._record_node_execution_success_locked(
+                    assignment["nodeID"]
+                )
 
             if execution_failed:
                 accepted = False
                 message = execution_failure_message
                 verification = None
+                reference_comparison = None
             else:
-                accepted, message, verification = self._verify_result(
-                    work_unit,
-                    result,
+                accepted, message, validation_details = (
+                    self._validate_metal_result(
+                        work_unit,
+                        result,
+                    )
                 )
 
-                if not accepted:
-                    (
-                        consensus_accepted,
-                        consensus_message,
-                        consensus_verification,
-                    ) = self._try_cross_node_consensus_locked(
-                        work_id,
+                reference_comparison = None
+
+                if accepted:
+                    reference_comparison = self._reference_comparison(
                         work_unit,
-                        assignment,
                         result,
-                        verification,
                     )
 
-                    if consensus_accepted:
-                        accepted = True
-                        message = consensus_message
-                        verification = consensus_verification
+                    mismatch = (
+                            reference_comparison.get("status")
+                            == "mismatch"
+                    )
+                    self.reference_mismatch_counts[work_id] = (
+                        1 if mismatch else 0
+                    )
+
+                    comparison_details = reference_comparison.get(
+                        "details",
+                        {},
+                    )
+
+                    verification = {
+                        **comparison_details,
+                        "method": "metal-result",
+                        "referenceComparisonStatus": (
+                            reference_comparison.get("status")
+                        ),
+                        "referenceComparisonMethod": (
+                            reference_comparison.get("method")
+                        ),
+                        "referenceComparisonMessage": (
+                            reference_comparison.get("message")
+                        ),
+                    }
+
+                    if mismatch:
+                        message = (
+                            "Metal result accepted. Astropy comparison "
+                            "disagreed, recorded diagnostically only."
+                        )
+                    elif (
+                            reference_comparison.get("status")
+                            == "match"
+                    ):
+                        message = (
+                            "Metal result accepted. Astropy comparison "
+                            "matched."
+                        )
+                    else:
+                        message = (
+                            "Metal result accepted. No Astropy reference "
+                            "was supplied."
+                        )
+                else:
+                    verification = {
+                        "method": "metal-result-invalid",
+                        **validation_details,
+                    }
 
             if execution_failed:
                 rejection_args = None
@@ -1293,14 +1854,16 @@ class CoordinatorState:
                         "verification": dict(verification),
                         "failedAt": time.time(),
                     }
+                    self.dataset_diagnostic_cache.pop(
+                        work_unit["datasetID"],
+                        None,
+                    )
                 else:
                     now = time.time()
 
-                    # A deterministic scientific retry should be useful. Do
-                    # not immediately hand the same rejected work unit back to
-                    # the same device; give another registered node a chance
-                    # to reproduce or disagree with the result. This expires
-                    # so single-node projects continue after a short delay.
+                    # The Metal result itself was malformed/out-of-range.
+                    # Requeue it and temporarily avoid the same node for this
+                    # exact work unit so another execution can try it.
                     failing_node_key = normalize_id(assignment["nodeID"])
                     avoid_by_node = self.execution_avoid_until.setdefault(
                         work_id,
@@ -1341,6 +1904,10 @@ class CoordinatorState:
                     )
 
                 self.completed[work_id] = stored_result
+                self.dataset_diagnostic_cache.pop(
+                    work_unit["datasetID"],
+                    None,
+                )
                 self.assigned.pop(work_id, None)
                 self.retry_after.pop(work_id, None)
                 self.execution_avoid_until.pop(work_id, None)
@@ -1351,7 +1918,16 @@ class CoordinatorState:
                 total_count = len(self.work_units)
 
         if execution_failed:
-            self._print_execution_failure(**execution_failure_args)
+            if environment_unavailable_args is not None:
+                self._print_environment_unavailable(
+                    **environment_unavailable_args
+                )
+            elif transport_unavailable_args is not None:
+                self._print_transport_unavailable(
+                    **transport_unavailable_args
+                )
+            elif execution_failure_args is not None:
+                self._print_execution_failure(**execution_failure_args)
 
             # The client reported that execution itself did not complete.
             # Returning 200 acknowledges the report so the networking layer
@@ -1361,6 +1937,11 @@ class CoordinatorState:
 
         if not accepted:
             self._print_rejection(**rejection_args)
+
+            # Terminal scientific failures must advance scheduling while
+            # remaining explicit failures.
+            if rejection_args.get("hard_failed"):
+                self._report_completions()
 
             # This is an application-level scientific rejection, not a broken
             # HTTP request. Returning 200 prevents networking layers from
@@ -1385,6 +1966,30 @@ class CoordinatorState:
             f"{stored_result['verification'].get('method')}"
         )
 
+        reference_status = stored_result["verification"].get(
+            "referenceComparisonStatus"
+        )
+
+        if reference_status == "match":
+            reference_method = stored_result["verification"].get(
+                "referenceComparisonMethod"
+            )
+            print(
+                "   Astropy comparison: MATCH"
+                + (
+                    f" ({reference_method})"
+                    if reference_method
+                    else ""
+                )
+            )
+        elif reference_status == "mismatch":
+            print(
+                "   Astropy comparison: MISMATCH "
+                "(diagnostic only; Metal result retained)"
+            )
+        elif reference_status == "not-available":
+            print("   Astropy comparison: not available")
+
         if stored_result.get("duration") is not None:
             print(f"   duration: {float(stored_result['duration']):.4f}s")
 
@@ -1407,6 +2012,425 @@ class CoordinatorState:
                 best = result
 
         return best
+
+    @staticmethod
+    def _finite_float_list(values):
+        result = []
+
+        for value in values:
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                continue
+
+            if math.isfinite(value):
+                result.append(value)
+
+        return result
+
+    @staticmethod
+    def _fold_metrics(times, flux, period_days):
+        try:
+            period_days = float(period_days)
+        except (TypeError, ValueError):
+            return None
+
+        if not math.isfinite(period_days) or period_days <= 0:
+            return None
+
+        sample_count = min(len(times), len(flux))
+
+        if sample_count < 2:
+            return None
+
+        bin_sums = [0.0] * PERIOD_FOLD_BINS
+        bin_counts = [0] * PERIOD_FOLD_BINS
+        usable = []
+
+        for index in range(sample_count):
+            try:
+                time_value = float(times[index])
+                flux_value = float(flux[index])
+            except (TypeError, ValueError):
+                continue
+
+            if not math.isfinite(time_value) or not math.isfinite(flux_value):
+                continue
+
+            phase = (time_value / period_days) % 1.0
+            bin_index = int(phase * PERIOD_FOLD_BINS)
+
+            if bin_index >= PERIOD_FOLD_BINS:
+                bin_index = PERIOD_FOLD_BINS - 1
+
+            bin_sums[bin_index] += flux_value
+            bin_counts[bin_index] += 1
+            usable.append((bin_index, flux_value))
+
+        if len(usable) < 2:
+            return None
+
+        overall_mean = sum(value for _, value in usable) / len(usable)
+        total_ss = sum(
+            (value - overall_mean) ** 2
+            for _, value in usable
+        )
+
+        if total_ss <= 0:
+            return None
+
+        bin_means = [None] * PERIOD_FOLD_BINS
+
+        for bin_index in range(PERIOD_FOLD_BINS):
+            count = bin_counts[bin_index]
+
+            if count >= PERIOD_MIN_POINTS_PER_BIN:
+                bin_means[bin_index] = (
+                        bin_sums[bin_index] / count
+                )
+
+        residual_ss = 0.0
+        residual_count = 0
+
+        for bin_index, value in usable:
+            bin_mean = bin_means[bin_index]
+
+            if bin_mean is None:
+                continue
+
+            residual_ss += (value - bin_mean) ** 2
+            residual_count += 1
+
+        if residual_count <= 0:
+            return None
+
+        within_bin_rms = math.sqrt(
+            residual_ss / residual_count
+        )
+
+        total_rms = math.sqrt(
+            total_ss / len(usable)
+        )
+
+        coherence = 1.0 - (
+                residual_ss / total_ss
+        )
+
+        coherence = max(
+            0.0,
+            min(
+                1.0,
+                coherence,
+            ),
+        )
+
+        return {
+            "periodDays": period_days,
+            "withinBinRMS": within_bin_rms,
+            "totalRMS": total_rms,
+            "coherence": coherence,
+            "usedSamples": residual_count,
+            "occupiedBins": sum(
+                1
+                for count in bin_counts
+                if count >= PERIOD_MIN_POINTS_PER_BIN
+            ),
+        }
+
+    def _independent_candidates_locked(self, dataset_id):
+        dataset = self.datasets[dataset_id]
+        times = self._finite_float_list(
+            dataset.get("times", [])
+        )
+
+        baseline = None
+
+        if len(times) >= 2:
+            baseline = max(times) - min(times)
+
+        rayleigh = (
+            1.0 / baseline
+            if baseline is not None and baseline > 0
+            else None
+        )
+
+        candidates = []
+
+        for work_id in self.work_ids_by_dataset.get(dataset_id, []):
+            result = self.completed.get(work_id)
+
+            if (
+                    result is None
+                    or result.get("bestPower") is None
+                    or result.get("bestFrequency") is None
+            ):
+                continue
+
+            try:
+                frequency = float(result["bestFrequency"])
+                power = float(result["bestPower"])
+            except (TypeError, ValueError):
+                continue
+
+            if (
+                    not math.isfinite(frequency)
+                    or not math.isfinite(power)
+                    or frequency <= 0
+            ):
+                continue
+
+            candidates.append(
+                {
+                    "frequency": frequency,
+                    "periodDays": 1.0 / frequency,
+                    "power": power,
+                    "workID": work_id,
+                }
+            )
+
+        candidates.sort(
+            key=lambda item: item["power"],
+            reverse=True,
+        )
+
+        selected = []
+
+        for candidate in candidates:
+            if rayleigh is not None and any(
+                    abs(
+                        candidate["frequency"]
+                        - existing["frequency"]
+                    ) < rayleigh
+                    for existing in selected
+            ):
+                continue
+
+            selected.append(candidate)
+
+            if len(selected) >= PERIOD_INDEPENDENT_CANDIDATE_COUNT:
+                break
+
+        return selected
+
+    def _dataset_result_diagnostics_locked(self, dataset_id):
+        pending, assigned, completed, total = self._dataset_counts_locked(
+            dataset_id
+        )
+        failed = self._dataset_failed_count_locked(dataset_id)
+        terminal = (
+                total > 0
+                and completed + failed == total
+        )
+
+        best = self._dataset_best_locked(dataset_id)
+
+        if not terminal:
+            return {
+                "periodStatus": "SEARCHING",
+                "periodConfidence": None,
+                "coverageComplete": False,
+                "candidate": (
+                    {
+                        "frequency": float(best["bestFrequency"]),
+                        "periodDays": float(best["bestPeriodDays"]),
+                        "power": float(best["bestPower"]),
+                    }
+                    if best is not None
+                    else None
+                ),
+                "authoritative": None,
+                "harmonicCandidates": [],
+                "preferredPhysicalPeriodDays": None,
+                "independentCandidates": [],
+            }
+
+        cached = self.dataset_diagnostic_cache.get(dataset_id)
+
+        if cached is not None:
+            return cached
+
+        dataset = self.datasets[dataset_id]
+        times = dataset.get("times", [])
+        flux = dataset.get("flux", [])
+
+        independent_candidates = self._independent_candidates_locked(
+            dataset_id
+        )
+
+        if best is None:
+            diagnostic = {
+                "periodStatus": (
+                    "INCOMPLETE_COVERAGE"
+                    if failed
+                    else "NO_RESULT"
+                ),
+                "periodConfidence": "none",
+                "coverageComplete": failed == 0,
+                "candidate": None,
+                "authoritative": None,
+                "harmonicCandidates": [],
+                "preferredPhysicalPeriodDays": None,
+                "independentCandidates": independent_candidates,
+            }
+            self.dataset_diagnostic_cache[dataset_id] = diagnostic
+            return diagnostic
+
+        best_frequency = float(best["bestFrequency"])
+        best_period = float(best["bestPeriodDays"])
+        best_power = float(best["bestPower"])
+
+        primary_fold = self._fold_metrics(
+            times,
+            flux,
+            best_period,
+        )
+        doubled_fold = self._fold_metrics(
+            times,
+            flux,
+            best_period * 2.0,
+            )
+        half_fold = self._fold_metrics(
+            times,
+            flux,
+            best_period * 0.5,
+            )
+
+        primary_coherence = (
+            primary_fold["coherence"]
+            if primary_fold is not None
+            else 0.0
+        )
+
+        second_power = (
+            independent_candidates[1]["power"]
+            if len(independent_candidates) >= 2
+            else None
+        )
+
+        prominence_ratio = (
+            best_power / second_power
+            if second_power is not None and second_power > 0
+            else None
+        )
+
+        candidate = {
+            "frequency": best_frequency,
+            "periodDays": best_period,
+            "power": best_power,
+            "foldCoherence": primary_coherence,
+            "foldWithinBinRMS": (
+                primary_fold["withinBinRMS"]
+                if primary_fold is not None
+                else None
+            ),
+            "independentPeakProminenceRatio": prominence_ratio,
+        }
+
+        harmonic_candidates = []
+
+        for relation, fold in (
+                ("0.5x", half_fold),
+                ("1x", primary_fold),
+                ("2x", doubled_fold),
+        ):
+            if fold is None:
+                continue
+
+            harmonic_candidates.append(
+                {
+                    "relation": relation,
+                    "periodDays": fold["periodDays"],
+                    "foldCoherence": fold["coherence"],
+                    "foldWithinBinRMS": fold["withinBinRMS"],
+                }
+            )
+
+        preferred_physical_period = best_period
+        preferred_relation = "1x"
+        preferred_coherence = primary_coherence
+
+        for relation, fold in (
+                ("0.5x", half_fold),
+                ("2x", doubled_fold),
+        ):
+            if fold is None:
+                continue
+
+            coherence_gain = (
+                    fold["coherence"]
+                    - primary_coherence
+            )
+
+            if (
+                    coherence_gain
+                    >= HARMONIC_PREFERENCE_MIN_COHERENCE_GAIN
+                    and fold["coherence"] > preferred_coherence
+            ):
+                preferred_physical_period = fold["periodDays"]
+                preferred_relation = relation
+                preferred_coherence = fold["coherence"]
+
+        if failed:
+            period_status = "INCOMPLETE_COVERAGE"
+            period_confidence = "none"
+            authoritative = None
+        elif (
+                best_power < PERIOD_RELIABLE_MIN_POWER
+                and primary_coherence < PERIOD_RELIABLE_MIN_FOLD_COHERENCE
+        ):
+            period_status = "NO_RELIABLE_PERIOD"
+            period_confidence = "none"
+            authoritative = None
+        else:
+            if (
+                    best_power < PERIOD_LOW_CONFIDENCE_POWER
+                    or primary_coherence < PERIOD_LOW_CONFIDENCE_FOLD_COHERENCE
+            ):
+                period_status = "LOW_CONFIDENCE"
+                period_confidence = "low"
+            elif (
+                    best_power >= 0.10
+                    and primary_coherence >= 0.10
+            ):
+                period_status = "RELIABLE"
+                period_confidence = "high"
+            else:
+                period_status = "RELIABLE"
+                period_confidence = "medium"
+
+            authoritative = {
+                "frequency": best_frequency,
+                "periodDays": best_period,
+                "power": best_power,
+            }
+
+        diagnostic = {
+            "periodStatus": period_status,
+            "periodConfidence": period_confidence,
+            "coverageComplete": failed == 0,
+            "candidate": candidate,
+            "authoritative": authoritative,
+            "harmonicCandidates": harmonic_candidates,
+            "preferredPhysicalPeriodDays": (
+                preferred_physical_period
+                if authoritative is not None
+                else None
+            ),
+            "preferredPhysicalPeriodRelation": (
+                preferred_relation
+                if authoritative is not None
+                else None
+            ),
+            "preferredPhysicalPeriodCoherence": (
+                preferred_coherence
+                if authoritative is not None
+                else None
+            ),
+            "independentCandidates": independent_candidates,
+        }
+
+        self.dataset_diagnostic_cache[dataset_id] = diagnostic
+        return diagnostic
 
     def _dataset_contributions_locked(self, dataset_id):
         iphone = 0
@@ -1448,6 +2472,9 @@ class CoordinatorState:
                 dataset_id
             )
             best = self._dataset_best_locked(dataset_id)
+            diagnostics = self._dataset_result_diagnostics_locked(
+                dataset_id
+            )
 
             dataset = self.datasets[dataset_id]
             manifest = self.dataset_manifest_entries.get(dataset_id, {})
@@ -1461,7 +2488,59 @@ class CoordinatorState:
             execution_failure_count = (
                 self._dataset_execution_failure_count_locked(dataset_id)
             )
+            execution_failure_kinds = (
+                self._dataset_execution_failure_kinds_locked(dataset_id)
+            )
+            environment_unavailable_count = (
+                self._dataset_environment_unavailable_count_locked(dataset_id)
+            )
+            transport_unavailable_count = (
+                self._dataset_transport_unavailable_count_locked(dataset_id)
+            )
+            reference_mismatch_count = (
+                self._dataset_reference_mismatch_count_locked(dataset_id)
+            )
             failed_count = self._dataset_failed_count_locked(dataset_id)
+
+            authoritative = diagnostics.get("authoritative")
+            candidate = diagnostics.get("candidate")
+
+            # During an active search, preserve the old best-so-far fields so
+            # existing clients continue to show live progress. Once terminal,
+            # best* means authoritative. Incomplete/weak datasets therefore
+            # return null instead of publishing a false final period.
+            if diagnostics["periodStatus"] == "SEARCHING":
+                legacy_best_frequency = (
+                    best.get("bestFrequency")
+                    if best
+                    else None
+                )
+                legacy_best_period = (
+                    best.get("bestPeriodDays")
+                    if best
+                    else None
+                )
+                legacy_best_power = (
+                    best.get("bestPower")
+                    if best
+                    else None
+                )
+            else:
+                legacy_best_frequency = (
+                    authoritative.get("frequency")
+                    if authoritative
+                    else None
+                )
+                legacy_best_period = (
+                    authoritative.get("periodDays")
+                    if authoritative
+                    else None
+                )
+                legacy_best_power = (
+                    authoritative.get("power")
+                    if authoritative
+                    else None
+                )
 
             return {
                 "id": dataset_id,
@@ -1476,14 +2555,66 @@ class CoordinatorState:
                 "assignedWorkUnits": assigned,
                 "completedWorkUnits": completed,
                 "totalWorkUnits": total,
-                "progress": completed / total if total else 1.0,
+                "progress": (
+                    (completed + failed_count) / total
+                    if total
+                    else 1.0
+                ),
                 "retryCount": retry_count,
                 "verificationFailureCount": verification_failure_count,
                 "executionFailureCount": execution_failure_count,
+                "executionFailureKinds": execution_failure_kinds,
+                "environmentUnavailableCount": environment_unavailable_count,
+                "transportUnavailableCount": transport_unavailable_count,
+                "referenceMismatchCount": reference_mismatch_count,
                 "failedWorkUnits": failed_count,
-                "bestFrequency": best.get("bestFrequency") if best else None,
-                "bestPeriodDays": best.get("bestPeriodDays") if best else None,
-                "bestPower": best.get("bestPower") if best else None,
+                "periodStatus": diagnostics["periodStatus"],
+                "periodConfidence": diagnostics["periodConfidence"],
+                "coverageComplete": diagnostics["coverageComplete"],
+                "bestFrequency": legacy_best_frequency,
+                "bestPeriodDays": legacy_best_period,
+                "bestPower": legacy_best_power,
+                "candidateFrequency": (
+                    candidate.get("frequency")
+                    if candidate
+                    else None
+                ),
+                "candidatePeriodDays": (
+                    candidate.get("periodDays")
+                    if candidate
+                    else None
+                ),
+                "candidatePower": (
+                    candidate.get("power")
+                    if candidate
+                    else None
+                ),
+                "candidateFoldCoherence": (
+                    candidate.get("foldCoherence")
+                    if candidate
+                    else None
+                ),
+                "candidatePeakProminenceRatio": (
+                    candidate.get(
+                        "independentPeakProminenceRatio"
+                    )
+                    if candidate
+                    else None
+                ),
+                "preferredPhysicalPeriodDays": diagnostics.get(
+                    "preferredPhysicalPeriodDays"
+                ),
+                "preferredPhysicalPeriodRelation": diagnostics.get(
+                    "preferredPhysicalPeriodRelation"
+                ),
+                "harmonicCandidates": diagnostics.get(
+                    "harmonicCandidates",
+                    [],
+                ),
+                "independentCandidates": diagnostics.get(
+                    "independentCandidates",
+                    [],
+                ),
                 "iPhoneContribution": contributions["iPhone"],
                 "macContribution": contributions["Mac"],
                 "otherContribution": contributions["other"],
@@ -1499,6 +2630,12 @@ class CoordinatorState:
             project_failed = len(self.failed)
             project_execution_failures = sum(
                 self.execution_failure_counts.values()
+            )
+            project_environment_unavailable = sum(
+                self.environment_unavailable_counts.values()
+            )
+            project_transport_unavailable = sum(
+                self.transport_unavailable_counts.values()
             )
             project_total = len(self.work_units)
 
@@ -1522,10 +2659,22 @@ class CoordinatorState:
                     "retryCount": 0,
                     "verificationFailureCount": 0,
                     "executionFailureCount": 0,
+                    "executionFailureKinds": {},
+                    "environmentUnavailableCount": 0,
+                    "transportUnavailableCount": 0,
                     "failedWorkUnits": 0,
                     "bestFrequency": None,
                     "bestPeriodDays": None,
                     "bestPower": None,
+                    "periodStatus": "NO_DATASET",
+                    "periodConfidence": None,
+                    "coverageComplete": False,
+                    "candidateFrequency": None,
+                    "candidatePeriodDays": None,
+                    "candidatePower": None,
+                    "preferredPhysicalPeriodDays": None,
+                    "preferredPhysicalPeriodRelation": None,
+                    "harmonicCandidates": [],
                 }
                 sample_count = 0
             else:
@@ -1562,11 +2711,36 @@ class CoordinatorState:
                     "verificationFailureCount"
                 ],
                 "executionFailureCount": current["executionFailureCount"],
+                "executionFailureKinds": current.get(
+                    "executionFailureKinds",
+                    {},
+                ),
+                "environmentUnavailableCount": current.get(
+                    "environmentUnavailableCount",
+                    0,
+                ),
+                "transportUnavailableCount": current.get(
+                    "transportUnavailableCount",
+                    0,
+                ),
                 "failedWorkUnits": current["failedWorkUnits"],
                 "activeNodes": len(self.nodes),
                 "bestFrequency": current["bestFrequency"],
                 "bestPeriodDays": current["bestPeriodDays"],
                 "bestPower": current["bestPower"],
+                "periodStatus": current.get("periodStatus"),
+                "periodConfidence": current.get("periodConfidence"),
+                "coverageComplete": current.get("coverageComplete"),
+                "candidateFrequency": current.get("candidateFrequency"),
+                "candidatePeriodDays": current.get("candidatePeriodDays"),
+                "candidatePower": current.get("candidatePower"),
+                "preferredPhysicalPeriodDays": current.get(
+                    "preferredPhysicalPeriodDays"
+                ),
+                "preferredPhysicalPeriodRelation": current.get(
+                    "preferredPhysicalPeriodRelation"
+                ),
+                "harmonicCandidates": current.get("harmonicCandidates", []),
 
                 # Project-wide fields for newer clients.
                 "projectPendingWorkUnits": project_pending,
@@ -1574,9 +2748,15 @@ class CoordinatorState:
                 "projectCompletedWorkUnits": project_completed,
                 "projectFailedWorkUnits": project_failed,
                 "projectExecutionFailureCount": project_execution_failures,
+                "projectEnvironmentUnavailableCount": (
+                    project_environment_unavailable
+                ),
+                "projectTransportUnavailableCount": (
+                    project_transport_unavailable
+                ),
                 "projectTotalWorkUnits": project_total,
                 "projectProgress": (
-                    project_completed / project_total
+                    (project_completed + project_failed) / project_total
                     if project_total
                     else 1.0
                 ),
@@ -1587,8 +2767,25 @@ class CoordinatorState:
         with self.lock:
             dataset = self.datasets[dataset_id]
             science = dataset.get("science", {})
-            best = self._dataset_best_locked(dataset_id)
+            diagnostics = self._dataset_result_diagnostics_locked(
+                dataset_id
+            )
             contributions = self._dataset_contributions_locked(dataset_id)
+            reference_mismatch_count = (
+                self._dataset_reference_mismatch_count_locked(dataset_id)
+            )
+            execution_failure_count = (
+                self._dataset_execution_failure_count_locked(dataset_id)
+            )
+            execution_failure_kinds = (
+                self._dataset_execution_failure_kinds_locked(dataset_id)
+            )
+            environment_unavailable_count = (
+                self._dataset_environment_unavailable_count_locked(dataset_id)
+            )
+            transport_unavailable_count = (
+                self._dataset_transport_unavailable_count_locked(dataset_id)
+            )
             reference_frequency, reference_period, reference_power = (
                 self._global_reference(dataset)
             )
@@ -1609,26 +2806,135 @@ class CoordinatorState:
             print(f"{indent}classification: [BLINDED]")
             print(f"{indent}published period: [BLINDED]")
 
-        if best is None:
-            print(f"{indent}OpenStar result: none")
-            return
+        period_status = diagnostics["periodStatus"]
+        period_confidence = diagnostics.get("periodConfidence")
+        candidate = diagnostics.get("candidate")
+        authoritative = diagnostics.get("authoritative")
 
-        best_frequency = float(best["bestFrequency"])
-        best_period = best.get("bestPeriodDays")
-        best_power = float(best["bestPower"])
+        print(f"{indent}OpenStar period status: {period_status}")
 
-        print(
-            f"{indent}OpenStar frequency: "
-            f"{best_frequency:.8f} cycles/day"
-        )
-
-        if best_period is not None:
+        if execution_failure_count:
             print(
-                f"{indent}OpenStar period: "
-                f"{float(best_period):.8f} days"
+                f"{indent}execution failures: "
+                f"{execution_failure_count}"
+            )
+            for failure_kind, count in sorted(
+                    execution_failure_kinds.items()
+            ):
+                print(
+                    f"{indent}   {failure_kind}: {count}"
+                )
+
+        if environment_unavailable_count:
+            print(
+                f"{indent}environment-unavailable interruptions: "
+                f"{environment_unavailable_count}"
             )
 
-        print(f"{indent}OpenStar power: {best_power:.8f}")
+        if transport_unavailable_count:
+            print(
+                f"{indent}transport-unavailable interruptions: "
+                f"{transport_unavailable_count}"
+            )
+
+        reference_chunk_count = len(
+            self.chunk_references_by_dataset.get(dataset_id, {})
+        )
+        if reference_chunk_count:
+            print(
+                f"{indent}Astropy chunk comparison mismatches: "
+                f"{reference_mismatch_count}/{reference_chunk_count}"
+            )
+
+        if period_confidence is not None:
+            print(
+                f"{indent}OpenStar period confidence: "
+                f"{period_confidence}"
+            )
+
+        if not diagnostics.get("coverageComplete", False):
+            print(
+                f"{indent}science coverage: INCOMPLETE "
+                "(one or more frequency chunks hard-failed)"
+            )
+
+        if candidate is None:
+            print(f"{indent}OpenStar candidate: none")
+            return
+
+        if authoritative is None:
+            print(
+                f"{indent}candidate frequency: "
+                f"{float(candidate['frequency']):.8f} cycles/day"
+            )
+            print(
+                f"{indent}candidate period: "
+                f"{float(candidate['periodDays']):.8f} days"
+            )
+            print(
+                f"{indent}candidate power: "
+                f"{float(candidate['power']):.8f}"
+            )
+        else:
+            print(
+                f"{indent}OpenStar frequency: "
+                f"{float(authoritative['frequency']):.8f} cycles/day"
+            )
+            print(
+                f"{indent}OpenStar period: "
+                f"{float(authoritative['periodDays']):.8f} days"
+            )
+            print(
+                f"{indent}OpenStar power: "
+                f"{float(authoritative['power']):.8f}"
+            )
+
+        if candidate.get("foldCoherence") is not None:
+            print(
+                f"{indent}fold coherence: "
+                f"{float(candidate['foldCoherence']):.6f}"
+            )
+
+        if candidate.get("independentPeakProminenceRatio") is not None:
+            print(
+                f"{indent}independent-peak prominence: "
+                f"{float(candidate['independentPeakProminenceRatio']):.3f}x"
+            )
+
+        harmonic_candidates = diagnostics.get(
+            "harmonicCandidates",
+            [],
+        )
+
+        if harmonic_candidates:
+            print(f"{indent}fold candidates:")
+
+            for harmonic in harmonic_candidates:
+                print(
+                    f"{indent}   {harmonic['relation']}: "
+                    f"{float(harmonic['periodDays']):.8f} days | "
+                    f"coherence "
+                    f"{float(harmonic['foldCoherence']):.6f}"
+                )
+
+        preferred_period = diagnostics.get(
+            "preferredPhysicalPeriodDays"
+        )
+        preferred_relation = diagnostics.get(
+            "preferredPhysicalPeriodRelation"
+        )
+
+        if (
+                authoritative is not None
+                and preferred_period is not None
+                and preferred_relation is not None
+                and preferred_relation != "1x"
+        ):
+            print(
+                f"{indent}preferred full-cycle candidate: "
+                f"{float(preferred_period):.8f} days "
+                f"({preferred_relation})"
+            )
 
         if reference_frequency is not None:
             reference_frequency = float(reference_frequency)
@@ -1636,32 +2942,44 @@ class CoordinatorState:
                 f"{indent}Astropy frequency: "
                 f"{reference_frequency:.8f} cycles/day"
             )
-            print(
-                f"{indent}frequency error: "
-                f"{abs(best_frequency - reference_frequency):.8f}"
-            )
 
-        if reference_period is not None and best_period is not None:
+            if authoritative is not None:
+                print(
+                    f"{indent}frequency error: "
+                    f"{abs(float(authoritative['frequency']) - reference_frequency):.8f}"
+                )
+
+        if reference_period is not None:
             reference_period = float(reference_period)
             print(
                 f"{indent}Astropy period: "
                 f"{reference_period:.8f} days"
             )
-            print(
-                f"{indent}period error: "
-                f"{abs(float(best_period) - reference_period):.8f} days"
-            )
+
+            if authoritative is not None:
+                print(
+                    f"{indent}period error: "
+                    f"{abs(float(authoritative['periodDays']) - reference_period):.8f} days"
+                )
 
         if reference_power is not None:
-            print(f"{indent}Astropy power: {float(reference_power):.8f}")
+            print(
+                f"{indent}Astropy power: "
+                f"{float(reference_power):.8f}"
+            )
 
         if (
                 role == "known"
-                and best_period is not None
+                and authoritative is not None
                 and science.get("publishedPeriodDays") is not None
         ):
-            published_period = float(science["publishedPeriodDays"])
-            published_error = abs(float(best_period) - published_period)
+            published_period = float(
+                science["publishedPeriodDays"]
+            )
+            published_error = abs(
+                float(authoritative["periodDays"])
+                - published_period
+            )
             print(
                 f"{indent}OpenStar vs published error: "
                 f"{published_error:.8f} days"
@@ -1688,14 +3006,22 @@ class CoordinatorState:
                 return
 
             _, _, completed, total = self._dataset_counts_locked(dataset_id)
+            failed = self._dataset_failed_count_locked(dataset_id)
 
-            if total == 0 or completed != total:
+            if total == 0 or completed + failed != total:
                 return
 
             self.reported_completed_datasets.add(dataset_id)
 
         print()
-        print("🌟 Dataset complete")
+
+        if failed:
+            print("⚠️ Dataset finished with hard failures")
+            print(f"   accepted work units: {completed}/{total}")
+            print(f"   hard-failed work units: {failed}/{total}")
+        else:
+            print("🌟 Dataset complete")
+
         self._print_dataset_result_summary(dataset_id)
 
     def _report_project_complete(self):
@@ -1703,7 +3029,11 @@ class CoordinatorState:
             if self.reported_project_complete:
                 return
 
-            if len(self.completed) != len(self.work_units):
+            completed = len(self.completed)
+            failed = len(self.failed)
+            total = len(self.work_units)
+
+            if completed + failed != total:
                 return
 
             self.reported_project_complete = True
@@ -1712,6 +3042,14 @@ class CoordinatorState:
         print()
         print("🏁 Project complete")
         print(f"   project: {self.project_id}")
+
+        if failed:
+            print("   status: COMPLETE WITH HARD FAILURES")
+            print(f"   accepted work units: {completed}/{total}")
+            print(f"   hard-failed work units: {failed}/{total}")
+        else:
+            print("   status: COMPLETE")
+            print(f"   accepted work units: {completed}/{total}")
 
         for dataset_id in dataset_ids:
             print()
@@ -1728,7 +3066,7 @@ class CoordinatorState:
 
         print()
         print("⭐ OpenStar Coordinator")
-        print("Build: multi-target-v13-cross-node-consensus")
+        print("Build: multi-target-v19.3-transport-availability")
         print(f"File: {Path(__file__).resolve()}")
         print(f"Listening on {host}:{port}")
         print()
@@ -1737,39 +3075,52 @@ class CoordinatorState:
         print(f"Datasets: {len(self.datasets)}")
         print(f"Work units: {len(self.work_units)}")
         print(
-            "Verification: frequency OR equivalent chunk-max power, with nearby-peak and cross-node consensus fallbacks"
+            "Scheduling: work units use workloadID + payload; registered node "
+            "workload capabilities are matched before assignment"
         )
         print(
-            "Primary match: frequency agreement; secondary match: strict "
-            "equivalent chunk power"
+            "Failure provenance: failed results record failureKind + "
+            "errorMessage; dataset summaries report failures by kind"
         )
         print(
-            "Equivalent-power tolerance: "
-            f"max({POWER_ABSOLUTE_TOLERANCE:.8f}, "
-            "Astropy power * "
-            f"{EQUIVALENT_POWER_RELATIVE_TOLERANCE:.4f})"
+            "Environment availability: environment-unavailable work is "
+            "requeued without retry, execution-failure, or cooldown penalty"
         )
         print(
-            "Nearby-peak power tolerance: "
-            f"max({POWER_ABSOLUTE_TOLERANCE:.8f}, "
-            "Astropy power * "
-            f"{AMBIGUOUS_POWER_RELATIVE_TOLERANCE:.4f})"
+            "Transport availability: transport-unavailable work is requeued "
+            "without retry, execution-failure, or cooldown penalty"
         )
         print(
-            "Max verification failures/work unit: "
-            f"{MAX_VERIFICATION_FAILURES_PER_WORK_UNIT}"
+            "Execution authority: valid Metal chunk results are accepted "
+            "without Astropy voting"
+        )
+        print(
+            "Reference validation: Astropy chunk references are optional "
+            "diagnostics only; mismatches do not retry, replace, or discard "
+            "Metal results"
         )
         print(
             "Execution failure handling: requeue without scientific failure; "
             f"avoid same node for {EXECUTION_FAILURE_NODE_AVOID_SECONDS:.0f}s"
         )
         print(
-            "Scientific retry handling: requeue verification failures; "
-            f"avoid same node for {SCIENTIFIC_FAILURE_NODE_AVOID_SECONDS:.0f}s"
+            "Node execution cooldown: after "
+            f"{NODE_EXECUTION_FAILURE_STREAK_LIMIT} consecutive execution "
+            f"failures, pause all work to that node for "
+            f"{NODE_EXECUTION_COOLDOWN_SECONDS:.0f}s; successful execution "
+            "resets the streak"
         )
         print(
-            "Cross-node consensus: different nodes may confirm the same "
-            "Astropy-ambiguous result without widening Astropy tolerances"
+            "Invalid-result handling: malformed/out-of-range Metal results "
+            f"retry up to {MAX_VERIFICATION_FAILURES_PER_WORK_UNIT} times"
+        )
+        print(
+            "Final period handling: incomplete coverage and weak signals do "
+            "not publish an authoritative period"
+        )
+        print(
+            "Harmonic handling: 0.5x / 1x / 2x fold coherence is reported; "
+            "a materially better fold may be preferred as the physical cycle"
         )
 
         for dataset_id, dataset in self.datasets.items():
@@ -1791,7 +3142,7 @@ class CoordinatorState:
             print(f"Samples: {len(dataset.get('times', []))}")
             print(f"Role: {science.get('role', 'unspecified')}")
             print(
-                "Astropy work-unit references: "
+                "Astropy diagnostic chunk references: "
                 f"{chunk_count}/{expected_chunk_count}"
             )
 
