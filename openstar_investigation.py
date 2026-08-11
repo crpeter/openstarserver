@@ -27,6 +27,14 @@ def sha256_json(value: Any) -> str:
     return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
 
 
+def sha256_file(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 @dataclass(frozen=True)
 class ArtifactReference:
     path: str
@@ -55,6 +63,7 @@ class InvestigationStage:
     started_at: str | None = None
     completed_at: str | None = None
     result: dict[str, Any] | None = None
+    error: str | None = None
     artifacts: tuple[ArtifactReference, ...] = ()
     provenance: StageProvenance | None = None
 
@@ -73,19 +82,41 @@ class Investigation:
 
 class InvestigationStore:
     """
-    Domain-neutral immutable-stage investigation store.
+    Domain-neutral investigation store with immutable terminal stage records.
 
-    Existing stage records are never edited in place. Updating an
-    investigation writes a new complete JSON snapshot atomically, while every
-    completed stage contains its own immutable result/provenance hashes.
+    Layout:
+      <root>/<investigation-id>/investigation.json
+      <root>/<investigation-id>/stages/<stage-id>.json
+
+    `investigation.json` is the current snapshot. Once a stage becomes COMPLETE
+    or FAILED, its individual stage file is written exactly once and is never
+    replaced.
     """
 
     def __init__(self, root: str | Path = "data/investigations"):
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
 
+    @staticmethod
+    def _safe_id(value: str) -> str:
+        if not value or value in (".", ".."):
+            raise ValueError("ID must not be empty.")
+        if "/" in value or "\\" in value:
+            raise ValueError(f"ID may not contain path separators: {value}")
+        return value
+
+    def directory_for(self, investigation_id: str) -> Path:
+        return self.root / self._safe_id(investigation_id)
+
     def path_for(self, investigation_id: str) -> Path:
-        return self.root / f"{investigation_id}.json"
+        return self.directory_for(investigation_id) / "investigation.json"
+
+    def stage_path_for(self, investigation_id: str, stage_id: str) -> Path:
+        return (
+            self.directory_for(investigation_id)
+            / "stages"
+            / f"{self._safe_id(stage_id)}.json"
+        )
 
     def create(
         self,
@@ -115,35 +146,22 @@ class InvestigationStore:
     def load(self, investigation_id: str) -> Investigation:
         path = self.path_for(investigation_id)
         with path.open("r", encoding="utf-8") as handle:
-            raw = json.load(handle)
-        return self._decode(raw)
+            return self._decode(json.load(handle))
 
     def save(self, investigation: Investigation) -> None:
-        payload = self._encode(investigation)
-        path = self.path_for(investigation.id)
-        path.parent.mkdir(parents=True, exist_ok=True)
-
-        fd, temp_path = tempfile.mkstemp(
-            prefix=f".{path.name}.",
-            suffix=".tmp",
-            dir=path.parent,
+        self._atomic_write_json(
+            self.path_for(investigation.id),
+            self._encode(investigation),
+            replace=True,
         )
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump(payload, handle, indent=2, sort_keys=True)
-                handle.write("\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temp_path, path)
-        finally:
-            if os.path.exists(temp_path):
-                os.unlink(temp_path)
 
-    def append_stage(
+    def append_running_stage(
         self,
         investigation: Investigation,
         stage: InvestigationStage,
     ) -> Investigation:
+        if stage.status != "RUNNING":
+            raise ValueError("New stage must start as RUNNING.")
         if any(existing.id == stage.id for existing in investigation.stages):
             raise ValueError(f"Duplicate stage id: {stage.id}")
 
@@ -160,19 +178,26 @@ class InvestigationStore:
         self.save(updated)
         return updated
 
-    def replace_last_pending_stage(
+    def complete_current_stage(
         self,
         investigation: Investigation,
-        completed_stage: InvestigationStage,
+        terminal_stage: InvestigationStage,
     ) -> Investigation:
+        if terminal_stage.status not in ("COMPLETE", "FAILED"):
+            raise ValueError("Terminal stage must be COMPLETE or FAILED.")
         if not investigation.stages:
             raise ValueError("Investigation has no stage to complete.")
 
-        previous = investigation.stages[-1]
-        if previous.id != completed_stage.id:
-            raise ValueError("Only the most recently appended stage may complete.")
-        if previous.status not in ("PENDING", "RUNNING"):
-            raise ValueError("The current stage is already terminal.")
+        current = investigation.stages[-1]
+        if current.id != terminal_stage.id or current.status != "RUNNING":
+            raise ValueError("Only the current RUNNING stage may become terminal.")
+
+        stage_path = self.stage_path_for(investigation.id, terminal_stage.id)
+        self._atomic_write_json(
+            stage_path,
+            asdict(terminal_stage),
+            replace=False,
+        )
 
         updated = Investigation(
             id=investigation.id,
@@ -182,16 +207,12 @@ class InvestigationStore:
             created_at=investigation.created_at,
             updated_at=utc_now_iso(),
             metadata=investigation.metadata,
-            stages=investigation.stages[:-1] + (completed_stage,),
+            stages=investigation.stages[:-1] + (terminal_stage,),
         )
         self.save(updated)
         return updated
 
-    def set_status(
-        self,
-        investigation: Investigation,
-        status: str,
-    ) -> Investigation:
+    def set_status(self, investigation: Investigation, status: str) -> Investigation:
         updated = Investigation(
             id=investigation.id,
             workflow_id=investigation.workflow_id,
@@ -206,13 +227,15 @@ class InvestigationStore:
         return updated
 
     @staticmethod
-    def build_completed_stage(
+    def build_terminal_stage(
         *,
         stage_id: str,
         handler_id: str,
+        status: str,
         triggered_by_stage_id: str | None,
         parameters: dict[str, Any],
-        result: dict[str, Any],
+        result: dict[str, Any] | None,
+        error: str | None,
         software_id: str,
         software_version: str,
         input_hashes: dict[str, str] | None = None,
@@ -224,23 +247,59 @@ class InvestigationStore:
         return InvestigationStage(
             id=stage_id,
             handler_id=handler_id,
-            status="COMPLETE",
+            status=status,
             triggered_by_stage_id=triggered_by_stage_id,
             parameters=dict(parameters),
-            started_at=started_at or utc_now_iso(),
+            started_at=started_at,
             completed_at=utc_now_iso(),
-            result=dict(result),
+            result=dict(result) if result is not None else None,
+            error=error,
             artifacts=artifacts,
             provenance=StageProvenance(
                 software_id=software_id,
                 software_version=software_version,
                 input_hashes=dict(input_hashes or {}),
                 parameters_hash=sha256_json(parameters),
-                result_hash=sha256_json(result),
+                result_hash=(
+                    sha256_json(result)
+                    if result is not None
+                    else None
+                ),
                 node_contributions=dict(node_contributions or {}),
                 project_ids=project_ids,
             ),
         )
+
+    @staticmethod
+    def _atomic_write_json(path: Path, payload: Any, *, replace: bool) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        if not replace and path.exists():
+            raise FileExistsError(f"Immutable stage already exists: {path}")
+
+        fd, temp_path = tempfile.mkstemp(
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            dir=path.parent,
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, indent=2, sort_keys=True)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+
+            if replace:
+                os.replace(temp_path, path)
+            else:
+                # Atomic publish that fails if an immutable stage path already
+                # exists. The temporary file is on the same filesystem.
+                os.link(temp_path, path)
+                os.unlink(temp_path)
+                temp_path = ""
+        finally:
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
 
     @staticmethod
     def _encode(investigation: Investigation) -> dict[str, Any]:
@@ -248,11 +307,12 @@ class InvestigationStore:
 
     @staticmethod
     def _decode(raw: dict[str, Any]) -> Investigation:
-        stages = []
+        stages: list[InvestigationStage] = []
         for stage_raw in raw.get("stages", []):
             provenance_raw = stage_raw.get("provenance")
-            provenance = (
-                StageProvenance(
+            provenance = None
+            if provenance_raw:
+                provenance = StageProvenance(
                     software_id=provenance_raw["software_id"],
                     software_version=provenance_raw["software_version"],
                     input_hashes=dict(provenance_raw.get("input_hashes", {})),
@@ -263,9 +323,6 @@ class InvestigationStore:
                     ),
                     project_ids=tuple(provenance_raw.get("project_ids", [])),
                 )
-                if provenance_raw
-                else None
-            )
 
             artifacts = tuple(
                 ArtifactReference(
@@ -281,13 +338,12 @@ class InvestigationStore:
                     id=stage_raw["id"],
                     handler_id=stage_raw["handler_id"],
                     status=stage_raw["status"],
-                    triggered_by_stage_id=stage_raw.get(
-                        "triggered_by_stage_id"
-                    ),
+                    triggered_by_stage_id=stage_raw.get("triggered_by_stage_id"),
                     parameters=dict(stage_raw.get("parameters", {})),
                     started_at=stage_raw.get("started_at"),
                     completed_at=stage_raw.get("completed_at"),
                     result=stage_raw.get("result"),
+                    error=stage_raw.get("error"),
                     artifacts=artifacts,
                     provenance=provenance,
                 )

@@ -4,14 +4,19 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
-from coordinator_state import CoordinatorState, first_value
+from coordinator_runtime import (
+    CoordinatorRuntime,
+    ProjectBusyError,
+)
+from coordinator_state import first_value
 
 
 DEFAULT_PROJECT_PATH = "data/projects/openstar.tess-validation-v1.json"
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8080
+COORDINATOR_BUILD = "openstar-coordinator-v20.0-workflow-control"
 
-STATE = None
+RUNTIME = CoordinatorRuntime()
 
 
 class RequestHandler(BaseHTTPRequestHandler):
@@ -27,7 +32,6 @@ class RequestHandler(BaseHTTPRequestHandler):
             return {}
 
         body = self.rfile.read(content_length)
-
         if not body:
             return {}
 
@@ -41,10 +45,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         ).encode("utf-8")
 
         self.send_response(status_code)
-        self.send_header(
-            "Content-Type",
-            "application/json; charset=utf-8",
-        )
+        self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
 
@@ -68,44 +69,48 @@ class RequestHandler(BaseHTTPRequestHandler):
         )
 
     def do_GET(self):
-        global STATE
-
         path = urlparse(self.path).path
         print(f"🌐 GET {path}")
 
-        if path == "/v1/projects/current/status":
-            status = STATE.project_status()
+        if path == "/v1/health":
+            self._send_json(
+                200,
+                {
+                    "ok": True,
+                    "build": COORDINATOR_BUILD,
+                    "project": RUNTIME.project_status(),
+                },
+            )
+            return
 
+        if path == "/v1/projects/current/status":
+            status = RUNTIME.project_status()
+            print(f"   status projectID: {status.get('projectID')}")
             print(f"   status targetName: {status.get('targetName')}")
             print(f"   status datasetID: {status.get('datasetID')}")
-            print(f"   status retryCount: {status.get('retryCount', 0)}")
-
+            print(f"   status: {status.get('status')}")
             self._send_json(200, status)
             return
 
         dataset_prefix = "/v1/datasets/"
-
         if path.startswith(dataset_prefix):
             dataset_id = unquote(path[len(dataset_prefix):]).strip("/")
-            dataset = STATE.datasets.get(dataset_id)
+            dataset = RUNTIME.dataset(dataset_id)
 
             if dataset is None:
-                self._send_error_json(404, "Unknown dataset.")
+                self._send_error_json(404, "Unknown dataset or no active project.")
                 return
 
             print(
                 "   dataset targetName: "
                 f"{dataset.get('targetName', dataset_id)}"
             )
-
             self._send_json(200, dataset)
             return
 
         self._send_error_json(404, "Not found.")
 
     def do_POST(self):
-        global STATE
-
         path = urlparse(self.path).path
         print(f"🌐 POST {path}")
 
@@ -115,23 +120,48 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._send_error_json(400, "Invalid JSON.")
             return
 
-        if path == "/v1/nodes/register":
-            node_id = first_value(
+        if path == "/v1/projects/activate":
+            project_path = first_value(
                 payload,
-                "nodeID",
-                "nodeId",
-                "id",
+                "projectPath",
+                "path",
             )
+            if project_path is None:
+                self._send_error_json(400, "Missing projectPath.")
+                return
 
+            require_terminal = bool(payload.get("requireTerminal", True))
+
+            try:
+                status = RUNTIME.activate_project(
+                    str(project_path),
+                    require_terminal=require_terminal,
+                )
+            except ProjectBusyError as error:
+                self._send_error_json(409, str(error))
+                return
+            except (OSError, KeyError, TypeError, ValueError, RuntimeError) as error:
+                self._send_error_json(400, str(error))
+                return
+
+            self._send_json(
+                200,
+                {
+                    "accepted": True,
+                    "message": "Project activated.",
+                    "status": status,
+                },
+            )
+            return
+
+        if path == "/v1/nodes/register":
+            node_id = first_value(payload, "nodeID", "nodeId", "id")
             if node_id is None:
                 self._send_error_json(400, "Missing node ID.")
                 return
 
-            normalized_payload = dict(payload)
-            normalized_payload["nodeID"] = str(node_id)
-
             try:
-                STATE.register_node(normalized_payload)
+                RUNTIME.register_node(payload)
             except (KeyError, TypeError, ValueError) as error:
                 self._send_error_json(400, str(error))
                 return
@@ -146,19 +176,12 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/v1/work/claim":
-            node_id = first_value(
-                payload,
-                "nodeID",
-                "nodeId",
-                "id",
-            )
-
+            node_id = first_value(payload, "nodeID", "nodeId", "id")
             if node_id is None:
                 self._send_error_json(400, "Missing node ID.")
                 return
 
-            work_unit = STATE.claim_work(node_id)
-
+            work_unit = RUNTIME.claim_work(node_id)
             if work_unit is None:
                 self._send_no_content()
                 return
@@ -168,22 +191,16 @@ class RequestHandler(BaseHTTPRequestHandler):
 
         result_prefix = "/v1/work/"
         result_suffix = "/result"
-
         if path.startswith(result_prefix) and path.endswith(result_suffix):
-            work_id = path[
-                len(result_prefix):
-                -len(result_suffix)
-            ].strip("/")
-
+            work_id = path[len(result_prefix):-len(result_suffix)].strip("/")
             if not work_id:
                 self._send_error_json(400, "Missing work unit ID.")
                 return
 
-            accepted, message, status_code = STATE.submit_result(
+            accepted, message, status_code = RUNTIME.submit_result(
                 unquote(work_id),
                 payload,
             )
-
             self._send_json(
                 status_code,
                 {
@@ -197,54 +214,48 @@ class RequestHandler(BaseHTTPRequestHandler):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        description="OpenStar coordinator"
-    )
-
+    parser = argparse.ArgumentParser(description="OpenStar coordinator")
     parser.add_argument(
         "--project",
         default=DEFAULT_PROJECT_PATH,
-        help="Path to generated project manifest.",
+        help="Path to initial project manifest.",
     )
-
     parser.add_argument(
-        "--host",
-        default=DEFAULT_HOST,
-        help="Coordinator bind host.",
+        "--idle",
+        action="store_true",
+        help="Start with no active project; a workflow may activate one later.",
     )
-
-    parser.add_argument(
-        "--port",
-        type=int,
-        default=DEFAULT_PORT,
-        help="Coordinator HTTP port.",
-    )
-
+    parser.add_argument("--host", default=DEFAULT_HOST)
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     return parser.parse_args()
 
 
 def main():
-    global STATE
-
     args = parse_args()
 
-    try:
-        STATE = CoordinatorState(args.project)
-        STATE.print_startup_summary(
-            port=args.port,
-            host=args.host,
-        )
-    except (OSError, KeyError, TypeError, ValueError, RuntimeError) as error:
+    if args.idle:
         print()
-        print("❌ OpenStar Coordinator failed to start")
-        print(f"   project: {Path(args.project)}")
-        print(f"   error: {error}")
-        raise SystemExit(1)
+        print("⭐ OpenStar Coordinator")
+        print(f"Build: {COORDINATOR_BUILD}")
+        print(f"Listening on {args.host}:{args.port}")
+        print("Project control: IDLE; waiting for workflow activation")
+    else:
+        try:
+            RUNTIME.activate_project(
+                args.project,
+                require_terminal=False,
+            )
+            state = RUNTIME.active_state()
+            assert state is not None
+            state.print_startup_summary(port=args.port, host=args.host)
+        except (OSError, KeyError, TypeError, ValueError, RuntimeError) as error:
+            print()
+            print("❌ OpenStar Coordinator failed to start")
+            print(f"   project: {Path(args.project)}")
+            print(f"   error: {error}")
+            raise SystemExit(1)
 
-    server = ThreadingHTTPServer(
-        (args.host, args.port),
-        RequestHandler,
-    )
+    server = ThreadingHTTPServer((args.host, args.port), RequestHandler)
 
     try:
         server.serve_forever()

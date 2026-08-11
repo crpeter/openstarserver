@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from openstar_investigation import (
+    ArtifactReference,
     Investigation,
     InvestigationStage,
     InvestigationStore,
@@ -25,29 +26,23 @@ class StageOutcome:
     next_stage: StageRequest | None = None
     stop: bool = False
     final_status: str = "COMPLETE"
+    input_hashes: dict[str, str] = field(default_factory=dict)
+    node_contributions: dict[str, int] = field(default_factory=dict)
+    project_ids: tuple[str, ...] = ()
+    artifacts: tuple[ArtifactReference, ...] = ()
 
 
 StageHandler = Callable[[Investigation, StageRequest], StageOutcome]
 
 
 class WorkflowEngine:
-    """
-    Domain-neutral deterministic workflow runner.
-
-    A handler may perform local/controller work, create or inspect ordinary
-    OpenStar projects, and deterministically choose the next stage. The engine
-    itself knows nothing about astronomy or any other science domain.
-    """
+    """Domain-neutral deterministic workflow runner."""
 
     def __init__(self, store: InvestigationStore):
         self.store = store
         self.handlers: dict[str, StageHandler] = {}
 
-    def register_handler(
-        self,
-        handler_id: str,
-        handler: StageHandler,
-    ) -> None:
+    def register_handler(self, handler_id: str, handler: StageHandler) -> None:
         if handler_id in self.handlers:
             raise ValueError(f"Handler already registered: {handler_id}")
         self.handlers[handler_id] = handler
@@ -64,7 +59,7 @@ class WorkflowEngine:
         if handler is None:
             raise KeyError(f"Unknown workflow handler: {request.handler_id}")
 
-        pending = InvestigationStage(
+        running = InvestigationStage(
             id=request.id,
             handler_id=request.handler_id,
             status="RUNNING",
@@ -72,25 +67,51 @@ class WorkflowEngine:
             parameters=dict(request.parameters),
             started_at=utc_now_iso(),
         )
-        investigation = self.store.append_stage(
-            investigation,
-            pending,
-        )
+        investigation = self.store.append_running_stage(investigation, running)
 
-        outcome = handler(investigation, request)
+        try:
+            outcome = handler(investigation, request)
+            if not outcome.stop and outcome.next_stage is None:
+                raise ValueError(
+                    f"Stage {request.id} returned neither stop=True nor next_stage."
+                )
+        except Exception as error:
+            failed = self.store.build_terminal_stage(
+                stage_id=request.id,
+                handler_id=request.handler_id,
+                status="FAILED",
+                triggered_by_stage_id=request.triggered_by_stage_id,
+                parameters=request.parameters,
+                result=None,
+                error=f"{type(error).__name__}: {error}",
+                software_id=software_id,
+                software_version=software_version,
+                started_at=running.started_at,
+            )
+            investigation = self.store.complete_current_stage(
+                investigation,
+                failed,
+            )
+            self.store.set_status(investigation, "FAILED")
+            raise
 
-        completed = self.store.build_completed_stage(
+        completed = self.store.build_terminal_stage(
             stage_id=request.id,
             handler_id=request.handler_id,
+            status="COMPLETE",
             triggered_by_stage_id=request.triggered_by_stage_id,
             parameters=request.parameters,
             result=outcome.result,
+            error=None,
             software_id=software_id,
             software_version=software_version,
-            started_at=pending.started_at,
+            input_hashes=outcome.input_hashes,
+            node_contributions=outcome.node_contributions,
+            project_ids=outcome.project_ids,
+            artifacts=outcome.artifacts,
+            started_at=running.started_at,
         )
-
-        investigation = self.store.replace_last_pending_stage(
+        investigation = self.store.complete_current_stage(
             investigation,
             completed,
         )
@@ -103,3 +124,35 @@ class WorkflowEngine:
             return investigation, None
 
         return investigation, outcome.next_stage
+
+    def run(
+        self,
+        investigation: Investigation,
+        initial_stage: StageRequest,
+        *,
+        software_id: str,
+        software_version: str,
+        max_stages: int = 100,
+    ) -> Investigation:
+        request: StageRequest | None = initial_stage
+        count = 0
+
+        while request is not None:
+            count += 1
+            if count > max_stages:
+                investigation = self.store.set_status(
+                    investigation,
+                    "FAILED",
+                )
+                raise RuntimeError(
+                    f"Workflow exceeded max_stages={max_stages}."
+                )
+
+            investigation, request = self.run_stage(
+                investigation,
+                request,
+                software_id=software_id,
+                software_version=software_version,
+            )
+
+        return investigation
