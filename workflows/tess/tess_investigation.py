@@ -84,6 +84,41 @@ from .tess_external_highres import (
     build_external_high_resolution_project,
     interpret_external_high_resolution_project,
 )
+from .tess_skymapper_resolved import (
+    build_skymapper_resolved_project,
+    interpret_skymapper_resolved_project,
+)
+from .tess_nsc_resolved import (
+    build_nsc_resolved_project,
+    interpret_nsc_resolved_project,
+)
+from .tess_noirlab_forced_photometry import (
+    build_noirlab_image_forced_photometry_project,
+    interpret_noirlab_image_forced_photometry_project,
+)
+from .tess_des_dr2_se_local_forced import (
+    build_des_dr2_se_local_forced_project,
+    interpret_des_dr2_se_local_forced_project,
+)
+from .tess_atlas_forced_photometry import (
+    build_atlas_forced_photometry_project,
+    interpret_atlas_forced_photometry_project,
+)
+from .tess_atlas_forced_reanalysis import (
+    build_atlas_forced_photometry_reanalysis_project,
+    interpret_atlas_forced_photometry_reanalysis_project,
+)
+from .tess_atlas_time_resolved import (
+    build_atlas_time_resolved_project,
+    interpret_atlas_time_resolved_project,
+)
+from .tess_atlas_fixed_windows import (
+    build_atlas_fixed_window_project,
+    interpret_atlas_fixed_window_project,
+)
+from .tess_observation_planning import (
+    build_targeted_observation_plan,
+)
 from .tess_multisector import (
     build_broad_independent_sector_project,
     build_independent_sector_project,
@@ -93,7 +128,7 @@ from .tess_multisector import (
 WORKFLOW_ID = "openstar.workflow.tess-investigation.v1"
 WORKFLOW_VERSION = "20.2"
 SOFTWARE_ID = "openstar.tess-investigation-plugin"
-SOFTWARE_VERSION = "20.19"
+SOFTWARE_VERSION = "20.28"
 
 
 def _stage(investigation: Investigation, stage_id: str):
@@ -908,6 +943,259 @@ def _render_report(conclusion: dict[str, Any]) -> str:
             f"- Counterpart power: {(counterpart or {}).get('candidatePower')}",
             f"- Recommended next test: {external_high_resolution.get('recommendedNextTest')}",
             f"- Guard: {external_high_resolution.get('interpretationGuard')}",
+        ])
+
+    skymapper = conclusion.get("skyMapperResolvedPhotometryScreen")
+    if skymapper is not None:
+        distributed = skymapper.get("distributedValidation") or {}
+        pair = skymapper.get("sourcePair") or {}
+        target = skymapper.get("targetControl") or {}
+        counterpart = skymapper.get("catalogCounterpartEvidence") or {}
+        lines.extend([
+            "",
+            "## SkyMapper DR4 resolved-photometry screen",
+            "",
+            f"- Classification: {skymapper.get('classification')}",
+            f"- Residual-mode origin: {skymapper.get('residualModeOrigin')}",
+            f"- Archive: {skymapper.get('archive')}",
+            f"- Target Gaia DR3 source: {pair.get('targetGaiaDR3SourceID')}",
+            f"- Counterpart Gaia DR3 source: {pair.get('counterpartGaiaDR3SourceID')}",
+            f"- Pair separation: {skymapper.get('pairSeparationArcsec')} arcsec",
+            f"- Seeing limit: {skymapper.get('seeingLimitArcsec')} arcsec",
+            f"- Pair separately resolved in SkyMapper master: {skymapper.get('pairSeparatelyResolvedInSkyMapperMaster')}",
+            f"- Generic workload: {distributed.get('workloadID')}",
+            f"- Distributed work units: {distributed.get('totalWorkUnits')}",
+            f"- Target accepted bands: {target.get('acceptedBands')}",
+            f"- Target cross-band supported: {target.get('sourceSupported')}",
+            f"- Counterpart accepted bands: {counterpart.get('acceptedBands')}",
+            f"- Counterpart cross-band supported: {counterpart.get('sourceSupported')}",
+            f"- Recommended next test: {skymapper.get('recommendedNextTest')}",
+            f"- Guard: {skymapper.get('interpretationGuard')}",
+        ])
+
+    nsc = conclusion.get("nscResolvedPhotometryScreen")
+    if nsc is not None:
+        distributed = nsc.get("distributedValidation") or {}
+        pair = nsc.get("sourcePair") or {}
+        target = nsc.get("targetControl") or {}
+        counterpart = nsc.get("catalogCounterpartEvidence") or {}
+        lines.extend([
+            "",
+            "## NOIRLab Source Catalog DR2 resolved-photometry screen",
+            "",
+            f"- Classification: {nsc.get('classification')}",
+            f"- Residual-mode origin: {nsc.get('residualModeOrigin')}",
+            f"- Archive: {nsc.get('archive')}",
+            f"- Target Gaia DR3 source: {pair.get('targetGaiaDR3SourceID')}",
+            f"- Counterpart Gaia DR3 source: {pair.get('counterpartGaiaDR3SourceID')}",
+            f"- Pair separation: {nsc.get('pairSeparationArcsec')} arcsec",
+            f"- Pair separately resolved in NSC: {nsc.get('pairSeparatelyResolvedInNSC')}",
+            f"- Observed NSC object separation: {nsc.get('observedNSCObjectSeparationArcsec')} arcsec",
+            f"- Generic workload: {distributed.get('workloadID')}",
+            f"- Distributed work units: {distributed.get('totalWorkUnits')}",
+            f"- Target accepted bands: {target.get('acceptedBands')}",
+            f"- Target cross-band supported: {target.get('sourceSupported')}",
+            f"- Counterpart accepted bands: {counterpart.get('acceptedBands')}",
+            f"- Counterpart cross-band supported: {counterpart.get('sourceSupported')}",
+            f"- Recommended next test: {nsc.get('recommendedNextTest')}",
+            f"- Guard: {nsc.get('interpretationGuard')}",
+        ])
+
+    noirlab_forced = conclusion.get("noirlabImageForcedPhotometry")
+    if noirlab_forced is not None:
+        distributed = noirlab_forced.get("distributedValidation") or {}
+        pair = noirlab_forced.get("sourcePair") or {}
+        target = noirlab_forced.get("targetControl") or {}
+        counterpart = noirlab_forced.get("catalogCounterpartEvidence") or {}
+        lines.extend([
+            "",
+            "## NOIRLab image-level forced two-source photometry",
+            "",
+            f"- Classification: {noirlab_forced.get('classification')}",
+            f"- Residual-mode origin: {noirlab_forced.get('residualModeOrigin')}",
+            f"- Archive: {noirlab_forced.get('archive')}",
+            f"- Target Gaia DR3 source: {pair.get('targetGaiaDR3SourceID')}",
+            f"- Counterpart Gaia DR3 source: {pair.get('counterpartGaiaDR3SourceID')}",
+            f"- Gaia target-counterpart separation: {noirlab_forced.get('pairSeparationArcsec')} arcsec",
+            f"- Offset-component to catalog-match association separation carried from v20.19: {noirlab_forced.get('catalogAssociationSeparationArcsec')} arcsec",
+            f"- SIA rows: {noirlab_forced.get('siaRows')}",
+            f"- Candidate single-epoch images: {noirlab_forced.get('candidateExposures')}",
+            f"- Successful forced-photometry images: {noirlab_forced.get('successfulForcedPhotometryExposures')}",
+            f"- Rejection reasons: {noirlab_forced.get('failureReasons')}",
+            f"- Generic workload: {distributed.get('workloadID')}",
+            f"- Distributed work units: {distributed.get('totalWorkUnits')}",
+            f"- Target accepted bands: {target.get('acceptedBands')}",
+            f"- Target cross-band supported: {target.get('sourceSupported')}",
+            f"- Counterpart accepted bands: {counterpart.get('acceptedBands')}",
+            f"- Counterpart cross-band supported: {counterpart.get('sourceSupported')}",
+            f"- Recommended next test: {noirlab_forced.get('recommendedNextTest')}",
+            f"- Guard: {noirlab_forced.get('interpretationGuard')}",
+        ])
+
+    des_local = conclusion.get("desDr2SeLocalForcedPhotometry")
+    if des_local is not None:
+        distributed = des_local.get("distributedValidation") or {}
+        target = des_local.get("targetControl") or {}
+        counterpart = des_local.get("catalogCounterpartEvidence") or {}
+        lines.extend([
+            "",
+            "## DES DR2 single-epoch source-local forced photometry",
+            "",
+            f"- Classification: {des_local.get('classification')}",
+            f"- Residual-mode origin: {des_local.get('residualModeOrigin')}",
+            f"- Archive: {des_local.get('archive')}",
+            f"- Actual Gaia target-counterpart separation: {des_local.get('pairSeparationArcsec')} arcsec",
+            f"- SIA rows: {des_local.get('siaRows')}",
+            f"- Candidate single-epoch images: {des_local.get('candidateExposures')}",
+            f"- Source attempts: {des_local.get('sourceAttempts')}",
+            f"- Source successes: {des_local.get('sourceSuccesses')}",
+            f"- Failure reasons: {des_local.get('failureReasons')}",
+            f"- Generic workload: {distributed.get('workloadID')}",
+            f"- Distributed work units: {distributed.get('totalWorkUnits')}",
+            f"- Target accepted bands: {target.get('acceptedBands')}",
+            f"- Target cross-band supported: {target.get('sourceSupported')}",
+            f"- Counterpart accepted bands: {counterpart.get('acceptedBands')}",
+            f"- Counterpart cross-band supported: {counterpart.get('sourceSupported')}",
+            f"- Recommended next test: {des_local.get('recommendedNextTest')}",
+            f"- Guard: {des_local.get('interpretationGuard')}",
+        ])
+
+    atlas = conclusion.get("atlasForcedPhotometry")
+    if atlas is not None:
+        distributed = atlas.get("distributedValidation") or {}
+        target = atlas.get("targetControl") or {}
+        counterpart = atlas.get("catalogCounterpartEvidence") or {}
+        lines.extend([
+            "",
+            "## ATLAS source-resolved forced photometry",
+            "",
+            f"- Classification: {atlas.get('classification')}",
+            f"- Residual-mode origin: {atlas.get('residualModeOrigin')}",
+            f"- Archive: {atlas.get('archive')}",
+            f"- Corrected Gaia target-counterpart separation: {atlas.get('gaiaPairSeparationArcsec')} arcsec",
+            f"- Target-image forced photometry: {atlas.get('useReducedTargetImages')}",
+            f"- Difference imaging used: {atlas.get('differenceImagingUsed')}",
+            f"- Minimum MJD: {atlas.get('mjdMinimum')}",
+            f"- Generic workload: {distributed.get('workloadID')}",
+            f"- Distributed work units: {distributed.get('totalWorkUnits')}",
+            f"- Target accepted bands: {target.get('acceptedBands')}",
+            f"- Target cross-band supported: {target.get('sourceSupported')}",
+            f"- Counterpart accepted bands: {counterpart.get('acceptedBands')}",
+            f"- Counterpart cross-band supported: {counterpart.get('sourceSupported')}",
+            f"- Recommended next test: {atlas.get('recommendedNextTest')}",
+            f"- Guard: {atlas.get('interpretationGuard')}",
+        ])
+
+    atlas_reanalysis = conclusion.get("atlasForcedPhotometryReanalysis")
+    if atlas_reanalysis is not None:
+        distributed = atlas_reanalysis.get("distributedValidation") or {}
+        target = atlas_reanalysis.get("targetControl") or {}
+        counterpart = atlas_reanalysis.get("catalogCounterpartEvidence") or {}
+        lines.extend([
+            "",
+            "## ATLAS signed forced-photometry reanalysis",
+            "",
+            f"- Classification: {atlas_reanalysis.get('classification')}",
+            f"- Residual-mode origin: {atlas_reanalysis.get('residualModeOrigin')}",
+            f"- Archive: {atlas_reanalysis.get('archive')}",
+            f"- Raw v20.24 artifacts reused: {atlas_reanalysis.get('rawArtifactsReusedFromV20_24')}",
+            f"- Individual detection threshold applied: {atlas_reanalysis.get('individualDetectionThresholdApplied')}",
+            f"- Signed forced flux retained: {atlas_reanalysis.get('signedForcedFluxRetained')}",
+            f"- Generic workload: {distributed.get('workloadID')}",
+            f"- Distributed work units: {distributed.get('totalWorkUnits')}",
+            f"- Target accepted bands: {target.get('acceptedBands')}",
+            f"- Target cross-band supported: {target.get('sourceSupported')}",
+            f"- Counterpart accepted bands: {counterpart.get('acceptedBands')}",
+            f"- Counterpart cross-band supported: {counterpart.get('sourceSupported')}",
+            f"- Recommended next test: {atlas_reanalysis.get('recommendedNextTest')}",
+            f"- Guard: {atlas_reanalysis.get('interpretationGuard')}",
+        ])
+
+    atlas_time_resolved = conclusion.get("atlasTimeResolved")
+    if atlas_time_resolved is not None:
+        distributed = atlas_time_resolved.get("distributedValidation") or {}
+        counterpart = atlas_time_resolved.get("catalogCounterpartEvidence") or {}
+        lines.extend([
+            "",
+            "## ATLAS time-resolved counterpart recurrence",
+            "",
+            f"- Classification: {atlas_time_resolved.get('classification')}",
+            f"- Residual-mode origin: {atlas_time_resolved.get('residualModeOrigin')}",
+            f"- Counterpart Gaia DR3: {atlas_time_resolved.get('counterpartGaiaDR3SourceID')}",
+            f"- Season gap: {atlas_time_resolved.get('seasonGapDays')} days",
+            f"- Seasons: {len(atlas_time_resolved.get('seasons') or [])}",
+            f"- Generic workload: {distributed.get('workloadID')}",
+            f"- Distributed work units: {distributed.get('totalWorkUnits')}",
+            f"- Accepted season-band results: {counterpart.get('acceptedSeasonBandCount')}",
+            f"- Accepted seasons: {counterpart.get('acceptedSeasons')}",
+            f"- Accepted bands: {counterpart.get('acceptedBands')}",
+            f"- Cross-band-consistent seasons: {counterpart.get('crossBandConsistentSeasons')}",
+            f"- Independent ATLAS frequency trend: {counterpart.get('independentFrequencyTrend')}",
+            f"- Counterpart supported: {counterpart.get('sourceSupported')}",
+            f"- Counterpart suggestive: {counterpart.get('sourceSuggestive')}",
+            f"- Recommended next test: {atlas_time_resolved.get('recommendedNextTest')}",
+            f"- Guard: {atlas_time_resolved.get('interpretationGuard')}",
+        ])
+
+    atlas_fixed = conclusion.get("atlasFixedWindowRecurrence")
+    if atlas_fixed is not None:
+        distributed = atlas_fixed.get("distributedValidation") or {}
+        counterpart = atlas_fixed.get("catalogCounterpartEvidence") or {}
+        lines.extend([
+            "",
+            "## ATLAS fixed-window counterpart recurrence",
+            "",
+            f"- Classification: {atlas_fixed.get('classification')}",
+            f"- Residual-mode origin: {atlas_fixed.get('residualModeOrigin')}",
+            f"- Counterpart Gaia DR3: {atlas_fixed.get('counterpartGaiaDR3SourceID')}",
+            f"- Fixed window size: {atlas_fixed.get('windowDays')} days",
+            f"- Window anchor: {atlas_fixed.get('windowAnchor')}",
+            f"- Windows intersecting data: {len(atlas_fixed.get('windows') or [])}",
+            f"- Generic workload: {distributed.get('workloadID')}",
+            f"- Distributed work units: {distributed.get('totalWorkUnits')}",
+            f"- Accepted window-band results: {counterpart.get('acceptedWindowBandCount')}",
+            f"- Accepted windows: {counterpart.get('acceptedWindows')}",
+            f"- Accepted bands: {counterpart.get('acceptedBands')}",
+            f"- Cross-band-consistent windows: {counterpart.get('crossBandConsistentWindows')}",
+            f"- Independent ATLAS frequency trend: {counterpart.get('independentATLASFrequencyTrend')}",
+            f"- Counterpart supported: {counterpart.get('sourceSupported')}",
+            f"- Counterpart suggestive: {counterpart.get('sourceSuggestive')}",
+            f"- Recommended next test: {atlas_fixed.get('recommendedNextTest')}",
+            f"- Guard: {atlas_fixed.get('interpretationGuard')}",
+        ])
+
+    observation_plan = conclusion.get("targetedObservationPlan")
+    if observation_plan is not None:
+        geometry = observation_plan.get("sourceGeometry") or {}
+        cadence = observation_plan.get("cadence") or {}
+        exposure = observation_plan.get("exposureStrategy") or {}
+        filters = observation_plan.get("filterStrategy") or {}
+        artifacts = observation_plan.get("artifacts") or {}
+        lines.extend([
+            "",
+            "## Targeted high-resolution time-series observation plan",
+            "",
+            f"- Status: {observation_plan.get('status')}",
+            f"- Scientific objective: {observation_plan.get('scientificObjective')}",
+            f"- Gaia target-counterpart separation: {geometry.get('separationArcsec')} arcsec",
+            f"- Preferred FWHM: {geometry.get('preferredFwhmArcsec')} arcsec",
+            f"- Maximum FWHM: {geometry.get('maximumFwhmArcsec')} arcsec",
+            f"- Preferred pixel scale: {geometry.get('preferredPixelScaleArcsec')} arcsec/pixel",
+            f"- Maximum pixel scale: {geometry.get('maximumPixelScaleArcsec')} arcsec/pixel",
+            f"- Frozen frequency range: {cadence.get('frozenFrequencyRangeCyclesPerDay')}",
+            f"- Frozen period range: {cadence.get('frozenPeriodRangeDays')}",
+            f"- Minimum baseline: {cadence.get('minimumBaselineDays')} days",
+            f"- Preferred baseline: {cadence.get('preferredBaselineDays')} days",
+            f"- Minimum distinct nights: {cadence.get('minimumDistinctNights')}",
+            f"- Preferred distinct nights: {cadence.get('preferredDistinctNights')}",
+            f"- Minimum visits per night: {cadence.get('minimumVisitsPerObservedNight')}",
+            f"- Time-resolved analysis: {cadence.get('timeResolvedAnalysis')}",
+            f"- Filters: {filters}",
+            f"- Exposure strategy: {exposure}",
+            f"- JSON plan: {artifacts.get('jsonPlanPath')}",
+            f"- Markdown plan: {artifacts.get('markdownPlanPath')}",
+            f"- CSV ingest template: {artifacts.get('csvIngestTemplatePath')}",
+            f"- Recommended next test: {observation_plan.get('recommendedNextTest')}",
         ])
 
     lines.extend([
@@ -3884,6 +4172,1439 @@ def build_engine(
             input_hashes={"harmonicEvidence": sha256_json(harmonic or broad or {})},
         )
 
+    def skymapper_resolved_prepare_stage(investigation, request):
+        prepared = _latest_result_for_handler(investigation, "openstar.tess.prepare-target")
+        external = _latest_result_for_handler(
+            investigation, "openstar.tess.external-high-resolution-variability-validation.interpret"
+        )
+        if prepared is None or external is None:
+            raise RuntimeError(
+                "v20.20 requires the frozen target and completed v20.19 external high-resolution result."
+            )
+        if external.get("recommendedNextTest") != "TARGETED_HIGH_RESOLUTION_TIME_SERIES_PHOTOMETRY":
+            raise RuntimeError(
+                "v20.19 did not leave the investigation at TARGETED_HIGH_RESOLUTION_TIME_SERIES_PHOTOMETRY."
+            )
+
+        artifact_root = store.directory_for(investigation.id) / "artifacts"
+        print("🔎 Preparing SkyMapper DR4 resolved-photometry screen")
+        print(f"   target TIC: {prepared.get('ticID')}")
+        print("   archive: SkyMapper Southern Survey DR4")
+        print("   pair must map to two distinct SkyMapper master objects")
+        print("   only clean, good-seeing per-image PSF detections are admitted")
+        print("   the TESS drift law is NOT extrapolated into the SkyMapper epoch")
+
+        spec = build_skymapper_resolved_project(
+            source_project_id=str(prepared["sourceProjectID"]),
+            source_dataset_id=str(prepared["datasetID"]),
+            external_high_resolution_summary=external,
+            output_dir=artifact_root,
+            investigation_id=investigation.id,
+        )
+
+        pair = spec.get("sourcePair") or {}
+        print(f"   target Gaia DR3: {pair.get('targetGaiaDR3SourceID')}")
+        print(f"   counterpart Gaia DR3: {pair.get('counterpartGaiaDR3SourceID')}")
+        print(f"   pair separation: {spec.get('pairSeparationArcsec')} arcsec")
+        print(f"   seeing limit: {spec.get('seeingLimitArcsec')} arcsec")
+        print(f"   distinct SkyMapper pair: {spec.get('pairSeparatelyResolvedInSkyMapperMaster')}")
+        print(f"   prepared SkyMapper datasets: {len(spec.get('preparedSeries') or [])}")
+        print(f"   distributed work units: {spec.get('totalWorkUnits')}")
+
+        artifacts: list[ArtifactReference] = []
+        for item in spec.get("preparedSeries") or []:
+            dataset_path = item.get("datasetPath")
+            if dataset_path and Path(dataset_path).exists():
+                artifacts.append(_artifact(Path(dataset_path), "application/json"))
+        project_path = spec.get("projectPath")
+        if project_path and Path(project_path).exists():
+            artifacts.append(_artifact(Path(project_path), "application/json"))
+
+        if spec.get("available") and project_path:
+            next_stage = StageRequest(
+                id=_next_stage_id(request.id, "run-skymapper-resolved-photometry"),
+                handler_id="openstar.tess.skymapper-resolved-photometry.run",
+                parameters={"projectPath": project_path},
+                triggered_by_stage_id=request.id,
+            )
+        else:
+            next_stage = StageRequest(
+                id=_next_stage_id(request.id, "interpret-skymapper-resolved-photometry"),
+                handler_id="openstar.tess.skymapper-resolved-photometry.interpret",
+                parameters={"distributedRunExpected": False},
+                triggered_by_stage_id=request.id,
+            )
+
+        return StageOutcome(
+            result=spec,
+            next_stage=next_stage,
+            input_hashes={"externalHighResolutionValidation": sha256_json(external)},
+            artifacts=tuple(artifacts),
+        )
+
+    def skymapper_resolved_run_stage(investigation, request):
+        print("⚙️ Activating generic SkyMapper DR4 single-band Lomb-Scargle work")
+        run = coordinator.run_project(
+            request.parameters["projectPath"],
+            poll_interval=poll_interval,
+            timeout=timeout,
+        )
+        print("✅ Distributed SkyMapper resolved-photometry search complete")
+        print(f"   datasets: {len(run.status.get('datasets') or [])}")
+        return StageOutcome(
+            result=run.status,
+            next_stage=StageRequest(
+                id=_next_stage_id(request.id, "interpret-skymapper-resolved-photometry"),
+                handler_id="openstar.tess.skymapper-resolved-photometry.interpret",
+                parameters={"distributedRunExpected": True},
+                triggered_by_stage_id=request.id,
+            ),
+            node_contributions=run.node_contributions,
+            project_ids=(run.project_id,),
+        )
+
+    def skymapper_resolved_interpret_stage(investigation, request):
+        preparation = _latest_result_for_handler(
+            investigation, "openstar.tess.skymapper-resolved-photometry.prepare"
+        )
+        run = _latest_result_for_handler(
+            investigation, "openstar.tess.skymapper-resolved-photometry.run"
+        )
+        if preparation is None:
+            raise RuntimeError("SkyMapper resolved-photometry screen requires a prepare stage.")
+        if bool(request.parameters.get("distributedRunExpected")) and run is None:
+            raise RuntimeError("SkyMapper resolved-photometry screen expected a distributed run result.")
+
+        summary = interpret_skymapper_resolved_project(
+            project_status=run,
+            preparation=preparation,
+        )
+        target = summary.get("targetControl") or {}
+        counterpart = summary.get("catalogCounterpartEvidence") or {}
+        print("🔎 SkyMapper DR4 resolved-photometry screen")
+        print(f"   classification: {summary.get('classification')}")
+        print(f"   residual mode origin: {summary.get('residualModeOrigin')}")
+        print(f"   target accepted bands: {target.get('acceptedBands')}")
+        print(f"   target cross-band supported: {target.get('sourceSupported')}")
+        print(f"   counterpart accepted bands: {counterpart.get('acceptedBands')}")
+        print(f"   counterpart cross-band supported: {counterpart.get('sourceSupported')}")
+        print(f"   recommended next test: {summary.get('recommendedNextTest')}")
+
+        artifact_path = (
+            store.directory_for(investigation.id)
+            / "artifacts"
+            / "skymapper-resolved-photometry"
+            / "skymapper-resolved-photometry-v20.20.json"
+        )
+        _write_json(artifact_path, summary)
+        input_hashes = {"preparation": sha256_json(preparation)}
+        if run is not None:
+            input_hashes["projectResult"] = sha256_json(run)
+        return StageOutcome(
+            result=summary,
+            next_stage=StageRequest(
+                id=_next_stage_id(request.id, "finalize"),
+                handler_id="openstar.tess.finalize",
+                parameters={"outputSuffix": "v20.20"},
+                triggered_by_stage_id=request.id,
+            ),
+            input_hashes=input_hashes,
+            artifacts=(_artifact(artifact_path, "application/json"),),
+        )
+
+    def nsc_resolved_prepare_stage(investigation, request):
+        prepared = _latest_result_for_handler(investigation, "openstar.tess.prepare-target")
+        external = _latest_result_for_handler(
+            investigation, "openstar.tess.external-high-resolution-variability-validation.interpret"
+        )
+        skymapper = _latest_result_for_handler(
+            investigation, "openstar.tess.skymapper-resolved-photometry.interpret"
+        )
+        if prepared is None or external is None or skymapper is None:
+            raise RuntimeError(
+                "v20.21 requires the frozen target plus completed v20.19 and v20.20 archival screens."
+            )
+        if skymapper.get("recommendedNextTest") != "TARGETED_HIGH_RESOLUTION_TIME_SERIES_PHOTOMETRY":
+            raise RuntimeError(
+                "v20.20 did not leave the investigation at TARGETED_HIGH_RESOLUTION_TIME_SERIES_PHOTOMETRY."
+            )
+
+        artifact_root = store.directory_for(investigation.id) / "artifacts"
+        print("🔎 Preparing NOIRLab Source Catalog DR2 resolved-photometry screen")
+        print(f"   target TIC: {prepared.get('ticID')}")
+        print("   archive: NOIRLab Source Catalog DR2")
+        print("   pair must map to two distinct NSC objects")
+        print("   only same-exposure/filter co-detections position-matched to both Gaia sources are admitted")
+        print("   the TESS drift law is NOT extrapolated into the NSC observing epochs")
+
+        spec = build_nsc_resolved_project(
+            source_project_id=str(prepared["sourceProjectID"]),
+            source_dataset_id=str(prepared["datasetID"]),
+            external_high_resolution_summary=external,
+            skymapper_summary=skymapper,
+            output_dir=artifact_root,
+            investigation_id=investigation.id,
+        )
+
+        pair = spec.get("sourcePair") or {}
+        print(f"   target Gaia DR3: {pair.get('targetGaiaDR3SourceID')}")
+        print(f"   counterpart Gaia DR3: {pair.get('counterpartGaiaDR3SourceID')}")
+        print(f"   pair separation: {spec.get('pairSeparationArcsec')} arcsec")
+        print(f"   distinct NSC pair: {spec.get('pairSeparatelyResolvedInNSC')}")
+        print(f"   observed NSC separation: {spec.get('observedNSCObjectSeparationArcsec')} arcsec")
+        print(f"   prepared NSC datasets: {len(spec.get('preparedSeries') or [])}")
+        print(f"   distributed work units: {spec.get('totalWorkUnits')}")
+
+        artifacts: list[ArtifactReference] = []
+        for item in spec.get("preparedSeries") or []:
+            dataset_path = item.get("datasetPath")
+            if dataset_path and Path(dataset_path).exists():
+                artifacts.append(_artifact(Path(dataset_path), "application/json"))
+        project_path = spec.get("projectPath")
+        if project_path and Path(project_path).exists():
+            artifacts.append(_artifact(Path(project_path), "application/json"))
+
+        if spec.get("available") and project_path:
+            next_stage = StageRequest(
+                id=_next_stage_id(request.id, "run-nsc-resolved-photometry"),
+                handler_id="openstar.tess.nsc-resolved-photometry.run",
+                parameters={"projectPath": project_path},
+                triggered_by_stage_id=request.id,
+            )
+        else:
+            next_stage = StageRequest(
+                id=_next_stage_id(request.id, "interpret-nsc-resolved-photometry"),
+                handler_id="openstar.tess.nsc-resolved-photometry.interpret",
+                parameters={"distributedRunExpected": False},
+                triggered_by_stage_id=request.id,
+            )
+
+        return StageOutcome(
+            result=spec,
+            next_stage=next_stage,
+            input_hashes={
+                "externalHighResolutionValidation": sha256_json(external),
+                "skyMapperResolvedPhotometry": sha256_json(skymapper),
+            },
+            artifacts=tuple(artifacts),
+        )
+
+    def nsc_resolved_run_stage(investigation, request):
+        print("⚙️ Activating generic NSC DR2 resolved single-band Lomb-Scargle work")
+        run = coordinator.run_project(
+            request.parameters["projectPath"],
+            poll_interval=poll_interval,
+            timeout=timeout,
+        )
+        print("✅ Distributed NSC resolved-photometry search complete")
+        print(f"   datasets: {len(run.status.get('datasets') or [])}")
+        return StageOutcome(
+            result=run.status,
+            next_stage=StageRequest(
+                id=_next_stage_id(request.id, "interpret-nsc-resolved-photometry"),
+                handler_id="openstar.tess.nsc-resolved-photometry.interpret",
+                parameters={"distributedRunExpected": True},
+                triggered_by_stage_id=request.id,
+            ),
+            node_contributions=run.node_contributions,
+            project_ids=(run.project_id,),
+        )
+
+    def nsc_resolved_interpret_stage(investigation, request):
+        preparation = _latest_result_for_handler(
+            investigation, "openstar.tess.nsc-resolved-photometry.prepare"
+        )
+        run = _latest_result_for_handler(
+            investigation, "openstar.tess.nsc-resolved-photometry.run"
+        )
+        if preparation is None:
+            raise RuntimeError("NSC resolved-photometry screen requires a prepare stage.")
+        if bool(request.parameters.get("distributedRunExpected")) and run is None:
+            raise RuntimeError("NSC resolved-photometry screen expected a distributed run result.")
+
+        summary = interpret_nsc_resolved_project(
+            project_status=run,
+            preparation=preparation,
+        )
+        target = summary.get("targetControl") or {}
+        counterpart = summary.get("catalogCounterpartEvidence") or {}
+        print("🔎 NOIRLab Source Catalog DR2 resolved-photometry screen")
+        print(f"   classification: {summary.get('classification')}")
+        print(f"   residual mode origin: {summary.get('residualModeOrigin')}")
+        print(f"   target accepted bands: {target.get('acceptedBands')}")
+        print(f"   target cross-band supported: {target.get('sourceSupported')}")
+        print(f"   counterpart accepted bands: {counterpart.get('acceptedBands')}")
+        print(f"   counterpart cross-band supported: {counterpart.get('sourceSupported')}")
+        print(f"   recommended next test: {summary.get('recommendedNextTest')}")
+
+        artifact_path = (
+            store.directory_for(investigation.id)
+            / "artifacts"
+            / "nsc-resolved-photometry"
+            / "nsc-resolved-photometry-v20.21.json"
+        )
+        _write_json(artifact_path, summary)
+        input_hashes = {"preparation": sha256_json(preparation)}
+        if run is not None:
+            input_hashes["projectResult"] = sha256_json(run)
+        return StageOutcome(
+            result=summary,
+            next_stage=StageRequest(
+                id=_next_stage_id(request.id, "finalize"),
+                handler_id="openstar.tess.finalize",
+                parameters={"outputSuffix": "v20.21"},
+                triggered_by_stage_id=request.id,
+            ),
+            input_hashes=input_hashes,
+            artifacts=(_artifact(artifact_path, "application/json"),),
+        )
+
+    def noirlab_forced_prepare_stage(investigation, request):
+        prepared = _latest_result_for_handler(investigation, "openstar.tess.prepare-target")
+        external = _latest_result_for_handler(
+            investigation, "openstar.tess.external-high-resolution-variability-validation.interpret"
+        )
+        nsc = _latest_result_for_handler(
+            investigation, "openstar.tess.nsc-resolved-photometry.interpret"
+        )
+        if prepared is None or external is None or nsc is None:
+            raise RuntimeError(
+                "v20.22 requires the frozen target plus completed v20.19 and v20.21 archival results."
+            )
+        if nsc.get("recommendedNextTest") != "TARGETED_HIGH_RESOLUTION_TIME_SERIES_PHOTOMETRY":
+            raise RuntimeError(
+                "v20.21 did not leave the investigation at TARGETED_HIGH_RESOLUTION_TIME_SERIES_PHOTOMETRY."
+            )
+
+        artifact_root = store.directory_for(investigation.id) / "artifacts"
+        print("🖼️ Preparing NOIRLab image-level forced two-source photometry")
+        print(f"   target TIC: {prepared.get('ticID')}")
+        print("   archive: public NSC DR2 SIA calibrated single-epoch images")
+        print("   both source positions are frozen from Gaia before any image fit")
+        print("   saturation, PSF width, source-template correlation, conditioning, fit quality, and source SNR are hard guards")
+        print("   accepted calibrated source series become ordinary openstar.lomb-scargle.v1 datasets")
+        print("   the TESS drift law is NOT extrapolated into the NOIRLab image epochs")
+
+        spec = build_noirlab_image_forced_photometry_project(
+            source_project_id=str(prepared["sourceProjectID"]),
+            source_dataset_id=str(prepared["datasetID"]),
+            external_high_resolution_summary=external,
+            nsc_summary=nsc,
+            output_dir=artifact_root,
+            investigation_id=investigation.id,
+        )
+
+        pair = spec.get("sourcePair") or {}
+        print(f"   target Gaia DR3: {pair.get('targetGaiaDR3SourceID')}")
+        print(f"   counterpart Gaia DR3: {pair.get('counterpartGaiaDR3SourceID')}")
+        print(f"   Gaia target-counterpart separation: {spec.get('pairSeparationArcsec')} arcsec")
+        print(f"   offset-component/catalog association separation: {spec.get('catalogAssociationSeparationArcsec')} arcsec")
+        print(f"   SIA rows: {spec.get('siaRows')}")
+        print(f"   candidate images: {spec.get('candidateExposures')}")
+        print(f"   successful forced-photometry images: {spec.get('successfulForcedPhotometryExposures')}")
+        print(f"   prepared source-band datasets: {len(spec.get('preparedSeries') or [])}")
+        print(f"   distributed work units: {spec.get('totalWorkUnits')}")
+
+        artifacts: list[ArtifactReference] = []
+        diagnostics_path = spec.get("diagnosticsPath")
+        if diagnostics_path and Path(diagnostics_path).exists():
+            artifacts.append(_artifact(Path(diagnostics_path), "application/json"))
+        for item in spec.get("preparedSeries") or []:
+            dataset_path = item.get("datasetPath")
+            if dataset_path and Path(dataset_path).exists():
+                artifacts.append(_artifact(Path(dataset_path), "application/json"))
+        project_path = spec.get("projectPath")
+        if project_path and Path(project_path).exists():
+            artifacts.append(_artifact(Path(project_path), "application/json"))
+
+        if spec.get("available") and project_path:
+            next_stage = StageRequest(
+                id=_next_stage_id(request.id, "run-noirlab-image-forced-photometry"),
+                handler_id="openstar.tess.noirlab-image-forced-photometry.run",
+                parameters={"projectPath": project_path},
+                triggered_by_stage_id=request.id,
+            )
+        else:
+            next_stage = StageRequest(
+                id=_next_stage_id(request.id, "interpret-noirlab-image-forced-photometry"),
+                handler_id="openstar.tess.noirlab-image-forced-photometry.interpret",
+                parameters={"distributedRunExpected": False},
+                triggered_by_stage_id=request.id,
+            )
+
+        return StageOutcome(
+            result=spec,
+            next_stage=next_stage,
+            input_hashes={
+                "externalHighResolutionValidation": sha256_json(external),
+                "nscResolvedPhotometry": sha256_json(nsc),
+            },
+            artifacts=tuple(artifacts),
+        )
+
+    def noirlab_forced_run_stage(investigation, request):
+        print("⚙️ Activating generic NOIRLab forced-photometry Lomb-Scargle work")
+        run = coordinator.run_project(
+            request.parameters["projectPath"],
+            poll_interval=poll_interval,
+            timeout=timeout,
+        )
+        print("✅ Distributed NOIRLab forced-photometry search complete")
+        print(f"   datasets: {len(run.status.get('datasets') or [])}")
+        return StageOutcome(
+            result=run.status,
+            next_stage=StageRequest(
+                id=_next_stage_id(request.id, "interpret-noirlab-image-forced-photometry"),
+                handler_id="openstar.tess.noirlab-image-forced-photometry.interpret",
+                parameters={"distributedRunExpected": True},
+                triggered_by_stage_id=request.id,
+            ),
+            node_contributions=run.node_contributions,
+            project_ids=(run.project_id,),
+        )
+
+    def noirlab_forced_interpret_stage(investigation, request):
+        preparation = _latest_result_for_handler(
+            investigation, "openstar.tess.noirlab-image-forced-photometry.prepare"
+        )
+        run = _latest_result_for_handler(
+            investigation, "openstar.tess.noirlab-image-forced-photometry.run"
+        )
+        if preparation is None:
+            raise RuntimeError("NOIRLab image forced photometry requires a prepare stage.")
+        if bool(request.parameters.get("distributedRunExpected")) and run is None:
+            raise RuntimeError("NOIRLab image forced photometry expected a distributed run result.")
+
+        summary = interpret_noirlab_image_forced_photometry_project(
+            project_status=run,
+            preparation=preparation,
+        )
+        target = summary.get("targetControl") or {}
+        counterpart = summary.get("catalogCounterpartEvidence") or {}
+        print("🖼️ NOIRLab image-level forced two-source photometry")
+        print(f"   classification: {summary.get('classification')}")
+        print(f"   residual mode origin: {summary.get('residualModeOrigin')}")
+        print(f"   candidate images: {summary.get('candidateExposures')}")
+        print(f"   successful forced-photometry images: {summary.get('successfulForcedPhotometryExposures')}")
+        print(f"   target accepted bands: {target.get('acceptedBands')}")
+        print(f"   target cross-band supported: {target.get('sourceSupported')}")
+        print(f"   counterpart accepted bands: {counterpart.get('acceptedBands')}")
+        print(f"   counterpart cross-band supported: {counterpart.get('sourceSupported')}")
+        print(f"   recommended next test: {summary.get('recommendedNextTest')}")
+
+        artifact_path = (
+            store.directory_for(investigation.id)
+            / "artifacts"
+            / "noirlab-image-forced-photometry"
+            / "noirlab-image-forced-photometry-v20.22.json"
+        )
+        _write_json(artifact_path, summary)
+        input_hashes = {"preparation": sha256_json(preparation)}
+        if run is not None:
+            input_hashes["projectResult"] = sha256_json(run)
+        return StageOutcome(
+            result=summary,
+            next_stage=StageRequest(
+                id=_next_stage_id(request.id, "finalize"),
+                handler_id="openstar.tess.finalize",
+                parameters={"outputSuffix": "v20.22"},
+                triggered_by_stage_id=request.id,
+            ),
+            input_hashes=input_hashes,
+            artifacts=(_artifact(artifact_path, "application/json"),),
+        )
+
+    def des_dr2_se_local_forced_prepare_stage(investigation, request):
+        prepared = _latest_result_for_handler(investigation, "openstar.tess.prepare-target")
+        external = _latest_result_for_handler(
+            investigation,
+            "openstar.tess.external-high-resolution-variability-validation.interpret",
+        )
+        noirlab = _latest_result_for_handler(
+            investigation,
+            "openstar.tess.noirlab-image-forced-photometry.interpret",
+        )
+        if prepared is None or external is None or noirlab is None:
+            raise RuntimeError(
+                "v20.23 requires the frozen target plus completed v20.19 and v20.22 archival results."
+            )
+        if noirlab.get("recommendedNextTest") != "TARGETED_HIGH_RESOLUTION_TIME_SERIES_PHOTOMETRY":
+            raise RuntimeError(
+                "v20.22 did not leave the investigation at TARGETED_HIGH_RESOLUTION_TIME_SERIES_PHOTOMETRY."
+            )
+
+        artifact_root = store.directory_for(investigation.id) / "artifacts"
+        print("🌌 Preparing DES DR2 single-epoch source-local forced photometry")
+        print(f"   target TIC: {prepared.get('ticID')}")
+        print("   archive: DES DR2 single-epoch SIA")
+        print("   target and counterpart are fit in independent local cutouts at frozen Gaia positions")
+        print("   saturation of one source does not veto the other unless contamination reaches that source's local pixels")
+        print("   accepted source-band series become ordinary openstar.lomb-scargle.v1 datasets")
+        print("   the TESS drift law is NOT extrapolated into the DES observing epochs")
+
+        spec = build_des_dr2_se_local_forced_project(
+            source_project_id=str(prepared["sourceProjectID"]),
+            source_dataset_id=str(prepared["datasetID"]),
+            external_high_resolution_summary=external,
+            noirlab_image_summary=noirlab,
+            output_dir=artifact_root,
+            investigation_id=investigation.id,
+        )
+
+        print(f"   actual Gaia pair separation: {spec.get('pairSeparationArcsec')} arcsec")
+        print(f"   DES SIA rows: {spec.get('siaRows')}")
+        print(f"   candidate images: {spec.get('candidateExposures')}")
+        print(f"   source attempts: {spec.get('sourceAttempts')}")
+        print(f"   source successes: {spec.get('sourceSuccesses')}")
+        print(f"   prepared source-band datasets: {len(spec.get('preparedSeries') or [])}")
+        print(f"   distributed work units: {spec.get('totalWorkUnits')}")
+
+        artifacts: list[ArtifactReference] = []
+        diagnostics_path = spec.get("diagnosticsPath")
+        if diagnostics_path and Path(diagnostics_path).exists():
+            artifacts.append(_artifact(Path(diagnostics_path), "application/json"))
+        for item in spec.get("preparedSeries") or []:
+            dataset_path = item.get("datasetPath")
+            if dataset_path and Path(dataset_path).exists():
+                artifacts.append(_artifact(Path(dataset_path), "application/json"))
+        project_path = spec.get("projectPath")
+        if project_path and Path(project_path).exists():
+            artifacts.append(_artifact(Path(project_path), "application/json"))
+
+        if spec.get("available") and project_path:
+            next_stage = StageRequest(
+                id=_next_stage_id(request.id, "run-des-dr2-se-local-forced-photometry"),
+                handler_id="openstar.tess.des-dr2-se-local-forced-photometry.run",
+                parameters={"projectPath": project_path},
+                triggered_by_stage_id=request.id,
+            )
+        else:
+            next_stage = StageRequest(
+                id=_next_stage_id(request.id, "interpret-des-dr2-se-local-forced-photometry"),
+                handler_id="openstar.tess.des-dr2-se-local-forced-photometry.interpret",
+                parameters={"distributedRunExpected": False},
+                triggered_by_stage_id=request.id,
+            )
+
+        return StageOutcome(
+            result=spec,
+            next_stage=next_stage,
+            input_hashes={
+                "externalHighResolutionValidation": sha256_json(external),
+                "noirlabImageForcedPhotometry": sha256_json(noirlab),
+            },
+            artifacts=tuple(artifacts),
+        )
+
+    def des_dr2_se_local_forced_run_stage(investigation, request):
+        print("⚙️ Activating generic DES DR2 source-local Lomb-Scargle work")
+        run = coordinator.run_project(
+            request.parameters["projectPath"],
+            poll_interval=poll_interval,
+            timeout=timeout,
+        )
+        print("✅ Distributed DES DR2 source-local search complete")
+        print(f"   datasets: {len(run.status.get('datasets') or [])}")
+        return StageOutcome(
+            result=run.status,
+            next_stage=StageRequest(
+                id=_next_stage_id(request.id, "interpret-des-dr2-se-local-forced-photometry"),
+                handler_id="openstar.tess.des-dr2-se-local-forced-photometry.interpret",
+                parameters={"distributedRunExpected": True},
+                triggered_by_stage_id=request.id,
+            ),
+            node_contributions=run.node_contributions,
+            project_ids=(run.project_id,),
+        )
+
+    def des_dr2_se_local_forced_interpret_stage(investigation, request):
+        preparation = _latest_result_for_handler(
+            investigation,
+            "openstar.tess.des-dr2-se-local-forced-photometry.prepare",
+        )
+        run = _latest_result_for_handler(
+            investigation,
+            "openstar.tess.des-dr2-se-local-forced-photometry.run",
+        )
+        if preparation is None:
+            raise RuntimeError("DES DR2 source-local forced photometry requires a prepare stage.")
+        if bool(request.parameters.get("distributedRunExpected")) and run is None:
+            raise RuntimeError(
+                "DES DR2 source-local forced photometry expected a distributed run result."
+            )
+
+        summary = interpret_des_dr2_se_local_forced_project(
+            project_status=run,
+            preparation=preparation,
+        )
+        target = summary.get("targetControl") or {}
+        counterpart = summary.get("catalogCounterpartEvidence") or {}
+        print("🌌 DES DR2 single-epoch source-local forced photometry")
+        print(f"   classification: {summary.get('classification')}")
+        print(f"   residual mode origin: {summary.get('residualModeOrigin')}")
+        print(f"   candidate images: {summary.get('candidateExposures')}")
+        print(f"   source successes: {summary.get('sourceSuccesses')}")
+        print(f"   target accepted bands: {target.get('acceptedBands')}")
+        print(f"   target cross-band supported: {target.get('sourceSupported')}")
+        print(f"   counterpart accepted bands: {counterpart.get('acceptedBands')}")
+        print(f"   counterpart cross-band supported: {counterpart.get('sourceSupported')}")
+        print(f"   recommended next test: {summary.get('recommendedNextTest')}")
+
+        artifact_path = (
+            store.directory_for(investigation.id)
+            / "artifacts"
+            / "des-dr2-se-local-forced-photometry"
+            / "des-dr2-se-local-forced-photometry-v20.23.json"
+        )
+        _write_json(artifact_path, summary)
+        input_hashes = {"preparation": sha256_json(preparation)}
+        if run is not None:
+            input_hashes["projectResult"] = sha256_json(run)
+
+        return StageOutcome(
+            result=summary,
+            next_stage=StageRequest(
+                id=_next_stage_id(request.id, "finalize"),
+                handler_id="openstar.tess.finalize",
+                parameters={"outputSuffix": "v20.23"},
+                triggered_by_stage_id=request.id,
+            ),
+            input_hashes=input_hashes,
+            artifacts=(_artifact(artifact_path, "application/json"),),
+        )
+
+    def atlas_forced_prepare_stage(investigation, request):
+        prepared = _latest_result_for_handler(investigation, "openstar.tess.prepare-target")
+        external = _latest_result_for_handler(
+            investigation,
+            "openstar.tess.external-high-resolution-variability-validation.interpret",
+        )
+        des = _latest_result_for_handler(
+            investigation,
+            "openstar.tess.des-dr2-se-local-forced-photometry.interpret",
+        )
+        if prepared is None or external is None or des is None:
+            raise RuntimeError(
+                "v20.24 requires the frozen target plus completed v20.19 and v20.23 archival results."
+            )
+        if des.get("recommendedNextTest") != "TARGETED_HIGH_RESOLUTION_TIME_SERIES_PHOTOMETRY":
+            raise RuntimeError(
+                "v20.23 did not leave the investigation at TARGETED_HIGH_RESOLUTION_TIME_SERIES_PHOTOMETRY."
+            )
+
+        artifact_root = store.directory_for(investigation.id) / "artifacts"
+        print("🌐 Preparing ATLAS source-resolved forced photometry")
+        print(f"   target TIC: {prepared.get('ticID')}")
+        print("   archive: ATLAS Forced Photometry")
+        print("   credentials are read only from OPENSTAR_ATLAS_* environment variables")
+        print("   calibrated target-image forced photometry is requested independently at both frozen Gaia coordinates")
+        print("   southern difference-image photometry is not used")
+        print("   accepted nightly source-band series become ordinary openstar.lomb-scargle.v1 datasets")
+        print("   the TESS drift law is NOT extrapolated into the ATLAS observing epochs")
+
+        spec = build_atlas_forced_photometry_project(
+            source_project_id=str(prepared["sourceProjectID"]),
+            source_dataset_id=str(prepared["datasetID"]),
+            external_high_resolution_summary=external,
+            des_dr2_se_summary=des,
+            output_dir=artifact_root,
+            investigation_id=investigation.id,
+        )
+
+        print(f"   corrected Gaia source separation: {spec.get('gaiaPairSeparationArcsec')} arcsec")
+        print(f"   prepared ATLAS source-band datasets: {len(spec.get('preparedSeries') or [])}")
+        print(f"   distributed work units: {spec.get('totalWorkUnits')}")
+
+        artifacts: list[ArtifactReference] = []
+        for record in spec.get("sourceRecords") or []:
+            raw_path = record.get("rawPath")
+            if raw_path and Path(raw_path).exists():
+                artifacts.append(_artifact(Path(raw_path), "text/plain"))
+
+        for item in spec.get("preparedSeries") or []:
+            dataset_path = item.get("datasetPath")
+            if dataset_path and Path(dataset_path).exists():
+                artifacts.append(_artifact(Path(dataset_path), "application/json"))
+
+        project_path = spec.get("projectPath")
+        if project_path and Path(project_path).exists():
+            artifacts.append(_artifact(Path(project_path), "application/json"))
+
+        if spec.get("available") and project_path:
+            next_stage = StageRequest(
+                id=_next_stage_id(request.id, "run-atlas-forced-photometry"),
+                handler_id="openstar.tess.atlas-forced-photometry.run",
+                parameters={"projectPath": project_path},
+                triggered_by_stage_id=request.id,
+            )
+        else:
+            next_stage = StageRequest(
+                id=_next_stage_id(request.id, "interpret-atlas-forced-photometry"),
+                handler_id="openstar.tess.atlas-forced-photometry.interpret",
+                parameters={"distributedRunExpected": False},
+                triggered_by_stage_id=request.id,
+            )
+
+        return StageOutcome(
+            result=spec,
+            next_stage=next_stage,
+            input_hashes={
+                "externalHighResolutionValidation": sha256_json(external),
+                "desDr2SeLocalForcedPhotometry": sha256_json(des),
+            },
+            artifacts=tuple(artifacts),
+        )
+
+    def atlas_forced_run_stage(investigation, request):
+        print("⚙️ Activating generic ATLAS nightly source-resolved Lomb-Scargle work")
+        run = coordinator.run_project(
+            request.parameters["projectPath"],
+            poll_interval=poll_interval,
+            timeout=timeout,
+        )
+        print("✅ Distributed ATLAS forced-photometry search complete")
+        print(f"   datasets: {len(run.status.get('datasets') or [])}")
+        return StageOutcome(
+            result=run.status,
+            next_stage=StageRequest(
+                id=_next_stage_id(request.id, "interpret-atlas-forced-photometry"),
+                handler_id="openstar.tess.atlas-forced-photometry.interpret",
+                parameters={"distributedRunExpected": True},
+                triggered_by_stage_id=request.id,
+            ),
+            node_contributions=run.node_contributions,
+            project_ids=(run.project_id,),
+        )
+
+    def atlas_forced_interpret_stage(investigation, request):
+        preparation = _latest_result_for_handler(
+            investigation,
+            "openstar.tess.atlas-forced-photometry.prepare",
+        )
+        run = _latest_result_for_handler(
+            investigation,
+            "openstar.tess.atlas-forced-photometry.run",
+        )
+        if preparation is None:
+            raise RuntimeError("ATLAS forced photometry requires a prepare stage.")
+        if bool(request.parameters.get("distributedRunExpected")) and run is None:
+            raise RuntimeError(
+                "ATLAS forced photometry expected a distributed run result."
+            )
+
+        summary = interpret_atlas_forced_photometry_project(
+            project_status=run,
+            preparation=preparation,
+        )
+        target = summary.get("targetControl") or {}
+        counterpart = summary.get("catalogCounterpartEvidence") or {}
+        print("🌐 ATLAS source-resolved forced photometry")
+        print(f"   classification: {summary.get('classification')}")
+        print(f"   residual mode origin: {summary.get('residualModeOrigin')}")
+        print(f"   corrected Gaia source separation: {summary.get('gaiaPairSeparationArcsec')} arcsec")
+        print(f"   target accepted bands: {target.get('acceptedBands')}")
+        print(f"   target cross-band supported: {target.get('sourceSupported')}")
+        print(f"   counterpart accepted bands: {counterpart.get('acceptedBands')}")
+        print(f"   counterpart cross-band supported: {counterpart.get('sourceSupported')}")
+        print(f"   recommended next test: {summary.get('recommendedNextTest')}")
+
+        artifact_path = (
+            store.directory_for(investigation.id)
+            / "artifacts"
+            / "atlas-forced-photometry"
+            / "atlas-forced-photometry-v20.24.json"
+        )
+        _write_json(artifact_path, summary)
+
+        input_hashes = {"preparation": sha256_json(preparation)}
+        if run is not None:
+            input_hashes["projectResult"] = sha256_json(run)
+
+        return StageOutcome(
+            result=summary,
+            next_stage=StageRequest(
+                id=_next_stage_id(request.id, "finalize"),
+                handler_id="openstar.tess.finalize",
+                parameters={"outputSuffix": "v20.24"},
+                triggered_by_stage_id=request.id,
+            ),
+            input_hashes=input_hashes,
+            artifacts=(_artifact(artifact_path, "application/json"),),
+        )
+
+    def atlas_reanalysis_prepare_stage(investigation, request):
+        prepared = _latest_result_for_handler(investigation, "openstar.tess.prepare-target")
+        atlas = _latest_result_for_handler(
+            investigation,
+            "openstar.tess.atlas-forced-photometry.interpret",
+        )
+        if prepared is None or atlas is None:
+            raise RuntimeError(
+                "v20.25 requires the frozen target and completed v20.24 ATLAS interpretation."
+            )
+
+        artifact_root = store.directory_for(investigation.id) / "artifacts"
+
+        print("♻️ Preparing ATLAS signed forced-photometry reanalysis")
+        print(f"   target TIC: {prepared.get('ticID')}")
+        print("   no new ATLAS query is performed")
+        print("   immutable v20.24 raw target-image photometry files are reused")
+        print("   low-S/N and negative signed forced fluxes are retained")
+        print("   actual fit/error failures remain rejected")
+        print("   nightly source-band series become ordinary openstar.lomb-scargle.v1 datasets")
+
+        spec = build_atlas_forced_photometry_reanalysis_project(
+            source_project_id=str(prepared["sourceProjectID"]),
+            source_dataset_id=str(prepared["datasetID"]),
+            atlas_v20_24_summary=atlas,
+            output_dir=artifact_root,
+            investigation_id=investigation.id,
+        )
+
+        print(f"   prepared source-band datasets: {len(spec.get('preparedSeries') or [])}")
+        print(f"   distributed work units: {spec.get('totalWorkUnits')}")
+
+        artifacts: list[ArtifactReference] = []
+        for item in spec.get("preparedSeries") or []:
+            dataset_path = item.get("datasetPath")
+            if dataset_path and Path(dataset_path).exists():
+                artifacts.append(_artifact(Path(dataset_path), "application/json"))
+
+        project_path = spec.get("projectPath")
+        if project_path and Path(project_path).exists():
+            artifacts.append(_artifact(Path(project_path), "application/json"))
+
+        if spec.get("available") and project_path:
+            next_stage = StageRequest(
+                id=_next_stage_id(request.id, "run-atlas-forced-photometry-reanalysis"),
+                handler_id="openstar.tess.atlas-forced-photometry-reanalysis.run",
+                parameters={"projectPath": project_path},
+                triggered_by_stage_id=request.id,
+            )
+        else:
+            next_stage = StageRequest(
+                id=_next_stage_id(request.id, "interpret-atlas-forced-photometry-reanalysis"),
+                handler_id="openstar.tess.atlas-forced-photometry-reanalysis.interpret",
+                parameters={"distributedRunExpected": False},
+                triggered_by_stage_id=request.id,
+            )
+
+        return StageOutcome(
+            result=spec,
+            next_stage=next_stage,
+            input_hashes={
+                "atlasV20_24Interpretation": sha256_json(atlas),
+            },
+            artifacts=tuple(artifacts),
+        )
+
+    def atlas_reanalysis_run_stage(investigation, request):
+        print("⚙️ Activating generic ATLAS signed nightly Lomb-Scargle work")
+        run = coordinator.run_project(
+            request.parameters["projectPath"],
+            poll_interval=poll_interval,
+            timeout=timeout,
+        )
+        print("✅ Distributed ATLAS reanalysis search complete")
+        print(f"   datasets: {len(run.status.get('datasets') or [])}")
+
+        return StageOutcome(
+            result=run.status,
+            next_stage=StageRequest(
+                id=_next_stage_id(request.id, "interpret-atlas-forced-photometry-reanalysis"),
+                handler_id="openstar.tess.atlas-forced-photometry-reanalysis.interpret",
+                parameters={"distributedRunExpected": True},
+                triggered_by_stage_id=request.id,
+            ),
+            node_contributions=run.node_contributions,
+            project_ids=(run.project_id,),
+        )
+
+    def atlas_reanalysis_interpret_stage(investigation, request):
+        preparation = _latest_result_for_handler(
+            investigation,
+            "openstar.tess.atlas-forced-photometry-reanalysis.prepare",
+        )
+        run = _latest_result_for_handler(
+            investigation,
+            "openstar.tess.atlas-forced-photometry-reanalysis.run",
+        )
+
+        if preparation is None:
+            raise RuntimeError("ATLAS reanalysis requires a prepare stage.")
+        if bool(request.parameters.get("distributedRunExpected")) and run is None:
+            raise RuntimeError(
+                "ATLAS reanalysis expected a distributed run result."
+            )
+
+        summary = interpret_atlas_forced_photometry_reanalysis_project(
+            project_status=run,
+            preparation=preparation,
+        )
+
+        target = summary.get("targetControl") or {}
+        counterpart = summary.get("catalogCounterpartEvidence") or {}
+
+        print("♻️ ATLAS signed forced-photometry reanalysis")
+        print(f"   classification: {summary.get('classification')}")
+        print(f"   residual mode origin: {summary.get('residualModeOrigin')}")
+        print(f"   target accepted bands: {target.get('acceptedBands')}")
+        print(f"   target cross-band supported: {target.get('sourceSupported')}")
+        print(f"   counterpart accepted bands: {counterpart.get('acceptedBands')}")
+        print(f"   counterpart cross-band supported: {counterpart.get('sourceSupported')}")
+        print(f"   recommended next test: {summary.get('recommendedNextTest')}")
+
+        artifact_path = (
+            store.directory_for(investigation.id)
+            / "artifacts"
+            / "atlas-forced-photometry-reanalysis"
+            / "atlas-forced-photometry-reanalysis-v20.25.json"
+        )
+        _write_json(artifact_path, summary)
+
+        input_hashes = {"preparation": sha256_json(preparation)}
+        if run is not None:
+            input_hashes["projectResult"] = sha256_json(run)
+
+        return StageOutcome(
+            result=summary,
+            next_stage=StageRequest(
+                id=_next_stage_id(request.id, "finalize"),
+                handler_id="openstar.tess.finalize",
+                parameters={"outputSuffix": "v20.25"},
+                triggered_by_stage_id=request.id,
+            ),
+            input_hashes=input_hashes,
+            artifacts=(_artifact(artifact_path, "application/json"),),
+        )
+
+    def atlas_time_resolved_prepare_stage(investigation, request):
+        prepared = _latest_result_for_handler(investigation, "openstar.tess.prepare-target")
+        atlas_v20_24 = _latest_result_for_handler(
+            investigation,
+            "openstar.tess.atlas-forced-photometry.interpret",
+        )
+        atlas_v20_25_prepare = _latest_result_for_handler(
+            investigation,
+            "openstar.tess.atlas-forced-photometry-reanalysis.prepare",
+        )
+        atlas_v20_25 = _latest_result_for_handler(
+            investigation,
+            "openstar.tess.atlas-forced-photometry-reanalysis.interpret",
+        )
+
+        if (
+            prepared is None
+            or atlas_v20_24 is None
+            or atlas_v20_25_prepare is None
+            or atlas_v20_25 is None
+        ):
+            raise RuntimeError(
+                "v20.26 requires the frozen target plus completed v20.24 and v20.25 ATLAS stages."
+            )
+
+        artifact_root = store.directory_for(investigation.id) / "artifacts"
+
+        print("🕰️ Preparing ATLAS time-resolved counterpart recurrence")
+        print(f"   target TIC: {prepared.get('ticID')}")
+        print("   no new ATLAS query is performed")
+        print("   immutable v20.24 counterpart photometry is reused")
+        print("   the shared c/o cadence is split into independent observing seasons")
+        print("   each season/filter keeps the same strict prominence >= 2.0 acceptance rule")
+        print("   no TESS drift extrapolation is used to choose ATLAS season frequencies")
+
+        spec = build_atlas_time_resolved_project(
+            source_project_id=str(prepared["sourceProjectID"]),
+            source_dataset_id=str(prepared["datasetID"]),
+            atlas_v20_24_summary=atlas_v20_24,
+            atlas_v20_25_preparation=atlas_v20_25_prepare,
+            atlas_v20_25_summary=atlas_v20_25,
+            output_dir=artifact_root,
+            investigation_id=investigation.id,
+        )
+
+        print(f"   seasons: {len(spec.get('seasons') or [])}")
+        print(f"   prepared season-band datasets: {len(spec.get('preparedSeries') or [])}")
+        print(f"   distributed work units: {spec.get('totalWorkUnits')}")
+
+        artifacts: list[ArtifactReference] = []
+        for item in spec.get("preparedSeries") or []:
+            dataset_path = item.get("datasetPath")
+            if dataset_path and Path(dataset_path).exists():
+                artifacts.append(_artifact(Path(dataset_path), "application/json"))
+
+        project_path = spec.get("projectPath")
+        if project_path and Path(project_path).exists():
+            artifacts.append(_artifact(Path(project_path), "application/json"))
+
+        if spec.get("available") and project_path:
+            next_stage = StageRequest(
+                id=_next_stage_id(request.id, "run-atlas-time-resolved"),
+                handler_id="openstar.tess.atlas-time-resolved.run",
+                parameters={"projectPath": project_path},
+                triggered_by_stage_id=request.id,
+            )
+        else:
+            next_stage = StageRequest(
+                id=_next_stage_id(request.id, "interpret-atlas-time-resolved"),
+                handler_id="openstar.tess.atlas-time-resolved.interpret",
+                parameters={"distributedRunExpected": False},
+                triggered_by_stage_id=request.id,
+            )
+
+        return StageOutcome(
+            result=spec,
+            next_stage=next_stage,
+            input_hashes={
+                "atlasV20_24Interpretation": sha256_json(atlas_v20_24),
+                "atlasV20_25Preparation": sha256_json(atlas_v20_25_prepare),
+                "atlasV20_25Interpretation": sha256_json(atlas_v20_25),
+            },
+            artifacts=tuple(artifacts),
+        )
+
+    def atlas_time_resolved_run_stage(investigation, request):
+        print("⚙️ Activating generic ATLAS season/filter Lomb-Scargle work")
+        run = coordinator.run_project(
+            request.parameters["projectPath"],
+            poll_interval=poll_interval,
+            timeout=timeout,
+        )
+        print("✅ Distributed ATLAS time-resolved search complete")
+        print(f"   datasets: {len(run.status.get('datasets') or [])}")
+
+        return StageOutcome(
+            result=run.status,
+            next_stage=StageRequest(
+                id=_next_stage_id(request.id, "interpret-atlas-time-resolved"),
+                handler_id="openstar.tess.atlas-time-resolved.interpret",
+                parameters={"distributedRunExpected": True},
+                triggered_by_stage_id=request.id,
+            ),
+            node_contributions=run.node_contributions,
+            project_ids=(run.project_id,),
+        )
+
+    def atlas_time_resolved_interpret_stage(investigation, request):
+        preparation = _latest_result_for_handler(
+            investigation,
+            "openstar.tess.atlas-time-resolved.prepare",
+        )
+        run = _latest_result_for_handler(
+            investigation,
+            "openstar.tess.atlas-time-resolved.run",
+        )
+
+        if preparation is None:
+            raise RuntimeError("ATLAS time-resolved recurrence requires a prepare stage.")
+        if bool(request.parameters.get("distributedRunExpected")) and run is None:
+            raise RuntimeError(
+                "ATLAS time-resolved recurrence expected a distributed run result."
+            )
+
+        summary = interpret_atlas_time_resolved_project(
+            project_status=run,
+            preparation=preparation,
+        )
+        counterpart = summary.get("catalogCounterpartEvidence") or {}
+
+        print("🕰️ ATLAS time-resolved counterpart recurrence")
+        print(f"   classification: {summary.get('classification')}")
+        print(f"   residual mode origin: {summary.get('residualModeOrigin')}")
+        print(f"   accepted season-band results: {counterpart.get('acceptedSeasonBandCount')}")
+        print(f"   accepted seasons: {counterpart.get('acceptedSeasons')}")
+        print(f"   accepted bands: {counterpart.get('acceptedBands')}")
+        print(f"   cross-band-consistent seasons: {counterpart.get('crossBandConsistentSeasons')}")
+        print(f"   independent ATLAS frequency trend: {counterpart.get('independentFrequencyTrend')}")
+        print(f"   counterpart supported: {counterpart.get('sourceSupported')}")
+        print(f"   counterpart suggestive: {counterpart.get('sourceSuggestive')}")
+        print(f"   recommended next test: {summary.get('recommendedNextTest')}")
+
+        artifact_path = (
+            store.directory_for(investigation.id)
+            / "artifacts"
+            / "atlas-time-resolved"
+            / "atlas-time-resolved-v20.26.json"
+        )
+        _write_json(artifact_path, summary)
+
+        input_hashes = {"preparation": sha256_json(preparation)}
+        if run is not None:
+            input_hashes["projectResult"] = sha256_json(run)
+
+        return StageOutcome(
+            result=summary,
+            next_stage=StageRequest(
+                id=_next_stage_id(request.id, "finalize"),
+                handler_id="openstar.tess.finalize",
+                parameters={"outputSuffix": "v20.26"},
+                triggered_by_stage_id=request.id,
+            ),
+            input_hashes=input_hashes,
+            artifacts=(_artifact(artifact_path, "application/json"),),
+        )
+
+    def atlas_fixed_window_prepare_stage(investigation, request):
+        prepared = _latest_result_for_handler(
+            investigation,
+            "openstar.tess.prepare-target",
+        )
+        atlas_v20_24 = _latest_result_for_handler(
+            investigation,
+            "openstar.tess.atlas-forced-photometry.interpret",
+        )
+        atlas_v20_26 = _latest_result_for_handler(
+            investigation,
+            "openstar.tess.atlas-time-resolved.interpret",
+        )
+
+        if (
+            prepared is None
+            or atlas_v20_24 is None
+            or atlas_v20_26 is None
+        ):
+            raise RuntimeError(
+                "v20.27 requires the frozen target plus completed v20.24 and v20.26 ATLAS results."
+            )
+
+        artifact_root = (
+            store.directory_for(investigation.id) / "artifacts"
+        )
+
+        print("🧱 Preparing ATLAS fixed-window counterpart recurrence")
+        print(f"   target TIC: {prepared.get('ticID')}")
+        print("   no new ATLAS query is performed")
+        print("   immutable v20.24 counterpart photometry is reused")
+        print("   v20.26 gap-based season splitting is replaced because it produced one 4.6-year season")
+        print("   windows are fixed non-overlapping 180-day absolute-MJD bins")
+        print("   the strict prominence >= 2.0 acceptance rule is unchanged")
+        print("   boundary-hit candidates are rejected")
+        print("   no TESS drift extrapolation is used to choose ATLAS window frequencies")
+
+        spec = build_atlas_fixed_window_project(
+            source_project_id=str(prepared["sourceProjectID"]),
+            source_dataset_id=str(prepared["datasetID"]),
+            atlas_v20_24_summary=atlas_v20_24,
+            atlas_v20_26_summary=atlas_v20_26,
+            output_dir=artifact_root,
+            investigation_id=investigation.id,
+        )
+
+        print(f"   windows intersecting data: {len(spec.get('windows') or [])}")
+        print(f"   prepared window-band datasets: {len(spec.get('preparedSeries') or [])}")
+        print(f"   distributed work units: {spec.get('totalWorkUnits')}")
+
+        artifacts: list[ArtifactReference] = []
+
+        for item in spec.get("preparedSeries") or []:
+            dataset_path = item.get("datasetPath")
+            if dataset_path and Path(dataset_path).exists():
+                artifacts.append(
+                    _artifact(
+                        Path(dataset_path),
+                        "application/json",
+                    )
+                )
+
+        project_path = spec.get("projectPath")
+        if project_path and Path(project_path).exists():
+            artifacts.append(
+                _artifact(
+                    Path(project_path),
+                    "application/json",
+                )
+            )
+
+        if spec.get("available") and project_path:
+            next_stage = StageRequest(
+                id=_next_stage_id(
+                    request.id,
+                    "run-atlas-fixed-window",
+                ),
+                handler_id=(
+                    "openstar.tess.atlas-fixed-window.run"
+                ),
+                parameters={
+                    "projectPath": project_path,
+                },
+                triggered_by_stage_id=request.id,
+            )
+        else:
+            next_stage = StageRequest(
+                id=_next_stage_id(
+                    request.id,
+                    "interpret-atlas-fixed-window",
+                ),
+                handler_id=(
+                    "openstar.tess.atlas-fixed-window.interpret"
+                ),
+                parameters={
+                    "distributedRunExpected": False,
+                },
+                triggered_by_stage_id=request.id,
+            )
+
+        return StageOutcome(
+            result=spec,
+            next_stage=next_stage,
+            input_hashes={
+                "atlasV20_24Interpretation": sha256_json(
+                    atlas_v20_24
+                ),
+                "atlasV20_26Interpretation": sha256_json(
+                    atlas_v20_26
+                ),
+            },
+            artifacts=tuple(artifacts),
+        )
+
+    def atlas_fixed_window_run_stage(investigation, request):
+        print("⚙️ Activating generic ATLAS fixed-window Lomb-Scargle work")
+        run = coordinator.run_project(
+            request.parameters["projectPath"],
+            poll_interval=poll_interval,
+            timeout=timeout,
+        )
+        print("✅ Distributed ATLAS fixed-window search complete")
+        print(f"   datasets: {len(run.status.get('datasets') or [])}")
+
+        return StageOutcome(
+            result=run.status,
+            next_stage=StageRequest(
+                id=_next_stage_id(
+                    request.id,
+                    "interpret-atlas-fixed-window",
+                ),
+                handler_id=(
+                    "openstar.tess.atlas-fixed-window.interpret"
+                ),
+                parameters={
+                    "distributedRunExpected": True,
+                },
+                triggered_by_stage_id=request.id,
+            ),
+            node_contributions=run.node_contributions,
+            project_ids=(run.project_id,),
+        )
+
+    def atlas_fixed_window_interpret_stage(
+        investigation,
+        request,
+    ):
+        preparation = _latest_result_for_handler(
+            investigation,
+            "openstar.tess.atlas-fixed-window.prepare",
+        )
+        run = _latest_result_for_handler(
+            investigation,
+            "openstar.tess.atlas-fixed-window.run",
+        )
+
+        if preparation is None:
+            raise RuntimeError(
+                "ATLAS fixed-window recurrence requires a prepare stage."
+            )
+
+        if (
+            bool(
+                request.parameters.get(
+                    "distributedRunExpected"
+                )
+            )
+            and run is None
+        ):
+            raise RuntimeError(
+                "ATLAS fixed-window recurrence expected a distributed run result."
+            )
+
+        summary = interpret_atlas_fixed_window_project(
+            project_status=run,
+            preparation=preparation,
+        )
+        counterpart = (
+            summary.get("catalogCounterpartEvidence") or {}
+        )
+
+        print("🧱 ATLAS fixed-window counterpart recurrence")
+        print(
+            f"   classification: "
+            f"{summary.get('classification')}"
+        )
+        print(
+            f"   residual mode origin: "
+            f"{summary.get('residualModeOrigin')}"
+        )
+        print(
+            "   accepted window-band results: "
+            f"{counterpart.get('acceptedWindowBandCount')}"
+        )
+        print(
+            f"   accepted windows: "
+            f"{counterpart.get('acceptedWindows')}"
+        )
+        print(
+            f"   accepted bands: "
+            f"{counterpart.get('acceptedBands')}"
+        )
+        print(
+            "   cross-band-consistent windows: "
+            f"{counterpart.get('crossBandConsistentWindows')}"
+        )
+        print(
+            "   independent ATLAS frequency trend: "
+            f"{counterpart.get('independentATLASFrequencyTrend')}"
+        )
+        print(
+            f"   counterpart supported: "
+            f"{counterpart.get('sourceSupported')}"
+        )
+        print(
+            f"   counterpart suggestive: "
+            f"{counterpart.get('sourceSuggestive')}"
+        )
+        print(
+            f"   recommended next test: "
+            f"{summary.get('recommendedNextTest')}"
+        )
+
+        artifact_path = (
+            store.directory_for(investigation.id)
+            / "artifacts"
+            / "atlas-fixed-windows"
+            / "atlas-fixed-window-v20.27.json"
+        )
+        _write_json(artifact_path, summary)
+
+        input_hashes = {
+            "preparation": sha256_json(preparation),
+        }
+        if run is not None:
+            input_hashes["projectResult"] = sha256_json(run)
+
+        return StageOutcome(
+            result=summary,
+            next_stage=StageRequest(
+                id=_next_stage_id(
+                    request.id,
+                    "finalize",
+                ),
+                handler_id="openstar.tess.finalize",
+                parameters={
+                    "outputSuffix": "v20.27",
+                },
+                triggered_by_stage_id=request.id,
+            ),
+            input_hashes=input_hashes,
+            artifacts=(
+                _artifact(
+                    artifact_path,
+                    "application/json",
+                ),
+            ),
+        )
+
+    def targeted_observation_plan_stage(investigation, request):
+        prepared = _latest_result_for_handler(
+            investigation,
+            "openstar.tess.prepare-target",
+        )
+        external = _latest_result_for_handler(
+            investigation,
+            "openstar.tess.external-high-resolution-variability-validation.interpret",
+        )
+        atlas_fixed = _latest_result_for_handler(
+            investigation,
+            "openstar.tess.atlas-fixed-window.interpret",
+        )
+
+        if prepared is None or external is None or atlas_fixed is None:
+            raise RuntimeError(
+                "v20.28 requires the frozen target plus completed v20.19 and v20.27 results."
+            )
+
+        if atlas_fixed.get("recommendedNextTest") != (
+            "TARGETED_HIGH_RESOLUTION_TIME_SERIES_PHOTOMETRY"
+        ):
+            raise RuntimeError(
+                "v20.27 did not leave the investigation at targeted high-resolution time-series photometry."
+            )
+
+        artifact_root = (
+            store.directory_for(investigation.id) / "artifacts"
+        )
+
+        print("🔭 Building targeted high-resolution time-series observation plan")
+        print(f"   target TIC: {prepared.get('ticID')}")
+        print("   no archive query is performed")
+        print("   no distributed science work is activated")
+        print("   the existing residual-frequency search band is frozen into the plan")
+        print("   the existing prominence >= 2.0 acceptance rule is retained")
+        print("   campaign cadence, image-quality, exposure-tier, filter, and ingest rules are preregistered")
+        print("   the established main-family target association remains unchanged")
+
+        plan = build_targeted_observation_plan(
+            source_project_id=str(prepared["sourceProjectID"]),
+            source_dataset_id=str(prepared["datasetID"]),
+            investigation_id=investigation.id,
+            external_high_resolution_summary=external,
+            atlas_fixed_window_summary=atlas_fixed,
+            output_dir=artifact_root,
+        )
+
+        geometry = plan.get("sourceGeometry") or {}
+        cadence = plan.get("cadence") or {}
+        artifacts_map = plan.get("artifacts") or {}
+
+        print(f"   Gaia source separation: {geometry.get('separationArcsec')} arcsec")
+        print(f"   minimum campaign baseline: {cadence.get('minimumBaselineDays')} days")
+        print(f"   preferred campaign baseline: {cadence.get('preferredBaselineDays')} days")
+        print(f"   minimum distinct nights: {cadence.get('minimumDistinctNights')}")
+        print(f"   preferred distinct nights: {cadence.get('preferredDistinctNights')}")
+        print(f"   JSON plan: {artifacts_map.get('jsonPlanPath')}")
+        print(f"   markdown plan: {artifacts_map.get('markdownPlanPath')}")
+        print(f"   CSV ingest template: {artifacts_map.get('csvIngestTemplatePath')}")
+        print(f"   recommended next test: {plan.get('recommendedNextTest')}")
+
+        artifacts: list[ArtifactReference] = []
+
+        for key, media_type in (
+            ("jsonPlanPath", "application/json"),
+            ("markdownPlanPath", "text/markdown"),
+            ("csvIngestTemplatePath", "text/csv"),
+        ):
+            path_text = artifacts_map.get(key)
+            if path_text and Path(path_text).exists():
+                artifacts.append(
+                    _artifact(
+                        Path(path_text),
+                        media_type,
+                    )
+                )
+
+        return StageOutcome(
+            result=plan,
+            next_stage=StageRequest(
+                id=_next_stage_id(
+                    request.id,
+                    "finalize",
+                ),
+                handler_id="openstar.tess.finalize",
+                parameters={
+                    "outputSuffix": "v20.28",
+                },
+                triggered_by_stage_id=request.id,
+            ),
+            input_hashes={
+                "externalHighResolutionValidation": sha256_json(
+                    external
+                ),
+                "atlasFixedWindowRecurrence": sha256_json(
+                    atlas_fixed
+                ),
+            },
+            artifacts=tuple(artifacts),
+        )
+
     def finalize_stage(investigation, request):
         prepared = _result(investigation, "001-prepare-target")
         primary_analysis = _result(investigation, "004-hypotheses")
@@ -3975,6 +5696,42 @@ def build_engine(
         external_high_resolution_validation = _latest_result_for_handler(
             investigation,
             "openstar.tess.external-high-resolution-variability-validation.interpret",
+        )
+        skymapper_resolved_photometry = _latest_result_for_handler(
+            investigation,
+            "openstar.tess.skymapper-resolved-photometry.interpret",
+        )
+        nsc_resolved_photometry = _latest_result_for_handler(
+            investigation,
+            "openstar.tess.nsc-resolved-photometry.interpret",
+        )
+        noirlab_image_forced_photometry = _latest_result_for_handler(
+            investigation,
+            "openstar.tess.noirlab-image-forced-photometry.interpret",
+        )
+        des_dr2_se_local_forced_photometry = _latest_result_for_handler(
+            investigation,
+            "openstar.tess.des-dr2-se-local-forced-photometry.interpret",
+        )
+        atlas_forced_photometry = _latest_result_for_handler(
+            investigation,
+            "openstar.tess.atlas-forced-photometry.interpret",
+        )
+        atlas_forced_photometry_reanalysis = _latest_result_for_handler(
+            investigation,
+            "openstar.tess.atlas-forced-photometry-reanalysis.interpret",
+        )
+        atlas_time_resolved = _latest_result_for_handler(
+            investigation,
+            "openstar.tess.atlas-time-resolved.interpret",
+        )
+        atlas_fixed_window = _latest_result_for_handler(
+            investigation,
+            "openstar.tess.atlas-fixed-window.interpret",
+        )
+        targeted_observation_plan = _latest_result_for_handler(
+            investigation,
+            "openstar.tess.targeted-observation-planning.generate",
         )
 
         if harmonic_family_interpretation is not None:
@@ -4458,6 +6215,370 @@ def build_engine(
                 "rationale": existing_rationale,
             }
 
+        if skymapper_resolved_photometry is not None:
+            existing_rationale = list(claim_decision.get("rationale") or [])
+            classification = skymapper_resolved_photometry.get("classification")
+            if classification == "SKYMAPPER_DR4_COUNTERPART_RESIDUAL_BAND_VARIABILITY_SUPPORTED":
+                existing_rationale.append(
+                    "v20.20 SkyMapper DR4 clean good-seeing PSF photometry finds cross-band residual-frequency support on the catalog counterpart but not the target control, providing archival support for the offset residual source."
+                )
+            elif classification == "SKYMAPPER_DR4_TARGET_RESIDUAL_BAND_VARIABILITY_SUPPORTED":
+                existing_rationale.append(
+                    "v20.20 SkyMapper DR4 clean good-seeing PSF photometry finds cross-band residual-frequency support on Blind C but not the catalog counterpart, favoring an intrinsic target residual."
+                )
+            elif classification == "SKYMAPPER_DR4_TARGET_AND_COUNTERPART_RESIDUAL_BAND_VARIABILITY_SUPPORTED":
+                existing_rationale.append(
+                    "v20.20 SkyMapper DR4 clean good-seeing PSF photometry finds cross-band residual-frequency support on both frozen sources, preserving a multi-source interpretation."
+                )
+            elif classification == "SKYMAPPER_DR4_PAIR_NOT_SEPARATELY_RESOLVED":
+                existing_rationale.append(
+                    "v20.20 finds that SkyMapper DR4 does not represent the frozen Gaia pair as two distinct usable survey objects, so the archive cannot provide source-resolved variability evidence at this separation."
+                )
+            elif classification == "SKYMAPPER_DR4_NO_QUALIFYING_RESOLVED_EPOCH_SERIES":
+                existing_rationale.append(
+                    "v20.20 finds no SkyMapper DR4 time series with enough clean, position-matched, good-seeing PSF epochs to test the residual-frequency band without relaxing the spatial-quality guard."
+                )
+            elif "SUGGESTIVE" in str(classification):
+                existing_rationale.append(
+                    "v20.20 SkyMapper DR4 provides only single-band/suggestive residual-frequency evidence and therefore does not promote the residual source attribution."
+                )
+            else:
+                existing_rationale.append(
+                    "v20.20 SkyMapper DR4 resolved-photometry screening remains unable to securely distinguish the drifting residual source."
+                )
+            existing_rationale.append(
+                "SkyMapper was treated only as an opportunistic archival screen: detections had to be clean, position-matched, and obtained in seeing tighter than the frozen pair separation; the TESS drift law was not extrapolated into the SkyMapper epoch."
+            )
+            existing_rationale.append(
+                f"Recommended next confirmation step: {skymapper_resolved_photometry.get('recommendedNextTest')}."
+            )
+            claim_decision = {
+                "claim": claim_decision["claim"],
+                "rationale": existing_rationale,
+            }
+
+        if nsc_resolved_photometry is not None:
+            existing_rationale = list(claim_decision.get("rationale") or [])
+            classification = nsc_resolved_photometry.get("classification")
+            if classification == "NSC_DR2_COUNTERPART_RESIDUAL_BAND_VARIABILITY_SUPPORTED":
+                existing_rationale.append(
+                    "v20.21 NOIRLab Source Catalog DR2 co-detected resolved photometry finds cross-band residual-frequency support on the catalog counterpart but not the target control."
+                )
+            elif classification == "NSC_DR2_TARGET_RESIDUAL_BAND_VARIABILITY_SUPPORTED":
+                existing_rationale.append(
+                    "v20.21 NOIRLab Source Catalog DR2 co-detected resolved photometry finds cross-band residual-frequency support on Blind C but not the catalog counterpart."
+                )
+            elif classification == "NSC_DR2_TARGET_AND_COUNTERPART_RESIDUAL_BAND_VARIABILITY_SUPPORTED":
+                existing_rationale.append(
+                    "v20.21 NOIRLab Source Catalog DR2 co-detected resolved photometry supports residual-band variability on both frozen sources."
+                )
+            elif classification == "NSC_DR2_PAIR_NOT_SEPARATELY_RESOLVED":
+                existing_rationale.append(
+                    "v20.21 finds that NSC DR2 does not safely represent the frozen Gaia pair as two distinct source matches, so the archive cannot provide source-resolved variability evidence."
+                )
+            elif classification == "NSC_DR2_NO_QUALIFYING_CODETECTED_RESOLVED_SERIES":
+                existing_rationale.append(
+                    "v20.21 finds no NSC DR2 time series with enough same-exposure, independently position-matched co-detections of both frozen sources to test the residual-frequency band."
+                )
+            elif "SUGGESTIVE" in str(classification):
+                existing_rationale.append(
+                    "v20.21 NSC DR2 provides only single-band/suggestive residual-frequency evidence and therefore does not promote the residual source attribution."
+                )
+            else:
+                existing_rationale.append(
+                    "v20.21 NOIRLab Source Catalog DR2 resolved-photometry screening remains unable to securely distinguish the drifting residual source."
+                )
+            existing_rationale.append(
+                "NSC measurements were admitted only when both distinct sources were co-detected in the same exposure/filter and independently position-matched to their frozen Gaia coordinates; the TESS drift law was not extrapolated into the NSC epochs."
+            )
+            existing_rationale.append(
+                f"Recommended next confirmation step: {nsc_resolved_photometry.get('recommendedNextTest')}."
+            )
+            claim_decision = {
+                "claim": claim_decision["claim"],
+                "rationale": existing_rationale,
+            }
+
+        if noirlab_image_forced_photometry is not None:
+            existing_rationale = list(claim_decision.get("rationale") or [])
+            classification = noirlab_image_forced_photometry.get("classification")
+            if classification == "NOIRLAB_IMAGE_COUNTERPART_RESIDUAL_BAND_VARIABILITY_SUPPORTED":
+                existing_rationale.append(
+                    "v20.22 image-level two-source forced photometry on public calibrated NOIRLab images finds cross-band residual-frequency support on the catalog counterpart but not the target control."
+                )
+            elif classification == "NOIRLAB_IMAGE_TARGET_RESIDUAL_BAND_VARIABILITY_SUPPORTED":
+                existing_rationale.append(
+                    "v20.22 image-level two-source forced photometry on public calibrated NOIRLab images finds cross-band residual-frequency support on Blind C but not the catalog counterpart."
+                )
+            elif classification == "NOIRLAB_IMAGE_TARGET_AND_COUNTERPART_RESIDUAL_BAND_VARIABILITY_SUPPORTED":
+                existing_rationale.append(
+                    "v20.22 image-level two-source forced photometry on public calibrated NOIRLab images supports residual-band variability on both frozen sources."
+                )
+            elif classification == "NOIRLAB_IMAGE_FORCED_PHOTOMETRY_SATURATION_LIMIT":
+                existing_rationale.append(
+                    "v20.22 reaches an archival image-level saturation limit: the public NOIRLab exposures do not provide enough unsaturated two-source fits for a source-resolved residual-frequency test."
+                )
+            elif classification == "NOIRLAB_IMAGE_FORCED_PHOTOMETRY_NO_QUALIFYING_EXPOSURES":
+                existing_rationale.append(
+                    "v20.22 finds public NOIRLab image coverage but no exposures that pass the preregistered two-source PSF, saturation, conditioning, fit-quality, and source-SNR guards."
+                )
+            elif classification == "NOIRLAB_IMAGE_FORCED_PHOTOMETRY_INSUFFICIENT_TIME_SERIES":
+                existing_rationale.append(
+                    "v20.22 obtains some acceptable image-level two-source fits but not enough calibrated epochs/baseline to form a defensible distributed residual-frequency test."
+                )
+            elif "SUGGESTIVE" in str(classification):
+                existing_rationale.append(
+                    "v20.22 image-level NOIRLab photometry provides only single-band/suggestive residual-frequency evidence and therefore does not promote the residual source attribution."
+                )
+            else:
+                existing_rationale.append(
+                    "v20.22 image-level NOIRLab two-source forced photometry remains unable to securely distinguish the drifting residual source."
+                )
+            existing_rationale.append(
+                "v20.22 corrects the archival spatial geometry by recomputing the Blind-C-to-counterpart separation directly from the two frozen Gaia coordinates. The earlier catalogSeparationArcsec field was the offset-component-to-catalog-match association distance, not the Gaia source-pair separation; no prior stage promoted a positive claim from that field."
+            )
+            existing_rationale.append(
+                "v20.22 bypassed the NSC extracted-object catalog and fit the public calibrated image pixels directly at the frozen Gaia source positions; the TESS drift law was not extrapolated into the archival image epochs."
+            )
+            existing_rationale.append(
+                f"Recommended next confirmation step: {noirlab_image_forced_photometry.get('recommendedNextTest')}."
+            )
+            claim_decision = {
+                "claim": claim_decision["claim"],
+                "rationale": existing_rationale,
+            }
+
+        if des_dr2_se_local_forced_photometry is not None:
+            existing_rationale = list(claim_decision.get("rationale") or [])
+            classification = des_dr2_se_local_forced_photometry.get("classification")
+            if classification == "DES_DR2_SE_COUNTERPART_RESIDUAL_BAND_VARIABILITY_SUPPORTED":
+                existing_rationale.append(
+                    "v20.23 DES DR2 single-epoch source-local forced photometry finds cross-band residual-frequency support on the frozen catalog counterpart without requiring Blind C to be unsaturated in the same exposure."
+                )
+            elif classification == "DES_DR2_SE_TARGET_RESIDUAL_BAND_VARIABILITY_SUPPORTED":
+                existing_rationale.append(
+                    "v20.23 DES DR2 single-epoch source-local forced photometry finds cross-band residual-frequency support on Blind C."
+                )
+            elif classification == "DES_DR2_SE_TARGET_AND_COUNTERPART_RESIDUAL_BAND_VARIABILITY_SUPPORTED":
+                existing_rationale.append(
+                    "v20.23 DES DR2 single-epoch source-local forced photometry supports residual-band variability on both frozen Gaia sources."
+                )
+            elif classification == "DES_DR2_SE_NO_FIELD_COVERAGE":
+                existing_rationale.append(
+                    "v20.23 finds no usable DES DR2 single-epoch coverage for the frozen Gaia source pair."
+                )
+            elif classification == "DES_DR2_SE_NO_QUALIFYING_LOCAL_SOURCE_FITS":
+                existing_rationale.append(
+                    "v20.23 finds DES DR2 single-epoch coverage but no source-local image fits that pass the preregistered saturation, PSF, conditioning, fit-quality, and SNR guards."
+                )
+            elif classification == "DES_DR2_SE_LOCAL_PHOTOMETRY_INSUFFICIENT_TIME_SERIES":
+                existing_rationale.append(
+                    "v20.23 recovers some acceptable DES DR2 source-local measurements but not enough independent epochs and baseline to form a defensible residual-frequency time series."
+                )
+            elif "SUGGESTIVE" in str(classification):
+                existing_rationale.append(
+                    "v20.23 DES DR2 source-local photometry provides only single-band or otherwise suggestive residual-frequency evidence and therefore does not promote the source attribution."
+                )
+            else:
+                existing_rationale.append(
+                    "v20.23 DES DR2 single-epoch source-local forced photometry remains unable to securely assign the drifting residual source."
+                )
+            existing_rationale.append(
+                "v20.23 uses the corrected Gaia-to-Gaia separation and fits the two sources in independent local cutouts; saturation of Blind C is not used to veto the counterpart unless the counterpart's own pixels are contaminated."
+            )
+            existing_rationale.append(
+                "The TESS frequency-drift law was not extrapolated into DES epochs; accepted DES light curves were searched only inside the frozen residual-frequency band."
+            )
+            existing_rationale.append(
+                f"Recommended next confirmation step: {des_dr2_se_local_forced_photometry.get('recommendedNextTest')}."
+            )
+            claim_decision = {
+                "claim": claim_decision["claim"],
+                "rationale": existing_rationale,
+            }
+
+        if atlas_forced_photometry is not None:
+            existing_rationale = list(claim_decision.get("rationale") or [])
+            classification = atlas_forced_photometry.get("classification")
+            if classification == "ATLAS_COUNTERPART_RESIDUAL_BAND_VARIABILITY_SUPPORTED":
+                existing_rationale.append(
+                    "v20.24 ATLAS calibrated target-image forced photometry finds cross-filter residual-frequency support on the frozen catalog counterpart but not Blind C."
+                )
+            elif classification == "ATLAS_TARGET_RESIDUAL_BAND_VARIABILITY_SUPPORTED":
+                existing_rationale.append(
+                    "v20.24 ATLAS calibrated target-image forced photometry finds cross-filter residual-frequency support on Blind C but not the frozen catalog counterpart."
+                )
+            elif classification == "ATLAS_TARGET_AND_COUNTERPART_RESIDUAL_BAND_VARIABILITY_SUPPORTED":
+                existing_rationale.append(
+                    "v20.24 ATLAS calibrated target-image forced photometry supports residual-band variability on both frozen Gaia sources."
+                )
+            elif classification == "ATLAS_NO_QUALIFYING_FORCED_PHOTOMETRY_TIME_SERIES":
+                existing_rationale.append(
+                    "v20.24 ATLAS forced photometry does not produce enough quality-controlled nightly source-resolved measurements to test the residual-frequency band under the preregistered guards."
+                )
+            elif "SUGGESTIVE" in str(classification):
+                existing_rationale.append(
+                    "v20.24 ATLAS source-resolved forced photometry provides only single-filter or otherwise suggestive residual-frequency evidence and therefore does not promote the residual source attribution."
+                )
+            else:
+                existing_rationale.append(
+                    "v20.24 ATLAS source-resolved forced photometry remains unable to securely assign the drifting residual source."
+                )
+            existing_rationale.append(
+                "ATLAS target-image forced photometry was used instead of southern difference imaging; each source was measured independently at its frozen Gaia coordinate using the corrected Gaia-to-Gaia separation."
+            )
+            existing_rationale.append(
+                "The TESS frequency-drift law was not extrapolated into ATLAS epochs; accepted nightly light curves were searched independently inside the frozen residual-frequency band."
+            )
+            existing_rationale.append(
+                f"Recommended next confirmation step: {atlas_forced_photometry.get('recommendedNextTest')}."
+            )
+            claim_decision = {
+                "claim": claim_decision["claim"],
+                "rationale": existing_rationale,
+            }
+
+        if atlas_forced_photometry_reanalysis is not None:
+            existing_rationale = list(claim_decision.get("rationale") or [])
+            classification = atlas_forced_photometry_reanalysis.get("classification")
+            if classification == "ATLAS_REANALYSIS_COUNTERPART_RESIDUAL_BAND_VARIABILITY_SUPPORTED":
+                existing_rationale.append(
+                    "v20.25 statistically valid reanalysis of the immutable ATLAS target-image forced-photometry files finds cross-filter residual-frequency support on the frozen catalog counterpart but not Blind C."
+                )
+            elif classification == "ATLAS_REANALYSIS_TARGET_RESIDUAL_BAND_VARIABILITY_SUPPORTED":
+                existing_rationale.append(
+                    "v20.25 statistically valid reanalysis of the immutable ATLAS target-image forced-photometry files finds cross-filter residual-frequency support on Blind C."
+                )
+            elif classification == "ATLAS_REANALYSIS_TARGET_AND_COUNTERPART_RESIDUAL_BAND_VARIABILITY_SUPPORTED":
+                existing_rationale.append(
+                    "v20.25 statistically valid ATLAS forced-photometry reanalysis supports residual-band variability on both frozen Gaia sources."
+                )
+            elif classification == "ATLAS_REANALYSIS_NO_QUALIFYING_NIGHTLY_TIME_SERIES":
+                existing_rationale.append(
+                    "v20.25 corrects the v20.24 individual-SNR selection gate but still cannot form enough quality-controlled nightly ATLAS time series for a defensible residual-frequency test."
+                )
+            elif "SUGGESTIVE" in str(classification):
+                existing_rationale.append(
+                    "v20.25 ATLAS signed-flux reanalysis provides only single-filter or otherwise suggestive residual-frequency evidence and therefore does not promote the residual source attribution."
+                )
+            else:
+                existing_rationale.append(
+                    "v20.25 ATLAS signed-flux reanalysis remains unable to securely assign the drifting residual source."
+                )
+            existing_rationale.append(
+                "v20.25 is a methodological correction to v20.24: it reuses the same immutable ATLAS target-image files but removes the inappropriate requirement that each forced measurement be an individual positive >=3-sigma detection before nightly binning."
+            )
+            existing_rationale.append(
+                "Actual tphot errors and excessive fit chi/N remain rejected; signed quality-valid fluxes are inverse-variance binned nightly before the frozen residual-frequency search."
+            )
+            existing_rationale.append(
+                f"Recommended next confirmation step: {atlas_forced_photometry_reanalysis.get('recommendedNextTest')}."
+            )
+            claim_decision = {
+                "claim": claim_decision["claim"],
+                "rationale": existing_rationale,
+            }
+
+        if atlas_time_resolved is not None:
+            existing_rationale = list(claim_decision.get("rationale") or [])
+            classification = atlas_time_resolved.get("classification")
+
+            if classification == "ATLAS_TIME_RESOLVED_COUNTERPART_VARIABILITY_SUPPORTED":
+                existing_rationale.append(
+                    "v20.26 time-resolved ATLAS analysis finds strict residual-band recurrence on the frozen catalog counterpart across multiple independent observing seasons and filters."
+                )
+            elif classification == "ATLAS_TIME_RESOLVED_COUNTERPART_VARIABILITY_SUGGESTIVE":
+                existing_rationale.append(
+                    "v20.26 time-resolved ATLAS analysis finds recurrent strict residual-band evidence on the frozen catalog counterpart, but the preregistered multi-season/multi-filter support requirements are not fully satisfied."
+                )
+            elif classification == "ATLAS_TIME_RESOLVED_NO_QUALIFYING_SEASON_SERIES":
+                existing_rationale.append(
+                    "v20.26 cannot construct enough independent ATLAS season/filter series to perform the preregistered recurrence test."
+                )
+            else:
+                existing_rationale.append(
+                    "v20.26 splits the immutable ATLAS counterpart light curve into independent observing seasons but does not confirm strict recurrent residual-band variability."
+                )
+
+            existing_rationale.append(
+                "v20.26 does not lower the prominence>=2.0 gate that blocked the v20.25 global peaks; every seasonal result must independently satisfy the same acceptance threshold."
+            )
+            existing_rationale.append(
+                "The TESS frequency-drift law is not extrapolated into ATLAS epochs; any ATLAS frequency trend is fit only after independent seasonal frequencies are measured."
+            )
+            existing_rationale.append(
+                f"Recommended next confirmation step: {atlas_time_resolved.get('recommendedNextTest')}."
+            )
+
+            claim_decision = {
+                "claim": claim_decision["claim"],
+                "rationale": existing_rationale,
+            }
+
+        if atlas_fixed_window is not None:
+            existing_rationale = list(
+                claim_decision.get("rationale") or []
+            )
+            classification = atlas_fixed_window.get(
+                "classification"
+            )
+
+            if classification == "ATLAS_FIXED_WINDOW_COUNTERPART_VARIABILITY_SUPPORTED":
+                existing_rationale.append(
+                    "v20.27 fixed-window ATLAS analysis finds strict residual-band recurrence on the frozen catalog counterpart across multiple deterministic independent 180-day windows and both ATLAS filters."
+                )
+            elif classification == "ATLAS_FIXED_WINDOW_COUNTERPART_VARIABILITY_SUGGESTIVE":
+                existing_rationale.append(
+                    "v20.27 fixed-window ATLAS analysis finds strict residual-band recurrence on the frozen catalog counterpart in multiple deterministic windows, but the preregistered strong-support criteria are not fully satisfied."
+                )
+            elif classification == "ATLAS_FIXED_WINDOW_NO_QUALIFYING_WINDOW_SERIES":
+                existing_rationale.append(
+                    "v20.27 deterministic 180-day ATLAS windows do not contain enough quality-controlled cadence to perform the preregistered recurrence test."
+                )
+            else:
+                existing_rationale.append(
+                    "v20.27 deterministic 180-day ATLAS windows do not confirm strict recurrent residual-band variability on the frozen catalog counterpart."
+                )
+
+            existing_rationale.append(
+                "v20.27 corrects only the v20.26 segmentation rule: v20.26 produced one 4.6-year season because the ATLAS cadence contained no gap longer than 75 days. v20.27 uses non-overlapping 180-day bins anchored to absolute MJD zero, independent of the measured light curve and frequencies."
+            )
+            existing_rationale.append(
+                "The prominence>=2.0 gate is unchanged, search-grid boundary hits are rejected, and the TESS frequency-drift law is not extrapolated into ATLAS epochs."
+            )
+            existing_rationale.append(
+                f"Recommended next confirmation step: {atlas_fixed_window.get('recommendedNextTest')}."
+            )
+
+            claim_decision = {
+                "claim": claim_decision["claim"],
+                "rationale": existing_rationale,
+            }
+
+        if targeted_observation_plan is not None:
+            existing_rationale = list(
+                claim_decision.get("rationale") or []
+            )
+            existing_rationale.append(
+                "v20.28 treats the public archival branch as exhausted for the residual-source attribution question and freezes a targeted source-resolved observing experiment before new measurements are collected."
+            )
+            existing_rationale.append(
+                "The observation plan preserves the existing residual-frequency search band, the RELIABLE + prominence>=2.0 acceptance rule, cross-filter consistency, and time-resolved recurrence requirements rather than tuning thresholds after future data are seen."
+            )
+            existing_rationale.append(
+                "The campaign requires paired short/deep exposures so Blind C can remain unsaturated in the short tier while the fainter counterpart can reach useful precision in the deep tier; target saturation in deep frames is allowed only when it does not contaminate the counterpart measurement region."
+            )
+            existing_rationale.append(
+                "The established main periodic-family target association is unchanged; the new campaign tests only the drifting residual component."
+            )
+            existing_rationale.append(
+                f"Recommended next confirmation step: {targeted_observation_plan.get('recommendedNextTest')}."
+            )
+            claim_decision = {
+                "claim": claim_decision["claim"],
+                "rationale": existing_rationale,
+            }
+
         period_evidence = _build_period_evidence(
             claim_decision=claim_decision,
             selected_period=selected_period,
@@ -4487,7 +6608,25 @@ def build_engine(
                 "OFF_TARGET_VARIABLE_SOURCE_SUPPORTED",
             }
 
-        if external_high_resolution_validation is not None:
+        if targeted_observation_plan is not None:
+            recommended_next_test = targeted_observation_plan.get("recommendedNextTest")
+        elif atlas_fixed_window is not None:
+            recommended_next_test = atlas_fixed_window.get("recommendedNextTest")
+        elif atlas_time_resolved is not None:
+            recommended_next_test = atlas_time_resolved.get("recommendedNextTest")
+        elif atlas_forced_photometry_reanalysis is not None:
+            recommended_next_test = atlas_forced_photometry_reanalysis.get("recommendedNextTest")
+        elif atlas_forced_photometry is not None:
+            recommended_next_test = atlas_forced_photometry.get("recommendedNextTest")
+        elif des_dr2_se_local_forced_photometry is not None:
+            recommended_next_test = des_dr2_se_local_forced_photometry.get("recommendedNextTest")
+        elif noirlab_image_forced_photometry is not None:
+            recommended_next_test = noirlab_image_forced_photometry.get("recommendedNextTest")
+        elif nsc_resolved_photometry is not None:
+            recommended_next_test = nsc_resolved_photometry.get("recommendedNextTest")
+        elif skymapper_resolved_photometry is not None:
+            recommended_next_test = skymapper_resolved_photometry.get("recommendedNextTest")
+        elif external_high_resolution_validation is not None:
             recommended_next_test = external_high_resolution_validation.get("recommendedNextTest")
         elif official_spoc_prf_forward_modeling is not None:
             recommended_next_test = official_spoc_prf_forward_modeling.get("recommendedNextTest")
@@ -4560,6 +6699,15 @@ def build_engine(
             "frequencyLocalizedPixelResponse": frequency_localized_pixel_response,
             "officialSpocPrfForwardModeling": official_spoc_prf_forward_modeling,
             "externalHighResolutionVariabilityValidation": external_high_resolution_validation,
+            "skyMapperResolvedPhotometryScreen": skymapper_resolved_photometry,
+            "nscResolvedPhotometryScreen": nsc_resolved_photometry,
+            "noirlabImageForcedPhotometry": noirlab_image_forced_photometry,
+            "desDr2SeLocalForcedPhotometry": des_dr2_se_local_forced_photometry,
+            "atlasForcedPhotometry": atlas_forced_photometry,
+            "atlasForcedPhotometryReanalysis": atlas_forced_photometry_reanalysis,
+            "atlasTimeResolved": atlas_time_resolved,
+            "atlasFixedWindowRecurrence": atlas_fixed_window,
+            "targetedObservationPlan": targeted_observation_plan,
             "recommendedNextTest": recommended_next_test,
             "automaticDiscoveryClaim": False,
         }
@@ -4741,7 +6889,137 @@ def build_engine(
             print(f"   counterpart Gaia DR3: {pair.get('counterpartGaiaDR3SourceID')}")
             print(f"   target residual-band accepted: {target_external.get('acceptedResidualBandVariability')}")
             print(f"   counterpart residual-band accepted: {counterpart_external.get('acceptedResidualBandVariability')}")
-            print(f"   recommended next test: {external_high_resolution_validation.get('recommendedNextTest')}")
+            if skymapper_resolved_photometry is None:
+                print(f"   recommended next test: {external_high_resolution_validation.get('recommendedNextTest')}")
+        if skymapper_resolved_photometry is not None:
+            target_skymapper = skymapper_resolved_photometry.get("targetControl") or {}
+            counterpart_skymapper = skymapper_resolved_photometry.get("catalogCounterpartEvidence") or {}
+            print(f"   SkyMapper DR4 resolved photometry: {skymapper_resolved_photometry.get('classification')}")
+            print(f"   SkyMapper residual origin: {skymapper_resolved_photometry.get('residualModeOrigin')}")
+            print(f"   pair separately resolved: {skymapper_resolved_photometry.get('pairSeparatelyResolvedInSkyMapperMaster')}")
+            print(f"   target accepted bands: {target_skymapper.get('acceptedBands')}")
+            print(f"   counterpart accepted bands: {counterpart_skymapper.get('acceptedBands')}")
+            print(f"   recommended next test: {skymapper_resolved_photometry.get('recommendedNextTest')}")
+        if nsc_resolved_photometry is not None:
+            target_nsc = nsc_resolved_photometry.get("targetControl") or {}
+            counterpart_nsc = nsc_resolved_photometry.get("catalogCounterpartEvidence") or {}
+            print(f"   NSC DR2 resolved photometry: {nsc_resolved_photometry.get('classification')}")
+            print(f"   NSC residual origin: {nsc_resolved_photometry.get('residualModeOrigin')}")
+            print(f"   pair separately resolved in NSC: {nsc_resolved_photometry.get('pairSeparatelyResolvedInNSC')}")
+            print(f"   target accepted bands: {target_nsc.get('acceptedBands')}")
+            print(f"   counterpart accepted bands: {counterpart_nsc.get('acceptedBands')}")
+            print(f"   recommended next test: {nsc_resolved_photometry.get('recommendedNextTest')}")
+        if noirlab_image_forced_photometry is not None:
+            target_noirlab = noirlab_image_forced_photometry.get("targetControl") or {}
+            counterpart_noirlab = noirlab_image_forced_photometry.get("catalogCounterpartEvidence") or {}
+            print(f"   NOIRLab image forced photometry: {noirlab_image_forced_photometry.get('classification')}")
+            print(f"   NOIRLab image residual origin: {noirlab_image_forced_photometry.get('residualModeOrigin')}")
+            print(f"   candidate images: {noirlab_image_forced_photometry.get('candidateExposures')}")
+            print(f"   successful forced-photometry images: {noirlab_image_forced_photometry.get('successfulForcedPhotometryExposures')}")
+            print(f"   target accepted bands: {target_noirlab.get('acceptedBands')}")
+            print(f"   counterpart accepted bands: {counterpart_noirlab.get('acceptedBands')}")
+            print(f"   recommended next test: {noirlab_image_forced_photometry.get('recommendedNextTest')}")
+        if des_dr2_se_local_forced_photometry is not None:
+            target_des = des_dr2_se_local_forced_photometry.get("targetControl") or {}
+            counterpart_des = des_dr2_se_local_forced_photometry.get("catalogCounterpartEvidence") or {}
+            print(f"   DES DR2 source-local forced photometry: {des_dr2_se_local_forced_photometry.get('classification')}")
+            print(f"   DES residual origin: {des_dr2_se_local_forced_photometry.get('residualModeOrigin')}")
+            print(f"   actual Gaia pair separation: {des_dr2_se_local_forced_photometry.get('pairSeparationArcsec')} arcsec")
+            print(f"   candidate images: {des_dr2_se_local_forced_photometry.get('candidateExposures')}")
+            print(f"   source successes: {des_dr2_se_local_forced_photometry.get('sourceSuccesses')}")
+            print(f"   target accepted bands: {target_des.get('acceptedBands')}")
+            print(f"   counterpart accepted bands: {counterpart_des.get('acceptedBands')}")
+            print(f"   recommended next test: {des_dr2_se_local_forced_photometry.get('recommendedNextTest')}")
+        if atlas_forced_photometry is not None:
+            target_atlas = atlas_forced_photometry.get("targetControl") or {}
+            counterpart_atlas = atlas_forced_photometry.get("catalogCounterpartEvidence") or {}
+            print(f"   ATLAS forced photometry: {atlas_forced_photometry.get('classification')}")
+            print(f"   ATLAS residual origin: {atlas_forced_photometry.get('residualModeOrigin')}")
+            print(f"   corrected Gaia source separation: {atlas_forced_photometry.get('gaiaPairSeparationArcsec')} arcsec")
+            print(f"   target accepted bands: {target_atlas.get('acceptedBands')}")
+            print(f"   counterpart accepted bands: {counterpart_atlas.get('acceptedBands')}")
+            print(f"   recommended next test: {atlas_forced_photometry.get('recommendedNextTest')}")
+        if atlas_forced_photometry_reanalysis is not None:
+            target_atlas_re = atlas_forced_photometry_reanalysis.get("targetControl") or {}
+            counterpart_atlas_re = atlas_forced_photometry_reanalysis.get("catalogCounterpartEvidence") or {}
+            print(f"   ATLAS signed-flux reanalysis: {atlas_forced_photometry_reanalysis.get('classification')}")
+            print(f"   ATLAS reanalysis residual origin: {atlas_forced_photometry_reanalysis.get('residualModeOrigin')}")
+            print(f"   target accepted bands: {target_atlas_re.get('acceptedBands')}")
+            print(f"   counterpart accepted bands: {counterpart_atlas_re.get('acceptedBands')}")
+            print(f"   recommended next test: {atlas_forced_photometry_reanalysis.get('recommendedNextTest')}")
+        if atlas_time_resolved is not None:
+            counterpart_atlas_time = atlas_time_resolved.get("catalogCounterpartEvidence") or {}
+            print(f"   ATLAS time-resolved recurrence: {atlas_time_resolved.get('classification')}")
+            print(f"   ATLAS time-resolved residual origin: {atlas_time_resolved.get('residualModeOrigin')}")
+            print(f"   accepted seasons: {counterpart_atlas_time.get('acceptedSeasons')}")
+            print(f"   accepted bands: {counterpart_atlas_time.get('acceptedBands')}")
+            print(f"   cross-band-consistent seasons: {counterpart_atlas_time.get('crossBandConsistentSeasons')}")
+            print(f"   counterpart supported: {counterpart_atlas_time.get('sourceSupported')}")
+            print(f"   recommended next test: {atlas_time_resolved.get('recommendedNextTest')}")
+        if atlas_fixed_window is not None:
+            counterpart_atlas_fixed = (
+                atlas_fixed_window.get(
+                    "catalogCounterpartEvidence"
+                )
+                or {}
+            )
+            print(
+                "   ATLAS fixed-window recurrence: "
+                f"{atlas_fixed_window.get('classification')}"
+            )
+            print(
+                "   ATLAS fixed-window residual origin: "
+                f"{atlas_fixed_window.get('residualModeOrigin')}"
+            )
+            print(
+                "   accepted windows: "
+                f"{counterpart_atlas_fixed.get('acceptedWindows')}"
+            )
+            print(
+                "   accepted bands: "
+                f"{counterpart_atlas_fixed.get('acceptedBands')}"
+            )
+            print(
+                "   cross-band-consistent windows: "
+                f"{counterpart_atlas_fixed.get('crossBandConsistentWindows')}"
+            )
+            print(
+                "   counterpart supported: "
+                f"{counterpart_atlas_fixed.get('sourceSupported')}"
+            )
+            print(
+                "   recommended next test: "
+                f"{atlas_fixed_window.get('recommendedNextTest')}"
+            )
+        if targeted_observation_plan is not None:
+            geometry_plan = (
+                targeted_observation_plan.get("sourceGeometry") or {}
+            )
+            cadence_plan = (
+                targeted_observation_plan.get("cadence") or {}
+            )
+            print(
+                "   targeted observation plan: "
+                f"{targeted_observation_plan.get('status')}"
+            )
+            print(
+                "   Gaia source separation: "
+                f"{geometry_plan.get('separationArcsec')} arcsec"
+            )
+            print(
+                "   minimum/preferred baseline: "
+                f"{cadence_plan.get('minimumBaselineDays')} / "
+                f"{cadence_plan.get('preferredBaselineDays')} days"
+            )
+            print(
+                "   minimum/preferred nights: "
+                f"{cadence_plan.get('minimumDistinctNights')} / "
+                f"{cadence_plan.get('preferredDistinctNights')}"
+            )
+            print(
+                "   recommended next test: "
+                f"{targeted_observation_plan.get('recommendedNextTest')}"
+            )
         print(f"   report: {report_path}")
 
         project_ids = tuple(
@@ -4953,6 +7231,106 @@ def build_engine(
     engine.register_handler(
         "openstar.tess.external-high-resolution-variability-validation.interpret",
         external_high_resolution_interpret_stage,
+    )
+    engine.register_handler(
+        "openstar.tess.skymapper-resolved-photometry.prepare",
+        skymapper_resolved_prepare_stage,
+    )
+    engine.register_handler(
+        "openstar.tess.skymapper-resolved-photometry.run",
+        skymapper_resolved_run_stage,
+    )
+    engine.register_handler(
+        "openstar.tess.skymapper-resolved-photometry.interpret",
+        skymapper_resolved_interpret_stage,
+    )
+    engine.register_handler(
+        "openstar.tess.nsc-resolved-photometry.prepare",
+        nsc_resolved_prepare_stage,
+    )
+    engine.register_handler(
+        "openstar.tess.nsc-resolved-photometry.run",
+        nsc_resolved_run_stage,
+    )
+    engine.register_handler(
+        "openstar.tess.nsc-resolved-photometry.interpret",
+        nsc_resolved_interpret_stage,
+    )
+    engine.register_handler(
+        "openstar.tess.noirlab-image-forced-photometry.prepare",
+        noirlab_forced_prepare_stage,
+    )
+    engine.register_handler(
+        "openstar.tess.noirlab-image-forced-photometry.run",
+        noirlab_forced_run_stage,
+    )
+    engine.register_handler(
+        "openstar.tess.noirlab-image-forced-photometry.interpret",
+        noirlab_forced_interpret_stage,
+    )
+    engine.register_handler(
+        "openstar.tess.des-dr2-se-local-forced-photometry.prepare",
+        des_dr2_se_local_forced_prepare_stage,
+    )
+    engine.register_handler(
+        "openstar.tess.des-dr2-se-local-forced-photometry.run",
+        des_dr2_se_local_forced_run_stage,
+    )
+    engine.register_handler(
+        "openstar.tess.des-dr2-se-local-forced-photometry.interpret",
+        des_dr2_se_local_forced_interpret_stage,
+    )
+    engine.register_handler(
+        "openstar.tess.atlas-forced-photometry.prepare",
+        atlas_forced_prepare_stage,
+    )
+    engine.register_handler(
+        "openstar.tess.atlas-forced-photometry.run",
+        atlas_forced_run_stage,
+    )
+    engine.register_handler(
+        "openstar.tess.atlas-forced-photometry.interpret",
+        atlas_forced_interpret_stage,
+    )
+    engine.register_handler(
+        "openstar.tess.atlas-forced-photometry-reanalysis.prepare",
+        atlas_reanalysis_prepare_stage,
+    )
+    engine.register_handler(
+        "openstar.tess.atlas-forced-photometry-reanalysis.run",
+        atlas_reanalysis_run_stage,
+    )
+    engine.register_handler(
+        "openstar.tess.atlas-forced-photometry-reanalysis.interpret",
+        atlas_reanalysis_interpret_stage,
+    )
+    engine.register_handler(
+        "openstar.tess.atlas-time-resolved.prepare",
+        atlas_time_resolved_prepare_stage,
+    )
+    engine.register_handler(
+        "openstar.tess.atlas-time-resolved.run",
+        atlas_time_resolved_run_stage,
+    )
+    engine.register_handler(
+        "openstar.tess.atlas-time-resolved.interpret",
+        atlas_time_resolved_interpret_stage,
+    )
+    engine.register_handler(
+        "openstar.tess.atlas-fixed-window.prepare",
+        atlas_fixed_window_prepare_stage,
+    )
+    engine.register_handler(
+        "openstar.tess.atlas-fixed-window.run",
+        atlas_fixed_window_run_stage,
+    )
+    engine.register_handler(
+        "openstar.tess.atlas-fixed-window.interpret",
+        atlas_fixed_window_interpret_stage,
+    )
+    engine.register_handler(
+        "openstar.tess.targeted-observation-planning.generate",
+        targeted_observation_plan_stage,
     )
     engine.register_handler(
         "openstar.tess.period-semantics.reinterpret",

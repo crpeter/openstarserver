@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 
 from openstar_coordinator_client import OpenStarCoordinatorClient
@@ -19,7 +20,7 @@ from workflows.tess.tess_investigation import (
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "Run the OpenStar v20.19 deterministic TESS investigation plugin. "
+            "Run the OpenStar v20.20 deterministic TESS investigation plugin. "
             "It derives a single-target project from an existing frozen project, "
             "runs distributed compute, resolves catalogs, evaluates hypotheses, "
             "and conditionally launches same-sector and independent multi-sector follow-ups."
@@ -206,6 +207,87 @@ def parse_args():
             "Append v20.19 source-resolved external variability validation after v20.18 reaches the "
             "TESS spatial-attribution limit. Gaia DR3 epoch photometry is queried independently for the "
             "frozen target/counterpart pair; usable G-band series run as ordinary openstar.lomb-scargle.v1 datasets."
+        ),
+    )
+    recovery.add_argument(
+        "--continue-skymapper-resolved-photometry",
+        action="store_true",
+        help=(
+            "Append v20.20 SkyMapper DR4 resolved-epoch-photometry screening after v20.19 finds no Gaia DR3 epoch data. "
+            "Only distinct SkyMapper objects and clean, good-seeing PSF detections are admitted; usable single-band series "
+            "run as ordinary openstar.lomb-scargle.v1 datasets."
+        ),
+    )
+    recovery.add_argument(
+        "--continue-nsc-resolved-photometry",
+        action="store_true",
+        help=(
+            "Append v20.21 NOIRLab Source Catalog DR2 resolved-photometry screening after v20.20 remains unresolved. "
+            "The frozen Gaia pair must map to two distinct NSC objects; only same-exposure/filter co-detections that "
+            "independently position-match both sources are admitted to ordinary openstar.lomb-scargle.v1 work."
+        ),
+    )
+    recovery.add_argument(
+        "--continue-noirlab-image-forced-photometry",
+        action="store_true",
+        help=(
+            "Append v20.22 public NOIRLab image-level two-source forced photometry after v20.21 remains unresolved. "
+            "The frozen Gaia positions are fit directly in calibrated single-epoch SIA cutouts; only strict unsaturated, "
+            "well-resolved, well-conditioned source series become ordinary openstar.lomb-scargle.v1 datasets."
+        ),
+    )
+    recovery.add_argument(
+        "--continue-des-dr2-se-local-forced-photometry",
+        action="store_true",
+        help=(
+            "Append v20.23 DES DR2 single-epoch source-local forced photometry after v20.22 remains unresolved. "
+            "The two frozen Gaia sources are fit in independent local cutouts, so saturation of one source does not "
+            "automatically veto the other; accepted source-band series run as ordinary openstar.lomb-scargle.v1 datasets."
+        ),
+    )
+    recovery.add_argument(
+        "--continue-atlas-forced-photometry",
+        action="store_true",
+        help=(
+            "Append v20.24 ATLAS calibrated target-image forced photometry after v20.23 finds no DES single-epoch coverage. "
+            "Credentials are read from OPENSTAR_ATLAS_API_TOKEN or OPENSTAR_ATLAS_USERNAME/OPENSTAR_ATLAS_PASSWORD. "
+            "Accepted nightly source-band series run as ordinary openstar.lomb-scargle.v1 datasets."
+        ),
+    )
+    recovery.add_argument(
+        "--continue-atlas-forced-photometry-reanalysis",
+        action="store_true",
+        help=(
+            "Append v20.25 reanalysis of the immutable v20.24 ATLAS target-image files. "
+            "The inappropriate individual >=3-sigma detection gate is removed; signed quality-valid forced fluxes are "
+            "inverse-variance binned nightly before ordinary openstar.lomb-scargle.v1 work."
+        ),
+    )
+    recovery.add_argument(
+        "--continue-atlas-time-resolved",
+        action="store_true",
+        help=(
+            "Append v20.26 time-resolved ATLAS counterpart recurrence after the v20.25 global signed-flux analysis remains unresolved. "
+            "No new archive query is performed; the immutable counterpart light curve is split into shared c/o observing seasons and "
+            "each season/filter is searched independently with the unchanged strict prominence gate."
+        ),
+    )
+    recovery.add_argument(
+        "--continue-atlas-fixed-window-recurrence",
+        action="store_true",
+        help=(
+            "Append v20.27 deterministic ATLAS fixed-window counterpart recurrence after v20.26 gap-based splitting collapses into one season. "
+            "No new ATLAS query is performed. The immutable counterpart nightly photometry is divided into non-overlapping 180-day bins "
+            "anchored to absolute MJD zero; every window/filter keeps the unchanged RELIABLE + prominence>=2.0 acceptance rule."
+        ),
+    )
+    recovery.add_argument(
+        "--continue-targeted-observation-planning",
+        action="store_true",
+        help=(
+            "Append v20.28 targeted high-resolution time-series observation planning after v20.27 exhausts the archival recurrence branch. "
+            "This stage performs no new archive query and no distributed period search; it freezes the campaign cadence, image-quality, "
+            "paired exposure tiers, filters, acceptance criteria, and OpenStar ingest contract before new observations are collected."
         ),
     )
     return parser.parse_args()
@@ -1045,6 +1127,1009 @@ def _can_continue_external_high_resolution_variability_validation(investigation)
     )
 
 
+
+def _can_continue_skymapper_resolved_photometry(investigation) -> str:
+    """
+    Validate v20.20 continuation and return a recovery mode.
+
+    Modes:
+      NEW
+      RETRY_PREPARE
+      RETRY_RUN
+      RETRY_INTERPRET
+
+    Failed stages remain immutable provenance. Recovery appends a new stage.
+    """
+    if any(stage.status == "RUNNING" for stage in investigation.stages):
+        raise RuntimeError(
+            "Investigation contains a RUNNING stage. Use --resume before SkyMapper validation."
+        )
+
+    external = None
+    completed_interpretation = None
+    existing = []
+    prefix = "openstar.tess.skymapper-resolved-photometry."
+    for stage in investigation.stages:
+        if (
+            stage.handler_id == "openstar.tess.external-high-resolution-variability-validation.interpret"
+            and stage.status == "COMPLETE"
+        ):
+            external = stage.result
+        if stage.handler_id.startswith(prefix):
+            existing.append(stage)
+            if (
+                stage.handler_id == "openstar.tess.skymapper-resolved-photometry.interpret"
+                and stage.status == "COMPLETE"
+            ):
+                completed_interpretation = stage.result
+
+    if external is None:
+        raise RuntimeError(
+            "Run --continue-external-high-resolution-variability-validation first so v20.20 has the v20.19 result."
+        )
+    if external.get("recommendedNextTest") != "TARGETED_HIGH_RESOLUTION_TIME_SERIES_PHOTOMETRY":
+        raise RuntimeError(
+            "v20.19 did not leave the investigation at the targeted high-resolution follow-up branch."
+        )
+    if completed_interpretation is not None:
+        raise RuntimeError(
+            "Investigation already contains a completed v20.20 SkyMapper interpretation."
+        )
+
+    if investigation.status in {"COMPLETE", "HUMAN_REVIEW_REQUIRED"}:
+        if existing:
+            raise RuntimeError(
+                "Investigation already contains incomplete v20.20 stages but is terminal; refusing ambiguous duplicate history."
+            )
+        return "NEW"
+
+    if investigation.status != "FAILED":
+        raise RuntimeError(
+            "--continue-skymapper-resolved-photometry requires a terminal investigation or a FAILED v20.20 stage eligible for retry."
+        )
+    if not investigation.stages:
+        raise RuntimeError("FAILED investigation has no stage history to validate for v20.20 retry.")
+
+    failed_stage = investigation.stages[-1]
+    if failed_stage.status != "FAILED":
+        raise RuntimeError(
+            "FAILED investigation does not end in a FAILED stage; refusing ambiguous v20.20 recovery."
+        )
+
+    handler = failed_stage.handler_id
+    if handler == "openstar.tess.skymapper-resolved-photometry.prepare":
+        return "RETRY_PREPARE"
+    if handler == "openstar.tess.skymapper-resolved-photometry.run":
+        preparation = next(
+            (
+                stage.result
+                for stage in reversed(investigation.stages)
+                if stage.handler_id == "openstar.tess.skymapper-resolved-photometry.prepare"
+                and stage.status == "COMPLETE"
+                and stage.result is not None
+            ),
+            None,
+        )
+        if preparation is None or not preparation.get("projectPath"):
+            raise RuntimeError(
+                "Cannot retry the failed v20.20 run because its completed preparation/projectPath is missing."
+            )
+        return "RETRY_RUN"
+    if handler == "openstar.tess.skymapper-resolved-photometry.interpret":
+        preparation = next(
+            (
+                stage.result
+                for stage in reversed(investigation.stages)
+                if stage.handler_id == "openstar.tess.skymapper-resolved-photometry.prepare"
+                and stage.status == "COMPLETE"
+                and stage.result is not None
+            ),
+            None,
+        )
+        if preparation is None:
+            raise RuntimeError(
+                "Cannot retry the failed v20.20 interpretation because its completed preparation is missing."
+            )
+        return "RETRY_INTERPRET"
+
+    raise RuntimeError(
+        "--continue-skymapper-resolved-photometry can recover a FAILED investigation only when its most recent stage is a v20.20 prepare, run, or interpret stage."
+    )
+
+
+
+def _can_continue_nsc_resolved_photometry(investigation) -> str:
+    if any(stage.status == "RUNNING" for stage in investigation.stages):
+        raise RuntimeError(
+            "Investigation contains a RUNNING stage. Use --resume before NSC validation."
+        )
+
+    skymapper = None
+    completed_interpretation = None
+    existing = []
+    prefix = "openstar.tess.nsc-resolved-photometry."
+    for stage in investigation.stages:
+        if (
+            stage.handler_id == "openstar.tess.skymapper-resolved-photometry.interpret"
+            and stage.status == "COMPLETE"
+        ):
+            skymapper = stage.result
+        if stage.handler_id.startswith(prefix):
+            existing.append(stage)
+            if (
+                stage.handler_id == "openstar.tess.nsc-resolved-photometry.interpret"
+                and stage.status == "COMPLETE"
+            ):
+                completed_interpretation = stage.result
+
+    if skymapper is None:
+        raise RuntimeError(
+            "Run --continue-skymapper-resolved-photometry first so v20.21 has the v20.20 result."
+        )
+    if skymapper.get("recommendedNextTest") != "TARGETED_HIGH_RESOLUTION_TIME_SERIES_PHOTOMETRY":
+        raise RuntimeError(
+            "v20.20 did not leave the investigation at the targeted high-resolution follow-up branch."
+        )
+    if completed_interpretation is not None:
+        raise RuntimeError(
+            "Investigation already contains a completed v20.21 NSC interpretation."
+        )
+
+    if investigation.status in {"COMPLETE", "HUMAN_REVIEW_REQUIRED"}:
+        if existing:
+            raise RuntimeError(
+                "Investigation already contains incomplete v20.21 stages but is terminal; refusing ambiguous duplicate history."
+            )
+        return "NEW"
+
+    if investigation.status != "FAILED":
+        raise RuntimeError(
+            "--continue-nsc-resolved-photometry requires a terminal investigation or a FAILED v20.21 stage eligible for retry."
+        )
+    if not investigation.stages:
+        raise RuntimeError("FAILED investigation has no stage history to validate for v20.21 retry.")
+
+    failed_stage = investigation.stages[-1]
+    if failed_stage.status != "FAILED":
+        raise RuntimeError(
+            "FAILED investigation does not end in a FAILED stage; refusing ambiguous v20.21 recovery."
+        )
+
+    handler = failed_stage.handler_id
+    if handler == "openstar.tess.nsc-resolved-photometry.prepare":
+        return "RETRY_PREPARE"
+    if handler == "openstar.tess.nsc-resolved-photometry.run":
+        preparation = next(
+            (
+                stage.result
+                for stage in reversed(investigation.stages)
+                if stage.handler_id == "openstar.tess.nsc-resolved-photometry.prepare"
+                and stage.status == "COMPLETE"
+                and stage.result is not None
+            ),
+            None,
+        )
+        if preparation is None or not preparation.get("projectPath"):
+            raise RuntimeError(
+                "Cannot retry the failed v20.21 run because its completed preparation/projectPath is missing."
+            )
+        return "RETRY_RUN"
+    if handler == "openstar.tess.nsc-resolved-photometry.interpret":
+        preparation = next(
+            (
+                stage.result
+                for stage in reversed(investigation.stages)
+                if stage.handler_id == "openstar.tess.nsc-resolved-photometry.prepare"
+                and stage.status == "COMPLETE"
+                and stage.result is not None
+            ),
+            None,
+        )
+        if preparation is None:
+            raise RuntimeError(
+                "Cannot retry the failed v20.21 interpretation because its completed preparation is missing."
+            )
+        return "RETRY_INTERPRET"
+
+    raise RuntimeError(
+        "--continue-nsc-resolved-photometry can recover a FAILED investigation only when its most recent stage is a v20.21 prepare, run, or interpret stage."
+    )
+
+
+
+def _can_continue_noirlab_image_forced_photometry(investigation) -> str:
+    if any(stage.status == "RUNNING" for stage in investigation.stages):
+        raise RuntimeError(
+            "Investigation contains a RUNNING stage. Use --resume before NOIRLab image forced photometry."
+        )
+
+    nsc = None
+    completed_interpretation = None
+    existing = []
+    prefix = "openstar.tess.noirlab-image-forced-photometry."
+    for stage in investigation.stages:
+        if (
+            stage.handler_id == "openstar.tess.nsc-resolved-photometry.interpret"
+            and stage.status == "COMPLETE"
+        ):
+            nsc = stage.result
+        if stage.handler_id.startswith(prefix):
+            existing.append(stage)
+            if (
+                stage.handler_id == "openstar.tess.noirlab-image-forced-photometry.interpret"
+                and stage.status == "COMPLETE"
+            ):
+                completed_interpretation = stage.result
+
+    if nsc is None:
+        raise RuntimeError(
+            "Run --continue-nsc-resolved-photometry first so v20.22 has the v20.21 result."
+        )
+    if nsc.get("recommendedNextTest") != "TARGETED_HIGH_RESOLUTION_TIME_SERIES_PHOTOMETRY":
+        raise RuntimeError(
+            "v20.21 did not leave the investigation at the targeted high-resolution follow-up branch."
+        )
+    if completed_interpretation is not None:
+        raise RuntimeError(
+            "Investigation already contains a completed v20.22 NOIRLab image forced-photometry interpretation."
+        )
+
+    if investigation.status in {"COMPLETE", "HUMAN_REVIEW_REQUIRED"}:
+        if existing:
+            raise RuntimeError(
+                "Investigation already contains incomplete v20.22 stages but is terminal; refusing ambiguous duplicate history."
+            )
+        return "NEW"
+
+    if investigation.status != "FAILED":
+        raise RuntimeError(
+            "--continue-noirlab-image-forced-photometry requires a terminal investigation or a FAILED v20.22 stage eligible for retry."
+        )
+    if not investigation.stages:
+        raise RuntimeError("FAILED investigation has no stage history to validate for v20.22 retry.")
+
+    failed_stage = investigation.stages[-1]
+    if failed_stage.status != "FAILED":
+        raise RuntimeError(
+            "FAILED investigation does not end in a FAILED stage; refusing ambiguous v20.22 recovery."
+        )
+
+    handler = failed_stage.handler_id
+    if handler == "openstar.tess.noirlab-image-forced-photometry.prepare":
+        return "RETRY_PREPARE"
+    if handler == "openstar.tess.noirlab-image-forced-photometry.run":
+        preparation = next(
+            (
+                stage.result
+                for stage in reversed(investigation.stages)
+                if stage.handler_id == "openstar.tess.noirlab-image-forced-photometry.prepare"
+                and stage.status == "COMPLETE"
+                and stage.result is not None
+            ),
+            None,
+        )
+        if preparation is None or not preparation.get("projectPath"):
+            raise RuntimeError(
+                "Cannot retry the failed v20.22 run because its completed preparation/projectPath is missing."
+            )
+        return "RETRY_RUN"
+    if handler == "openstar.tess.noirlab-image-forced-photometry.interpret":
+        preparation = next(
+            (
+                stage.result
+                for stage in reversed(investigation.stages)
+                if stage.handler_id == "openstar.tess.noirlab-image-forced-photometry.prepare"
+                and stage.status == "COMPLETE"
+                and stage.result is not None
+            ),
+            None,
+        )
+        if preparation is None:
+            raise RuntimeError(
+                "Cannot retry the failed v20.22 interpretation because its completed preparation is missing."
+            )
+        return "RETRY_INTERPRET"
+
+    raise RuntimeError(
+        "--continue-noirlab-image-forced-photometry can recover a FAILED investigation only when its most recent stage is a v20.22 prepare, run, or interpret stage."
+    )
+
+
+def _can_continue_des_dr2_se_local_forced_photometry(investigation) -> str:
+    if any(stage.status == "RUNNING" for stage in investigation.stages):
+        raise RuntimeError(
+            "Investigation contains a RUNNING stage. Use --resume before DES DR2 source-local forced photometry."
+        )
+
+    noirlab = None
+    completed_interpretation = None
+    existing = []
+    prefix = "openstar.tess.des-dr2-se-local-forced-photometry."
+
+    for stage in investigation.stages:
+        if (
+            stage.handler_id == "openstar.tess.noirlab-image-forced-photometry.interpret"
+            and stage.status == "COMPLETE"
+        ):
+            noirlab = stage.result
+        if stage.handler_id.startswith(prefix):
+            existing.append(stage)
+            if (
+                stage.handler_id == "openstar.tess.des-dr2-se-local-forced-photometry.interpret"
+                and stage.status == "COMPLETE"
+            ):
+                completed_interpretation = stage.result
+
+    if noirlab is None:
+        raise RuntimeError(
+            "Run --continue-noirlab-image-forced-photometry first so v20.23 has the completed v20.22 result."
+        )
+    if noirlab.get("recommendedNextTest") != "TARGETED_HIGH_RESOLUTION_TIME_SERIES_PHOTOMETRY":
+        raise RuntimeError(
+            "v20.22 did not leave the investigation at the targeted high-resolution time-series branch."
+        )
+    if completed_interpretation is not None:
+        raise RuntimeError(
+            "Investigation already contains a completed v20.23 DES DR2 source-local interpretation."
+        )
+
+    if investigation.status in {"COMPLETE", "HUMAN_REVIEW_REQUIRED"}:
+        if existing:
+            raise RuntimeError(
+                "Investigation already contains incomplete v20.23 stages but is terminal; refusing ambiguous duplicate history."
+            )
+        return "NEW"
+
+    if investigation.status != "FAILED":
+        raise RuntimeError(
+            "--continue-des-dr2-se-local-forced-photometry requires a terminal investigation or a FAILED v20.23 stage eligible for retry."
+        )
+    if not investigation.stages:
+        raise RuntimeError("FAILED investigation has no stage history to validate for v20.23 retry.")
+
+    failed_stage = investigation.stages[-1]
+    if failed_stage.status != "FAILED":
+        raise RuntimeError(
+            "FAILED investigation does not end in a FAILED stage; refusing ambiguous v20.23 recovery."
+        )
+
+    handler = failed_stage.handler_id
+    if handler == "openstar.tess.des-dr2-se-local-forced-photometry.prepare":
+        return "RETRY_PREPARE"
+
+    if handler == "openstar.tess.des-dr2-se-local-forced-photometry.run":
+        preparation = next(
+            (
+                stage.result
+                for stage in reversed(investigation.stages)
+                if stage.handler_id == "openstar.tess.des-dr2-se-local-forced-photometry.prepare"
+                and stage.status == "COMPLETE"
+                and stage.result is not None
+            ),
+            None,
+        )
+        if preparation is None or not preparation.get("projectPath"):
+            raise RuntimeError(
+                "Cannot retry the failed v20.23 run because its completed preparation/projectPath is missing."
+            )
+        return "RETRY_RUN"
+
+    if handler == "openstar.tess.des-dr2-se-local-forced-photometry.interpret":
+        preparation = next(
+            (
+                stage.result
+                for stage in reversed(investigation.stages)
+                if stage.handler_id == "openstar.tess.des-dr2-se-local-forced-photometry.prepare"
+                and stage.status == "COMPLETE"
+                and stage.result is not None
+            ),
+            None,
+        )
+        if preparation is None:
+            raise RuntimeError(
+                "Cannot retry the failed v20.23 interpretation because its completed preparation is missing."
+            )
+        return "RETRY_INTERPRET"
+
+    raise RuntimeError(
+        "--continue-des-dr2-se-local-forced-photometry can recover a FAILED investigation only when its most recent stage is a v20.23 prepare, run, or interpret stage."
+    )
+
+
+def _atlas_credentials_available() -> bool:
+    token = (os.environ.get("OPENSTAR_ATLAS_API_TOKEN") or "").strip()
+    username = (os.environ.get("OPENSTAR_ATLAS_USERNAME") or "").strip()
+    password = (os.environ.get("OPENSTAR_ATLAS_PASSWORD") or "").strip()
+    return bool(token or (username and password))
+
+
+def _can_continue_atlas_forced_photometry(investigation) -> str:
+    # Credential preflight deliberately occurs before the caller changes the
+    # investigation status. Missing credentials therefore leave the terminal
+    # v20.23 investigation untouched.
+    if not _atlas_credentials_available():
+        raise RuntimeError(
+            "v20.24 requires ATLAS forced-photometry credentials before changing investigation state. "
+            "Set OPENSTAR_ATLAS_API_TOKEN, or set both OPENSTAR_ATLAS_USERNAME and OPENSTAR_ATLAS_PASSWORD."
+        )
+
+    if any(stage.status == "RUNNING" for stage in investigation.stages):
+        raise RuntimeError(
+            "Investigation contains a RUNNING stage. Use --resume before ATLAS forced photometry."
+        )
+
+    des = None
+    completed_interpretation = None
+    existing = []
+    prefix = "openstar.tess.atlas-forced-photometry."
+
+    for stage in investigation.stages:
+        if (
+            stage.handler_id == "openstar.tess.des-dr2-se-local-forced-photometry.interpret"
+            and stage.status == "COMPLETE"
+        ):
+            des = stage.result
+
+        if stage.handler_id.startswith(prefix):
+            existing.append(stage)
+            if (
+                stage.handler_id == "openstar.tess.atlas-forced-photometry.interpret"
+                and stage.status == "COMPLETE"
+            ):
+                completed_interpretation = stage.result
+
+    if des is None:
+        raise RuntimeError(
+            "Run --continue-des-dr2-se-local-forced-photometry first so v20.24 has the completed v20.23 result."
+        )
+
+    if des.get("recommendedNextTest") != "TARGETED_HIGH_RESOLUTION_TIME_SERIES_PHOTOMETRY":
+        raise RuntimeError(
+            "v20.23 did not leave the investigation at the targeted high-resolution time-series branch."
+        )
+
+    if completed_interpretation is not None:
+        raise RuntimeError(
+            "Investigation already contains a completed v20.24 ATLAS interpretation."
+        )
+
+    if investigation.status in {"COMPLETE", "HUMAN_REVIEW_REQUIRED"}:
+        if existing:
+            raise RuntimeError(
+                "Investigation already contains incomplete v20.24 stages but is terminal; refusing ambiguous duplicate history."
+            )
+        return "NEW"
+
+    if investigation.status != "FAILED":
+        raise RuntimeError(
+            "--continue-atlas-forced-photometry requires a terminal investigation or a FAILED v20.24 stage eligible for retry."
+        )
+
+    if not investigation.stages:
+        raise RuntimeError(
+            "FAILED investigation has no stage history to validate for v20.24 retry."
+        )
+
+    failed_stage = investigation.stages[-1]
+    if failed_stage.status != "FAILED":
+        raise RuntimeError(
+            "FAILED investigation does not end in a FAILED stage; refusing ambiguous v20.24 recovery."
+        )
+
+    handler = failed_stage.handler_id
+    if handler == "openstar.tess.atlas-forced-photometry.prepare":
+        return "RETRY_PREPARE"
+
+    if handler == "openstar.tess.atlas-forced-photometry.run":
+        preparation = next(
+            (
+                stage.result
+                for stage in reversed(investigation.stages)
+                if stage.handler_id == "openstar.tess.atlas-forced-photometry.prepare"
+                and stage.status == "COMPLETE"
+                and stage.result is not None
+            ),
+            None,
+        )
+        if preparation is None or not preparation.get("projectPath"):
+            raise RuntimeError(
+                "Cannot retry the failed v20.24 run because its completed preparation/projectPath is missing."
+            )
+        return "RETRY_RUN"
+
+    if handler == "openstar.tess.atlas-forced-photometry.interpret":
+        preparation = next(
+            (
+                stage.result
+                for stage in reversed(investigation.stages)
+                if stage.handler_id == "openstar.tess.atlas-forced-photometry.prepare"
+                and stage.status == "COMPLETE"
+                and stage.result is not None
+            ),
+            None,
+        )
+        if preparation is None:
+            raise RuntimeError(
+                "Cannot retry the failed v20.24 interpretation because its completed preparation is missing."
+            )
+        return "RETRY_INTERPRET"
+
+    raise RuntimeError(
+        "--continue-atlas-forced-photometry can recover a FAILED investigation only when its most recent stage is a v20.24 prepare, run, or interpret stage."
+    )
+
+
+def _can_continue_atlas_forced_photometry_reanalysis(investigation) -> str:
+    if any(stage.status == "RUNNING" for stage in investigation.stages):
+        raise RuntimeError(
+            "Investigation contains a RUNNING stage. Use --resume before ATLAS reanalysis."
+        )
+
+    atlas = None
+    completed_interpretation = None
+    existing = []
+    prefix = "openstar.tess.atlas-forced-photometry-reanalysis."
+
+    for stage in investigation.stages:
+        if (
+            stage.handler_id == "openstar.tess.atlas-forced-photometry.interpret"
+            and stage.status == "COMPLETE"
+        ):
+            atlas = stage.result
+
+        if stage.handler_id.startswith(prefix):
+            existing.append(stage)
+            if (
+                stage.handler_id == "openstar.tess.atlas-forced-photometry-reanalysis.interpret"
+                and stage.status == "COMPLETE"
+            ):
+                completed_interpretation = stage.result
+
+    if atlas is None:
+        raise RuntimeError(
+            "Run --continue-atlas-forced-photometry first so v20.25 has the completed v20.24 result."
+        )
+
+    if atlas.get("classification") != "ATLAS_NO_QUALIFYING_FORCED_PHOTOMETRY_TIME_SERIES":
+        raise RuntimeError(
+            "v20.25 is preregistered only for the completed v20.24 individual-SNR-gate correction branch."
+        )
+
+    if completed_interpretation is not None:
+        raise RuntimeError(
+            "Investigation already contains a completed v20.25 ATLAS reanalysis interpretation."
+        )
+
+    if investigation.status in {"COMPLETE", "HUMAN_REVIEW_REQUIRED"}:
+        if existing:
+            raise RuntimeError(
+                "Investigation already contains incomplete v20.25 stages but is terminal; refusing ambiguous duplicate history."
+            )
+        return "NEW"
+
+    if investigation.status != "FAILED":
+        raise RuntimeError(
+            "--continue-atlas-forced-photometry-reanalysis requires a terminal investigation or a FAILED v20.25 stage eligible for retry."
+        )
+
+    if not investigation.stages:
+        raise RuntimeError(
+            "FAILED investigation has no stage history to validate for v20.25 retry."
+        )
+
+    failed_stage = investigation.stages[-1]
+    if failed_stage.status != "FAILED":
+        raise RuntimeError(
+            "FAILED investigation does not end in a FAILED stage; refusing ambiguous v20.25 recovery."
+        )
+
+    handler = failed_stage.handler_id
+
+    if handler == "openstar.tess.atlas-forced-photometry-reanalysis.prepare":
+        return "RETRY_PREPARE"
+
+    if handler == "openstar.tess.atlas-forced-photometry-reanalysis.run":
+        preparation = next(
+            (
+                stage.result
+                for stage in reversed(investigation.stages)
+                if stage.handler_id == "openstar.tess.atlas-forced-photometry-reanalysis.prepare"
+                and stage.status == "COMPLETE"
+                and stage.result is not None
+            ),
+            None,
+        )
+        if preparation is None or not preparation.get("projectPath"):
+            raise RuntimeError(
+                "Cannot retry the failed v20.25 run because its completed preparation/projectPath is missing."
+            )
+        return "RETRY_RUN"
+
+    if handler == "openstar.tess.atlas-forced-photometry-reanalysis.interpret":
+        preparation = next(
+            (
+                stage.result
+                for stage in reversed(investigation.stages)
+                if stage.handler_id == "openstar.tess.atlas-forced-photometry-reanalysis.prepare"
+                and stage.status == "COMPLETE"
+                and stage.result is not None
+            ),
+            None,
+        )
+        if preparation is None:
+            raise RuntimeError(
+                "Cannot retry the failed v20.25 interpretation because its completed preparation is missing."
+            )
+        return "RETRY_INTERPRET"
+
+    raise RuntimeError(
+        "--continue-atlas-forced-photometry-reanalysis can recover a FAILED investigation only when its most recent stage is a v20.25 prepare, run, or interpret stage."
+    )
+
+
+def _can_continue_atlas_time_resolved(investigation) -> str:
+    if any(stage.status == "RUNNING" for stage in investigation.stages):
+        raise RuntimeError(
+            "Investigation contains a RUNNING stage. Use --resume before ATLAS time-resolved recurrence."
+        )
+
+    atlas_v20_25 = None
+    completed_interpretation = None
+    existing = []
+    prefix = "openstar.tess.atlas-time-resolved."
+
+    for stage in investigation.stages:
+        if (
+            stage.handler_id == "openstar.tess.atlas-forced-photometry-reanalysis.interpret"
+            and stage.status == "COMPLETE"
+        ):
+            atlas_v20_25 = stage.result
+
+        if stage.handler_id.startswith(prefix):
+            existing.append(stage)
+            if (
+                stage.handler_id == "openstar.tess.atlas-time-resolved.interpret"
+                and stage.status == "COMPLETE"
+            ):
+                completed_interpretation = stage.result
+
+    if atlas_v20_25 is None:
+        raise RuntimeError(
+            "Run --continue-atlas-forced-photometry-reanalysis first so v20.26 has the completed v20.25 result."
+        )
+
+    if atlas_v20_25.get("classification") != "ATLAS_REANALYSIS_SOURCE_ATTRIBUTION_UNRESOLVED":
+        raise RuntimeError(
+            "v20.26 is preregistered only for the completed unresolved v20.25 global ATLAS branch."
+        )
+
+    if completed_interpretation is not None:
+        raise RuntimeError(
+            "Investigation already contains a completed v20.26 ATLAS time-resolved interpretation."
+        )
+
+    if investigation.status in {"COMPLETE", "HUMAN_REVIEW_REQUIRED"}:
+        if existing:
+            raise RuntimeError(
+                "Investigation already contains incomplete v20.26 stages but is terminal; refusing ambiguous duplicate history."
+            )
+        return "NEW"
+
+    if investigation.status != "FAILED":
+        raise RuntimeError(
+            "--continue-atlas-time-resolved requires a terminal investigation or a FAILED v20.26 stage eligible for retry."
+        )
+
+    if not investigation.stages:
+        raise RuntimeError(
+            "FAILED investigation has no stage history to validate for v20.26 retry."
+        )
+
+    failed_stage = investigation.stages[-1]
+    if failed_stage.status != "FAILED":
+        raise RuntimeError(
+            "FAILED investigation does not end in a FAILED stage; refusing ambiguous v20.26 recovery."
+        )
+
+    handler = failed_stage.handler_id
+
+    if handler == "openstar.tess.atlas-time-resolved.prepare":
+        return "RETRY_PREPARE"
+
+    if handler == "openstar.tess.atlas-time-resolved.run":
+        preparation = next(
+            (
+                stage.result
+                for stage in reversed(investigation.stages)
+                if stage.handler_id == "openstar.tess.atlas-time-resolved.prepare"
+                and stage.status == "COMPLETE"
+                and stage.result is not None
+            ),
+            None,
+        )
+        if preparation is None or not preparation.get("projectPath"):
+            raise RuntimeError(
+                "Cannot retry the failed v20.26 run because its completed preparation/projectPath is missing."
+            )
+        return "RETRY_RUN"
+
+    if handler == "openstar.tess.atlas-time-resolved.interpret":
+        preparation = next(
+            (
+                stage.result
+                for stage in reversed(investigation.stages)
+                if stage.handler_id == "openstar.tess.atlas-time-resolved.prepare"
+                and stage.status == "COMPLETE"
+                and stage.result is not None
+            ),
+            None,
+        )
+        if preparation is None:
+            raise RuntimeError(
+                "Cannot retry the failed v20.26 interpretation because its completed preparation is missing."
+            )
+        return "RETRY_INTERPRET"
+
+    raise RuntimeError(
+        "--continue-atlas-time-resolved can recover a FAILED investigation only when its most recent stage is a v20.26 prepare, run, or interpret stage."
+    )
+
+
+def _can_continue_atlas_fixed_window_recurrence(
+    investigation,
+) -> str:
+    if any(
+        stage.status == "RUNNING"
+        for stage in investigation.stages
+    ):
+        raise RuntimeError(
+            "Investigation contains a RUNNING stage. "
+            "Use --resume before ATLAS fixed-window recurrence."
+        )
+
+    atlas_v20_26 = None
+    completed_interpretation = None
+    existing = []
+    prefix = "openstar.tess.atlas-fixed-window."
+
+    for stage in investigation.stages:
+        if (
+            stage.handler_id
+            == "openstar.tess.atlas-time-resolved.interpret"
+            and stage.status == "COMPLETE"
+        ):
+            atlas_v20_26 = stage.result
+
+        if stage.handler_id.startswith(prefix):
+            existing.append(stage)
+
+            if (
+                stage.handler_id
+                == "openstar.tess.atlas-fixed-window.interpret"
+                and stage.status == "COMPLETE"
+            ):
+                completed_interpretation = stage.result
+
+    if atlas_v20_26 is None:
+        raise RuntimeError(
+            "Run --continue-atlas-time-resolved first so "
+            "v20.27 has the completed v20.26 result."
+        )
+
+    if atlas_v20_26.get("classification") != (
+        "ATLAS_TIME_RESOLVED_COUNTERPART_RECURRENCE_NOT_CONFIRMED"
+    ):
+        raise RuntimeError(
+            "v20.27 is preregistered only for the completed "
+            "v20.26 single-gap-season branch."
+        )
+
+    seasons = atlas_v20_26.get("seasons") or []
+    if len(seasons) != 1:
+        raise RuntimeError(
+            "v20.27 is specifically the correction for v20.26 "
+            "producing exactly one cadence-gap season."
+        )
+
+    if completed_interpretation is not None:
+        raise RuntimeError(
+            "Investigation already contains a completed "
+            "v20.27 ATLAS fixed-window interpretation."
+        )
+
+    if investigation.status in {
+        "COMPLETE",
+        "HUMAN_REVIEW_REQUIRED",
+    }:
+        if existing:
+            raise RuntimeError(
+                "Investigation already contains incomplete v20.27 "
+                "stages but is terminal; refusing ambiguous duplicate history."
+            )
+        return "NEW"
+
+    if investigation.status != "FAILED":
+        raise RuntimeError(
+            "--continue-atlas-fixed-window-recurrence requires "
+            "a terminal investigation or a FAILED v20.27 stage "
+            "eligible for retry."
+        )
+
+    if not investigation.stages:
+        raise RuntimeError(
+            "FAILED investigation has no stage history "
+            "to validate for v20.27 retry."
+        )
+
+    failed_stage = investigation.stages[-1]
+    if failed_stage.status != "FAILED":
+        raise RuntimeError(
+            "FAILED investigation does not end in a FAILED stage; "
+            "refusing ambiguous v20.27 recovery."
+        )
+
+    handler = failed_stage.handler_id
+
+    if handler == "openstar.tess.atlas-fixed-window.prepare":
+        return "RETRY_PREPARE"
+
+    if handler == "openstar.tess.atlas-fixed-window.run":
+        preparation = next(
+            (
+                stage.result
+                for stage in reversed(
+                    investigation.stages
+                )
+                if (
+                    stage.handler_id
+                    == "openstar.tess.atlas-fixed-window.prepare"
+                    and stage.status == "COMPLETE"
+                    and stage.result is not None
+                )
+            ),
+            None,
+        )
+
+        if (
+            preparation is None
+            or not preparation.get("projectPath")
+        ):
+            raise RuntimeError(
+                "Cannot retry the failed v20.27 run because "
+                "its completed preparation/projectPath is missing."
+            )
+
+        return "RETRY_RUN"
+
+    if handler == "openstar.tess.atlas-fixed-window.interpret":
+        preparation = next(
+            (
+                stage.result
+                for stage in reversed(
+                    investigation.stages
+                )
+                if (
+                    stage.handler_id
+                    == "openstar.tess.atlas-fixed-window.prepare"
+                    and stage.status == "COMPLETE"
+                    and stage.result is not None
+                )
+            ),
+            None,
+        )
+
+        if preparation is None:
+            raise RuntimeError(
+                "Cannot retry the failed v20.27 interpretation "
+                "because its completed preparation is missing."
+            )
+
+        return "RETRY_INTERPRET"
+
+    raise RuntimeError(
+        "--continue-atlas-fixed-window-recurrence can recover "
+        "a FAILED investigation only when its most recent stage "
+        "is a v20.27 prepare, run, or interpret stage."
+    )
+
+
+def _can_continue_targeted_observation_planning(
+    investigation,
+) -> str:
+    if any(
+        stage.status == "RUNNING"
+        for stage in investigation.stages
+    ):
+        raise RuntimeError(
+            "Investigation contains a RUNNING stage. "
+            "Use --resume before targeted observation planning."
+        )
+
+    atlas_fixed = None
+    completed_plan = None
+    existing = []
+    prefix = "openstar.tess.targeted-observation-planning."
+
+    for stage in investigation.stages:
+        if (
+            stage.handler_id
+            == "openstar.tess.atlas-fixed-window.interpret"
+            and stage.status == "COMPLETE"
+        ):
+            atlas_fixed = stage.result
+
+        if stage.handler_id.startswith(prefix):
+            existing.append(stage)
+            if (
+                stage.handler_id
+                == "openstar.tess.targeted-observation-planning.generate"
+                and stage.status == "COMPLETE"
+            ):
+                completed_plan = stage.result
+
+    if atlas_fixed is None:
+        raise RuntimeError(
+            "Run --continue-atlas-fixed-window-recurrence first so "
+            "v20.28 has the completed v20.27 result."
+        )
+
+    if atlas_fixed.get("recommendedNextTest") != (
+        "TARGETED_HIGH_RESOLUTION_TIME_SERIES_PHOTOMETRY"
+    ):
+        raise RuntimeError(
+            "v20.27 did not leave the investigation at targeted "
+            "high-resolution time-series photometry."
+        )
+
+    if completed_plan is not None:
+        raise RuntimeError(
+            "Investigation already contains a completed "
+            "v20.28 targeted observation plan."
+        )
+
+    if investigation.status in {
+        "COMPLETE",
+        "HUMAN_REVIEW_REQUIRED",
+    }:
+        if existing:
+            raise RuntimeError(
+                "Investigation already contains incomplete v20.28 "
+                "stages but is terminal; refusing ambiguous duplicate history."
+            )
+        return "NEW"
+
+    if investigation.status != "FAILED":
+        raise RuntimeError(
+            "--continue-targeted-observation-planning requires a terminal "
+            "investigation or a FAILED v20.28 stage eligible for retry."
+        )
+
+    if not investigation.stages:
+        raise RuntimeError(
+            "FAILED investigation has no stage history "
+            "to validate for v20.28 retry."
+        )
+
+    failed_stage = investigation.stages[-1]
+    if failed_stage.status != "FAILED":
+        raise RuntimeError(
+            "FAILED investigation does not end in a FAILED stage; "
+            "refusing ambiguous v20.28 recovery."
+        )
+
+    if (
+        failed_stage.handler_id
+        == "openstar.tess.targeted-observation-planning.generate"
+    ):
+        return "RETRY_GENERATE"
+
+    raise RuntimeError(
+        "--continue-targeted-observation-planning can recover a FAILED "
+        "investigation only when its most recent stage is the "
+        "v20.28 observation-plan generation stage."
+    )
+
+
 def main():
     args = parse_args()
     store = InvestigationStore(args.store)
@@ -1068,6 +2153,15 @@ def main():
     recovered_orphaned_status = False
     retrying_failed_official_spoc_prf_prepare = False
     external_high_resolution_recovery_mode = None
+    skymapper_recovery_mode = None
+    nsc_recovery_mode = None
+    noirlab_forced_recovery_mode = None
+    des_dr2_se_local_recovery_mode = None
+    atlas_forced_recovery_mode = None
+    atlas_reanalysis_recovery_mode = None
+    atlas_time_resolved_recovery_mode = None
+    atlas_fixed_window_recovery_mode = None
+    targeted_observation_plan_recovery_mode = None
 
     if args.resume:
         investigation = store.load(args.investigation_id)
@@ -1433,6 +2527,484 @@ def main():
                 parameters={"distributedRunExpected": distributed_run_expected},
                 triggered_by_stage_id=last_stage_id,
             )
+    elif args.continue_skymapper_resolved_photometry:
+        investigation = store.load(args.investigation_id)
+        if investigation.workflow_id != WORKFLOW_ID:
+            raise RuntimeError(
+                "Cannot continue investigation with a different workflow: "
+                f"{investigation.workflow_id}"
+            )
+        skymapper_recovery_mode = _can_continue_skymapper_resolved_photometry(investigation)
+        last_stage_id = investigation.stages[-1].id if investigation.stages else None
+        next_number = _next_stage_number(investigation)
+        investigation = store.set_status(investigation, "RUNNING")
+
+        if skymapper_recovery_mode in {"NEW", "RETRY_PREPARE"}:
+            initial_stage = StageRequest(
+                id=f"{next_number:03d}-prepare-skymapper-resolved-photometry",
+                handler_id="openstar.tess.skymapper-resolved-photometry.prepare",
+                parameters={},
+                triggered_by_stage_id=last_stage_id,
+            )
+        elif skymapper_recovery_mode == "RETRY_RUN":
+            preparation = next(
+                stage.result
+                for stage in reversed(investigation.stages)
+                if stage.handler_id == "openstar.tess.skymapper-resolved-photometry.prepare"
+                and stage.status == "COMPLETE"
+                and stage.result is not None
+            )
+            initial_stage = StageRequest(
+                id=f"{next_number:03d}-run-skymapper-resolved-photometry",
+                handler_id="openstar.tess.skymapper-resolved-photometry.run",
+                parameters={"projectPath": preparation["projectPath"]},
+                triggered_by_stage_id=last_stage_id,
+            )
+        else:
+            distributed_run_expected = any(
+                stage.handler_id == "openstar.tess.skymapper-resolved-photometry.run"
+                and stage.status == "COMPLETE"
+                for stage in investigation.stages
+            )
+            initial_stage = StageRequest(
+                id=f"{next_number:03d}-interpret-skymapper-resolved-photometry",
+                handler_id="openstar.tess.skymapper-resolved-photometry.interpret",
+                parameters={"distributedRunExpected": distributed_run_expected},
+                triggered_by_stage_id=last_stage_id,
+            )
+    elif args.continue_nsc_resolved_photometry:
+        investigation = store.load(args.investigation_id)
+        if investigation.workflow_id != WORKFLOW_ID:
+            raise RuntimeError(
+                "Cannot continue investigation with a different workflow: "
+                f"{investigation.workflow_id}"
+            )
+        nsc_recovery_mode = _can_continue_nsc_resolved_photometry(investigation)
+        last_stage_id = investigation.stages[-1].id if investigation.stages else None
+        next_number = _next_stage_number(investigation)
+        investigation = store.set_status(investigation, "RUNNING")
+
+        if nsc_recovery_mode in {"NEW", "RETRY_PREPARE"}:
+            initial_stage = StageRequest(
+                id=f"{next_number:03d}-prepare-nsc-resolved-photometry",
+                handler_id="openstar.tess.nsc-resolved-photometry.prepare",
+                parameters={},
+                triggered_by_stage_id=last_stage_id,
+            )
+        elif nsc_recovery_mode == "RETRY_RUN":
+            preparation = next(
+                stage.result
+                for stage in reversed(investigation.stages)
+                if stage.handler_id == "openstar.tess.nsc-resolved-photometry.prepare"
+                and stage.status == "COMPLETE"
+                and stage.result is not None
+            )
+            initial_stage = StageRequest(
+                id=f"{next_number:03d}-run-nsc-resolved-photometry",
+                handler_id="openstar.tess.nsc-resolved-photometry.run",
+                parameters={"projectPath": preparation["projectPath"]},
+                triggered_by_stage_id=last_stage_id,
+            )
+        else:
+            distributed_run_expected = any(
+                stage.handler_id == "openstar.tess.nsc-resolved-photometry.run"
+                and stage.status == "COMPLETE"
+                for stage in investigation.stages
+            )
+            initial_stage = StageRequest(
+                id=f"{next_number:03d}-interpret-nsc-resolved-photometry",
+                handler_id="openstar.tess.nsc-resolved-photometry.interpret",
+                parameters={"distributedRunExpected": distributed_run_expected},
+                triggered_by_stage_id=last_stage_id,
+            )
+    elif args.continue_noirlab_image_forced_photometry:
+        investigation = store.load(args.investigation_id)
+        if investigation.workflow_id != WORKFLOW_ID:
+            raise RuntimeError(
+                "Cannot continue investigation with a different workflow: "
+                f"{investigation.workflow_id}"
+            )
+        noirlab_forced_recovery_mode = _can_continue_noirlab_image_forced_photometry(investigation)
+        last_stage_id = investigation.stages[-1].id if investigation.stages else None
+        next_number = _next_stage_number(investigation)
+        investigation = store.set_status(investigation, "RUNNING")
+
+        if noirlab_forced_recovery_mode in {"NEW", "RETRY_PREPARE"}:
+            initial_stage = StageRequest(
+                id=f"{next_number:03d}-prepare-noirlab-image-forced-photometry",
+                handler_id="openstar.tess.noirlab-image-forced-photometry.prepare",
+                parameters={},
+                triggered_by_stage_id=last_stage_id,
+            )
+        elif noirlab_forced_recovery_mode == "RETRY_RUN":
+            preparation = next(
+                stage.result
+                for stage in reversed(investigation.stages)
+                if stage.handler_id == "openstar.tess.noirlab-image-forced-photometry.prepare"
+                and stage.status == "COMPLETE"
+                and stage.result is not None
+            )
+            initial_stage = StageRequest(
+                id=f"{next_number:03d}-run-noirlab-image-forced-photometry",
+                handler_id="openstar.tess.noirlab-image-forced-photometry.run",
+                parameters={"projectPath": preparation["projectPath"]},
+                triggered_by_stage_id=last_stage_id,
+            )
+        else:
+            distributed_run_expected = any(
+                stage.handler_id == "openstar.tess.noirlab-image-forced-photometry.run"
+                and stage.status == "COMPLETE"
+                for stage in investigation.stages
+            )
+            initial_stage = StageRequest(
+                id=f"{next_number:03d}-interpret-noirlab-image-forced-photometry",
+                handler_id="openstar.tess.noirlab-image-forced-photometry.interpret",
+                parameters={"distributedRunExpected": distributed_run_expected},
+                triggered_by_stage_id=last_stage_id,
+            )
+    elif args.continue_des_dr2_se_local_forced_photometry:
+        investigation = store.load(args.investigation_id)
+        if investigation.workflow_id != WORKFLOW_ID:
+            raise RuntimeError(
+                "Cannot continue investigation with a different workflow: "
+                f"{investigation.workflow_id}"
+            )
+
+        des_dr2_se_local_recovery_mode = (
+            _can_continue_des_dr2_se_local_forced_photometry(investigation)
+        )
+        last_stage_id = investigation.stages[-1].id if investigation.stages else None
+        next_number = _next_stage_number(investigation)
+        investigation = store.set_status(investigation, "RUNNING")
+
+        if des_dr2_se_local_recovery_mode in {"NEW", "RETRY_PREPARE"}:
+            initial_stage = StageRequest(
+                id=f"{next_number:03d}-prepare-des-dr2-se-local-forced-photometry",
+                handler_id="openstar.tess.des-dr2-se-local-forced-photometry.prepare",
+                parameters={},
+                triggered_by_stage_id=last_stage_id,
+            )
+        elif des_dr2_se_local_recovery_mode == "RETRY_RUN":
+            preparation = next(
+                stage.result
+                for stage in reversed(investigation.stages)
+                if stage.handler_id == "openstar.tess.des-dr2-se-local-forced-photometry.prepare"
+                and stage.status == "COMPLETE"
+                and stage.result is not None
+            )
+            initial_stage = StageRequest(
+                id=f"{next_number:03d}-run-des-dr2-se-local-forced-photometry",
+                handler_id="openstar.tess.des-dr2-se-local-forced-photometry.run",
+                parameters={"projectPath": preparation["projectPath"]},
+                triggered_by_stage_id=last_stage_id,
+            )
+        else:
+            distributed_run_expected = any(
+                stage.handler_id == "openstar.tess.des-dr2-se-local-forced-photometry.run"
+                and stage.status == "COMPLETE"
+                for stage in investigation.stages
+            )
+            initial_stage = StageRequest(
+                id=f"{next_number:03d}-interpret-des-dr2-se-local-forced-photometry",
+                handler_id="openstar.tess.des-dr2-se-local-forced-photometry.interpret",
+                parameters={"distributedRunExpected": distributed_run_expected},
+                triggered_by_stage_id=last_stage_id,
+            )
+
+    elif args.continue_atlas_forced_photometry:
+        investigation = store.load(args.investigation_id)
+        if investigation.workflow_id != WORKFLOW_ID:
+            raise RuntimeError(
+                "Cannot continue investigation with a different workflow: "
+                f"{investigation.workflow_id}"
+            )
+
+        atlas_forced_recovery_mode = _can_continue_atlas_forced_photometry(
+            investigation
+        )
+        last_stage_id = investigation.stages[-1].id if investigation.stages else None
+        next_number = _next_stage_number(investigation)
+
+        # This mutation occurs only after credential/recovery validation.
+        investigation = store.set_status(investigation, "RUNNING")
+
+        if atlas_forced_recovery_mode in {"NEW", "RETRY_PREPARE"}:
+            initial_stage = StageRequest(
+                id=f"{next_number:03d}-prepare-atlas-forced-photometry",
+                handler_id="openstar.tess.atlas-forced-photometry.prepare",
+                parameters={},
+                triggered_by_stage_id=last_stage_id,
+            )
+        elif atlas_forced_recovery_mode == "RETRY_RUN":
+            preparation = next(
+                stage.result
+                for stage in reversed(investigation.stages)
+                if stage.handler_id == "openstar.tess.atlas-forced-photometry.prepare"
+                and stage.status == "COMPLETE"
+                and stage.result is not None
+            )
+            initial_stage = StageRequest(
+                id=f"{next_number:03d}-run-atlas-forced-photometry",
+                handler_id="openstar.tess.atlas-forced-photometry.run",
+                parameters={"projectPath": preparation["projectPath"]},
+                triggered_by_stage_id=last_stage_id,
+            )
+        else:
+            distributed_run_expected = any(
+                stage.handler_id == "openstar.tess.atlas-forced-photometry.run"
+                and stage.status == "COMPLETE"
+                for stage in investigation.stages
+            )
+            initial_stage = StageRequest(
+                id=f"{next_number:03d}-interpret-atlas-forced-photometry",
+                handler_id="openstar.tess.atlas-forced-photometry.interpret",
+                parameters={"distributedRunExpected": distributed_run_expected},
+                triggered_by_stage_id=last_stage_id,
+            )
+
+    elif args.continue_atlas_forced_photometry_reanalysis:
+        investigation = store.load(args.investigation_id)
+        if investigation.workflow_id != WORKFLOW_ID:
+            raise RuntimeError(
+                "Cannot continue investigation with a different workflow: "
+                f"{investigation.workflow_id}"
+            )
+
+        atlas_reanalysis_recovery_mode = (
+            _can_continue_atlas_forced_photometry_reanalysis(investigation)
+        )
+        last_stage_id = investigation.stages[-1].id if investigation.stages else None
+        next_number = _next_stage_number(investigation)
+        investigation = store.set_status(investigation, "RUNNING")
+
+        if atlas_reanalysis_recovery_mode in {"NEW", "RETRY_PREPARE"}:
+            initial_stage = StageRequest(
+                id=f"{next_number:03d}-prepare-atlas-forced-photometry-reanalysis",
+                handler_id="openstar.tess.atlas-forced-photometry-reanalysis.prepare",
+                parameters={},
+                triggered_by_stage_id=last_stage_id,
+            )
+        elif atlas_reanalysis_recovery_mode == "RETRY_RUN":
+            preparation = next(
+                stage.result
+                for stage in reversed(investigation.stages)
+                if stage.handler_id == "openstar.tess.atlas-forced-photometry-reanalysis.prepare"
+                and stage.status == "COMPLETE"
+                and stage.result is not None
+            )
+            initial_stage = StageRequest(
+                id=f"{next_number:03d}-run-atlas-forced-photometry-reanalysis",
+                handler_id="openstar.tess.atlas-forced-photometry-reanalysis.run",
+                parameters={"projectPath": preparation["projectPath"]},
+                triggered_by_stage_id=last_stage_id,
+            )
+        else:
+            distributed_run_expected = any(
+                stage.handler_id == "openstar.tess.atlas-forced-photometry-reanalysis.run"
+                and stage.status == "COMPLETE"
+                for stage in investigation.stages
+            )
+            initial_stage = StageRequest(
+                id=f"{next_number:03d}-interpret-atlas-forced-photometry-reanalysis",
+                handler_id="openstar.tess.atlas-forced-photometry-reanalysis.interpret",
+                parameters={"distributedRunExpected": distributed_run_expected},
+                triggered_by_stage_id=last_stage_id,
+            )
+
+    elif args.continue_atlas_time_resolved:
+        investigation = store.load(args.investigation_id)
+
+        if investigation.workflow_id != WORKFLOW_ID:
+            raise RuntimeError(
+                "Cannot continue investigation with a different workflow: "
+                f"{investigation.workflow_id}"
+            )
+
+        atlas_time_resolved_recovery_mode = _can_continue_atlas_time_resolved(
+            investigation
+        )
+        last_stage_id = investigation.stages[-1].id if investigation.stages else None
+        next_number = _next_stage_number(investigation)
+        investigation = store.set_status(investigation, "RUNNING")
+
+        if atlas_time_resolved_recovery_mode in {"NEW", "RETRY_PREPARE"}:
+            initial_stage = StageRequest(
+                id=f"{next_number:03d}-prepare-atlas-time-resolved",
+                handler_id="openstar.tess.atlas-time-resolved.prepare",
+                parameters={},
+                triggered_by_stage_id=last_stage_id,
+            )
+        elif atlas_time_resolved_recovery_mode == "RETRY_RUN":
+            preparation = next(
+                stage.result
+                for stage in reversed(investigation.stages)
+                if stage.handler_id == "openstar.tess.atlas-time-resolved.prepare"
+                and stage.status == "COMPLETE"
+                and stage.result is not None
+            )
+            initial_stage = StageRequest(
+                id=f"{next_number:03d}-run-atlas-time-resolved",
+                handler_id="openstar.tess.atlas-time-resolved.run",
+                parameters={"projectPath": preparation["projectPath"]},
+                triggered_by_stage_id=last_stage_id,
+            )
+        else:
+            distributed_run_expected = any(
+                stage.handler_id == "openstar.tess.atlas-time-resolved.run"
+                and stage.status == "COMPLETE"
+                for stage in investigation.stages
+            )
+            initial_stage = StageRequest(
+                id=f"{next_number:03d}-interpret-atlas-time-resolved",
+                handler_id="openstar.tess.atlas-time-resolved.interpret",
+                parameters={"distributedRunExpected": distributed_run_expected},
+                triggered_by_stage_id=last_stage_id,
+            )
+
+    elif args.continue_atlas_fixed_window_recurrence:
+        investigation = store.load(
+            args.investigation_id
+        )
+
+        if investigation.workflow_id != WORKFLOW_ID:
+            raise RuntimeError(
+                "Cannot continue investigation with a different workflow: "
+                f"{investigation.workflow_id}"
+            )
+
+        atlas_fixed_window_recovery_mode = (
+            _can_continue_atlas_fixed_window_recurrence(
+                investigation
+            )
+        )
+
+        last_stage_id = (
+            investigation.stages[-1].id
+            if investigation.stages
+            else None
+        )
+        next_number = _next_stage_number(
+            investigation
+        )
+        investigation = store.set_status(
+            investigation,
+            "RUNNING",
+        )
+
+        if atlas_fixed_window_recovery_mode in {
+            "NEW",
+            "RETRY_PREPARE",
+        }:
+            initial_stage = StageRequest(
+                id=(
+                    f"{next_number:03d}-"
+                    "prepare-atlas-fixed-window"
+                ),
+                handler_id=(
+                    "openstar.tess.atlas-fixed-window.prepare"
+                ),
+                parameters={},
+                triggered_by_stage_id=last_stage_id,
+            )
+
+        elif atlas_fixed_window_recovery_mode == "RETRY_RUN":
+            preparation = next(
+                stage.result
+                for stage in reversed(
+                    investigation.stages
+                )
+                if (
+                    stage.handler_id
+                    == "openstar.tess.atlas-fixed-window.prepare"
+                    and stage.status == "COMPLETE"
+                    and stage.result is not None
+                )
+            )
+
+            initial_stage = StageRequest(
+                id=(
+                    f"{next_number:03d}-"
+                    "run-atlas-fixed-window"
+                ),
+                handler_id=(
+                    "openstar.tess.atlas-fixed-window.run"
+                ),
+                parameters={
+                    "projectPath": preparation[
+                        "projectPath"
+                    ],
+                },
+                triggered_by_stage_id=last_stage_id,
+            )
+
+        else:
+            distributed_run_expected = any(
+                (
+                    stage.handler_id
+                    == "openstar.tess.atlas-fixed-window.run"
+                    and stage.status == "COMPLETE"
+                )
+                for stage in investigation.stages
+            )
+
+            initial_stage = StageRequest(
+                id=(
+                    f"{next_number:03d}-"
+                    "interpret-atlas-fixed-window"
+                ),
+                handler_id=(
+                    "openstar.tess.atlas-fixed-window.interpret"
+                ),
+                parameters={
+                    "distributedRunExpected": (
+                        distributed_run_expected
+                    ),
+                },
+                triggered_by_stage_id=last_stage_id,
+            )
+
+    elif args.continue_targeted_observation_planning:
+        investigation = store.load(
+            args.investigation_id
+        )
+
+        if investigation.workflow_id != WORKFLOW_ID:
+            raise RuntimeError(
+                "Cannot continue investigation with a different workflow: "
+                f"{investigation.workflow_id}"
+            )
+
+        targeted_observation_plan_recovery_mode = (
+            _can_continue_targeted_observation_planning(
+                investigation
+            )
+        )
+
+        last_stage_id = (
+            investigation.stages[-1].id
+            if investigation.stages
+            else None
+        )
+        next_number = _next_stage_number(
+            investigation
+        )
+        investigation = store.set_status(
+            investigation,
+            "RUNNING",
+        )
+
+        initial_stage = StageRequest(
+            id=(
+                f"{next_number:03d}-"
+                "generate-targeted-observation-plan"
+            ),
+            handler_id=(
+                "openstar.tess.targeted-observation-planning.generate"
+            ),
+            parameters={},
+            triggered_by_stage_id=last_stage_id,
+        )
+
     elif args.continue_contradiction:
         investigation = store.load(args.investigation_id)
         if investigation.workflow_id != WORKFLOW_ID:
@@ -1623,6 +3195,200 @@ def main():
         print("   one compatible generic worker is sufficient; concurrency is not required")
         print("   Gaia DR3 source-resolved epoch photometry is prepared locally; usable G-band series run as generic openstar.lomb-scargle.v1 work")
         print("   the TESS v20.9 drift law is not extrapolated backward into the Gaia observing epoch")
+    elif args.continue_skymapper_resolved_photometry:
+        if skymapper_recovery_mode == "NEW":
+            print("🔎 Continuing terminal investigation with v20.20 SkyMapper DR4 resolved-photometry screen")
+        else:
+            print(
+                "🔎 Retrying v20.20 SkyMapper DR4 resolved-photometry screen "
+                f"from {skymapper_recovery_mode}"
+            )
+            print("   prior FAILED stage is preserved as immutable provenance")
+        print(f"   stage: {initial_stage.id}")
+        print(f"   handler: {initial_stage.handler_id}")
+        print("   coordinator required only when clean SkyMapper source datasets are prepared")
+        print("   one compatible generic worker is sufficient; concurrency is not required")
+        print("   only distinct SkyMapper objects plus clean, good-seeing per-image PSF measurements are admitted")
+        print("   usable single-band series run as ordinary openstar.lomb-scargle.v1 work")
+        print("   the TESS v20.9 drift law is not extrapolated into the SkyMapper observing epoch")
+    elif args.continue_nsc_resolved_photometry:
+        if nsc_recovery_mode == "NEW":
+            print("🔎 Continuing terminal investigation with v20.21 NOIRLab Source Catalog DR2 resolved-photometry screen")
+        else:
+            print(
+                "🔎 Retrying v20.21 NOIRLab Source Catalog DR2 resolved-photometry screen "
+                f"from {nsc_recovery_mode}"
+            )
+            print("   prior FAILED stage is preserved as immutable provenance")
+        print(f"   stage: {initial_stage.id}")
+        print(f"   handler: {initial_stage.handler_id}")
+        print("   coordinator required only when qualifying NSC source datasets are prepared")
+        print("   one compatible generic worker is sufficient; concurrency is not required")
+        print("   the frozen pair must map to two distinct NSC objects")
+        print("   only same-exposure/filter co-detections independently position-matched to both Gaia sources are admitted")
+        print("   usable single-band series run as ordinary openstar.lomb-scargle.v1 work")
+        print("   the TESS drift law is not extrapolated into the NSC observing epochs")
+    elif args.continue_noirlab_image_forced_photometry:
+        if noirlab_forced_recovery_mode == "NEW":
+            print("🖼️ Continuing terminal investigation with v20.22 NOIRLab image-level forced two-source photometry")
+        else:
+            print(
+                "🖼️ Retrying v20.22 NOIRLab image-level forced two-source photometry "
+                f"from {noirlab_forced_recovery_mode}"
+            )
+            print("   prior FAILED stage is preserved as immutable provenance")
+        print(f"   stage: {initial_stage.id}")
+        print(f"   handler: {initial_stage.handler_id}")
+        print("   coordinator required only when qualifying source-band light curves are prepared")
+        print("   one compatible generic worker is sufficient; concurrency is not required")
+        print("   preparation queries public NSC DR2 SIA cutouts and fits both frozen Gaia positions directly in the image pixels")
+        print("   saturation and source-separation quality guards are not relaxed")
+        print("   usable source-band series run as ordinary openstar.lomb-scargle.v1 work")
+        print("   the TESS drift law is not extrapolated into the NOIRLab observing epochs")
+    elif args.continue_des_dr2_se_local_forced_photometry:
+        if des_dr2_se_local_recovery_mode == "NEW":
+            print("🌌 Continuing terminal investigation with v20.23 DES DR2 single-epoch source-local forced photometry")
+        else:
+            print(
+                "🌌 Retrying v20.23 DES DR2 single-epoch source-local forced photometry "
+                f"from {des_dr2_se_local_recovery_mode}"
+            )
+            print("   prior FAILED stage is preserved as immutable provenance")
+        print(f"   stage: {initial_stage.id}")
+        print(f"   handler: {initial_stage.handler_id}")
+        print("   coordinator required only when qualifying source-band light curves are prepared")
+        print("   one compatible generic worker is sufficient; concurrency is not required")
+        print("   target and counterpart are measured in independent local DES cutouts")
+        print("   saturation of one source does not veto the other unless its local pixels are contaminated")
+        print("   usable source-band series run as ordinary openstar.lomb-scargle.v1 work")
+        print("   the TESS drift law is not extrapolated into the DES observing epochs")
+    elif args.continue_atlas_forced_photometry:
+        if atlas_forced_recovery_mode == "NEW":
+            print("🌐 Continuing terminal investigation with v20.24 ATLAS source-resolved forced photometry")
+        else:
+            print(
+                "🌐 Retrying v20.24 ATLAS source-resolved forced photometry "
+                f"from {atlas_forced_recovery_mode}"
+            )
+            print("   prior FAILED stage is preserved as immutable provenance")
+        print(f"   stage: {initial_stage.id}")
+        print(f"   handler: {initial_stage.handler_id}")
+        print("   ATLAS credentials are read only from OPENSTAR_ATLAS_* environment variables")
+        print("   calibrated target-image forced photometry is requested at both frozen Gaia coordinates")
+        print("   southern difference-image photometry is not used")
+        print("   coordinator required only when qualifying nightly source-band light curves are prepared")
+        print("   one compatible generic worker is sufficient; concurrency is not required")
+        print("   usable nightly source-band series run as ordinary openstar.lomb-scargle.v1 work")
+        print("   the TESS drift law is not extrapolated into the ATLAS observing epochs")
+    elif args.continue_atlas_forced_photometry_reanalysis:
+        if atlas_reanalysis_recovery_mode == "NEW":
+            print("♻️ Continuing terminal investigation with v20.25 ATLAS signed forced-photometry reanalysis")
+        else:
+            print(
+                "♻️ Retrying v20.25 ATLAS signed forced-photometry reanalysis "
+                f"from {atlas_reanalysis_recovery_mode}"
+            )
+            print("   prior FAILED stage is preserved as immutable provenance")
+        print(f"   stage: {initial_stage.id}")
+        print(f"   handler: {initial_stage.handler_id}")
+        print("   no new ATLAS query is performed")
+        print("   immutable v20.24 raw photometry artifacts are reused")
+        print("   individual positive detection SNR is NOT required before nightly binning")
+        print("   signed quality-valid forced fluxes are retained")
+        print("   coordinator required only when qualifying nightly source-band light curves are prepared")
+        print("   usable nightly source-band series run as ordinary openstar.lomb-scargle.v1 work")
+    elif args.continue_atlas_time_resolved:
+        if atlas_time_resolved_recovery_mode == "NEW":
+            print("🕰️ Continuing terminal investigation with v20.26 ATLAS time-resolved counterpart recurrence")
+        else:
+            print(
+                "🕰️ Retrying v20.26 ATLAS time-resolved counterpart recurrence "
+                f"from {atlas_time_resolved_recovery_mode}"
+            )
+            print("   prior FAILED stage is preserved as immutable provenance")
+        print(f"   stage: {initial_stage.id}")
+        print(f"   handler: {initial_stage.handler_id}")
+        print("   no new ATLAS query is performed")
+        print("   immutable v20.24 counterpart photometry is reused")
+        print("   c/o measurements are split into shared independent observing seasons")
+        print("   the prominence>=2.0 gate is unchanged")
+        print("   coordinator required when qualifying season/filter light curves are prepared")
+        print("   season/filter datasets run as ordinary openstar.lomb-scargle.v1 work")
+        print("   the TESS drift law is not extrapolated into ATLAS observing epochs")
+    elif args.continue_atlas_fixed_window_recurrence:
+        if atlas_fixed_window_recovery_mode == "NEW":
+            print(
+                "🧱 Continuing terminal investigation with "
+                "v20.27 ATLAS deterministic fixed-window recurrence"
+            )
+        else:
+            print(
+                "🧱 Retrying v20.27 ATLAS deterministic "
+                "fixed-window recurrence "
+                f"from {atlas_fixed_window_recovery_mode}"
+            )
+            print(
+                "   prior FAILED stage is preserved "
+                "as immutable provenance"
+            )
+
+        print(f"   stage: {initial_stage.id}")
+        print(
+            f"   handler: {initial_stage.handler_id}"
+        )
+        print("   no new ATLAS query is performed")
+        print(
+            "   immutable v20.24 counterpart photometry is reused"
+        )
+        print(
+            "   fixed non-overlapping 180-day windows are anchored to absolute MJD zero"
+        )
+        print(
+            "   the RELIABLE + prominence>=2.0 acceptance gate is unchanged"
+        )
+        print(
+            "   search-grid boundary hits are rejected"
+        )
+        print(
+            "   coordinator required when qualifying window/filter light curves are prepared"
+        )
+        print(
+            "   each window/filter runs as ordinary openstar.lomb-scargle.v1 work"
+        )
+        print(
+            "   the TESS drift law is not extrapolated into ATLAS observing epochs"
+        )
+    elif args.continue_targeted_observation_planning:
+        if targeted_observation_plan_recovery_mode == "NEW":
+            print(
+                "🔭 Continuing terminal investigation with "
+                "v20.28 targeted observation planning"
+            )
+        else:
+            print(
+                "🔭 Retrying v20.28 targeted observation planning "
+                f"from {targeted_observation_plan_recovery_mode}"
+            )
+            print(
+                "   prior FAILED stage is preserved "
+                "as immutable provenance"
+            )
+
+        print(f"   stage: {initial_stage.id}")
+        print(
+            f"   handler: {initial_stage.handler_id}"
+        )
+        print("   no new archive query is performed")
+        print("   no distributed science work is activated")
+        print(
+            "   the frozen residual-frequency band and acceptance rules are preserved"
+        )
+        print(
+            "   campaign cadence, source-resolution, paired exposure tiers, filters, and ingest schema are preregistered"
+        )
+        print(
+            "   the resulting artifacts are ready to hand to an observer or telescope scheduler"
+        )
     elif args.continue_contradiction:
         print("🔁 Continuing terminal investigation with v20.3 contradiction resolution")
         print(f"   stage: {initial_stage.id}")
