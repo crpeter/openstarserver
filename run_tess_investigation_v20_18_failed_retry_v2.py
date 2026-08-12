@@ -19,7 +19,7 @@ from workflows.tess.tess_investigation import (
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "Run the OpenStar v20.19 deterministic TESS investigation plugin. "
+            "Run the OpenStar v20.18 deterministic TESS investigation plugin. "
             "It derives a single-target project from an existing frozen project, "
             "runs distributed compute, resolves catalogs, evaluates hypotheses, "
             "and conditionally launches same-sector and independent multi-sector follow-ups."
@@ -197,15 +197,6 @@ def parse_args():
             "Append v20.18 official SPOC PRF forward modeling after v20.17 cannot securely localize "
             "the residual. The TESS workflow downloads/interpolates the public MAST PRF calibration, "
             "separates target/counterpart series, then exposes them as ordinary openstar.lomb-scargle.v1 datasets."
-        ),
-    )
-    recovery.add_argument(
-        "--continue-external-high-resolution-variability-validation",
-        action="store_true",
-        help=(
-            "Append v20.19 source-resolved external variability validation after v20.18 reaches the "
-            "TESS spatial-attribution limit. Gaia DR3 epoch photometry is queried independently for the "
-            "frozen target/counterpart pair; usable G-band series run as ordinary openstar.lomb-scargle.v1 datasets."
         ),
     )
     return parser.parse_args()
@@ -923,128 +914,6 @@ def _can_continue_official_spoc_prf_forward_modeling(investigation) -> bool:
     )
 
 
-def _can_continue_external_high_resolution_variability_validation(investigation) -> str:
-    """
-    Validate v20.19 continuation and return a recovery mode.
-
-    Modes:
-      NEW
-      RETRY_PREPARE
-      RETRY_RUN
-      RETRY_INTERPRET
-
-    Failed stages remain immutable provenance. Recovery always appends a new
-    stage with the next stage id.
-    """
-    if any(stage.status == "RUNNING" for stage in investigation.stages):
-        raise RuntimeError(
-            "Investigation contains a RUNNING stage. Use --resume before external high-resolution validation."
-        )
-
-    official_spoc = None
-    completed_interpretation = None
-    existing_v20_19 = []
-    for stage in investigation.stages:
-        if (
-            stage.handler_id == "openstar.tess.official-spoc-prf-forward-modeling.interpret"
-            and stage.status == "COMPLETE"
-        ):
-            official_spoc = stage.result
-
-        if stage.handler_id.startswith(
-            "openstar.tess.external-high-resolution-variability-validation."
-        ):
-            existing_v20_19.append(stage)
-            if (
-                stage.handler_id
-                == "openstar.tess.external-high-resolution-variability-validation.interpret"
-                and stage.status == "COMPLETE"
-            ):
-                completed_interpretation = stage.result
-
-    if official_spoc is None:
-        raise RuntimeError(
-            "Run --continue-official-spoc-prf-forward-modeling first so v20.19 has the v20.18 result."
-        )
-    if official_spoc.get("recommendedNextTest") != "EXTERNAL_HIGH_RESOLUTION_VARIABILITY_VALIDATION":
-        raise RuntimeError(
-            "v20.18 did not recommend EXTERNAL_HIGH_RESOLUTION_VARIABILITY_VALIDATION for this investigation."
-        )
-    if completed_interpretation is not None:
-        raise RuntimeError(
-            "Investigation already contains a completed v20.19 external high-resolution interpretation."
-        )
-
-    if investigation.status in {"COMPLETE", "HUMAN_REVIEW_REQUIRED"}:
-        if existing_v20_19:
-            raise RuntimeError(
-                "Investigation already contains incomplete v20.19 stages but is terminal; "
-                "refusing to append ambiguous duplicate history."
-            )
-        return "NEW"
-
-    if investigation.status != "FAILED":
-        raise RuntimeError(
-            "--continue-external-high-resolution-variability-validation requires a terminal investigation "
-            "or a FAILED v20.19 stage eligible for retry."
-        )
-    if not investigation.stages:
-        raise RuntimeError(
-            "FAILED investigation has no stage history to validate for v20.19 retry."
-        )
-
-    failed_stage = investigation.stages[-1]
-    if failed_stage.status != "FAILED":
-        raise RuntimeError(
-            "FAILED investigation does not end in a FAILED stage; refusing ambiguous v20.19 recovery."
-        )
-
-    handler = failed_stage.handler_id
-    if handler == "openstar.tess.external-high-resolution-variability-validation.prepare":
-        return "RETRY_PREPARE"
-
-    if handler == "openstar.tess.external-high-resolution-variability-validation.run":
-        preparation = next(
-            (
-                stage.result
-                for stage in reversed(investigation.stages)
-                if stage.handler_id
-                == "openstar.tess.external-high-resolution-variability-validation.prepare"
-                and stage.status == "COMPLETE"
-                and stage.result is not None
-            ),
-            None,
-        )
-        if preparation is None or not preparation.get("projectPath"):
-            raise RuntimeError(
-                "Cannot retry the failed v20.19 run because its completed preparation/projectPath is missing."
-            )
-        return "RETRY_RUN"
-
-    if handler == "openstar.tess.external-high-resolution-variability-validation.interpret":
-        preparation = next(
-            (
-                stage.result
-                for stage in reversed(investigation.stages)
-                if stage.handler_id
-                == "openstar.tess.external-high-resolution-variability-validation.prepare"
-                and stage.status == "COMPLETE"
-                and stage.result is not None
-            ),
-            None,
-        )
-        if preparation is None:
-            raise RuntimeError(
-                "Cannot retry the failed v20.19 interpretation because its completed preparation is missing."
-            )
-        return "RETRY_INTERPRET"
-
-    raise RuntimeError(
-        "--continue-external-high-resolution-variability-validation can recover a FAILED investigation "
-        "only when its most recent stage is a v20.19 prepare, run, or interpret stage."
-    )
-
-
 def main():
     args = parse_args()
     store = InvestigationStore(args.store)
@@ -1067,7 +936,6 @@ def main():
 
     recovered_orphaned_status = False
     retrying_failed_official_spoc_prf_prepare = False
-    external_high_resolution_recovery_mode = None
 
     if args.resume:
         investigation = store.load(args.investigation_id)
@@ -1384,55 +1252,6 @@ def main():
             parameters={},
             triggered_by_stage_id=last_stage_id,
         )
-    elif args.continue_external_high_resolution_variability_validation:
-        investigation = store.load(args.investigation_id)
-        if investigation.workflow_id != WORKFLOW_ID:
-            raise RuntimeError(
-                "Cannot continue investigation with a different workflow: "
-                f"{investigation.workflow_id}"
-            )
-        external_high_resolution_recovery_mode = (
-            _can_continue_external_high_resolution_variability_validation(investigation)
-        )
-        last_stage_id = investigation.stages[-1].id if investigation.stages else None
-        next_number = _next_stage_number(investigation)
-        investigation = store.set_status(investigation, "RUNNING")
-
-        if external_high_resolution_recovery_mode in {"NEW", "RETRY_PREPARE"}:
-            initial_stage = StageRequest(
-                id=f"{next_number:03d}-prepare-external-high-resolution-variability-validation",
-                handler_id="openstar.tess.external-high-resolution-variability-validation.prepare",
-                parameters={},
-                triggered_by_stage_id=last_stage_id,
-            )
-        elif external_high_resolution_recovery_mode == "RETRY_RUN":
-            preparation = next(
-                stage.result
-                for stage in reversed(investigation.stages)
-                if stage.handler_id
-                == "openstar.tess.external-high-resolution-variability-validation.prepare"
-                and stage.status == "COMPLETE"
-                and stage.result is not None
-            )
-            initial_stage = StageRequest(
-                id=f"{next_number:03d}-run-external-high-resolution-variability-validation",
-                handler_id="openstar.tess.external-high-resolution-variability-validation.run",
-                parameters={"projectPath": preparation["projectPath"]},
-                triggered_by_stage_id=last_stage_id,
-            )
-        else:
-            distributed_run_expected = any(
-                stage.handler_id
-                == "openstar.tess.external-high-resolution-variability-validation.run"
-                and stage.status == "COMPLETE"
-                for stage in investigation.stages
-            )
-            initial_stage = StageRequest(
-                id=f"{next_number:03d}-interpret-external-high-resolution-variability-validation",
-                handler_id="openstar.tess.external-high-resolution-variability-validation.interpret",
-                parameters={"distributedRunExpected": distributed_run_expected},
-                triggered_by_stage_id=last_stage_id,
-            )
     elif args.continue_contradiction:
         investigation = store.load(args.investigation_id)
         if investigation.workflow_id != WORKFLOW_ID:
@@ -1608,21 +1427,6 @@ def main():
         print("   coordinator required")
         print("   one compatible generic worker is sufficient; concurrency is not required")
         print("   MAST official PRF + TPF downloads occur during preparation; separated source series run as generic openstar.lomb-scargle.v1 work")
-    elif args.continue_external_high_resolution_variability_validation:
-        if external_high_resolution_recovery_mode == "NEW":
-            print("🔭 Continuing terminal investigation with v20.19 external high-resolution variability validation")
-        else:
-            print(
-                "🔭 Retrying v20.19 external high-resolution variability validation "
-                f"from {external_high_resolution_recovery_mode}"
-            )
-            print("   prior FAILED stage is preserved as immutable provenance")
-        print(f"   stage: {initial_stage.id}")
-        print(f"   handler: {initial_stage.handler_id}")
-        print("   coordinator required when Gaia epoch datasets are available")
-        print("   one compatible generic worker is sufficient; concurrency is not required")
-        print("   Gaia DR3 source-resolved epoch photometry is prepared locally; usable G-band series run as generic openstar.lomb-scargle.v1 work")
-        print("   the TESS v20.9 drift law is not extrapolated backward into the Gaia observing epoch")
     elif args.continue_contradiction:
         print("🔁 Continuing terminal investigation with v20.3 contradiction resolution")
         print(f"   stage: {initial_stage.id}")
@@ -1640,7 +1444,7 @@ def main():
         initial_stage,
         software_id=SOFTWARE_ID,
         software_version=SOFTWARE_VERSION,
-        max_stages=100,
+        max_stages=90,
     )
 
     print()
