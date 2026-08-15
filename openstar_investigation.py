@@ -66,6 +66,7 @@ class InvestigationStage:
     error: str | None = None
     artifacts: tuple[ArtifactReference, ...] = ()
     provenance: StageProvenance | None = None
+    next_stage: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -312,6 +313,7 @@ class InvestigationStore:
         project_ids: tuple[str, ...] = (),
         artifacts: tuple[ArtifactReference, ...] = (),
         started_at: str | None = None,
+        next_stage: dict[str, Any] | None = None,
     ) -> InvestigationStage:
         return InvestigationStage(
             id=stage_id,
@@ -329,14 +331,11 @@ class InvestigationStore:
                 software_version=software_version,
                 input_hashes=dict(input_hashes or {}),
                 parameters_hash=sha256_json(parameters),
-                result_hash=(
-                    sha256_json(result)
-                    if result is not None
-                    else None
-                ),
+                result_hash=(sha256_json(result) if result is not None else None),
                 node_contributions=dict(node_contributions or {}),
                 project_ids=project_ids,
             ),
+            next_stage=dict(next_stage) if next_stage is not None else None,
         )
 
     @staticmethod
@@ -415,6 +414,11 @@ class InvestigationStore:
                     error=stage_raw.get("error"),
                     artifacts=artifacts,
                     provenance=provenance,
+                    next_stage=(
+                        dict(stage_raw["next_stage"])
+                        if stage_raw.get("next_stage") is not None
+                        else None
+                    ),
                 )
             )
 

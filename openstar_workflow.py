@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Any, Callable
 
 from openstar_investigation import (
@@ -41,6 +41,7 @@ class WorkflowEngine:
     def __init__(self, store: InvestigationStore):
         self.store = store
         self.handlers: dict[str, StageHandler] = {}
+        self.chain_stages = True
 
     def register_handler(self, handler_id: str, handler: StageHandler) -> None:
         if handler_id in self.handlers:
@@ -110,6 +111,9 @@ class WorkflowEngine:
             project_ids=outcome.project_ids,
             artifacts=outcome.artifacts,
             started_at=running.started_at,
+            next_stage=(
+                asdict(outcome.next_stage) if outcome.next_stage is not None else None
+            ),
         )
         investigation = self.store.complete_current_stage(
             investigation,
@@ -144,9 +148,7 @@ class WorkflowEngine:
                     investigation,
                     "FAILED",
                 )
-                raise RuntimeError(
-                    f"Workflow exceeded max_stages={max_stages}."
-                )
+                raise RuntimeError(f"Workflow exceeded max_stages={max_stages}.")
 
             investigation, request = self.run_stage(
                 investigation,
@@ -154,5 +156,8 @@ class WorkflowEngine:
                 software_id=software_id,
                 software_version=software_version,
             )
+
+            if not self.chain_stages:
+                return investigation
 
         return investigation
