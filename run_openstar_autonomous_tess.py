@@ -1,0 +1,155 @@
+#!/usr/bin/env python3
+"""Production entry point for the durable autonomous TESS lifecycle."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from dataclasses import replace
+from pathlib import Path
+
+from openstar_coordinator_client import OpenStarCoordinatorClient
+from openstar_dispatch import InvestigationDispatcher
+from openstar_investigation import InvestigationStore
+from openstar_lifecycle import InvestigationLifecycleLoop, LifecycleResult
+from openstar_targets import InvestigationTargetPortfolio, NoEligibleTargetError
+from workflows.tess.tess_autonomy import (
+    WORKFLOW_ID,
+    TessInvestigationTargetSource,
+    plan_tess_branches,
+    register_tess_workflow_handlers,
+)
+
+SOFTWARE_ID = "openstar.autonomous-tess-runner"
+SOFTWARE_VERSION = "1"
+
+
+def _status(result: LifecycleResult) -> str:
+    investigation = result.investigation
+    fields = [
+        f"disposition={result.disposition}",
+        f"investigation={investigation.id}",
+        f"status={investigation.status}",
+        f"stages={len(investigation.stages)}",
+        f"transitions={result.transitions}",
+    ]
+    selection = investigation.metadata.get("targetSelection")
+    if isinstance(selection, dict) and selection.get("selectionID"):
+        fields.append(f"selection={selection['selectionID']}")
+    if investigation.stages:
+        stage = investigation.stages[-1]
+        fields.extend((f"latest={stage.id}:{stage.status}", f"handler={stage.handler_id}"))
+        if stage.provenance is not None:
+            fields.append(
+                f"software={stage.provenance.software_id}@{stage.provenance.software_version}"
+            )
+            if stage.provenance.project_ids:
+                fields.append(f"projects={','.join(stage.provenance.project_ids)}")
+    return "OpenStar lifecycle: " + " ".join(fields)
+
+
+def run_autonomous_tess(
+    project_paths: list[str | Path],
+    coordinator_url: str,
+    state_dir: str | Path,
+    *,
+    poll_interval: float = 1.0,
+    timeout: float | None = None,
+) -> int:
+    """Construct and run the existing lifecycle, returning a process exit code."""
+    root = Path(state_dir).expanduser().resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    store = InvestigationStore(root / "investigations")
+    coordinator = OpenStarCoordinatorClient(coordinator_url)
+    workflow = register_tess_workflow_handlers(
+        store, coordinator, poll_interval=poll_interval, timeout=timeout
+    )
+    dispatcher = InvestigationDispatcher(store, workflow)
+    source = TessInvestigationTargetSource(project_paths)
+    lifecycle_path = root / "lifecycle.json"
+    portfolio = InvestigationTargetPortfolio(
+        root / "portfolio.json", store, dispatcher
+    )
+    lifecycle = InvestigationLifecycleLoop(
+        lifecycle_path,
+        store,
+        dispatcher,
+        portfolio,
+        source,
+        {WORKFLOW_ID: plan_tess_branches},
+        software_id=SOFTWARE_ID,
+        software_version=SOFTWARE_VERSION,
+    )
+
+    if not lifecycle_path.exists():
+        try:
+            target, provenance = portfolio.select_initial(source)
+        except NoEligibleTargetError:
+            print("OpenStar lifecycle: disposition=NO_ELIGIBLE_TARGETS")
+            return 0
+        target = replace(
+            target,
+            metadata={**(target.metadata or {}), "targetSelection": provenance},
+        )
+        lifecycle.start(target)
+        print(
+            "OpenStar lifecycle: disposition=STARTED "
+            f"target={target.id} investigation={target.investigation_id}"
+        )
+    else:
+        persisted = json.loads(lifecycle_path.read_text(encoding="utf-8"))
+        target = persisted.get("currentTarget", {})
+        print(
+            "OpenStar lifecycle: disposition=RESUMING "
+            f"target={target.get('id', 'unknown')} "
+            f"investigation={target.get('investigation_id', 'unknown')}"
+        )
+
+    while True:
+        result = lifecycle.run()
+        print(_status(result))
+        if result.disposition == "LIFECYCLE_CHECKPOINT":
+            continue
+        return 2 if result.disposition == "EXPERIMENT_RECOVERY_REQUIRED" else 0
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Launch or resume autonomous TESS investigations."
+    )
+    parser.add_argument(
+        "--project", action="append", required=True, help="TESS project manifest path."
+    )
+    parser.add_argument("--coordinator-url", required=True)
+    parser.add_argument("--state-dir", required=True)
+    parser.add_argument("--poll-interval", type=float, default=1.0)
+    parser.add_argument("--timeout", type=float)
+    args = parser.parse_args(argv)
+    if args.poll_interval <= 0:
+        parser.error("--poll-interval must be positive")
+    if args.timeout is not None and args.timeout <= 0:
+        parser.error("--timeout must be positive")
+    return args
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    try:
+        return run_autonomous_tess(
+            args.project,
+            args.coordinator_url,
+            args.state_dir,
+            poll_interval=args.poll_interval,
+            timeout=args.timeout,
+        )
+    except KeyboardInterrupt:
+        print("OpenStar lifecycle: disposition=SHUTDOWN", file=sys.stderr)
+        return 130
+    except Exception as error:
+        print(f"OpenStar lifecycle: disposition=ERROR error={error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

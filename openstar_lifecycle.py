@@ -15,6 +15,7 @@ from openstar_targets import (
     InvestigationTarget,
     InvestigationTargetPortfolio,
     InvestigationTargetSource,
+    NoEligibleTargetError,
 )
 
 
@@ -176,18 +177,21 @@ class InvestigationLifecycleLoop:
                 return LifecycleResult(
                     dispatched.investigation, "WAITING_FOR_PREREQUISITES", transitions
                 )
-            if action == "INVESTIGATION_COMPLETE":
-                return LifecycleResult(
-                    dispatched.investigation, "INVESTIGATION_COMPLETE", transitions
-                )
-            if action == "ADVANCE_TO_NEXT_TARGET":
-                advanced = self.portfolio.advance(
-                    dispatched,
-                    self.target_source,
-                    self.planners,
-                    software_id=self.software_id,
-                    software_version=self.software_version,
-                )
+            if action in {"INVESTIGATION_COMPLETE", "ADVANCE_TO_NEXT_TARGET"}:
+                try:
+                    advanced = self.portfolio.advance(
+                        dispatched,
+                        self.target_source,
+                        self.planners,
+                        software_id=self.software_id,
+                        software_version=self.software_version,
+                    )
+                except NoEligibleTargetError:
+                    return LifecycleResult(
+                        dispatched.investigation,
+                        "INVESTIGATION_COMPLETE_NO_NEXT_TARGET",
+                        transitions,
+                    )
                 target = advanced.target
                 self._save_target(target)
                 transitions += 1

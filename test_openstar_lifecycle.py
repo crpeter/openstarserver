@@ -79,9 +79,10 @@ class InvestigationLifecycleLoopTests(unittest.TestCase):
         )
 
     def test_restart_between_plan_dispatch_and_replan_is_idempotent(self):
-        self.loop().start(self.initial)
+        source = StaticTargetSource((self.initial,))
+        self.loop(source=source).start(self.initial)
 
-        planned = self.loop().run(max_transitions=1)
+        planned = self.loop(source=source).run(max_transitions=1)
         self.assertEqual("LIFECYCLE_CHECKPOINT", planned.disposition)
         persisted = self.store.load(self.initial.investigation_id)
         self.assertEqual(
@@ -90,12 +91,14 @@ class InvestigationLifecycleLoopTests(unittest.TestCase):
         )
         self.assertEqual([], self.executions)
 
-        dispatched = self.loop().run(max_transitions=1)
+        dispatched = self.loop(source=source).run(max_transitions=1)
         self.assertEqual("LIFECYCLE_CHECKPOINT", dispatched.disposition)
         self.assertEqual([("investigation-one", "experiment-1")], self.executions)
 
-        completed = self.loop().run()
-        self.assertEqual("INVESTIGATION_COMPLETE", completed.disposition)
+        completed = self.loop(source=source).run()
+        self.assertEqual(
+            "INVESTIGATION_COMPLETE_NO_NEXT_TARGET", completed.disposition
+        )
         self.assertEqual(
             [
                 ("investigation-one", "experiment-1"),
@@ -188,7 +191,9 @@ class InvestigationLifecycleLoopTests(unittest.TestCase):
         )
 
         terminal = self.loop(planners=planners).run()
-        self.assertEqual("INVESTIGATION_COMPLETE", terminal.disposition)
+        self.assertEqual(
+            "INVESTIGATION_COMPLETE_NO_NEXT_TARGET", terminal.disposition
+        )
         self.assertEqual("investigation-two", terminal.investigation.id)
         self.assertEqual(
             "two",
