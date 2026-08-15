@@ -88,6 +88,9 @@ class CoordinatorState:
         self.pending = deque()
         self.assigned = {}
         self.completed = {}
+        # Original, normalized client submissions are retained separately from
+        # server-enriched results so transport retries can be compared safely.
+        self.accepted_result_submissions = {}
         self.failed = {}
         self.retry_after = {}
         self.retry_counts = {}
@@ -1553,7 +1556,13 @@ class CoordinatorState:
                 return False, "Unknown work unit.", 404
 
             if work_id in self.completed:
-                return True, "Result already accepted.", 200
+                if self.accepted_result_submissions.get(work_id) == result:
+                    return True, "Identical result already accepted.", 200
+                return (
+                    False,
+                    "A different result was already accepted for this work unit.",
+                    409,
+                )
 
             if work_id in self.failed:
                 return (
@@ -1904,6 +1913,7 @@ class CoordinatorState:
                     )
 
                 self.completed[work_id] = stored_result
+                self.accepted_result_submissions[work_id] = dict(result)
                 self.dataset_diagnostic_cache.pop(
                     work_unit["datasetID"],
                     None,
