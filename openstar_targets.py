@@ -38,6 +38,10 @@ BranchPlanner = Callable[
 ]
 
 
+class NoEligibleTargetError(RuntimeError):
+    """Raised when a portfolio has exhausted its eligible target set."""
+
+
 @dataclass(frozen=True)
 class TargetAdvanceResult:
     target: InvestigationTarget
@@ -127,7 +131,9 @@ class InvestigationTargetPortfolio:
 
         eligible, excluded = self._eligibility(targets, trigger_investigation_id)
         if not eligible:
-            raise RuntimeError("No eligible investigation target is available.")
+            raise NoEligibleTargetError(
+                "No eligible investigation target is available."
+            )
         selected = min(eligible, key=lambda target: (target.priority, target.id))
         selections = list(state.get("selections") or [])
         provenance: dict[str, object] = {
@@ -146,6 +152,12 @@ class InvestigationTargetPortfolio:
         selections.append(provenance)
         self._save_state({"selections": selections, "currentSelection": provenance})
         return selected, provenance
+
+    def select_initial(
+        self, source: InvestigationTargetSource
+    ) -> tuple[InvestigationTarget, dict[str, object]]:
+        """Select the first lifecycle target through the durable portfolio."""
+        return self._select(source, "__lifecycle_start__")
 
     def advance(
         self,

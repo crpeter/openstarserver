@@ -91,7 +91,11 @@ class InvestigationDispatcher:
             return DispatchResult(investigation, "WAITING_FOR_PREREQUISITES")
 
         if action == "INVESTIGATION_COMPLETE":
-            return DispatchResult(investigation, "INVESTIGATION_TERMINAL")
+            return DispatchResult(
+                investigation,
+                "INVESTIGATION_TERMINAL",
+                next_target_required=True,
+            )
 
         if action == "ADVANCE_TO_NEXT_TARGET":
             return DispatchResult(

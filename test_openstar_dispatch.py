@@ -110,7 +110,7 @@ class InvestigationDispatcherTests(unittest.TestCase):
     def test_non_execution_actions_preserve_investigation(self):
         cases = (
             ("WAIT_FOR_PREREQUISITES", "BLOCKED", "WAITING_FOR_PREREQUISITES", False),
-            ("INVESTIGATION_COMPLETE", "COMPLETE", "INVESTIGATION_TERMINAL", False),
+            ("INVESTIGATION_COMPLETE", "COMPLETE", "INVESTIGATION_TERMINAL", True),
             (
                 "ADVANCE_TO_NEXT_TARGET",
                 "QUIESCENT_AWAITING_DATA",
