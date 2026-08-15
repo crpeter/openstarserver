@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from openstar_autonomy import ScientificBranch
+from openstar_control import update_investigation_metadata
 from openstar_dispatch import DispatchResult, InvestigationDispatcher
 from openstar_investigation import InvestigationStore
 from openstar_targets import InvestigationTarget, InvestigationTargetPortfolio
@@ -39,14 +40,17 @@ class InvestigationTargetPortfolioTests(unittest.TestCase):
 
         self.workflow.register_handler("test.execute", execute)
         trigger = self.store.create("trigger-investigation", "test", "1")
-        trigger = self.store.set_control_state(
+        trigger = update_investigation_metadata(
+            self.store,
             trigger,
-            status="QUIESCENT_AWAITING_DATA",
-            control_state={
-                "branchAssessments": [],
-                "selectedExperiment": None,
-                "schedulerAction": "ADVANCE_TO_NEXT_TARGET",
+            {
+                "controlState": {
+                    "branchAssessments": [],
+                    "selectedExperiment": None,
+                    "schedulerAction": "ADVANCE_TO_NEXT_TARGET",
+                }
             },
+            status="QUIESCENT_AWAITING_DATA",
         )
         self.trigger = DispatchResult(
             trigger, "NEXT_TARGET_SELECTION_REQUIRED", next_target_required=True

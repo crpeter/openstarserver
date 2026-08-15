@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Callable, Protocol, Sequence
 
 from openstar_autonomy import AutonomousInvestigationEngine, ScientificBranch
+from openstar_control import update_investigation_metadata
 from openstar_dispatch import DispatchResult, InvestigationDispatcher
 from openstar_investigation import Investigation, InvestigationStore, sha256_json
 
@@ -177,8 +178,10 @@ class InvestigationTargetPortfolio:
             )
 
         if investigation.metadata.get("targetSelection") != provenance:
-            investigation = self.investigation_store.merge_metadata(
-                investigation, {"targetSelection": provenance}
+            investigation = update_investigation_metadata(
+                self.investigation_store,
+                investigation,
+                {"targetSelection": provenance},
             )
 
         if not isinstance(investigation.metadata.get("controlState"), dict):

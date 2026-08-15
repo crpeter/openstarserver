@@ -272,50 +272,6 @@ class InvestigationStore:
         self.save(updated)
         return updated
 
-    def set_control_state(
-        self,
-        investigation: Investigation,
-        *,
-        status: str,
-        control_state: dict[str, Any],
-    ) -> Investigation:
-        """Persist a scheduler-facing decision with its investigation status."""
-        metadata = dict(investigation.metadata)
-        metadata["controlState"] = dict(control_state)
-        updated = Investigation(
-            id=investigation.id,
-            workflow_id=investigation.workflow_id,
-            workflow_version=investigation.workflow_version,
-            status=status,
-            created_at=investigation.created_at,
-            updated_at=utc_now_iso(),
-            metadata=metadata,
-            stages=investigation.stages,
-        )
-        self.save(updated)
-        return updated
-
-    def merge_metadata(
-        self,
-        investigation: Investigation,
-        values: dict[str, Any],
-    ) -> Investigation:
-        """Persist additional investigation-level provenance."""
-        metadata = dict(investigation.metadata)
-        metadata.update(values)
-        updated = Investigation(
-            id=investigation.id,
-            workflow_id=investigation.workflow_id,
-            workflow_version=investigation.workflow_version,
-            status=investigation.status,
-            created_at=investigation.created_at,
-            updated_at=utc_now_iso(),
-            metadata=metadata,
-            stages=investigation.stages,
-        )
-        self.save(updated)
-        return updated
-
     @staticmethod
     def build_terminal_stage(
         *,

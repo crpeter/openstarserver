@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from typing import Any
 
+from openstar_control import update_investigation_metadata
 from openstar_investigation import Investigation, InvestigationStore
 from openstar_workflow import StageRequest
 
@@ -136,9 +137,10 @@ class AutonomousInvestigationEngine:
         branches: tuple[ScientificBranch, ...],
     ) -> tuple[Investigation, InvestigationDecision]:
         decision = self.inspect(investigation, branches)
-        investigation = self.store.set_control_state(
+        investigation = update_investigation_metadata(
+            self.store,
             investigation,
+            {"controlState": decision.control_state()},
             status=decision.investigation_status,
-            control_state=decision.control_state(),
         )
         return investigation, decision

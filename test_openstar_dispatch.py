@@ -3,6 +3,7 @@ import unittest
 from pathlib import Path
 
 from openstar_autonomy import AutonomousInvestigationEngine, ScientificBranch
+from openstar_control import update_investigation_metadata
 from openstar_dispatch import InvestigationDispatcher
 from openstar_investigation import InvestigationStage, InvestigationStore
 from openstar_workflow import StageOutcome, StageRequest, WorkflowEngine
@@ -25,14 +26,17 @@ class InvestigationDispatcherTests(unittest.TestCase):
         self.workflow.register_handler("test.execute", execute)
 
     def persist_action(self, action, *, status="RUNNING", selected=None):
-        return self.store.set_control_state(
+        return update_investigation_metadata(
+            self.store,
             self.investigation,
-            status=status,
-            control_state={
-                "branchAssessments": [],
-                "selectedExperiment": selected,
-                "schedulerAction": action,
+            {
+                "controlState": {
+                    "branchAssessments": [],
+                    "selectedExperiment": selected,
+                    "schedulerAction": action,
+                }
             },
+            status=status,
         )
 
     def dispatch(self):
