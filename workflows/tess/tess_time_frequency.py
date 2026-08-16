@@ -72,6 +72,19 @@ def _int(value: Any) -> int | None:
             return None
 
 
+def _percentile(values: list[float], quantile: float) -> float:
+    ordered = sorted(float(value) for value in values)
+    position = min(max(quantile, 0.0), 1.0) * (len(ordered) - 1)
+    lower = int(math.floor(position))
+    upper = int(math.ceil(position))
+    weight = position - lower
+    return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
+
+def _median(values: list[float]) -> float:
+    return _percentile(values, 0.5)
+
+
 def _dataset_arrays(dataset: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
     times = np.asarray(dataset.get("times") or [], dtype=np.float64)
     flux = np.asarray(dataset.get("flux") or [], dtype=np.float64)
@@ -219,6 +232,148 @@ def _source_items(
     return items
 
 
+def _solve_linear_system(matrix: list[list[float]], vector: list[float]) -> list[float]:
+    """Solve a small dense system with deterministic partial pivoting."""
+    size = len(vector)
+    augmented = [list(matrix[row]) + [float(vector[row])] for row in range(size)]
+    for column in range(size):
+        pivot = max(range(column, size), key=lambda row: abs(augmented[row][column]))
+        if abs(augmented[pivot][column]) <= 1e-14:
+            raise RuntimeError("Harmonic least-squares design is singular.")
+        augmented[column], augmented[pivot] = augmented[pivot], augmented[column]
+        scale = augmented[column][column]
+        augmented[column] = [value / scale for value in augmented[column]]
+        for row in range(size):
+            if row == column:
+                continue
+            factor = augmented[row][column]
+            if factor:
+                augmented[row] = [
+                    value - factor * pivot_value
+                    for value, pivot_value in zip(augmented[row], augmented[column])
+                ]
+    return [augmented[row][-1] for row in range(size)]
+
+
+def _fit_family_python(
+    times: list[float], flux: list[float], physical_frequency: float,
+) -> tuple[list[float], dict[str, Any]]:
+    """Coupled offset + fundamental + first-harmonic least-squares fit."""
+    rows = []
+    for time in times:
+        angle = 2.0 * math.pi * physical_frequency * time
+        rows.append([1.0, math.sin(angle), math.cos(angle), math.sin(2.0 * angle), math.cos(2.0 * angle)])
+    normal = [[sum(row[i] * row[j] for row in rows) for j in range(5)] for i in range(5)]
+    rhs = [sum(row[i] * value for row, value in zip(rows, flux)) for i in range(5)]
+    coefficients = _solve_linear_system(normal, rhs)
+    model = [sum(coefficient * basis for coefficient, basis in zip(coefficients, row)) for row in rows]
+    residual = [value - fitted for value, fitted in zip(flux, model)]
+    residual_mean = sum(residual) / len(residual)
+    residual_std = math.sqrt(
+        sum((value - residual_mean) ** 2 for value in residual) / len(residual)
+    )
+    normalized = [value / residual_std for value in residual] if residual_std > 1e-12 else list(residual)
+    mean = sum(flux) / len(flux)
+    total_ss = sum((value - mean) ** 2 for value in flux)
+    residual_ss = sum(value ** 2 for value in residual)
+    a1, b1, a2, b2 = coefficients[1:]
+    phase1 = math.atan2(b1, a1)
+    phase2 = math.atan2(b2, a2)
+    return normalized, {
+        "offset": coefficients[0],
+        "physicalFrequency": physical_frequency,
+        "firstHarmonicFrequency": 2.0 * physical_frequency,
+        "fundamentalAmplitude": math.hypot(a1, b1),
+        "firstHarmonicAmplitude": math.hypot(a2, b2),
+        "fundamentalPhaseRad": phase1,
+        "firstHarmonicPhaseRad": phase2,
+        "translationInvariantRelativeHarmonicPhaseRad": math.atan2(
+            math.sin(phase2 - 2.0 * phase1), math.cos(phase2 - 2.0 * phase1)
+        ),
+        "explainedVariance": max(0.0, min(1.0, 1.0 - residual_ss / total_ss)) if total_ss > 1e-18 else 0.0,
+        "residualRMS": math.sqrt(residual_ss / len(residual)),
+        "residualStdDevBeforeNormalization": residual_std,
+        "coefficients": coefficients,
+    }
+
+
+def _build_time_frequency_project_python(**kwargs: Any) -> dict[str, Any]:
+    """Prepare the same generic window project without optional NumPy."""
+    source_project = _load_json(kwargs["source_project_path"])
+    source_entry = kwargs["source_dataset_entry"]
+    period = float(kwargs["physical_period_days"])
+    frequency = 1.0 / period
+    root = Path(kwargs["output_dir"]) / "time-frequency"
+    root.mkdir(parents=True, exist_ok=True)
+    items = _source_items(
+        primary_dataset_path=kwargs["primary_dataset_path"],
+        primary_sector=kwargs["primary_sector"],
+        independent_spec=kwargs["independent_spec"],
+    )
+    prepared: list[dict[str, Any]] = []
+    entries: list[dict[str, Any]] = []
+    family_track: list[dict[str, Any]] = []
+
+    for item in items:
+        dataset = _load_json(item["datasetPath"])
+        pairs = sorted(
+            (float(t), float(f)) for t, f in zip(dataset.get("times") or [], dataset.get("flux") or [])
+            if math.isfinite(float(t)) and math.isfinite(float(f))
+        )
+        if len(pairs) < MIN_WINDOW_SAMPLES:
+            raise RuntimeError("Dataset has too few finite samples for time-frequency analysis.")
+        times = [pair[0] for pair in pairs]
+        flux = [pair[1] for pair in pairs]
+        def subtract_family(selected_times: list[float], selected_flux: list[float]) -> tuple[list[float], dict[str, Any]]:
+            return _fit_family_python(selected_times, selected_flux, frequency)
+
+        _, full_fit = subtract_family(times, flux)
+        family_track.append({
+            "sectorKey": item["sectorKey"], "sector": item["sector"], "role": item["role"],
+            "baselineDays": times[-1] - times[0], "sampleCount": len(times), "familyFit": full_fit,
+        })
+        maximum_start = max(times[0], times[-1] - WINDOW_LENGTH_DAYS)
+        starts = [times[0]] if maximum_start == times[0] else [
+            times[0] + i * (maximum_start - times[0]) / (WINDOWS_PER_SECTOR - 1)
+            for i in range(WINDOWS_PER_SECTOR)
+        ]
+        for index, start in enumerate(starts, 1):
+            selected = [(t, f) for t, f in pairs if start <= t <= start + WINDOW_LENGTH_DAYS]
+            if len(selected) < MIN_WINDOW_SAMPLES:
+                continue
+            window_times = [value[0] for value in selected]
+            window_flux = [value[1] for value in selected]
+            residual, fit = subtract_family(window_times, window_flux)
+            dataset_id = f"{dataset.get('id') or source_entry['id']}-tf-window-{index}-v1"
+            path = root / f"{_safe(dataset_id)}.json"
+            output = copy.deepcopy(dataset)
+            output.update({"id": dataset_id, "times": [t-window_times[0] for t in window_times], "flux": residual,
+                           "frequencySearch": _frequency_search(), "reference": {}})
+            output["science"] = {"purpose": "sliding-window-time-frequency-evolution", "sectorKey": item["sectorKey"], "windowIndex": index}
+            _write_json(path, output)
+            meta = {"datasetID": dataset_id, "datasetPath": str(path.resolve()), "sectorKey": item["sectorKey"],
+                    "sector": item["sector"], "role": item["role"], "windowIndex": index,
+                    "sampleCount": len(selected), "baselineDays": window_times[-1]-window_times[0], "familyFit": fit}
+            prepared.append(meta)
+            entry = copy.deepcopy(source_entry)
+            entry.update({"id": dataset_id, "path": meta["datasetPath"], "sector": item["sector"], "role": item["role"]})
+            entries.append(entry)
+
+    project_id = f"{source_project['id']}.investigation.{_safe(kwargs['investigation_id'])}.time-frequency-evolution-v1"
+    manifest = {"id": project_id, "name": f"{source_project.get('name', source_project['id'])} — time-frequency evolution",
+                "workloadID": source_project["workloadID"], "datasets": entries,
+                "investigation": {"sourceProjectID": source_project["id"], "sourceDatasetID": source_entry["id"],
+                                  "purpose": "sliding-window-time-frequency-evolution", "physicalPeriodDays": period}}
+    manifest_path = root / f"{_safe(project_id)}.json"
+    _write_json(manifest_path, manifest)
+    work_units = math.ceil(TOTAL_FREQUENCIES / FREQUENCIES_PER_WORK_UNIT)
+    return {"available": True, "projectID": project_id, "projectPath": str(manifest_path.resolve()),
+            "physicalPeriodDays": period, "physicalFrequency": frequency, "firstHarmonicFrequency": 2*frequency,
+            "absoluteTimeReferenceDays": None, "frequencySearch": _frequency_search(), "windowLengthDays": WINDOW_LENGTH_DAYS,
+            "windowsPerSector": WINDOWS_PER_SECTOR, "preparedWindows": prepared, "familyTrack": family_track,
+            "totalWorkUnits": len(entries)*work_units, "workUnitsPerDataset": work_units}
+
+
 def build_time_frequency_project(
     *,
     source_project_path: str | Path,
@@ -232,6 +387,24 @@ def build_time_frequency_project(
 ) -> dict[str, Any]:
     if physical_period_days <= 0:
         raise ValueError("physical_period_days must be positive")
+
+    # The coordinator deployment normally provides NumPy, but the server's
+    # dependency-minimal control-plane environment does not.  Preparing this
+    # experiment only needs deterministic harmonic subtraction, so retain a
+    # pure-Python path rather than making autonomous branch selection depend on
+    # an optional numerical package.  Distributed period searching remains the
+    # same generic workload.
+    if not hasattr(np, "asarray"):
+        return _build_time_frequency_project_python(
+            source_project_path=source_project_path,
+            source_dataset_entry=source_dataset_entry,
+            primary_dataset_path=primary_dataset_path,
+            primary_sector=primary_sector,
+            independent_spec=independent_spec,
+            physical_period_days=physical_period_days,
+            output_dir=output_dir,
+            investigation_id=investigation_id,
+        )
 
     source_project = _load_json(source_project_path)
     physical_frequency = 1.0 / float(physical_period_days)
@@ -549,7 +722,7 @@ def _cluster_points(points: list[dict[str, Any]]) -> list[dict[str, Any]]:
         frequency = float(point["candidateFrequency"])
         placed = False
         for cluster in clusters:
-            center = float(np.median([float(item["candidateFrequency"]) for item in cluster]))
+            center = float(_median([float(item["candidateFrequency"]) for item in cluster]))
             if abs(frequency - center) / max(abs(center), 1e-12) <= FREQUENCY_CLUSTER_RELATIVE_TOLERANCE:
                 cluster.append(point)
                 placed = True
@@ -559,14 +732,14 @@ def _cluster_points(points: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
     summaries: list[dict[str, Any]] = []
     for cluster in clusters:
-        frequencies = np.asarray([float(item["candidateFrequency"]) for item in cluster], dtype=np.float64)
+        frequencies = [float(item["candidateFrequency"]) for item in cluster]
         independent_sectors = sorted({
             int(item["sector"])
             for item in cluster
             if item.get("sector") is not None
             and item.get("role") == "independent-time-frequency-window"
         })
-        median_frequency = float(np.median(frequencies))
+        median_frequency = float(_median(frequencies))
         summaries.append({
             "medianFrequency": median_frequency,
             "medianPeriodDays": 1.0 / median_frequency,
@@ -574,7 +747,7 @@ def _cluster_points(points: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "independentSectors": independent_sectors,
             "independentSectorCount": len(independent_sectors),
             "relativeSpan": (
-                float((np.max(frequencies) - np.min(frequencies)) / median_frequency)
+                float((max(frequencies) - min(frequencies)) / median_frequency)
                 if median_frequency > 0 and len(frequencies) > 1
                 else 0.0
             ),
@@ -617,19 +790,18 @@ def _linear_track(points: list[dict[str, Any]]) -> dict[str, Any] | None:
     ]
     if len(usable) < 3:
         return None
-    x = np.asarray([float(item["absoluteWindowCenterDays"]) for item in usable], dtype=np.float64)
-    y = np.asarray([float(item["candidateFrequency"]) for item in usable], dtype=np.float64)
-    x0 = float(np.mean(x))
-    centered = x - x0
-    design = np.column_stack([np.ones(len(x)), centered])
-    coefficients, _, _, _ = np.linalg.lstsq(design, y, rcond=None)
-    predicted = design @ coefficients
-    total_ss = float(np.sum(np.square(y - np.mean(y))))
-    residual_ss = float(np.sum(np.square(y - predicted)))
+    x = [float(item["absoluteWindowCenterDays"]) for item in usable]
+    y = [float(item["candidateFrequency"]) for item in usable]
+    x0 = sum(x) / len(x)
+    y0 = sum(y) / len(y)
+    centered = [value - x0 for value in x]
+    slope = sum(dx * (value - y0) for dx, value in zip(centered, y)) / max(sum(dx * dx for dx in centered), 1e-18)
+    predicted = [y0 + slope * dx for dx in centered]
+    total_ss = sum((value - y0) ** 2 for value in y)
+    residual_ss = sum((value - fitted) ** 2 for value, fitted in zip(y, predicted))
     r_squared = 1.0 if total_ss <= 1e-18 else max(0.0, min(1.0, 1.0 - residual_ss / total_ss))
-    span_days = float(np.max(x) - np.min(x))
-    slope = float(coefficients[1])
-    median_frequency = float(np.median(y))
+    span_days = max(x) - min(x)
+    median_frequency = float(_median(y))
     drift_fraction = (
         abs(slope) * span_days / max(abs(median_frequency), 1e-12)
         if span_days > 0
@@ -638,7 +810,7 @@ def _linear_track(points: list[dict[str, Any]]) -> dict[str, Any] | None:
     return {
         "sampleCount": len(usable),
         "slopeCyclesPerDayPerDay": slope,
-        "interceptFrequencyAtMeanTime": float(coefficients[0]),
+        "interceptFrequencyAtMeanTime": y0,
         "meanTimeDays": x0,
         "timeSpanDays": span_days,
         "rSquared": r_squared,
@@ -649,13 +821,12 @@ def _linear_track(points: list[dict[str, Any]]) -> dict[str, Any] | None:
 def _circular_concentration(phases: list[float], weights: list[float] | None = None) -> float | None:
     if not phases:
         return None
-    z = np.exp(1j * np.asarray(phases, dtype=np.float64))
     if weights is not None and len(weights) == len(phases):
-        w = np.asarray(weights, dtype=np.float64)
-        w = np.maximum(w, 0.0)
-        if float(np.sum(w)) > 0:
-            return float(abs(np.sum(w * z) / np.sum(w)))
-    return float(abs(np.mean(z)))
+        positive = [max(float(value), 0.0) for value in weights]
+        total = sum(positive)
+        if total > 0:
+            return abs(sum(weight * complex(math.cos(phase), math.sin(phase)) for weight, phase in zip(positive, phases)) / total)
+    return abs(sum(complex(math.cos(phase), math.sin(phase)) for phase in phases) / len(phases))
 
 
 def _phase_drift(points: list[dict[str, Any]], key: str) -> dict[str, Any] | None:
@@ -674,18 +845,20 @@ def _phase_drift(points: list[dict[str, Any]], key: str) -> dict[str, Any] | Non
     if len(usable) < 3:
         return None
     usable.sort(key=lambda item: item[0])
-    x = np.asarray([item[0] for item in usable], dtype=np.float64)
-    phase = np.unwrap(np.asarray([item[1] for item in usable], dtype=np.float64))
-    x0 = float(np.mean(x))
-    centered = x - x0
-    design = np.column_stack([np.ones(len(x)), centered])
-    coefficients, _, _, _ = np.linalg.lstsq(design, phase, rcond=None)
-    predicted = design @ coefficients
-    total_ss = float(np.sum(np.square(phase - np.mean(phase))))
-    residual_ss = float(np.sum(np.square(phase - predicted)))
+    x = [item[0] for item in usable]
+    phase = [usable[0][1]]
+    for _, value, _ in usable[1:]:
+        previous = phase[-1]
+        phase.append(value + round((previous - value) / (2.0 * math.pi)) * 2.0 * math.pi)
+    x0 = sum(x) / len(x)
+    phase0 = sum(phase) / len(phase)
+    centered = [value - x0 for value in x]
+    slope = sum(dx * (value - phase0) for dx, value in zip(centered, phase)) / max(sum(dx * dx for dx in centered), 1e-18)
+    predicted = [phase0 + slope * dx for dx in centered]
+    total_ss = sum((value - phase0) ** 2 for value in phase)
+    residual_ss = sum((value - fitted) ** 2 for value, fitted in zip(phase, predicted))
     r_squared = 1.0 if total_ss <= 1e-18 else max(0.0, min(1.0, 1.0 - residual_ss / total_ss))
-    span = float(np.max(x) - np.min(x))
-    slope = float(coefficients[1])
+    span = max(x) - min(x)
     return {
         "sampleCount": len(usable),
         "phaseSlopeRadPerDay": slope,
@@ -708,9 +881,8 @@ def _amplitude_variation(points: list[dict[str, Any]], key: str) -> dict[str, An
             values.append(value)
     if len(values) < 3:
         return None
-    array = np.asarray(values, dtype=np.float64)
-    median = float(np.median(array))
-    p10, p90 = np.percentile(array, [10.0, 90.0])
+    median = float(_median(values))
+    p10, p90 = _percentile(values, 0.10), _percentile(values, 0.90)
     variation = (
         float((p90 - p10) / median)
         if median > 1e-12

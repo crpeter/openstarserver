@@ -15,6 +15,7 @@ from workflows.tess.tess_hypotheses import (
     broad_independent_next_handler,
     interpret_broad_independent_sectors,
 )
+from workflows.tess.tess_morphology import analyze_morphology
 
 # The integration exercises handlers whose selected path is pure Python.  The
 # full adapter also registers optional NumPy-backed archival handlers; keep
@@ -24,6 +25,7 @@ if "numpy" not in sys.modules:
     sys.modules["numpy"] = types.ModuleType("numpy")
 
 from workflows.tess.tess_investigation import build_engine
+from workflows.tess.tess_time_frequency import _fit_family_python
 
 
 class BroadIndependentCharacterizationTests(unittest.TestCase):
@@ -44,15 +46,15 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
         )
         return store.complete_current_stage(investigation, terminal)
 
-    def _write_light_curve(self, root, name, sector, phase_offset):
+    def _write_light_curve(self, root, name, sector, phase_offset, shape="mixed"):
         path = root / f"{name}.json"
         times = [index * 0.01 for index in range(3001)]
-        flux = [
-            1.0
-            + 0.02 * math.sin(2.0 * math.pi * time / 6.86 + phase_offset)
-            + 0.008 * math.sin(2.0 * math.pi * time / 13.72)
-            for time in times
-        ]
+        double_amplitude = {"raw": 0.0, "double": 0.03, "mixed": 0.008}[shape]
+        raw_amplitude = {"raw": 0.025, "double": 0.008, "mixed": 0.02}[shape]
+        flux = [1.0
+            + raw_amplitude * math.sin(2.0 * math.pi * time / 6.86 + phase_offset)
+            + double_amplitude * math.sin(2.0 * math.pi * time / 13.72)
+            for time in times]
         path.write_text(
             json.dumps(
                 {
@@ -165,9 +167,14 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
             WORKFLOW_VERSION,
             metadata=target.metadata,
         )
-        primary_path = self._write_light_curve(root, "primary", 62, 0.0)
-        sector_66_path = self._write_light_curve(root, "sector-66", 66, 0.2)
-        sector_67_path = self._write_light_curve(root, "sector-67", 67, 0.5)
+        primary_path = self._write_light_curve(root, "primary", 62, 0.0, "mixed")
+        sector_66_path = self._write_light_curve(root, "sector-66", 66, 0.2, "raw")
+        sector_67_path = self._write_light_curve(root, "sector-67", 67, 0.5, "double")
+        source_project_path = root / "source-project.json"
+        source_project_path.write_text(json.dumps({
+            "id": "synthetic-source", "name": "Synthetic source",
+            "workloadID": "openstar.lomb-scargle.v1", "datasets": []
+        }), encoding="utf-8")
         independent = {
             "preparedSectors": [
                 {
@@ -216,7 +223,12 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
             (
                 "001-prepare-target",
                 "openstar.tess.prepare-target",
-                {"datasetPath": str(primary_path)},
+                {
+                    "datasetPath": str(primary_path),
+                    "sector": 62,
+                    "sourceProjectPath": str(source_project_path),
+                    "sourceDatasetEntry": {"id": "primary", "targetName": "Synthetic recurrent source"},
+                },
             ),
             (
                 "002-primary-distributed-search",
@@ -250,8 +262,28 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
                 store, investigation, stage_id, handler_id, result
             )
 
+        class DeterministicCoordinator:
+            def run_project(self, project_path, **_kwargs):
+                manifest = json.loads(Path(project_path).read_text(encoding="utf-8"))
+                datasets = []
+                for index, entry in enumerate(manifest["datasets"]):
+                    frequency = 0.31 + 0.001 * (index % 3)
+                    datasets.append({
+                        "datasetID": entry["id"],
+                        "periodStatus": "RELIABLE",
+                        "periodConfidence": "high",
+                        "candidateFrequency": frequency,
+                        "candidatePeriodDays": 1.0 / frequency,
+                        "candidatePower": 0.8,
+                        "candidatePeakProminenceRatio": 2.5,
+                    })
+                return types.SimpleNamespace(
+                    status={"datasets": datasets}, node_contributions={},
+                    project_id=manifest["id"],
+                )
+
         engine = build_engine(
-            store, coordinator=object(), poll_interval=0.0, timeout=None
+            store, coordinator=DeterministicCoordinator(), poll_interval=0.0, timeout=None
         )
         engine.chain_stages = False
         broad_request = StageRequest(
@@ -306,8 +338,121 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
             set(morphology_stage.provenance.input_hashes),
         )
         self.assertEqual(1, len(morphology_stage.artifacts))
-        self.assertEqual("openstar.tess.finalize", next_request.handler_id)
+        self.assertEqual("openstar.tess.time-frequency.prepare", next_request.handler_id)
         self.assertEqual(9, len(completed.stages))
+
+        # Restarting after morphology reconstructs its persisted continuation,
+        # without duplicating morphology or any prerequisite stage.
+        restarted_after_morphology = store.load(completed.id)
+        replayed_next = plan_tess_branches(restarted_after_morphology, target)[0].experiment
+        self.assertEqual(next_request, replayed_next)
+        self.assertEqual(9, len(restarted_after_morphology.stages))
+
+        prepared, run_request = engine.run_stage(
+            restarted_after_morphology, replayed_next,
+            software_id="integration", software_version="20.28",
+        )
+        time_frequency_stage = prepared.stages[-1]
+        self.assertEqual("COMPLETE", time_frequency_stage.status)
+        self.assertEqual("openstar.tess.time-frequency.prepare", time_frequency_stage.handler_id)
+        self.assertGreater(len(time_frequency_stage.result["preparedWindows"]), 0)
+        self.assertAlmostEqual(13.72, time_frequency_stage.result["physicalPeriodDays"])
+        self.assertTrue(Path(time_frequency_stage.result["projectPath"]).is_file())
+        self.assertEqual("openstar.tess.time-frequency.run", run_request.handler_id)
+        self.assertEqual(10, len(prepared.stages))
+
+        # Every persisted boundary reconstructs the exact continuation. Execute
+        # the real registered run, interpret, and summarize handlers.
+        current = prepared
+        request = run_request
+        expected_handlers = [
+            "openstar.tess.time-frequency.run",
+            "openstar.tess.time-frequency.interpret",
+            "openstar.tess.time-frequency.summarize",
+        ]
+        for expected_handler in expected_handlers:
+            restarted_boundary = store.load(current.id)
+            planned = plan_tess_branches(restarted_boundary, target)[0].experiment
+            self.assertEqual(request, planned)
+            stage_count = len(restarted_boundary.stages)
+            current, request = engine.run_stage(
+                restarted_boundary, planned,
+                software_id="integration", software_version="20.28",
+            )
+            self.assertEqual(stage_count + 1, len(current.stages))
+            self.assertEqual(expected_handler, current.stages[-1].handler_id)
+            self.assertEqual("COMPLETE", current.stages[-1].status)
+
+        summary = current.stages[-1].result
+        self.assertFalse(morphology_stage.result["physicalCycleResolved"])
+        self.assertAlmostEqual(13.72, summary["periodReference"]["periodDays"])
+        self.assertEqual("UNRESOLVED_FAMILY_ANALYSIS_REFERENCE", summary["periodReference"]["kind"])
+        self.assertFalse(summary["periodReference"]["physicalCycleResolved"])
+        self.assertFalse(summary["physicalMechanismResolved"])
+        self.assertEqual("TRANSIENT_MODE_VALIDATION", summary["recommendedNextTest"])
+        self.assertEqual("openstar.tess.finalize", request.handler_id)
+
+    def test_coupled_python_harmonic_fit_on_irregular_gapped_samples(self):
+        frequency = 1.0 / 13.72
+        coefficients = [1.13, 0.027, -0.014, 0.019, 0.011]
+        times = [
+            index * 0.071 + 0.013 * (index % 5)
+            for index in range(420)
+            if index % 7 not in (0, 3) and not 9.0 < index * 0.071 < 13.0
+        ]
+        flux = []
+        for time in times:
+            angle = 2.0 * math.pi * frequency * time
+            basis = [1.0, math.sin(angle), math.cos(angle), math.sin(2 * angle), math.cos(2 * angle)]
+            flux.append(sum(value * component for value, component in zip(coefficients, basis)))
+
+        residual, fit = _fit_family_python(times, flux, frequency)
+        for expected, actual in zip(coefficients, fit["coefficients"]):
+            self.assertAlmostEqual(expected, actual, places=11)
+        self.assertAlmostEqual(math.hypot(coefficients[1], coefficients[2]), fit["fundamentalAmplitude"], places=11)
+        self.assertAlmostEqual(math.hypot(coefficients[3], coefficients[4]), fit["firstHarmonicAmplitude"], places=11)
+        self.assertLess(fit["residualStdDevBeforeNormalization"], 1e-11)
+        self.assertLess(max(abs(value) for value in residual), 1e-10)
+
+        # Deliberately prove that this sampling is not an orthogonal special
+        # case, so independent projections would not be a valid substitute.
+        sin_f = [math.sin(2.0 * math.pi * frequency * time) for time in times]
+        cos_2f = [math.cos(4.0 * math.pi * frequency * time) for time in times]
+        cross_term = sum(left * right for left, right in zip(sin_f, cos_2f))
+        self.assertGreater(abs(cross_term), 1.0)
+
+    def test_stable_morphology_still_finalizes(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        primary = self._write_light_curve(root, "primary-stable", 1, 0.0, "raw")
+        paths = [self._write_light_curve(root, f"stable-{sector}", sector, 0.1, "raw")
+                 for sector in (2, 3, 4)]
+        result = analyze_morphology(
+            primary_dataset_path=primary,
+            independent_spec={"preparedSectors": [
+                {"sector": sector, "datasetPath": str(path)}
+                for sector, path in zip((2, 3, 4), paths)
+            ]},
+            raw_period_days=6.86,
+            possible_double_cycle_days=13.72,
+        )
+        self.assertTrue(result["physicalCycleResolved"])
+        self.assertFalse(result["continuationEvidence"]["timeFrequencyEvolutionWarranted"])
+
+    def test_weak_uninformative_morphology_does_not_continue(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        primary = self._write_light_curve(root, "primary-weak", 1, 0.0, "mixed")
+        result = analyze_morphology(
+            primary_dataset_path=primary,
+            independent_spec={"preparedSectors": []},
+            raw_period_days=6.86,
+            possible_double_cycle_days=13.72,
+        )
+        self.assertFalse(result["physicalCycleResolved"])
+        self.assertFalse(result["continuationEvidence"]["timeFrequencyEvolutionWarranted"])
 
 
 if __name__ == "__main__":
