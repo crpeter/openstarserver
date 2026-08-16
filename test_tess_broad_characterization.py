@@ -35,8 +35,10 @@ from workflows.tess.tess_investigation import time_frequency_continuation
 from workflows.tess.tess_investigation import nonstationary_continuation
 from workflows.tess.tess_investigation import residual_mode_localization_continuation
 from workflows.tess.tess_investigation import residual_mode_localization_review_continuation
+from workflows.tess.tess_investigation import multisource_residual_continuation
 from workflows.tess.tess_time_frequency import _fit_family_python
 from workflows.tess.tess_multisource_residual import interpret_multisource_residual_project
+from workflows.tess.tess_prf_refinement import compare_prf_hypotheses
 
 
 class BroadIndependentCharacterizationTests(unittest.TestCase):
@@ -915,6 +917,10 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
                 self.time = types.SimpleNamespace(value=absolute)
                 self.flux = types.SimpleNamespace(value=cube)
                 self.wcs = FrozenWCS()
+                self.camera = 1
+                self.ccd = 2
+                self.column = 100.0
+                self.row = 200.0
 
         def frozen_tpf(**kwargs):
             return FrozenTPF(kwargs["sector"]), {
@@ -1142,13 +1148,9 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
 
         decomposition = current.stages[-1]
         self.assertFalse(decomposition.result["physicalMechanismResolved"])
-        self.assertIn(decomposition.result["classification"], {
-            "MULTI_SOURCE_DECOMPOSITION_UNRESOLVED",
-            "MULTIPLE_RESIDUAL_SOURCES_SUPPORTED",
-            "TARGET_RESIDUAL_COMPONENT_DOMINANT",
-            "OFF_TARGET_RESIDUAL_COMPONENT_DOMINANT",
-        })
-        self.assertEqual("openstar.tess.finalize", request.handler_id)
+        self.assertEqual("MULTI_SOURCE_DECOMPOSITION_UNRESOLVED",
+                         decomposition.result["classification"])
+        self.assertEqual("openstar.tess.official-spoc-prf-forward-modeling.prepare", request.handler_id)
         self.assertEqual(sha256_json(decomposition_preparation.result),
                          decomposition.provenance.input_hashes["preparation"])
         summaries = {item["componentID"]: item
@@ -1197,6 +1199,66 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
                 self.assertTrue(item["lombScargleAccepted"])
                 self.assertGreater(item["coherentModelRMS"],
                                    item["predictedPointSourceLeakageRMS"])
+
+        current, request = engine.run_stage(
+            current, request, software_id="integration", software_version="20.31"
+        )
+        prf_preparation = current.stages[-1]
+        self.assertEqual("openstar.tess.official-spoc-prf-forward-modeling.prepare", prf_preparation.handler_id)
+        self.assertEqual("official-public-SPOC-TESS-PRF-FITS",
+                         prf_preparation.result["modelSource"])
+        self.assertEqual({64, 65}, set(prf_preparation.result["sectors"]))
+        self.assertEqual("target", prf_preparation.result["target"]["componentID"])
+        self.assertEqual("offset-1", prf_preparation.result["offset"]["componentID"])
+        self.assertIn("multiSourceDecomposition", prf_preparation.result["priorEvidence"])
+
+        frozen_prf = _real_numpy.zeros((11, 11), dtype=float)
+        frozen_prf[5, 5] = 1.0
+        frozen_header = {"CRPIX1": 6.0, "CRPIX2": 6.0, "OVERSAMP": 1}
+        frozen_grid = [
+            {"row": row, "column": column,
+             "url": f"frozen-prf-{row}-{column}.fits"}
+            for row in (200, 204) for column in (100, 104)
+        ]
+        with mock.patch("workflows.tess.tess_prf_refinement._download_tpf",
+                        side_effect=frozen_tpf), mock.patch(
+            "workflows.tess.tess_prf_refinement._list_official_prf_grid",
+            return_value=frozen_grid
+        ), mock.patch(
+            "workflows.tess.tess_spoc_prf._download_cached",
+            side_effect=lambda url, _destination: Path(url)
+        ), mock.patch(
+            "workflows.tess.tess_spoc_prf._fits_image",
+            return_value=(frozen_prf, frozen_header)
+        ):
+            current, request = engine.run_stage(
+                current, request, software_id="integration", software_version="20.31"
+            )
+        prf_run = current.stages[-1]
+        self.assertEqual("openstar.tess.official-spoc-prf-forward-modeling.run", prf_run.handler_id)
+        self.assertEqual(2, len(prf_run.result["sectorResults"]))
+        self.assertFalse(prf_run.result["workerProtocolUsed"])
+        for item in prf_run.result["sectorResults"]:
+            self.assertEqual({"TARGET_ONLY", "OFFSET_ONLY", "TARGET_PLUS_OFFSET"},
+                             set(item["models"]))
+            self.assertGreater(item["actualResidualPixelCount"], 0)
+            self.assertIn("bic", item["models"][item["bestModel"]])
+            self.assertIn("parameterCovariance", item["models"][item["bestModel"]])
+            self.assertIn("coherentCoefficientCovariances", item["temporalFit"])
+
+        current, request = engine.run_stage(
+            current, request, software_id="integration", software_version="20.31"
+        )
+        prf_summary = current.stages[-1].result
+        self.assertEqual("PRF_SOURCE_SWITCHING", prf_summary["classification"])
+        self.assertFalse(prf_summary["physicalMechanismResolved"])
+        self.assertEqual("CATALOG_COUNTERPART_IDENTIFICATION",
+                         prf_summary["recommendedNextTest"])
+        self.assertFalse(prf_summary["followingHandlerActivated"])
+        self.assertEqual("openstar.tess.finalize", request.handler_id)
+        restarted = store.load(current.id)
+        self.assertEqual(request, plan_tess_branches(restarted, target)[0].experiment)
+        self.assertEqual(len(current.stages), len(restarted.stages))
 
     def test_other_nonstationary_recommendations_do_not_enter_localization(self):
         localization = nonstationary_continuation(
@@ -1259,6 +1321,69 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
                     request_id="023-interpret-residual-mode-localization-review",
                 )
                 self.assertEqual("openstar.tess.finalize", request.handler_id)
+
+    def test_only_unresolved_prf_recommendation_enters_prf(self):
+        request = multisource_residual_continuation(
+            {"recommendedNextTest": "PIXEL_RESPONSE_FUNCTION_DEBLENDING",
+             "physicalMechanismResolved": False},
+            request_id="026-interpret-multi-source-residual",
+        )
+        self.assertEqual("openstar.tess.official-spoc-prf-forward-modeling.prepare", request.handler_id)
+        self.assertEqual("027-prepare-prf-deblending", request.id)
+        for recommendation, resolved in (
+            ("IDENTIFY_OFFSET_RESIDUAL_VARIABLE_SOURCE", False),
+            ("CATALOG_COUNTERPART_IDENTIFICATION", False),
+            ("PIXEL_RESPONSE_FUNCTION_DEBLENDING", True),
+        ):
+            with self.subTest(recommendation=recommendation, resolved=resolved):
+                request = multisource_residual_continuation(
+                    {"recommendedNextTest": recommendation,
+                     "physicalMechanismResolved": resolved},
+                    request_id="026-interpret-multi-source-residual",
+                )
+                self.assertEqual("openstar.tess.finalize", request.handler_id)
+
+    @unittest.skipUnless(_real_numpy is not None, "PRF controls require NumPy")
+    def test_covariance_weighted_prf_model_controls(self):
+        np = _real_numpy
+        x = np.linspace(-2.0, 2.0, 25)
+        target = np.exp(-0.5 * ((x + 0.8) / 0.45) ** 2)
+        offset = np.exp(-0.5 * ((x - 0.8) / 0.45) ** 2)
+        templates = np.column_stack((target / np.linalg.norm(target),
+                                     offset / np.linalg.norm(offset)))
+
+        def compare(target_vector=(0.0, 0.0), offset_vector=(0.0, 0.0),
+                    noise=0.02, matrix=templates):
+            coherent = (matrix[:, 0, None] * np.asarray(target_vector)[None, :]
+                        + matrix[:, 1, None] * np.asarray(offset_vector)[None, :])
+            covariance = np.repeat(np.diag([noise ** 2, (1.3 * noise) ** 2])[None, :, :],
+                                   len(matrix), axis=0)
+            return compare_prf_hypotheses(
+                coherent_coefficients=coherent, pixel_covariances=covariance,
+                template_matrix=matrix, component_ids=["target", "offset-1"],
+            )
+
+        controls = {
+            "target-only": (compare((1.0, 0.3)), "TARGET_ONLY", True),
+            "offset-only": (compare(offset_vector=(0.8, -0.2)), "OFFSET_ONLY", True),
+            "simultaneous": (compare((1.0, 0.2), (0.7, -0.3)), "TARGET_PLUS_OFFSET", True),
+            "weak-second": (compare((1.0, 0.2), (0.005, 0.0)), "TARGET_ONLY", True),
+            "null": (compare(), "TARGET_ONLY", False),
+        }
+        for name, (result, expected_model, identifiable) in controls.items():
+            with self.subTest(name=name):
+                self.assertEqual(expected_model, result["bestModel"])
+                self.assertEqual(identifiable, result["bestModelIdentifiable"])
+
+        coincident = np.column_stack((templates[:, 0], templates[:, 0]))
+        degenerate = compare((1.0, 0.2), (0.7, -0.3), matrix=coincident)
+        self.assertFalse(degenerate["models"]["TARGET_PLUS_OFFSET"]["fullRank"])
+        self.assertFalse(degenerate["bestModelIdentifiable"])
+
+        low_noise = compare((0.08, 0.02), noise=0.01)
+        high_noise = compare((0.08, 0.02), noise=0.20)
+        self.assertTrue(low_noise["bestModelIdentifiable"])
+        self.assertFalse(high_noise["bestModelIdentifiable"])
 
     def test_geometry_aware_multisource_support_controls(self):
         def interpret(target_amplitudes, offset_amplitudes, coupling, *, total_rms=None,
