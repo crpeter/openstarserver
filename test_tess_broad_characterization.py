@@ -16,6 +16,7 @@ from workflows.tess.tess_hypotheses import (
     interpret_broad_independent_sectors,
 )
 from workflows.tess.tess_morphology import analyze_morphology
+from workflows.tess.tess_morphology import _stationarity_evidence
 
 # The integration exercises handlers whose selected path is pure Python.  The
 # full adapter also registers optional NumPy-backed archival handlers; keep
@@ -46,14 +47,26 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
         )
         return store.complete_current_stage(investigation, terminal)
 
-    def _write_light_curve(self, root, name, sector, phase_offset, shape="mixed"):
+    def _write_light_curve(
+        self, root, name, sector, phase_offset, shape="mixed", *,
+        noise=0.0, gap_modulus=None, amplitude_scale=1.0,
+        double_phase=0.0, raw_amplitude=None, double_amplitude=None,
+    ):
         path = root / f"{name}.json"
-        times = [index * 0.01 for index in range(3001)]
-        double_amplitude = {"raw": 0.0, "double": 0.03, "mixed": 0.008}[shape]
-        raw_amplitude = {"raw": 0.025, "double": 0.008, "mixed": 0.02}[shape]
+        times = [index * 0.01 for index in range(3001)
+                 if gap_modulus is None or index % gap_modulus not in (0, 1)]
+        double_amplitude = (
+            {"raw": 0.0, "double": 0.03, "mixed": 0.008}[shape]
+            if double_amplitude is None else double_amplitude
+        ) * amplitude_scale
+        raw_amplitude = (
+            {"raw": 0.025, "double": 0.008, "mixed": 0.02}[shape]
+            if raw_amplitude is None else raw_amplitude
+        ) * amplitude_scale
         flux = [1.0
             + raw_amplitude * math.sin(2.0 * math.pi * time / 6.86 + phase_offset)
-            + double_amplitude * math.sin(2.0 * math.pi * time / 13.72)
+            + double_amplitude * math.sin(2.0 * math.pi * time / 13.72 + double_phase)
+            + noise * math.sin(2.0 * math.pi * time / 0.371 + sector * 0.17)
             for time in times]
         path.write_text(
             json.dumps(
@@ -439,6 +452,161 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
         )
         self.assertTrue(result["physicalCycleResolved"])
         self.assertFalse(result["continuationEvidence"]["timeFrequencyEvolutionWarranted"])
+        self.assertEqual(
+            "NO_TIME_FREQUENCY_EVOLUTION_FOLLOWUP_WARRANTED",
+            result["continuationEvidence"]["stationarityEvidence"]["classification"],
+        )
+
+    def test_stable_double_wave_morphology_finalizes(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        primary = self._write_light_curve(root, "primary-double", 1, 0.0, "double")
+        paths = [self._write_light_curve(root, f"double-{sector}", sector, 0.0, "double")
+                 for sector in (2, 3, 4)]
+        result = analyze_morphology(
+            primary_dataset_path=primary,
+            independent_spec={"preparedSectors": [
+                {"sector": sector, "datasetPath": str(path)}
+                for sector, path in zip((2, 3, 4), paths)
+            ]}, raw_period_days=6.86, possible_double_cycle_days=13.72,
+        )
+        self.assertEqual("DOUBLE_WAVE_PHYSICAL_CYCLE_SUPPORTED", result["morphologyClass"])
+        self.assertFalse(result["continuationEvidence"]["timeFrequencyEvolutionWarranted"])
+
+    def test_resolved_cycle_with_generic_morphology_evolution_continues(self):
+        # Blind-C-like values are used only as a regression input.  The rule is
+        # based on robust cross-sector IQRs and requires multiple diagnostics.
+        gains = [0.1547, 0.0951, 0.0920, 0.2383, 0.4700]
+        halves = [0.3876, 0.2966, 0.3599, 0.6052, 0.5695]
+        evidence = _stationarity_evidence([
+            {
+                "doubleExplainedVarianceImprovement": gain,
+                "doubleWaveMetrics": {"halfCycleDifferenceRatio": half},
+                "doubleProfile": {
+                    "profileAmplitude": 0.03, "minimumPhase": 0.2,
+                    "minimumDutyCycle": 0.25, "profileRoughness": 0.05,
+                },
+            }
+            for gain, half in zip(gains, halves)
+        ])
+        self.assertTrue(evidence["followupWarranted"])
+        self.assertEqual(
+            ["doubleExplainedVarianceGainIqr", "halfCycleDifferenceRatioIqr"],
+            evidence["triggeredMetrics"],
+        )
+        self.assertEqual(["SHAPE_RAW_DOUBLE"], evidence["triggeredEvidenceFamilies"])
+        self.assertIn("does not establish nonstationarity", evidence["interpretation"])
+
+    def test_stable_noisy_gapped_controls_do_not_trigger_followup(self):
+        for shape in ("raw", "double"):
+            with self.subTest(shape=shape):
+                temporary = tempfile.TemporaryDirectory()
+                self.addCleanup(temporary.cleanup)
+                root = Path(temporary.name)
+                primary = self._write_light_curve(
+                    root, f"{shape}-primary", 10, 0.0, shape,
+                    noise=0.003, gap_modulus=17,
+                )
+                paths = [self._write_light_curve(
+                    root, f"{shape}-{sector}", sector, 0.0, shape,
+                    noise=0.003, gap_modulus=modulus,
+                ) for sector, modulus in zip((11, 12, 13, 14), (13, 19, 23, 29))]
+                result = analyze_morphology(
+                    primary_dataset_path=primary,
+                    independent_spec={"preparedSectors": [
+                        {"sector": sector, "datasetPath": str(path)}
+                        for sector, path in zip((11, 12, 13, 14), paths)
+                    ]}, raw_period_days=6.86, possible_double_cycle_days=13.72,
+                )
+                stationarity = result["continuationEvidence"]["stationarityEvidence"]
+                self.assertFalse(stationarity["followupWarranted"], stationarity)
+                self.assertEqual([], stationarity["triggeredMetrics"])
+
+    def test_deliberate_amplitude_phase_and_shape_changes_trigger_expected_families(self):
+        cases = {
+            "AMPLITUDE": [
+                {"doubleProfile": {"profileAmplitude": value, "minimumPhase": .2,
+                 "minimumDutyCycle": .2, "profileRoughness": .05},
+                 "doubleExplainedVarianceImprovement": .2,
+                 "doubleWaveMetrics": {"halfCycleDifferenceRatio": .4}}
+                for value in (.01, .02, .04, .08, .12)
+            ],
+            "PHASE": [
+                {"doubleProfile": {"profileAmplitude": .03, "minimumPhase": value,
+                 "minimumDutyCycle": .2, "profileRoughness": .05},
+                 "doubleExplainedVarianceImprovement": .2,
+                 "doubleWaveMetrics": {"halfCycleDifferenceRatio": .4}}
+                for value in (.05, .15, .30, .45, .60)
+            ],
+            "SHAPE_RAW_DOUBLE": [
+                {"doubleProfile": {"profileAmplitude": .03, "minimumPhase": .2,
+                 "minimumDutyCycle": .2, "profileRoughness": .05},
+                 "doubleExplainedVarianceImprovement": gain,
+                 "doubleWaveMetrics": {"halfCycleDifferenceRatio": half}}
+                for gain, half in zip((.04, .08, .18, .32, .48), (.12, .20, .35, .55, .75))
+            ],
+        }
+        for expected_family, sectors in cases.items():
+            with self.subTest(expected_family=expected_family):
+                evidence = _stationarity_evidence(sectors)
+                self.assertTrue(evidence["followupWarranted"])
+                self.assertIn(expected_family, evidence["triggeredEvidenceFamilies"])
+
+    def test_resolved_evolving_real_time_frequency_preparation_uses_resolved_period(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        store = InvestigationStore(root / "investigations")
+        investigation = store.create("resolved-evolving", WORKFLOW_ID, WORKFLOW_VERSION)
+        primary = self._write_light_curve(root, "resolved-primary", 62, 0.0, "double")
+        independent_paths = [
+            self._write_light_curve(root, f"resolved-{sector}", sector, 0.1 * index, "double")
+            for index, sector in enumerate((64, 65, 66), start=1)
+        ]
+        source_project = root / "source-project.json"
+        source_project.write_text(json.dumps({
+            "id": "resolved-source", "name": "Resolved evolving source",
+            "workloadID": "openstar.lomb-scargle.v1", "datasets": [],
+        }), encoding="utf-8")
+        independent = {"preparedSectors": [
+            {"datasetID": f"sector-{sector}", "sector": sector,
+             "baselineDays": 30.0, "datasetPath": str(path)}
+            for sector, path in zip((64, 65, 66), independent_paths)
+        ]}
+        morphology = {
+            "physicalCycleResolved": True,
+            "resolvedPhysicalPeriodDays": 13.717836472675433,
+            "continuationEvidence": {
+                "timeFrequencyEvolutionWarranted": True,
+                "entryReason": "RESOLVED_MORPHOLOGY_EVOLUTION_FOLLOWUP",
+                "analysisReferencePeriodDays": 13.717836472675433,
+                "periodReferenceKind": "MORPHOLOGY_RESOLVED_PHYSICAL_PERIOD",
+            },
+        }
+        for stage_id, handler, result in (
+            ("001-prepare-target", "openstar.tess.prepare-target", {
+                "datasetPath": str(primary), "sector": 62,
+                "sourceProjectPath": str(source_project),
+                "sourceDatasetEntry": {"id": "primary", "targetName": "Resolved source"},
+            }),
+            ("006-prepare-independent", "openstar.tess.independent.prepare", independent),
+            ("010-morphology", "openstar.tess.morphology.analyze", morphology),
+        ):
+            investigation = self._complete(store, investigation, stage_id, handler, result)
+        engine = build_engine(store, coordinator=types.SimpleNamespace(), poll_interval=0.0, timeout=None)
+        engine.chain_stages = False
+        completed, next_request = engine.run_stage(
+            investigation,
+            StageRequest("011-prepare-time-frequency", "openstar.tess.time-frequency.prepare",
+                         {"entryReason": "RESOLVED_MORPHOLOGY_EVOLUTION_FOLLOWUP"}, "010-morphology"),
+            software_id="integration", software_version="20.29",
+        )
+        prepared = completed.stages[-1].result
+        self.assertAlmostEqual(13.717836472675433, prepared["physicalPeriodDays"])
+        self.assertEqual("MORPHOLOGY_RESOLVED_PHYSICAL_PERIOD", prepared["periodReference"]["kind"])
+        self.assertNotEqual("UNRESOLVED_FAMILY_ANALYSIS_REFERENCE", prepared["periodReference"]["kind"])
+        self.assertEqual("openstar.tess.time-frequency.run", next_request.handler_id)
 
     def test_weak_uninformative_morphology_does_not_continue(self):
         temporary = tempfile.TemporaryDirectory()
