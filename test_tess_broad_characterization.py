@@ -36,6 +36,7 @@ from workflows.tess.tess_investigation import nonstationary_continuation
 from workflows.tess.tess_investigation import residual_mode_localization_continuation
 from workflows.tess.tess_investigation import residual_mode_localization_review_continuation
 from workflows.tess.tess_time_frequency import _fit_family_python
+from workflows.tess.tess_multisource_residual import interpret_multisource_residual_project
 
 
 class BroadIndependentCharacterizationTests(unittest.TestCase):
@@ -1168,14 +1169,15 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
             self.assertGreater(item["coefficientRMS"], 0.0)
             self.assertAlmostEqual(residual_frequency, item["candidateFrequency"])
             self.assertAlmostEqual(1.0 / residual_frequency, item["candidatePeriodDays"])
-            self.assertEqual(0.25, item["supportRMSFractionThreshold"])
+            self.assertIn("predictedPointSourceLeakageRMS", item)
             print(
                 "MULTISOURCE_COMPONENT_EVIDENCE "
                 f"component={item['componentID']} sector={item['sector']} role={item['role']} "
                 f"samples={item['sampleCount']} rms={item['coefficientRMS']:.12g} "
                 f"power={item['candidatePower']:.12g} frequency={item['candidateFrequency']:.12g} "
-                f"period={item['candidatePeriodDays']:.12g} threshold="
-                f"{item['supportRMSFractionThreshold']} support={item['countedAsIndependentSupport']}"
+                f"period={item['candidatePeriodDays']:.12g} predictedLeakage="
+                f"{item['predictedPointSourceLeakageRMS']:.12g} "
+                f"support={item['countedAsIndependentSupport']}"
             )
             if item["sector"] is not None:
                 matrix[(item["componentID"], item["sector"])] = item
@@ -1249,6 +1251,79 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
                     request_id="023-interpret-residual-mode-localization-review",
                 )
                 self.assertEqual("openstar.tess.finalize", request.handler_id)
+
+    def test_geometry_aware_multisource_support_controls(self):
+        def interpret(target_amplitudes, offset_amplitudes, coupling):
+            prepared = []
+            status = []
+            coupling_map = {
+                "target": {"target": 1.0, "offset-1": coupling},
+                "offset-1": {"target": coupling, "offset-1": 1.0},
+            }
+            for component_id, component_type, amplitudes in (
+                ("target", "TARGET", target_amplitudes),
+                ("offset-1", "OFFSET", offset_amplitudes),
+            ):
+                for sector, amplitude in zip((1, 2), amplitudes):
+                    dataset_id = f"{component_id}-{sector}"
+                    prepared.append({
+                        "datasetID": dataset_id, "componentID": component_id,
+                        "componentType": component_type, "sector": sector,
+                        "role": "independent", "combined": False,
+                        "coefficientRMS": amplitude,
+                        "pointSourceLeakageCoupling": coupling_map,
+                    })
+                    status.append({
+                        "datasetID": dataset_id, "candidatePower": 0.5,
+                        "candidateFrequency": 0.25, "candidatePeriodDays": 4.0,
+                        "periodStatus": "RELIABLE", "periodConfidence": "high",
+                    })
+                dataset_id = f"{component_id}-combined"
+                prepared.append({
+                    "datasetID": dataset_id, "componentID": component_id,
+                    "componentType": component_type, "sector": None,
+                    "role": "combined", "combined": True,
+                    "coefficientRMS": sum(amplitudes) / 2.0,
+                    "pointSourceLeakageCoupling": coupling_map,
+                })
+                status.append({
+                    "datasetID": dataset_id, "candidatePower": 0.5,
+                    "candidateFrequency": 0.25, "candidatePeriodDays": 4.0,
+                    "periodStatus": "RELIABLE", "periodConfidence": "high",
+                })
+            return interpret_multisource_residual_project(
+                project_status={"datasets": status},
+                preparation={
+                    "preparedSeries": prepared,
+                    "spatialComponents": [
+                        {"componentID": "target", "componentType": "TARGET"},
+                        {"componentID": "offset-1", "componentType": "OFFSET"},
+                    ],
+                },
+            )
+
+        controls = (
+            ("target-only-near", (1.0, 1.0), (0.20, 0.20), 0.20,
+             "TARGET_RESIDUAL_COMPONENT_DOMINANT", (2, 0)),
+            ("offset-only-near", (0.20, 0.20), (1.0, 1.0), 0.20,
+             "OFF_TARGET_RESIDUAL_COMPONENT_DOMINANT", (0, 2)),
+            ("weaker-secondary-wide", (1.0, 1.0), (0.20, 0.20), 0.05,
+             "MULTIPLE_RESIDUAL_SOURCES_SUPPORTED", (2, 2)),
+            ("comparable-simultaneous", (1.0, 1.0), (0.8, 0.8), 0.20,
+             "MULTIPLE_RESIDUAL_SOURCES_SUPPORTED", (2, 2)),
+            ("sector-switching", (1.0, 0.20), (0.20, 1.0), 0.20,
+             "MULTI_SOURCE_DECOMPOSITION_UNRESOLVED", (1, 1)),
+        )
+        for name, target_rms, offset_rms, coupling, classification, supports in controls:
+            with self.subTest(name=name):
+                result = interpret(target_rms, offset_rms, coupling)
+                summaries = {item["componentID"]: item
+                             for item in result["componentSummaries"]}
+                self.assertEqual(classification, result["classification"])
+                self.assertEqual(supports, (
+                    summaries["target"]["independentSupportCount"],
+                    summaries["offset-1"]["independentSupportCount"],
+                ))
 
     def test_transient_recommendation_does_not_route_to_nonstationary(self):
         request = time_frequency_continuation(

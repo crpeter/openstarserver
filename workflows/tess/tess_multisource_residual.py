@@ -38,7 +38,6 @@ MIN_COMPONENT_SAMPLES = 80
 MIN_COMPONENT_POWER = 0.08
 MIN_INDEPENDENT_SUPPORT = 2
 DOMINANCE_POWER_RATIO = 1.25
-MIN_SECTOR_COMPONENT_RMS_FRACTION = 0.25
 
 
 def _design_matrix(times: np.ndarray, physical_frequency: float) -> np.ndarray:
@@ -290,6 +289,31 @@ def _decompose_residual_cube(
     )
     condition_number = float(np.linalg.cond(spatial))
     pinv = np.linalg.pinv(spatial)
+    coupling: dict[str, dict[str, float]] = {}
+    for source_index, source_component in enumerate(usable_components):
+        center = source_component["pixelCenter"]
+        source_x = min(max(float(center["x"]), 0.0), cols - 1.0)
+        source_y = min(max(float(center["y"]), 0.0), rows - 1.0)
+        x0, y0 = int(math.floor(source_x)), int(math.floor(source_y))
+        x1, y1 = min(x0 + 1, cols - 1), min(y0 + 1, rows - 1)
+        point = np.zeros(rows * cols, dtype=np.float64)
+        for x_pixel, x_weight in ((x0, x1 - source_x), (x1, source_x - x0)):
+            for y_pixel, y_weight in ((y0, y1 - source_y), (y1, source_y - y0)):
+                weight = x_weight * y_weight
+                if x0 == x1:
+                    weight = y_weight
+                if y0 == y1:
+                    weight = x_weight
+                point[y_pixel * cols + x_pixel] += weight
+        response = pinv @ point
+        own = abs(float(response[source_index]))
+        source_id = str(source_component["componentID"])
+        coupling[source_id] = {}
+        for measured_index, measured_component in enumerate(usable_components):
+            measured_id = str(measured_component["componentID"])
+            coupling[source_id][measured_id] = (
+                abs(float(response[measured_index])) / own if own > 1e-12 else math.inf
+            )
     flat = residual_cube.reshape(len(residual_cube), -1).astype(np.float64)
     coefficients = (pinv @ flat.T).T
 
@@ -304,6 +328,7 @@ def _decompose_residual_cube(
         component["coefficientRMS"] = std
         component["spatialDesignConditionNumber"] = condition_number
         component["normalizedTemplateOverlap"] = template_overlap
+        component["pointSourceLeakageCoupling"] = coupling
     return series, usable_components
 
 
@@ -481,6 +506,7 @@ def build_multisource_residual_project(
                         "coefficientRMS": component.get("coefficientRMS"),
                         "spatialDesignConditionNumber": component.get("spatialDesignConditionNumber"),
                         "normalizedTemplateOverlap": component.get("normalizedTemplateOverlap"),
+                        "pointSourceLeakageCoupling": component.get("pointSourceLeakageCoupling"),
                     }
                 )
                 combined.setdefault(component_id, []).append((np.asarray(warped, dtype=np.float64), np.asarray(values, dtype=np.float64)))
@@ -628,22 +654,48 @@ def interpret_multisource_residual_project(
         result["accepted"] = _accepted(dataset)
         results.append(result)
 
-    sector_max_rms: dict[int, float] = {}
     for result in results:
         sector = _int(result.get("sector"))
         rms = _float(result.get("coefficientRMS"))
-        if sector is not None and rms is not None:
-            sector_max_rms[sector] = max(sector_max_rms.get(sector, 0.0), rms)
+        power = _float(result.get("candidatePower"))
+        result["coherentCoefficientRMS"] = (
+            rms * math.sqrt(max(0.0, power))
+            if rms is not None and power is not None else None
+        )
+
     for result in results:
         sector = _int(result.get("sector"))
-        rms = _float(result.get("coefficientRMS"))
-        maximum = sector_max_rms.get(sector, 0.0) if sector is not None else 0.0
-        fraction = rms / maximum if rms is not None and maximum > 0 else None
-        result["componentRMSFractionOfSectorMaximum"] = fraction
-        result["supportRMSFractionThreshold"] = MIN_SECTOR_COMPONENT_RMS_FRACTION
+        coherent = _float(result.get("coherentCoefficientRMS"))
+        predicted = 0.0
+        predictors: list[dict[str, Any]] = []
+        if sector is not None and coherent is not None:
+            coupling = result.get("pointSourceLeakageCoupling") or {}
+            measured_id = str(result.get("componentID"))
+            for other in results:
+                if _int(other.get("sector")) != sector or other.get("combined"):
+                    continue
+                other_coherent = _float(other.get("coherentCoefficientRMS"))
+                if other_coherent is None or other_coherent <= coherent:
+                    continue
+                source_id = str(other.get("componentID"))
+                ratio = _float((coupling.get(source_id) or {}).get(measured_id))
+                if ratio is None or not math.isfinite(ratio):
+                    continue
+                allowance = ratio * other_coherent
+                predicted = max(predicted, allowance)
+                predictors.append({
+                    "sourceComponentID": source_id,
+                    "couplingRatio": ratio,
+                    "sourceCoherentCoefficientRMS": other_coherent,
+                    "allowedLeakageRMS": allowance,
+                })
+        result["predictedPointSourceLeakageRMS"] = predicted
+        result["leakagePredictors"] = predictors
         result["amplitudeQualified"] = bool(
             result.get("combined") or (
-                fraction is not None and fraction >= MIN_SECTOR_COMPONENT_RMS_FRACTION
+                coherent is not None
+                and coherent > predicted
+                and not math.isclose(coherent, predicted, rel_tol=1e-6, abs_tol=1e-12)
             )
         )
         result["countedAsIndependentSupport"] = bool(
@@ -695,8 +747,10 @@ def interpret_multisource_residual_project(
 
     target_support = int((target or {}).get("independentSupportCount") or 0)
     offset_support = int((best_offset or {}).get("independentSupportCount") or 0)
-    target_power = float((target or {}).get("combinedPower") or 0.0)
-    offset_power = float((best_offset or {}).get("combinedPower") or 0.0)
+    target_combined = next((item for item in results if item.get("combined") and item.get("componentType") == "TARGET"), None)
+    offset_combined = next((item for item in results if item.get("combined") and item.get("componentID") == (best_offset or {}).get("componentID")), None)
+    target_strength = float((target_combined or {}).get("coherentCoefficientRMS") or 0.0)
+    offset_strength = float((offset_combined or {}).get("coherentCoefficientRMS") or 0.0)
     target_present = target_support >= MIN_INDEPENDENT_SUPPORT and bool((target or {}).get("combinedAccepted"))
     offset_present = offset_support >= MIN_INDEPENDENT_SUPPORT and bool((best_offset or {}).get("combinedAccepted"))
 
@@ -704,11 +758,11 @@ def interpret_multisource_residual_project(
         classification = "MULTIPLE_RESIDUAL_SOURCES_SUPPORTED"
         origin = "TARGET_AND_OFFSET_COMPONENTS"
         next_test = "NEIGHBOR_SOURCE_IDENTIFICATION_AND_CATALOG_CROSSMATCH"
-    elif target_present and (offset_power <= 0 or target_power >= offset_power * DOMINANCE_POWER_RATIO):
+    elif target_present and (offset_strength <= 0 or target_strength >= offset_strength * DOMINANCE_POWER_RATIO):
         classification = "TARGET_RESIDUAL_COMPONENT_DOMINANT"
         origin = "TARGET_DOMINANT"
         next_test = "INTRINSIC_NONSTATIONARY_VARIABILITY_CLASSIFICATION"
-    elif offset_present and (target_power <= 0 or offset_power >= target_power * DOMINANCE_POWER_RATIO):
+    elif offset_present and (target_strength <= 0 or offset_strength >= target_strength * DOMINANCE_POWER_RATIO):
         classification = "OFF_TARGET_RESIDUAL_COMPONENT_DOMINANT"
         origin = "OFFSET_DOMINANT"
         next_test = "IDENTIFY_OFFSET_RESIDUAL_VARIABLE_SOURCE"
@@ -728,11 +782,10 @@ def interpret_multisource_residual_project(
         "supportQualification": {
             "minimumCandidatePower": MIN_COMPONENT_POWER,
             "minimumIndependentSupport": MIN_INDEPENDENT_SUPPORT,
-            "minimumSectorComponentRMSFraction": MIN_SECTOR_COMPONENT_RMS_FRACTION,
             "reason": (
                 "A normalized component periodogram is not independent-source evidence unless "
-                "the component's pre-normalization coefficient RMS is also a material fraction "
-                "of the strongest fitted spatial component in that sector."
+                "its coherent pre-normalization coefficient RMS exceeds the point-source leakage "
+                "predicted from the actual sector spatial design and stronger fitted components."
             ),
         },
         "spatialComponents": preparation.get("spatialComponents") or [],
