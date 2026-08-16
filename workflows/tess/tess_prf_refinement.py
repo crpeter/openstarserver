@@ -288,6 +288,11 @@ def run_prf_deblending(preparation: dict[str, Any]) -> dict[str, Any]:
                 "tpfPhysicalRow": tpf_row, "tpfPhysicalColumn": tpf_col,
                 "sampleCount": len(times), "actualResidualPixelCount": int(np.count_nonzero(valid)),
                 "calibration": calibration_provenance, "models": models,
+                "executionProvenance": {
+                    "officialDetectorGridInterpolationExecuted": True,
+                    "prfStampRenderingExecuted": True,
+                    "renderedComponentIDs": component_ids,
+                },
                 "bestModel": best_model,
                 "templateCorrelation": correlation, "designConditionNumber": condition,
                 "historicalForwardDesignGuard": {

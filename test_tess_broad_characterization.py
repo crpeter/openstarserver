@@ -921,6 +921,12 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
                 self.ccd = 2
                 self.column = 100.0
                 self.row = 200.0
+                # Match the minimum TessTargetPixelFile header contract used
+                # by _tpf_detector_geometry before its attribute fallbacks.
+                self.hdu = [
+                    types.SimpleNamespace(header={}),
+                    types.SimpleNamespace(header={}),
+                ]
 
         def frozen_tpf(**kwargs):
             return FrozenTPF(kwargs["sector"]), {
@@ -1236,6 +1242,8 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
             )
         prf_run = current.stages[-1]
         self.assertEqual("openstar.tess.official-spoc-prf-forward-modeling.run", prf_run.handler_id)
+        print("PRF_ERRORS", prf_run.result.get("errors"))
+        print("PRF_SECTOR_RESULTS", prf_run.result.get("sectorResults"))
         self.assertEqual(2, len(prf_run.result["sectorResults"]))
         self.assertFalse(prf_run.result["workerProtocolUsed"])
         for item in prf_run.result["sectorResults"]:
@@ -1245,11 +1253,39 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
             self.assertIn("bic", item["models"][item["bestModel"]])
             self.assertIn("parameterCovariance", item["models"][item["bestModel"]])
             self.assertIn("coherentCoefficientCovariances", item["temporalFit"])
+            self.assertTrue(item["executionProvenance"]["officialDetectorGridInterpolationExecuted"])
+            self.assertTrue(item["executionProvenance"]["prfStampRenderingExecuted"])
+            positions = {entry["componentID"]: entry for entry in item["calibration"]}
+            print(
+                "PRF_SECTOR_EVIDENCE",
+                {"sector": item["sector"], "camera": item["camera"], "ccd": item["ccd"],
+                 "targetDetectorPosition": positions["target"],
+                 "offsetDetectorPosition": positions["offset-1"],
+                 "templateCorrelation": item["templateCorrelation"],
+                 "bestModel": item["bestModel"]},
+            )
+            for model_id in ("TARGET_ONLY", "OFFSET_ONLY", "TARGET_PLUS_OFFSET"):
+                model = item["models"][model_id]
+                print(
+                    "PRF_HYPOTHESIS_EVIDENCE",
+                    {"sector": item["sector"], "model": model_id,
+                     "chiSquare": model["chiSquare"],
+                     "logLikelihood": model["logLikelihood"], "bic": model["bic"],
+                     "deltaBIC": model["deltaBIC"], "rank": model["rank"],
+                     "fullRank": model["fullRank"],
+                     "singularValues": model["singularValues"],
+                     "sources": model["sourceEstimates"]},
+                )
 
         current, request = engine.run_stage(
             current, request, software_id="integration", software_version="20.31"
         )
         prf_summary = current.stages[-1].result
+        print("PRF_CROSS_SECTOR_RESULT", {
+            "classification": prf_summary["classification"],
+            "physicalMechanismResolved": prf_summary["physicalMechanismResolved"],
+            "recommendedNextTest": prf_summary["recommendedNextTest"],
+        })
         self.assertEqual("PRF_SOURCE_SWITCHING", prf_summary["classification"])
         self.assertFalse(prf_summary["physicalMechanismResolved"])
         self.assertEqual("CATALOG_COUNTERPART_IDENTIFICATION",
