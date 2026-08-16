@@ -33,6 +33,7 @@ if _real_numpy is None:
 from workflows.tess.tess_investigation import build_engine
 from workflows.tess.tess_investigation import time_frequency_continuation
 from workflows.tess.tess_investigation import nonstationary_continuation
+from workflows.tess.tess_investigation import residual_mode_localization_continuation
 from workflows.tess.tess_time_frequency import _fit_family_python
 
 
@@ -721,7 +722,10 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
                 for entry in manifest["datasets"]:
                     dataset = json.loads(Path(entry["path"]).read_text(encoding="utf-8"))
                     q = float(dataset["science"]["fractionalFrequencyDriftPerDay"])
-                    if dataset["science"].get("role") == "residual-mode-pixel-localization":
+                    if dataset["science"].get("role") in (
+                        "residual-mode-pixel-localization",
+                        "residual-mode-time-resolved-pixel-localization",
+                    ):
                         sector = int(dataset["science"]["sector"])
                         row = int(dataset["science"]["pixelRow"])
                         column = int(dataset["science"]["pixelColumn"])
@@ -925,9 +929,78 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
         self.assertEqual("RESIDUAL_MODE_SOURCE_LOCALIZATION_REVIEW",
                          localization.result["recommendedNextTest"])
         self.assertFalse(localization.result["physicalMechanismResolved"])
-        self.assertEqual("openstar.tess.finalize", request.handler_id)
+        self.assertEqual("openstar.tess.residual-mode-localization-review.prepare",
+                         request.handler_id)
         self.assertEqual(sha256_json(nonstationary),
                          localization.provenance.input_hashes["nonstationaryModeling"])
+
+        with mock.patch(
+            "workflows.tess.tess_residual_localization_review._download_tpf",
+            side_effect=frozen_tpf,
+        ), mock.patch(
+            "workflows.tess.tess_residual_localization_review._pixel_scale_arcsec",
+            return_value=21.0,
+        ), mock.patch(
+            "workflows.tess.tess_residual_localization_review._local_sky_jacobian",
+            return_value={"eastArcsecPerPixelX": 21.0,
+                          "eastArcsecPerPixelY": 0.0,
+                          "northArcsecPerPixelX": 0.0,
+                          "northArcsecPerPixelY": 21.0},
+        ):
+            current, request = engine.run_stage(
+                current, request, software_id="integration", software_version="20.30"
+            )
+        review_preparation = current.stages[-1]
+        self.assertEqual("openstar.tess.residual-mode-localization-review.prepare",
+                         review_preparation.handler_id)
+        self.assertEqual(sha256_json(localization.result),
+                         review_preparation.provenance.input_hashes["residualModeLocalization"])
+        self.assertEqual(sha256_json(nonstationary),
+                         review_preparation.provenance.input_hashes["nonstationaryModeling"])
+        self.assertAlmostEqual(physical_period,
+                               review_preparation.result["physicalPeriodDays"])
+        self.assertAlmostEqual(residual_frequency,
+                               review_preparation.result["residualFrequencyAtReference"])
+        self.assertNotAlmostEqual(1.0 / physical_period,
+                                  review_preparation.result["residualFrequencyAtReference"])
+        self.assertEqual({"TARGET_CONSISTENT", "OFF_TARGET"}, {
+            item["v20_10StaticClassification"]
+            for item in review_preparation.result["windowMetadata"]
+        })
+        self.assertTrue(all(item.get("skyJacobian")
+                            for item in review_preparation.result["windowMetadata"]))
+
+        restarted = store.load(current.id)
+        self.assertEqual(request, plan_tess_branches(restarted, target)[0].experiment)
+        current = restarted
+        for expected_handler in (
+            "openstar.tess.residual-mode-localization-review.run",
+            "openstar.tess.residual-mode-localization-review.interpret",
+        ):
+            before = len(current.stages)
+            current, request = engine.run_stage(
+                current, request, software_id="integration", software_version="20.30"
+            )
+            self.assertEqual(expected_handler, current.stages[-1].handler_id)
+            self.assertEqual(before + 1, len(current.stages))
+            restarted = store.load(current.id)
+            self.assertEqual(request, plan_tess_branches(restarted, target)[0].experiment)
+            self.assertEqual(len(current.stages), len(restarted.stages))
+            current = restarted
+
+        review = current.stages[-1].result
+        self.assertEqual("RESIDUAL_MODE_SOURCE_SWITCHING_OR_BLEND",
+                         review["crossTime"]["classification"])
+        self.assertEqual("TIME_VARIABLE_OR_BLENDED",
+                         review["crossTime"]["residualModeOrigin"])
+        self.assertEqual("MULTI_SOURCE_RESIDUAL_DECOMPOSITION",
+                         review["recommendedNextTest"])
+        self.assertFalse(review["physicalMechanismResolved"])
+        self.assertEqual("openstar.tess.finalize", request.handler_id)
+        self.assertTrue(any(item["skySeparationArcsec"] > 0
+                            for item in review["windowResults"]))
+        self.assertTrue(any(item["offsetPixels"] > 0
+                            for item in review["windowResults"]))
 
     def test_other_nonstationary_recommendations_do_not_enter_localization(self):
         localization = nonstationary_continuation(
@@ -947,6 +1020,27 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
                     {"recommendedNextTest": recommendation,
                      "physicalMechanismResolved": resolved},
                     request_id="017-summarize-nonstationary",
+                )
+                self.assertEqual("openstar.tess.finalize", request.handler_id)
+
+    def test_only_unresolved_source_review_recommendation_enters_review(self):
+        review = residual_mode_localization_continuation(
+            {"recommendedNextTest": "RESIDUAL_MODE_SOURCE_LOCALIZATION_REVIEW",
+             "physicalMechanismResolved": False},
+            request_id="020-interpret-residual-mode-localization",
+        )
+        self.assertEqual("openstar.tess.residual-mode-localization-review.prepare",
+                         review.handler_id)
+        for recommendation, resolved in (
+            ("MULTI_SOURCE_RESIDUAL_DECOMPOSITION", False),
+            ("RESIDUAL_MODE_PIXEL_LOCALIZATION", False),
+            ("RESIDUAL_MODE_SOURCE_LOCALIZATION_REVIEW", True),
+        ):
+            with self.subTest(recommendation=recommendation, resolved=resolved):
+                request = residual_mode_localization_continuation(
+                    {"recommendedNextTest": recommendation,
+                     "physicalMechanismResolved": resolved},
+                    request_id="020-interpret-residual-mode-localization",
                 )
                 self.assertEqual("openstar.tess.finalize", request.handler_id)
 

@@ -287,6 +287,31 @@ def nonstationary_continuation(summary: dict[str, Any], *, request_id: str) -> S
     )
 
 
+def residual_mode_localization_continuation(
+    summary: dict[str, Any], *, request_id: str
+) -> StageRequest:
+    """Route only the persisted, unresolved source-localization review request."""
+
+    run_review = (
+        summary.get("recommendedNextTest")
+        == "RESIDUAL_MODE_SOURCE_LOCALIZATION_REVIEW"
+        and summary.get("physicalMechanismResolved") is False
+    )
+    return StageRequest(
+        id=_next_stage_id(
+            request_id,
+            "prepare-residual-mode-localization-review" if run_review else "finalize",
+        ),
+        handler_id=(
+            "openstar.tess.residual-mode-localization-review.prepare"
+            if run_review
+            else "openstar.tess.finalize"
+        ),
+        parameters={} if run_review else {"outputSuffix": "v20.10"},
+        triggered_by_stage_id=request_id,
+    )
+
+
 def _build_period_evidence(
     *,
     claim_decision: dict[str, Any],
@@ -2959,11 +2984,9 @@ def build_engine(
         _write_json(artifact_path, localization)
         return StageOutcome(
             result=localization,
-            next_stage=StageRequest(
-                id=_next_stage_id(request.id, "finalize"),
-                handler_id="openstar.tess.finalize",
-                parameters={"outputSuffix": "v20.10"},
-                triggered_by_stage_id=request.id,
+            next_stage=residual_mode_localization_continuation(
+                localization,
+                request_id=request.id,
             ),
             input_hashes={
                 "preparation": sha256_json(preparation),
