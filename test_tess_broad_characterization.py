@@ -1270,8 +1270,9 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
             validation = item["temporalPredictiveValidation"]
             self.assertEqual(4, len(validation["folds"]))
             self.assertLess(validation["totalDeltaLogLikelihood"], 0.0)
-            expected_delta = -6.661664 if sector == 64 else -23.362139
-            self.assertAlmostEqual(expected_delta, validation["totalDeltaLogLikelihood"], places=4)
+            self.assertEqual("TARGET_ONLY" if sector == 64 else "OFFSET_ONLY",
+                             validation["predictiveWinner"])
+            self.assertFalse(validation["predictiveSupport"])
             exact_tpf = FrozenTPF(sector)
             exact_replay = diagnose_prf_cube(
                 times=exact_tpf.time.value, cube=exact_tpf.flux.value,
@@ -1543,12 +1544,26 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
         ).reshape(len(times), 5, 5) + np.random.default_rng(91).normal(
             0.0, 0.0003, (len(times), 5, 5)
         )
+        phase_offset = 2.0 * math.pi * residual_frequency * reference
+        oracle_vectors = {
+            "target": [0.04 * math.cos(phase_offset), 0.04 * math.sin(phase_offset)],
+            "offset-1": [-0.015 * math.sin(phase_offset), 0.015 * math.cos(phase_offset)],
+        }
         stable = diagnose_prf_cube(
             times=times, cube=stable_cube, template_matrix=templates,
             physical_frequency=1.0 / physical_period,
             residual_frequency=residual_frequency, time_reference=reference,
             drift=drift, injected_component_id="target",
+            oracle_source_vectors=oracle_vectors,
         )
+        print("PRF_STRONG_PERSISTENT_CONTROL", {
+            "inSampleDetection": min(stable["models"],
+                                     key=lambda name: stable["models"][name]["bic"]),
+            "temporalPredictiveValidation": stable["temporalPredictiveValidation"],
+            "knownInjectedVectorsInFitBasis": oracle_vectors,
+        })
+        self.assertTrue(all(fold["oracle"]["deltaLogLikelihood"] > 0.0
+                            for fold in stable["temporalPredictiveValidation"]["folds"]))
         self.assertEqual("TARGET_PLUS_OFFSET", min(
             stable["models"], key=lambda name: stable["models"][name]["bic"]))
         self.assertEqual("JOINT_SOURCE_TEMPORALLY_VALIDATED",

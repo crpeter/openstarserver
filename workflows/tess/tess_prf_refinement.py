@@ -334,7 +334,8 @@ def _temporal_predictive_validation(*, times: np.ndarray, prewhitened: np.ndarra
                                     valid: np.ndarray, templates: np.ndarray,
                                     residual_frequency: float, time_reference: float,
                                     drift: float, primary_model_id: str,
-                                    block_count: int = 4) -> dict[str, Any]:
+                                    block_count: int = 4,
+                                    oracle_source_vectors: dict[str, list[float]] | None = None) -> dict[str, Any]:
     """Contiguous-fold prediction with training amplitudes frozen on held-out data."""
     injected_index = 0 if primary_model_id == "TARGET_ONLY" else 1
     secondary_index = 1 - injected_index
@@ -406,6 +407,29 @@ def _temporal_predictive_validation(*, times: np.ndarray, prewhitened: np.ndarra
             "secondaryTrainingVector": secondary_training,
             "secondaryIndependentBlockVector": secondary_block,
         })
+        if oracle_source_vectors is not None:
+            oracle_parameters = np.asarray([
+                oracle_source_vectors["target"], oracle_source_vectors["offset-1"]
+            ])
+            oracle_records = {}
+            for model_id, indices in ((primary_model_id, [injected_index]),
+                                      ("TARGET_PLUS_OFFSET", [0, 1])):
+                prediction = (templates[:, indices, None]
+                              * oracle_parameters[indices][None, :, :]).sum(axis=1).reshape(-1)
+                residual_vector = (observed - prediction).reshape(-1, 2)
+                chi_square = float(sum(value @ inverse @ value for value, inverse
+                                       in zip(residual_vector, inverse_blocks)))
+                oracle_records[model_id] = {
+                    "heldOutChiSquare": chi_square,
+                    "heldOutLogLikelihood": -0.5 * (
+                        chi_square + logdet + n * math.log(2.0 * math.pi)),
+                }
+            folds[-1]["oracle"] = {
+                "models": oracle_records,
+                "deltaLogLikelihood": (
+                    oracle_records["TARGET_PLUS_OFFSET"]["heldOutLogLikelihood"]
+                    - oracle_records[primary_model_id]["heldOutLogLikelihood"]),
+            }
 
     precision_sum = np.zeros((2, 2))
     weighted_sum = np.zeros(2)
@@ -467,7 +491,8 @@ def _array_hash(value: np.ndarray) -> str:
 def diagnose_prf_cube(*, times: np.ndarray, cube: np.ndarray,
                       template_matrix: np.ndarray, physical_frequency: float,
                       residual_frequency: float, time_reference: float, drift: float,
-                      injected_component_id: str, block_count: int = 4) -> dict[str, Any]:
+                      injected_component_id: str, block_count: int = 4,
+                      oracle_source_vectors: dict[str, list[float]] | None = None) -> dict[str, Any]:
     """Diagnostic-only full-cube ablation and contiguous held-out validation."""
     times = np.asarray(times, dtype=float)
     cube = np.asarray(cube, dtype=float)
@@ -501,6 +526,7 @@ def diagnose_prf_cube(*, times: np.ndarray, cube: np.ndarray,
         times=times, prewhitened=prewhitened, valid=valid, templates=templates,
         residual_frequency=residual_frequency, time_reference=time_reference,
         drift=drift, primary_model_id=primary_model_id, block_count=block_count,
+        oracle_source_vectors=oracle_source_vectors,
     )
 
     autocorrelations: dict[str, Any] = {}
