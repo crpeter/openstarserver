@@ -34,7 +34,9 @@ from workflows.tess.tess_investigation import build_engine
 from workflows.tess.tess_investigation import time_frequency_continuation
 from workflows.tess.tess_investigation import nonstationary_continuation
 from workflows.tess.tess_investigation import residual_mode_localization_continuation
+from workflows.tess.tess_investigation import residual_mode_localization_review_continuation
 from workflows.tess.tess_time_frequency import _fit_family_python
+from workflows.tess.tess_multisource_residual import interpret_multisource_residual_project
 
 
 class BroadIndependentCharacterizationTests(unittest.TestCase):
@@ -722,7 +724,8 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
                 for entry in manifest["datasets"]:
                     dataset = json.loads(Path(entry["path"]).read_text(encoding="utf-8"))
                     q = float(dataset["science"]["fractionalFrequencyDriftPerDay"])
-                    if dataset["science"].get("role") in (
+                    role = dataset["science"].get("role")
+                    if role in (
                         "residual-mode-pixel-localization",
                         "residual-mode-time-resolved-pixel-localization",
                     ):
@@ -731,11 +734,32 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
                         column = int(dataset["science"]["pixelColumn"])
                         source_pixel = (1, 1) if sector == 64 else (3, 3)
                         power = 1.0 if (row, column) == source_pixel else 0.01
+                    elif role in (
+                        "multi-source-residual-component",
+                        "multi-source-residual-component-combined",
+                    ):
+                        # Exercise the component comparison with evidence from
+                        # the extracted light curve, rather than prescribing a
+                        # component's worker result or science classification.
+                        times = _real_numpy.asarray(dataset["times"], dtype=float)
+                        values = _real_numpy.asarray(dataset["flux"], dtype=float)
+                        design = _real_numpy.column_stack((
+                            _real_numpy.ones(len(times)),
+                            _real_numpy.sin(2.0 * math.pi * residual_frequency * times),
+                            _real_numpy.cos(2.0 * math.pi * residual_frequency * times),
+                        ))
+                        fitted = design @ (_real_numpy.linalg.pinv(design) @ values)
+                        total = float(_real_numpy.sum((values - _real_numpy.mean(values)) ** 2))
+                        power = max(0.0, min(1.0, 1.0 - float(
+                            _real_numpy.sum((values - fitted) ** 2)
+                        ) / total)) if total > 0 else 0.0
                     else:
                         power = 1.0 - abs(q - injected_drift) * 1000.0
                     datasets.append({
-                        "datasetID": entry["id"], "periodStatus": "RELIABLE",
-                        "periodConfidence": "high", "candidateFrequency": residual_frequency,
+                        "datasetID": entry["id"],
+                        "periodStatus": "RELIABLE" if power >= 0.08 else "LOW_CONFIDENCE",
+                        "periodConfidence": "high" if power >= 0.08 else "low",
+                        "candidateFrequency": residual_frequency,
                         "candidatePeriodDays": 1.0 / residual_frequency,
                         "candidatePower": power,
                         "candidatePeakProminenceRatio": 3.0,
@@ -1049,11 +1073,130 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
         self.assertEqual("MULTI_SOURCE_RESIDUAL_DECOMPOSITION",
                          review["recommendedNextTest"])
         self.assertFalse(review["physicalMechanismResolved"])
-        self.assertEqual("openstar.tess.finalize", request.handler_id)
+        self.assertEqual("openstar.tess.multi-source-residual.prepare", request.handler_id)
         self.assertTrue(any(item["skySeparationArcsec"] > 0
                             for item in review["windowResults"]))
         self.assertTrue(any(item["offsetPixels"] > 0
                             for item in review["windowResults"]))
+
+        with mock.patch(
+            "workflows.tess.tess_multisource_residual._download_tpf",
+            side_effect=frozen_tpf,
+        ):
+            current, request = engine.run_stage(
+                current, request, software_id="integration", software_version="20.30"
+            )
+        decomposition_preparation = current.stages[-1]
+        self.assertEqual("openstar.tess.multi-source-residual.prepare",
+                         decomposition_preparation.handler_id)
+        self.assertEqual(sha256_json(review),
+                         decomposition_preparation.provenance.input_hashes["localizationReview"])
+        components = decomposition_preparation.result["spatialComponents"]
+        self.assertEqual(["target", "offset-1"],
+                         [item["componentID"] for item in components])
+        self.assertEqual([0.0, 0.0],
+                         [components[0]["eastArcsec"], components[0]["northArcsec"]])
+        self.assertGreater(math.hypot(components[1]["eastArcsec"],
+                                     components[1]["northArcsec"]), 0.0)
+        self.assertEqual("openstar.lomb-scargle.v1",
+                         decomposition_preparation.result["workloadID"])
+        self.assertEqual(6, len(decomposition_preparation.result["preparedSeries"]))
+        self.assertTrue(all(Path(item["datasetPath"]).is_file()
+                            for item in decomposition_preparation.result["preparedSeries"]))
+        for item in decomposition_preparation.result["preparedSeries"]:
+            dataset = json.loads(Path(item["datasetPath"]).read_text(encoding="utf-8"))
+            self.assertIn(dataset["science"]["componentID"], {"target", "offset-1"})
+            self.assertNotAlmostEqual(1.0 / physical_period, residual_frequency)
+        sector_prepared = [item for item in decomposition_preparation.result["preparedSeries"]
+                           if not item["combined"]]
+        self.assertTrue(all(item["sampleCount"] == 1501 for item in sector_prepared))
+        for sector in (64, 65):
+            sector_items = [item for item in sector_prepared if item["sector"] == sector]
+            centers = {item["componentID"]: item["pixelCenter"] for item in sector_items}
+            separation = math.hypot(
+                centers["target"]["x"] - centers["offset-1"]["x"],
+                centers["target"]["y"] - centers["offset-1"]["y"],
+            )
+            self.assertAlmostEqual(math.sqrt(8.0), separation, places=5)
+            self.assertAlmostEqual(0.0589694868,
+                                   sector_items[0]["normalizedTemplateOverlap"], places=6)
+            self.assertLess(sector_items[0]["spatialDesignConditionNumber"], 4.0)
+
+        restarted = store.load(current.id)
+        self.assertEqual(request, plan_tess_branches(restarted, target)[0].experiment)
+        current = restarted
+        for expected_handler in (
+            "openstar.tess.multi-source-residual.run",
+            "openstar.tess.multi-source-residual.interpret",
+        ):
+            before = len(current.stages)
+            current, request = engine.run_stage(
+                current, request, software_id="integration", software_version="20.30"
+            )
+            self.assertEqual(expected_handler, current.stages[-1].handler_id)
+            self.assertEqual(before + 1, len(current.stages))
+            restarted = store.load(current.id)
+            self.assertEqual(request, plan_tess_branches(restarted, target)[0].experiment)
+            self.assertEqual(len(current.stages), len(restarted.stages))
+            current = restarted
+
+        decomposition = current.stages[-1]
+        self.assertFalse(decomposition.result["physicalMechanismResolved"])
+        self.assertIn(decomposition.result["classification"], {
+            "MULTI_SOURCE_DECOMPOSITION_UNRESOLVED",
+            "MULTIPLE_RESIDUAL_SOURCES_SUPPORTED",
+            "TARGET_RESIDUAL_COMPONENT_DOMINANT",
+            "OFF_TARGET_RESIDUAL_COMPONENT_DOMINANT",
+        })
+        self.assertEqual("openstar.tess.finalize", request.handler_id)
+        self.assertEqual(sha256_json(decomposition_preparation.result),
+                         decomposition.provenance.input_hashes["preparation"])
+        summaries = {item["componentID"]: item
+                     for item in decomposition.result["componentSummaries"]}
+        self.assertEqual({"target", "offset-1"}, set(summaries))
+        self.assertGreater(summaries["target"]["combinedPower"], 0.08)
+        self.assertGreater(summaries["offset-1"]["combinedPower"], 0.08)
+        component_results = decomposition.result["componentResults"]
+        self.assertEqual(6, len(component_results))
+        matrix = {}
+        for item in component_results:
+            self.assertIn("sampleCount", item)
+            self.assertGreater(item["sampleCount"], 0)
+            self.assertGreater(item["coefficientRMS"], 0.0)
+            self.assertGreater(item["sinusoidAmplitude"], 0.0)
+            self.assertGreater(item["coherentModelRMS"], 0.0)
+            self.assertLessEqual(item["coherentModelRMS"], item["coefficientRMS"] + 1e-12)
+            self.assertAlmostEqual(residual_frequency, item["candidateFrequency"])
+            self.assertAlmostEqual(1.0 / residual_frequency, item["candidatePeriodDays"])
+            self.assertIn("predictedPointSourceLeakageRMS", item)
+            print(
+                "MULTISOURCE_COMPONENT_EVIDENCE "
+                f"component={item['componentID']} sector={item['sector']} role={item['role']} "
+                f"samples={item['sampleCount']} rms={item['coefficientRMS']:.12g} "
+                f"sinusoidAmplitude={item['sinusoidAmplitude']:.12g} "
+                f"coherentModelRMS={item['coherentModelRMS']:.12g} "
+                f"sinA={item['sinA']:.12g} cosB={item['cosB']:.12g} "
+                f"sinCosCovariance={item['sinCosCovariance']} "
+                f"power={item['candidatePower']:.12g} frequency={item['candidateFrequency']:.12g} "
+                f"period={item['candidatePeriodDays']:.12g} predictedLeakage="
+                f"{item['predictedPointSourceLeakageRMS']:.12g} "
+                f"residualAmplitude={item['residualCoherentAmplitude']:.12g} "
+                f"residualChiSquare={item['residualCoherentChiSquare']} "
+                f"jointCovarianceBlocks={item['jointCovarianceBlocks']} "
+                f"residualCovariance={item['residualSinCosCovariance']} "
+                f"support={item['countedAsIndependentSupport']}"
+            )
+            if item["sector"] is not None:
+                matrix[(item["componentID"], item["sector"])] = item
+        self.assertGreater(matrix[("target", 64)]["candidatePower"], 0.08)
+        self.assertGreater(matrix[("offset-1", 64)]["candidatePower"], 0.08)
+        self.assertGreater(matrix[("target", 65)]["candidatePower"], 0.08)
+        self.assertGreater(matrix[("offset-1", 65)]["candidatePower"], 0.08)
+        for item in matrix.values():
+            if item["countedAsIndependentSupport"]:
+                self.assertTrue(item["lombScargleAccepted"])
+                self.assertGreater(item["coherentModelRMS"],
+                                   item["predictedPointSourceLeakageRMS"])
 
     def test_other_nonstationary_recommendations_do_not_enter_localization(self):
         localization = nonstationary_continuation(
@@ -1096,6 +1239,156 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
                     request_id="020-interpret-residual-mode-localization",
                 )
                 self.assertEqual("openstar.tess.finalize", request.handler_id)
+
+    def test_only_unresolved_multisource_recommendation_enters_decomposition(self):
+        request = residual_mode_localization_review_continuation(
+            {"recommendedNextTest": "MULTI_SOURCE_RESIDUAL_DECOMPOSITION",
+             "physicalMechanismResolved": False},
+            request_id="023-interpret-residual-mode-localization-review",
+        )
+        self.assertEqual("openstar.tess.multi-source-residual.prepare", request.handler_id)
+        for recommendation, resolved in (
+            ("NEIGHBOR_SOURCE_IDENTIFICATION_AND_CATALOG_CROSSMATCH", False),
+            ("RESIDUAL_MODE_SOURCE_LOCALIZATION_REVIEW", False),
+            ("MULTI_SOURCE_RESIDUAL_DECOMPOSITION", True),
+        ):
+            with self.subTest(recommendation=recommendation, resolved=resolved):
+                request = residual_mode_localization_review_continuation(
+                    {"recommendedNextTest": recommendation,
+                     "physicalMechanismResolved": resolved},
+                    request_id="023-interpret-residual-mode-localization-review",
+                )
+                self.assertEqual("openstar.tess.finalize", request.handler_id)
+
+    def test_geometry_aware_multisource_support_controls(self):
+        def interpret(target_amplitudes, offset_amplitudes, coupling, *, total_rms=None,
+                      frequencies=None, phases=None, cross_covariance=None):
+            prepared = []
+            status = []
+            coupling_map = {
+                "target": {"target": 1.0, "offset-1": coupling},
+                "offset-1": {"target": coupling, "offset-1": 1.0},
+            }
+            variance = [[1e-4, 0.0], [0.0, 1e-4]]
+            cross = cross_covariance or [[0.0, 0.0], [0.0, 0.0]]
+            for component_id, component_type, amplitudes in (
+                ("target", "TARGET", target_amplitudes),
+                ("offset-1", "OFFSET", offset_amplitudes),
+            ):
+                for sector, amplitude in zip((1, 2), amplitudes):
+                    dataset_id = f"{component_id}-{sector}"
+                    total = amplitude if total_rms is None else total_rms[component_id]
+                    phase = (phases or {}).get(component_id, 0.0)
+                    prepared.append({
+                        "datasetID": dataset_id, "componentID": component_id,
+                        "componentType": component_type, "sector": sector,
+                        "role": "independent", "combined": False,
+                        "coefficientRMS": total,
+                        "sinA": amplitude * math.sqrt(2.0) * math.cos(phase),
+                        "cosB": amplitude * math.sqrt(2.0) * math.sin(phase),
+                        "sinusoidAmplitude": amplitude * math.sqrt(2.0),
+                        "coherentModelRMS": amplitude,
+                        "sinCosCovariance": variance,
+                        "jointSinCosCrossCovariance": {
+                            component_id: variance,
+                            "offset-1" if component_id == "target" else "target": cross,
+                        },
+                        "pointSourceLeakageCoupling": coupling_map,
+                    })
+                    status.append({
+                        "datasetID": dataset_id, "candidatePower": 0.5,
+                        "candidateFrequency": (frequencies or {}).get(component_id, 0.25),
+                        "candidatePeriodDays": 1.0 / (frequencies or {}).get(component_id, 0.25),
+                        "periodStatus": "RELIABLE", "periodConfidence": "high",
+                    })
+                dataset_id = f"{component_id}-combined"
+                prepared.append({
+                    "datasetID": dataset_id, "componentID": component_id,
+                    "componentType": component_type, "sector": None,
+                    "role": "combined", "combined": True,
+                    "coefficientRMS": sum(amplitudes) / 2.0,
+                    "sinA": sum(amplitudes) / math.sqrt(2.0), "cosB": 0.0,
+                    "sinusoidAmplitude": sum(amplitudes) / math.sqrt(2.0),
+                    "coherentModelRMS": sum(amplitudes) / 2.0,
+                    "sinCosCovariance": [[1e-4, 0.0], [0.0, 1e-4]],
+                    "pointSourceLeakageCoupling": coupling_map,
+                })
+                status.append({
+                    "datasetID": dataset_id, "candidatePower": 0.5,
+                    "candidateFrequency": 0.25, "candidatePeriodDays": 4.0,
+                    "periodStatus": "RELIABLE", "periodConfidence": "high",
+                })
+            return interpret_multisource_residual_project(
+                project_status={"datasets": status},
+                preparation={
+                    "preparedSeries": prepared,
+                    "spatialComponents": [
+                        {"componentID": "target", "componentType": "TARGET"},
+                        {"componentID": "offset-1", "componentType": "OFFSET"},
+                    ],
+                },
+            )
+
+        controls = (
+            ("target-only-near", (1.0, 1.0), (0.20, 0.20), 0.20,
+             "TARGET_RESIDUAL_COMPONENT_DOMINANT", (2, 0)),
+            ("offset-only-near", (0.20, 0.20), (1.0, 1.0), 0.20,
+             "OFF_TARGET_RESIDUAL_COMPONENT_DOMINANT", (0, 2)),
+            ("weaker-secondary-wide", (1.0, 1.0), (0.20, 0.20), 0.05,
+             "MULTIPLE_RESIDUAL_SOURCES_SUPPORTED", (2, 2)),
+            ("comparable-simultaneous", (1.0, 1.0), (0.8, 0.8), 0.20,
+             "MULTIPLE_RESIDUAL_SOURCES_SUPPORTED", (2, 2)),
+            ("sector-switching", (1.0, 0.20), (0.20, 1.0), 0.20,
+             "MULTI_SOURCE_DECOMPOSITION_UNRESOLVED", (1, 1)),
+        )
+        for name, target_rms, offset_rms, coupling, classification, supports in controls:
+            with self.subTest(name=name):
+                result = interpret(target_rms, offset_rms, coupling)
+                summaries = {item["componentID"]: item
+                             for item in result["componentSummaries"]}
+                self.assertEqual(classification, result["classification"])
+                self.assertEqual(supports, (
+                    summaries["target"]["independentSupportCount"],
+                    summaries["offset-1"]["independentSupportCount"],
+                ))
+
+        noisy = interpret(
+            (1.0, 1.0), (0.20, 0.20), 0.20,
+            total_rms={"target": 1.0, "offset-1": 5.0},
+        )
+        noisy_summaries = {item["componentID"]: item
+                           for item in noisy["componentSummaries"]}
+        self.assertEqual(0, noisy_summaries["offset-1"]["independentSupportCount"])
+        self.assertEqual("TARGET_RESIDUAL_COMPONENT_DOMINANT", noisy["classification"])
+
+        different_phase = interpret(
+            (1.0, 1.0), (0.20, 0.20), 0.05,
+            phases={"offset-1": math.pi / 2.0},
+        )
+        self.assertEqual("MULTIPLE_RESIDUAL_SOURCES_SUPPORTED",
+                         different_phase["classification"])
+
+        unrelated = interpret(
+            (1.0, 1.0), (0.20, 0.20), 0.20,
+            frequencies={"target": 0.25, "offset-1": 0.31},
+        )
+        self.assertEqual("MULTIPLE_RESIDUAL_SOURCES_SUPPORTED", unrelated["classification"])
+        self.assertTrue(all(not item["leakagePredictors"]
+                            for item in unrelated["componentResults"] if not item["combined"]))
+
+        correlated = interpret(
+            (1.0, 1.0), (0.205, 0.205), 0.20,
+            cross_covariance=[[9e-5, 0.0], [0.0, 9e-5]],
+        )
+        correlated_offset = next(item for item in correlated["componentResults"]
+                                 if item["componentID"] == "offset-1" and item["sector"] == 1)
+        independent_variance_chi2 = (
+            correlated_offset["residualCoherentAmplitude"] ** 2
+            / (1e-4 + 0.20 ** 2 * 1e-4)
+        )
+        self.assertNotAlmostEqual(independent_variance_chi2,
+                                  correlated_offset["residualCoherentChiSquare"])
+        self.assertFalse(correlated_offset["independentSpatialSupport"])
 
     def test_transient_recommendation_does_not_route_to_nonstationary(self):
         request = time_frequency_continuation(
