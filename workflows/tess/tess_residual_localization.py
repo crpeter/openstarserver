@@ -190,6 +190,15 @@ def _sector_candidates(
     return sectors
 
 
+def _target_coordinate(ra_deg: float, dec_deg: float) -> Any:
+    """Construct the astronomy-library coordinate used by a real TPF WCS."""
+
+    from astropy.coordinates import SkyCoord
+    from astropy import units as u
+
+    return SkyCoord(ra_deg * u.deg, dec_deg * u.deg, frame="icrs")
+
+
 def build_residual_mode_pixel_project(
     *,
     source_project_path: str | Path,
@@ -203,9 +212,6 @@ def build_residual_mode_pixel_project(
     output_dir: str | Path,
     investigation_id: str,
 ) -> dict[str, Any]:
-    from astropy.coordinates import SkyCoord
-    from astropy import units as u
-
     source_project = _load_json(source_project_path)
     source_workload_id = str(source_project.get("workloadID") or "")
     if source_workload_id and source_workload_id not in LOMB_SCARGLE_WORKLOAD_ALIASES:
@@ -240,7 +246,7 @@ def build_residual_mode_pixel_project(
     if ra_deg is None or dec_deg is None:
         raise RuntimeError("v20.10 requires TIC RA/Dec from the identity stage.")
 
-    target = SkyCoord(ra_deg * u.deg, dec_deg * u.deg, frame="icrs")
+    target = _target_coordinate(float(ra_deg), float(dec_deg))
     sectors = _sector_candidates(
         primary_sector=primary_sector,
         independent_spec=independent_spec,
