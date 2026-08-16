@@ -265,6 +265,28 @@ def time_frequency_continuation(summary: dict[str, Any], *, request_id: str) -> 
     )
 
 
+def nonstationary_continuation(summary: dict[str, Any], *, request_id: str) -> StageRequest:
+    """Route only the persisted unresolved residual-localization recommendation."""
+
+    run_localization = (
+        summary.get("recommendedNextTest") == "RESIDUAL_MODE_PIXEL_LOCALIZATION"
+        and summary.get("physicalMechanismResolved") is False
+    )
+    return StageRequest(
+        id=_next_stage_id(
+            request_id,
+            "prepare-residual-mode-localization" if run_localization else "finalize",
+        ),
+        handler_id=(
+            "openstar.tess.residual-mode-localization.prepare"
+            if run_localization
+            else "openstar.tess.finalize"
+        ),
+        parameters={} if run_localization else {"outputSuffix": "v20.9"},
+        triggered_by_stage_id=request_id,
+    )
+
+
 def _build_period_evidence(
     *,
     claim_decision: dict[str, Any],
@@ -2792,12 +2814,7 @@ def build_engine(
         _write_json(artifact_path, summary)
         return StageOutcome(
             result=summary,
-            next_stage=StageRequest(
-                id=_next_stage_id(request.id, "finalize"),
-                handler_id="openstar.tess.finalize",
-                parameters={"outputSuffix": "v20.9"},
-                triggered_by_stage_id=request.id,
-            ),
+            next_stage=nonstationary_continuation(summary, request_id=request.id),
             input_hashes={
                 "preparation": sha256_json(preparation),
                 "interpretation": sha256_json(interpreted),
@@ -2951,6 +2968,12 @@ def build_engine(
             input_hashes={
                 "preparation": sha256_json(preparation),
                 "projectResult": sha256_json(run),
+                "nonstationaryModeling": sha256_json(
+                    _latest_result_for_handler(
+                        investigation,
+                        "openstar.tess.nonstationary.summarize",
+                    )
+                ),
             },
             artifacts=(_artifact(artifact_path, "application/json"),),
         )
