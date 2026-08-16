@@ -17,6 +17,29 @@ RAW_SUPPORT_MAX_IMPROVEMENT = 0.025
 RAW_SUPPORT_MAX_HALF_DIFFERENCE = 0.10
 MIN_RESOLUTION_SECTORS = 3
 EVOLUTION_FOLLOWUP_MIN_INDEPENDENT_SECTORS = 2
+STATIONARITY_MIN_INDEPENDENT_SECTORS = 3
+
+# These limits describe changes large compared with a folded profile, rather
+# than any particular target.  IQR is used so that one damaged sector cannot
+# manufacture an evolution claim.
+# Deliberately large, interpretable exploratory effect-size floors: 50% of the
+# median profile amplitude, 8 explained-variance percentage points, 15% of the
+# profile amplitude for half-cycle differences, 12% of a cycle, 12 duty-cycle
+# percentage points, and 75% of median roughness.  The repository has no
+# labeled multi-sector population from which to estimate operating
+# characteristics, so these are explicitly NOT population-calibrated claims.
+# Stable noisy/gapped control ensembles exercise them in the regression suite;
+# crossing them only warrants another diagnostic.  The two raw-vs-double
+# quantities belong to one coupled SHAPE_RAW_DOUBLE family and never count as
+# independent dimensions.
+EVOLUTION_METRIC_LIMITS = {
+    "profileAmplitudeFractionalIqr": 0.50,
+    "doubleExplainedVarianceGainIqr": 0.08,
+    "halfCycleDifferenceRatioIqr": 0.15,
+    "minimumPhaseCircularIqr": 0.12,
+    "minimumDutyCycleIqr": 0.12,
+    "profileRoughnessFractionalIqr": 0.75,
+}
 
 
 def _float(value: Any) -> float | None:
@@ -53,6 +76,107 @@ def _variance(values: list[float]) -> float:
         return 0.0
     mean = sum(values) / len(values)
     return sum((value - mean) ** 2 for value in values) / len(values)
+
+
+def _iqr(values: list[float]) -> float | None:
+    q25 = _percentile(values, 0.25)
+    q75 = _percentile(values, 0.75)
+    return q75 - q25 if q25 is not None and q75 is not None else None
+
+
+def _fractional_iqr(values: list[float]) -> float | None:
+    spread = _iqr(values)
+    scale = _percentile([abs(value) for value in values], 0.5)
+    return spread / scale if spread is not None and scale is not None and scale > 1e-12 else None
+
+
+def _circular_iqr(phases: list[float]) -> float | None:
+    """Robust phase spread after unwrapping around the circular mean."""
+    if not phases:
+        return None
+    x = sum(math.cos(2.0 * math.pi * phase) for phase in phases)
+    y = sum(math.sin(2.0 * math.pi * phase) for phase in phases)
+    center = math.atan2(y, x) / (2.0 * math.pi) % 1.0
+    unwrapped = [center + ((phase - center + 0.5) % 1.0 - 0.5) for phase in phases]
+    return _iqr(unwrapped)
+
+
+def _stationarity_evidence(results: list[dict[str, Any]]) -> dict[str, Any]:
+    def values(path: tuple[str, ...]) -> list[float]:
+        found: list[float] = []
+        for result in results:
+            value: Any = result
+            for key in path:
+                value = (value or {}).get(key) if isinstance(value, dict) else None
+            finite = _float(value)
+            if finite is not None:
+                found.append(finite)
+        return found
+
+    amplitude = values(("doubleProfile", "profileAmplitude"))
+    roughness = values(("doubleProfile", "profileRoughness"))
+    metrics = {
+        "profileAmplitudeFractionalIqr": _fractional_iqr(amplitude),
+        "doubleExplainedVarianceGainIqr": _iqr(values(("doubleExplainedVarianceImprovement",))),
+        "halfCycleDifferenceRatioIqr": _iqr(values(("doubleWaveMetrics", "halfCycleDifferenceRatio"))),
+        "minimumPhaseCircularIqr": _circular_iqr(values(("doubleProfile", "minimumPhase"))),
+        "minimumDutyCycleIqr": _iqr(values(("doubleProfile", "minimumDutyCycle"))),
+        "profileRoughnessFractionalIqr": _fractional_iqr(roughness),
+    }
+    triggered_metrics = sorted(
+        name for name, value in metrics.items()
+        if value is not None and value >= EVOLUTION_METRIC_LIMITS[name]
+    )
+    evidence_families = {
+        "AMPLITUDE": ["profileAmplitudeFractionalIqr"],
+        "PHASE": ["minimumPhaseCircularIqr"],
+        "SHAPE_RAW_DOUBLE": [
+            "doubleExplainedVarianceGainIqr", "halfCycleDifferenceRatioIqr"
+        ],
+        "DUTY_CYCLE": ["minimumDutyCycleIqr"],
+        "ROUGHNESS": ["profileRoughnessFractionalIqr"],
+    }
+    triggered_families = sorted(
+        family for family, names in evidence_families.items()
+        if (
+            all(name in triggered_metrics for name in names)
+            if family == "SHAPE_RAW_DOUBLE"
+            else any(name in triggered_metrics for name in names)
+        )
+    )
+    adequate = len(results) >= STATIONARITY_MIN_INDEPENDENT_SECTORS
+    followup = adequate and bool(triggered_families)
+    return {
+        "classification": (
+            "TIME_FREQUENCY_EVOLUTION_FOLLOWUP_WARRANTED"
+            if followup
+            else "NO_TIME_FREQUENCY_EVOLUTION_FOLLOWUP_WARRANTED"
+            if adequate else "INADEQUATE_SECTOR_EVIDENCE"
+        ),
+        "independentSectorCount": len(results),
+        "minimumIndependentSectors": STATIONARITY_MIN_INDEPENDENT_SECTORS,
+        "interpretation": (
+            "Exploratory effect-size screen; this does not establish nonstationarity."
+        ),
+        "calibrationStatus": "STABLE_SYNTHETIC_CONTROL_VALIDATED_NOT_POPULATION_CALIBRATED",
+        "thresholdBasis": {
+            "profileAmplitudeFractionalIqr": "IQR is at least 50% of median folded-profile amplitude",
+            "doubleExplainedVarianceGainIqr": "IQR is at least 8 explained-variance percentage points",
+            "halfCycleDifferenceRatioIqr": "IQR is at least 15% of folded-profile amplitude",
+            "minimumPhaseCircularIqr": "circular IQR is at least 12% of one physical cycle",
+            "minimumDutyCycleIqr": "IQR is at least 12 duty-cycle percentage points",
+            "profileRoughnessFractionalIqr": "IQR is at least 75% of median profile roughness",
+        },
+        "metrics": metrics,
+        "limits": dict(EVOLUTION_METRIC_LIMITS),
+        "evidenceFamilies": evidence_families,
+        "triggeredMetrics": triggered_metrics,
+        "triggeredEvidenceFamilies": triggered_families,
+        "followupWarranted": followup,
+        # Compatibility with persisted v2 consumers.  This means diagnostic
+        # follow-up warranted, not scientifically established evolution.
+        "meaningfulEvolutionDetected": followup,
+    }
 
 
 def _phase_profile(
@@ -362,11 +486,16 @@ def analyze_morphology(
     # reference cycle for the next experiment: its fundamental plus first
     # harmonic spans both members of the unresolved raw/double family.
     represented_classes = sum(1 for count in independent_classes.values() if count)
-    evolution_followup_warranted = bool(
+    unresolved_evolution_warranted = bool(
         not physical_cycle_resolved
         and independent_eligible_count >= EVOLUTION_FOLLOWUP_MIN_INDEPENDENT_SECTORS
         and represented_classes >= 2
     )
+    stationarity = _stationarity_evidence(independent_eligible)
+    resolved_evolution_followup = bool(
+        physical_cycle_resolved and stationarity["followupWarranted"]
+    )
+    evolution_followup_warranted = unresolved_evolution_warranted or resolved_evolution_followup
 
     duty_cycles = [
         _float((item.get("doubleProfile") or {}).get("minimumDutyCycle"))
@@ -392,7 +521,7 @@ def analyze_morphology(
         phenomenology = "SECTOR_EVOLVING_OR_MULTI_COMPONENT_VARIABILITY"
 
     return {
-        "version": "openstar.tess-morphology.v1",
+        "version": "openstar.tess-morphology.v3",
         "rawPeriodDays": raw_period,
         "possibleDoubleCycleDays": double_period,
         "physicalCycleResolved": physical_cycle_resolved,
@@ -401,14 +530,28 @@ def analyze_morphology(
         "phenomenology": phenomenology,
         "continuationEvidence": {
             "timeFrequencyEvolutionWarranted": evolution_followup_warranted,
-            "analysisReferencePeriodDays": double_period if evolution_followup_warranted else None,
+            "entryReason": (
+                "RESOLVED_MORPHOLOGY_EVOLUTION_FOLLOWUP" if resolved_evolution_followup
+                else "UNRESOLVED_EVOLVING_MORPHOLOGY" if unresolved_evolution_warranted
+                else None
+            ),
+            "analysisReferencePeriodDays": (
+                resolved_period if resolved_evolution_followup
+                else double_period if unresolved_evolution_warranted else None
+            ),
+            "periodReferenceKind": (
+                "MORPHOLOGY_RESOLVED_PHYSICAL_PERIOD" if resolved_evolution_followup
+                else "UNRESOLVED_FAMILY_ANALYSIS_REFERENCE" if unresolved_evolution_warranted
+                else None
+            ),
             "independentEvidenceClassCount": represented_classes,
             "minimumIndependentSectors": EVOLUTION_FOLLOWUP_MIN_INDEPENDENT_SECTORS,
             "scientificQuestion": (
-                "Does temporal evolution/nonstationarity or an additional periodic component "
-                "explain the cross-sector morphology inconsistency?"
+                "Is the established periodic family stable in amplitude, phase, and morphology "
+                "across observing sectors, or does it evolve/nonstationarily vary with time?"
                 if evolution_followup_warranted else None
             ),
+            "stationarityEvidence": stationarity,
         },
         "rationale": list(rationale),
         "eligibleSectorCount": eligible_count,
@@ -427,6 +570,7 @@ def analyze_morphology(
             "rawMaximumExplainedVarianceImprovement": RAW_SUPPORT_MAX_IMPROVEMENT,
             "rawMaximumHalfCycleDifferenceRatio": RAW_SUPPORT_MAX_HALF_DIFFERENCE,
             "minimumResolutionSectors": MIN_RESOLUTION_SECTORS,
+            "stationarityMinimumIndependentSectors": STATIONARITY_MIN_INDEPENDENT_SECTORS,
         },
         "summaryMorphology": {
             "medianDoubleMinimumDutyCycle": median_duty,

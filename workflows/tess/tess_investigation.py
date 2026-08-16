@@ -1944,7 +1944,7 @@ def build_engine(
             next_stage = StageRequest(
                 id=_next_stage_id(request.id, "prepare-time-frequency"),
                 handler_id="openstar.tess.time-frequency.prepare",
-                parameters={"entryReason": "UNRESOLVED_EVOLVING_MORPHOLOGY"},
+                parameters={"entryReason": continuation.get("entryReason")},
                 triggered_by_stage_id=request.id,
             )
         else:
@@ -2383,7 +2383,12 @@ def build_engine(
             raise RuntimeError("v20.8 requires the frozen independent-sector preparation.")
         if morphology is None:
             raise RuntimeError("v20.8 requires completed morphology analysis.")
-        morphology_entry = request.parameters.get("entryReason") == "UNRESOLVED_EVOLVING_MORPHOLOGY"
+        entry_reason = request.parameters.get("entryReason")
+        morphology_entry = entry_reason in {
+            "UNRESOLVED_EVOLVING_MORPHOLOGY",
+            "RESOLVED_MORPHOLOGY_EVOLUTION_FOLLOWUP",
+            "RESOLVED_NONSTATIONARY_MORPHOLOGY",  # persisted v2 compatibility
+        }
         continuation = morphology.get("continuationEvidence") or {}
         if morphology_entry:
             if not continuation.get("timeFrequencyEvolutionWarranted"):
@@ -2397,7 +2402,8 @@ def build_engine(
             physical_period = float(morphology["resolvedPhysicalPeriodDays"])
         artifact_root = store.directory_for(investigation.id) / "artifacts"
         print("🪟 Preparing sliding-window residual time-frequency search")
-        reference_label = "unresolved family analysis reference" if morphology_entry else "resolved physical period"
+        unresolved_reference = entry_reason == "UNRESOLVED_EVOLVING_MORPHOLOGY"
+        reference_label = "unresolved family analysis reference" if unresolved_reference else "resolved physical period"
         print(f"   {reference_label}: {physical_period} days")
         print("   fitting/subtracting the established fundamental + first harmonic locally")
         spec = build_time_frequency_project(
@@ -2410,6 +2416,14 @@ def build_engine(
             output_dir=artifact_root,
             investigation_id=investigation.id,
         )
+        spec["periodReference"] = {
+            "periodDays": physical_period,
+            "kind": (
+                "UNRESOLVED_FAMILY_ANALYSIS_REFERENCE"
+                if unresolved_reference else "MORPHOLOGY_RESOLVED_PHYSICAL_PERIOD"
+            ),
+            "physicalCycleResolved": not unresolved_reference,
+        }
         search = spec.get("frequencySearch") or {}
         sectors = {}
         for item in spec.get("preparedWindows") or []:
