@@ -322,6 +322,143 @@ def _projection_on_templates(coefficients: np.ndarray, templates: np.ndarray) ->
     return {"target": fitted[0].tolist(), "offset": fitted[1].tolist()}
 
 
+def _chi_square_survival_even(statistic: float, degrees_of_freedom: int) -> float | None:
+    if degrees_of_freedom <= 0 or degrees_of_freedom % 2:
+        return None
+    x = max(float(statistic), 0.0) / 2.0
+    return float(math.exp(-x) * sum(x ** index / math.factorial(index)
+                                    for index in range(degrees_of_freedom // 2)))
+
+
+def _temporal_predictive_validation(*, times: np.ndarray, prewhitened: np.ndarray,
+                                    valid: np.ndarray, templates: np.ndarray,
+                                    residual_frequency: float, time_reference: float,
+                                    drift: float, primary_model_id: str,
+                                    block_count: int = 4) -> dict[str, Any]:
+    """Contiguous-fold prediction with training amplitudes frozen on held-out data."""
+    injected_index = 0 if primary_model_id == "TARGET_ONLY" else 1
+    secondary_index = 1 - injected_index
+    secondary_id = "offset-1" if injected_index == 0 else "target"
+    blocks = [item for item in np.array_split(np.arange(len(times)), block_count)
+              if len(item) >= 10]
+    folds = []
+    secondary_vectors = []
+    total_primary = 0.0
+    total_joint = 0.0
+    for fold_index, test_indices in enumerate(blocks):
+        train_indices = np.setdiff1d(np.arange(len(times)), test_indices)
+        train_fit = _coherent_pixel_fit(
+            times=times[train_indices], cube=prewhitened[train_indices][:, valid],
+            frequency=residual_frequency, time_reference=time_reference, drift=drift,
+        )
+        test_fit = _coherent_pixel_fit(
+            times=times[test_indices], cube=prewhitened[test_indices][:, valid],
+            frequency=residual_frequency, time_reference=time_reference, drift=drift,
+        )
+        train_comparison = compare_prf_hypotheses(
+            coherent_coefficients=train_fit["coefficients"],
+            pixel_covariances=train_fit["covariances"], template_matrix=templates,
+            component_ids=["target", "offset-1"],
+        )
+        test_comparison = compare_prf_hypotheses(
+            coherent_coefficients=test_fit["coefficients"],
+            pixel_covariances=test_fit["covariances"], template_matrix=templates,
+            component_ids=["target", "offset-1"],
+        )
+        secondary_training = train_comparison["models"]["TARGET_PLUS_OFFSET"]["sourceEstimates"][secondary_index]
+        secondary_block = test_comparison["models"]["TARGET_PLUS_OFFSET"]["sourceEstimates"][secondary_index]
+        secondary_vectors.append((np.asarray([secondary_block["sinA"], secondary_block["cosB"]]),
+                                  np.asarray(secondary_block["covariance"])))
+        observed = test_fit["coefficients"].reshape(-1)
+        inverse_blocks = [np.linalg.pinv(item, hermitian=True) for item in test_fit["covariances"]]
+        sign_logdets = [np.linalg.slogdet(item) for item in test_fit["covariances"]]
+        if any(sign <= 0 for sign, _ in sign_logdets):
+            raise RuntimeError("Held-out coherent covariance is not positive definite.")
+        logdet = float(sum(value for _, value in sign_logdets))
+        n = len(observed)
+        model_records = {}
+        for model_id, indices in (("TARGET_ONLY", [0]), ("OFFSET_ONLY", [1]),
+                                  ("TARGET_PLUS_OFFSET", [0, 1])):
+            parameters = np.asarray(train_comparison["models"][model_id]["parameterEstimates"])
+            prediction = (templates[:, indices, None]
+                          * parameters.reshape(len(indices), 2)[None, :, :]).sum(axis=1).reshape(-1)
+            residual_vector = (observed - prediction).reshape(-1, 2)
+            chi_square = float(sum(value @ inverse @ value for value, inverse
+                                   in zip(residual_vector, inverse_blocks)))
+            log_likelihood = -0.5 * (chi_square + logdet + n * math.log(2.0 * math.pi))
+            model_records[model_id] = {
+                "trainingParameterEstimates": parameters.tolist(),
+                "heldOutChiSquare": chi_square,
+                "heldOutLogLikelihood": log_likelihood,
+            }
+        primary_logl = model_records[primary_model_id]["heldOutLogLikelihood"]
+        joint_logl = model_records["TARGET_PLUS_OFFSET"]["heldOutLogLikelihood"]
+        total_primary += primary_logl
+        total_joint += joint_logl
+        folds.append({
+            "foldIndex": fold_index,
+            "trainingTimeRanges": [{"start": float(times[part[0]]), "end": float(times[part[-1]])}
+                                   for part in blocks if not np.array_equal(part, test_indices)],
+            "heldOutTimeRange": {"start": float(times[test_indices[0]]),
+                                 "end": float(times[test_indices[-1]])},
+            "trainingSampleCount": len(train_indices), "heldOutSampleCount": len(test_indices),
+            "models": model_records, "deltaLogLikelihood": joint_logl - primary_logl,
+            "secondaryTrainingVector": secondary_training,
+            "secondaryIndependentBlockVector": secondary_block,
+        })
+
+    precision_sum = np.zeros((2, 2))
+    weighted_sum = np.zeros(2)
+    available = True
+    for vector, covariance in secondary_vectors:
+        if np.linalg.matrix_rank(covariance) < 2:
+            available = False
+            break
+        precision = np.linalg.inv(covariance)
+        precision_sum += precision
+        weighted_sum += precision @ vector
+    if available and np.linalg.matrix_rank(precision_sum) == 2:
+        common_covariance = np.linalg.inv(precision_sum)
+        common_vector = common_covariance @ weighted_sum
+        heterogeneity = float(sum(
+            (vector - common_vector) @ np.linalg.inv(covariance) @ (vector - common_vector)
+            for vector, covariance in secondary_vectors
+        ))
+        dof = 2 * (len(secondary_vectors) - 1)
+        p_value = _chi_square_survival_even(heterogeneity, dof)
+        compatibility = {
+            "available": True, "method": "inverse-covariance weighted common 2-vector",
+            "commonVector": common_vector.tolist(), "covariance": common_covariance.tolist(),
+            "heterogeneityStatistic": heterogeneity, "degreesOfFreedom": dof,
+            "pValue": p_value, "compatible": bool(p_value is not None and p_value >= 0.05),
+            "compatibilityLevel": 0.95,
+        }
+    else:
+        compatibility = {"available": False, "reason": "block covariance was not identifiable",
+                         "compatible": False}
+    delta = total_joint - total_primary
+    predictive = delta > 0.0
+    return {
+        "method": "deterministic contiguous-fold frozen-parameter Gaussian predictive likelihood",
+        "preregisteredResidualFrequency": residual_frequency,
+        "preregisteredDrift": drift, "folds": folds,
+        "primaryModel": primary_model_id, "candidateJointModel": "TARGET_PLUS_OFFSET",
+        "totalPrimaryHeldOutLogLikelihood": total_primary,
+        "totalJointHeldOutLogLikelihood": total_joint,
+        "totalDeltaLogLikelihood": delta,
+        "predictiveWinner": "TARGET_PLUS_OFFSET" if predictive else primary_model_id,
+        "secondaryComponentID": secondary_id,
+        "secondaryVectorCompatibility": compatibility,
+        "predictiveSupport": predictive,
+        "conclusion": ("JOINT_SOURCE_TEMPORALLY_VALIDATED" if predictive and compatibility["compatible"]
+                       else "IN_SAMPLE_SECONDARY_NOT_TEMPORALLY_VALIDATED"),
+        "interpretationGuard": (
+            "Held-out likelihood protects against temporal covariance/model misspecification; "
+            "it is conditional model evidence, not a calibrated astrophysical posterior."
+        ),
+    }
+
+
 def _array_hash(value: np.ndarray) -> str:
     array = np.ascontiguousarray(np.asarray(value, dtype=np.float64))
     return hashlib.sha256(array.tobytes()).hexdigest()
@@ -360,6 +497,11 @@ def diagnose_prf_cube(*, times: np.ndarray, cube: np.ndarray,
     secondary_id = "offset-1" if injected_index == 0 else "target"
     joint_secondary = comparison["models"]["TARGET_PLUS_OFFSET"]["sourceEstimates"][secondary_index]
     primary_model_id = "TARGET_ONLY" if injected_index == 0 else "OFFSET_ONLY"
+    production_predictive_validation = _temporal_predictive_validation(
+        times=times, prewhitened=prewhitened, valid=valid, templates=templates,
+        residual_frequency=residual_frequency, time_reference=time_reference,
+        drift=drift, primary_model_id=primary_model_id, block_count=block_count,
+    )
 
     autocorrelations: dict[str, Any] = {}
     for lag in (1, 2, 5, 10):
@@ -443,6 +585,7 @@ def diagnose_prf_cube(*, times: np.ndarray, cube: np.ndarray,
         "effectiveSampleSize": None,
         "effectiveSampleSizeReason": "Not reported: deterministic multi-frequency residuals do not justify AR(1).",
         "blocks": block_results, "heldOut": held_out,
+        "temporalPredictiveValidation": production_predictive_validation,
         "models": comparison["models"],
         "equivalence": {
             "timesHash": _array_hash(times), "rawCubeHash": _array_hash(cube),
@@ -534,6 +677,23 @@ def run_prf_deblending(preparation: dict[str, Any]) -> dict[str, Any]:
             )
             models = comparison["models"]
             best_model = comparison["bestModel"]
+            primary_model = min(("TARGET_ONLY", "OFFSET_ONLY"),
+                                key=lambda name: models[name]["bic"])
+            temporal_validation = None
+            attributed_model = best_model
+            evidence_state = "IN_SAMPLE_MODEL_ACCEPTED"
+            if best_model == "TARGET_PLUS_OFFSET" and comparison["bestModelIdentifiable"]:
+                temporal_validation = _temporal_predictive_validation(
+                    times=times, prewhitened=residual, valid=valid,
+                    templates=template_matrix, residual_frequency=float(
+                        preparation["residualReferenceFrequency"]),
+                    time_reference=float(preparation["residualTimeReferenceDays"]),
+                    drift=float(preparation["fractionalFrequencyDriftPerDay"]),
+                    primary_model_id=primary_model,
+                )
+                if temporal_validation["conclusion"] != "JOINT_SOURCE_TEMPORALLY_VALIDATED":
+                    attributed_model = primary_model
+                    evidence_state = "IN_SAMPLE_SECONDARY_NOT_TEMPORALLY_VALIDATED"
             primary_residual_diagnostics = _primary_residual_diagnostics(
                 coherent_coefficients=temporal_coefficients[:2].T,
                 pixel_covariances=pixel_covariances,
@@ -557,6 +717,11 @@ def run_prf_deblending(preparation: dict[str, Any]) -> dict[str, Any]:
                 "tpfPhysicalRow": tpf_row, "tpfPhysicalColumn": tpf_col,
                 "sampleCount": len(times), "actualResidualPixelCount": int(np.count_nonzero(valid)),
                 "calibration": calibration_provenance, "models": models,
+                "inSampleDetection": {"bestModel": best_model,
+                                      "bestModelIdentifiable": comparison["bestModelIdentifiable"]},
+                "temporalPredictiveValidation": temporal_validation,
+                "physicalAttributionModel": attributed_model,
+                "secondaryEvidenceState": evidence_state,
                 "primaryOnlyResidualDiagnostics": primary_residual_diagnostics,
                 "empiricalCrossPixelCovarianceDiagnostic": empirical_cross_pixel,
                 "executionProvenance": {
@@ -590,7 +755,15 @@ def run_prf_deblending(preparation: dict[str, Any]) -> dict[str, Any]:
                     "coherentCoefficientCovariances": pixel_covariances.tolist(),
                 },
                 "degenerate": not (comparison["bestModelIdentifiable"] and historical_guard),
-                "decisive": bool(comparison["bestModelIdentifiable"] and historical_guard),
+                "decisive": bool(
+                    historical_guard and (
+                        (attributed_model == "TARGET_PLUS_OFFSET"
+                         and temporal_validation is not None
+                         and temporal_validation["conclusion"] == "JOINT_SOURCE_TEMPORALLY_VALIDATED")
+                        or (attributed_model != "TARGET_PLUS_OFFSET"
+                            and models[attributed_model]["sourceEstimates"][0]["individuallyIdentifiable"])
+                    )
+                ),
             })
         except Exception as exc:
             errors.append({"sector": sector, "error": f"{type(exc).__name__}: {exc}"})
@@ -608,7 +781,7 @@ def interpret_prf_deblending(preparation: dict[str, Any], run: dict[str, Any]) -
         classification = None
         recommended = None
     decisive = [x for x in run.get("sectorResults", []) if x.get("decisive")]
-    winners = [x["bestModel"] for x in decisive]
+    winners = [x.get("physicalAttributionModel", x["bestModel"]) for x in decisive]
     if classification is not None:
         pass
     elif len(winners) >= 2 and set(winners) == {"TARGET_ONLY", "OFFSET_ONLY"}:

@@ -1263,6 +1263,15 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
             self.assertTrue(item["executionProvenance"]["officialDetectorGridInterpolationExecuted"])
             self.assertTrue(item["executionProvenance"]["prfStampRenderingExecuted"])
             sector = int(item["sector"])
+            self.assertEqual("IN_SAMPLE_SECONDARY_NOT_TEMPORALLY_VALIDATED",
+                             item["secondaryEvidenceState"])
+            self.assertEqual("TARGET_ONLY" if sector == 64 else "OFFSET_ONLY",
+                             item["physicalAttributionModel"])
+            validation = item["temporalPredictiveValidation"]
+            self.assertEqual(4, len(validation["folds"]))
+            self.assertLess(validation["totalDeltaLogLikelihood"], 0.0)
+            expected_delta = -6.661664 if sector == 64 else -23.362139
+            self.assertAlmostEqual(expected_delta, validation["totalDeltaLogLikelihood"], places=4)
             exact_tpf = FrozenTPF(sector)
             exact_replay = diagnose_prf_cube(
                 times=exact_tpf.time.value, cube=exact_tpf.flux.value,
@@ -1521,6 +1530,66 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
         self.assertTrue(all(not item["secondary"]["individuallyIdentifiable"] for item in clean))
         self.assertTrue(all(len(item["blocks"]) == 4 and len(item["heldOut"]) == 4
                             for item in matrix))
+
+        # A real persistent second PRF source must survive both in-sample and
+        # frozen-parameter contiguous-fold prediction.
+        times = np.arange(1501, dtype=float) * 0.02 + 1700.0
+        phase = 2.0 * math.pi * residual_frequency * (
+            times + 0.5 * drift * (times - reference) ** 2
+        )
+        stable_cube = 1.0 + (
+            0.04 * np.sin(phase)[:, None] * templates[:, 0][None, :]
+            + 0.015 * np.cos(phase)[:, None] * templates[:, 1][None, :]
+        ).reshape(len(times), 5, 5) + np.random.default_rng(91).normal(
+            0.0, 0.0003, (len(times), 5, 5)
+        )
+        stable = diagnose_prf_cube(
+            times=times, cube=stable_cube, template_matrix=templates,
+            physical_frequency=1.0 / physical_period,
+            residual_frequency=residual_frequency, time_reference=reference,
+            drift=drift, injected_component_id="target",
+        )
+        self.assertEqual("TARGET_PLUS_OFFSET", min(
+            stable["models"], key=lambda name: stable["models"][name]["bic"]))
+        self.assertEqual("JOINT_SOURCE_TEMPORALLY_VALIDATED",
+                         stable["temporalPredictiveValidation"]["conclusion"])
+
+        weak_cube = 1.0 + (
+            0.04 * np.sin(phase)[:, None] * templates[:, 0][None, :]
+            + 0.0015 * np.cos(phase)[:, None] * templates[:, 1][None, :]
+        ).reshape(len(times), 5, 5) + np.random.default_rng(92).normal(
+            0.0, 0.0003, (len(times), 5, 5)
+        )
+        weak = diagnose_prf_cube(
+            times=times, cube=weak_cube, template_matrix=templates,
+            physical_frequency=1.0 / physical_period,
+            residual_frequency=residual_frequency, time_reference=reference,
+            drift=drift, injected_component_id="target",
+        )
+        self.assertEqual("JOINT_SOURCE_TEMPORALLY_VALIDATED",
+                         weak["temporalPredictiveValidation"]["conclusion"])
+
+        varying_vector = np.where((np.arange(len(times)) // 376)[:, None] % 2 == 0,
+                                  np.cos(phase)[:, None], np.sin(phase)[:, None])
+        varying_cube = 1.0 + (
+            0.04 * np.sin(phase)[:, None] * templates[:, 0][None, :]
+            + 0.015 * varying_vector * templates[:, 1][None, :]
+        ).reshape(len(times), 5, 5) + np.random.default_rng(93).normal(
+            0.0, 0.0003, (len(times), 5, 5)
+        )
+        varying = diagnose_prf_cube(
+            times=times, cube=varying_cube, template_matrix=templates,
+            physical_frequency=1.0 / physical_period,
+            residual_frequency=residual_frequency, time_reference=reference,
+            drift=drift, injected_component_id="target",
+        )
+        self.assertFalse(varying["temporalPredictiveValidation"]
+                         ["secondaryVectorCompatibility"]["compatible"])
+        print("PRF_TEMPORAL_VALIDATION_CONTROLS", {
+            "stableJoint": stable["temporalPredictiveValidation"],
+            "weakStableJoint": weak["temporalPredictiveValidation"],
+            "varyingJoint": varying["temporalPredictiveValidation"],
+        })
 
     def test_geometry_aware_multisource_support_controls(self):
         def interpret(target_amplitudes, offset_amplitudes, coupling, *, total_rms=None,
