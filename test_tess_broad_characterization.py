@@ -1175,9 +1175,12 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
                 f"samples={item['sampleCount']} rms={item['coefficientRMS']:.12g} "
                 f"sinusoidAmplitude={item['sinusoidAmplitude']:.12g} "
                 f"coherentModelRMS={item['coherentModelRMS']:.12g} "
+                f"sinA={item['sinA']:.12g} cosB={item['cosB']:.12g} "
                 f"power={item['candidatePower']:.12g} frequency={item['candidateFrequency']:.12g} "
                 f"period={item['candidatePeriodDays']:.12g} predictedLeakage="
                 f"{item['predictedPointSourceLeakageRMS']:.12g} "
+                f"residualAmplitude={item['residualCoherentAmplitude']:.12g} "
+                f"residualChiSquare={item['residualCoherentChiSquare']} "
                 f"support={item['countedAsIndependentSupport']}"
             )
             if item["sector"] is not None:
@@ -1255,7 +1258,8 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
                 self.assertEqual("openstar.tess.finalize", request.handler_id)
 
     def test_geometry_aware_multisource_support_controls(self):
-        def interpret(target_amplitudes, offset_amplitudes, coupling, *, total_rms=None):
+        def interpret(target_amplitudes, offset_amplitudes, coupling, *, total_rms=None,
+                      frequencies=None, phases=None):
             prepared = []
             status = []
             coupling_map = {
@@ -1269,18 +1273,23 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
                 for sector, amplitude in zip((1, 2), amplitudes):
                     dataset_id = f"{component_id}-{sector}"
                     total = amplitude if total_rms is None else total_rms[component_id]
+                    phase = (phases or {}).get(component_id, 0.0)
                     prepared.append({
                         "datasetID": dataset_id, "componentID": component_id,
                         "componentType": component_type, "sector": sector,
                         "role": "independent", "combined": False,
                         "coefficientRMS": total,
+                        "sinA": amplitude * math.sqrt(2.0) * math.cos(phase),
+                        "cosB": amplitude * math.sqrt(2.0) * math.sin(phase),
                         "sinusoidAmplitude": amplitude * math.sqrt(2.0),
                         "coherentModelRMS": amplitude,
+                        "sinCosCovariance": [[1e-4, 0.0], [0.0, 1e-4]],
                         "pointSourceLeakageCoupling": coupling_map,
                     })
                     status.append({
                         "datasetID": dataset_id, "candidatePower": 0.5,
-                        "candidateFrequency": 0.25, "candidatePeriodDays": 4.0,
+                        "candidateFrequency": (frequencies or {}).get(component_id, 0.25),
+                        "candidatePeriodDays": 1.0 / (frequencies or {}).get(component_id, 0.25),
                         "periodStatus": "RELIABLE", "periodConfidence": "high",
                     })
                 dataset_id = f"{component_id}-combined"
@@ -1289,8 +1298,10 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
                     "componentType": component_type, "sector": None,
                     "role": "combined", "combined": True,
                     "coefficientRMS": sum(amplitudes) / 2.0,
+                    "sinA": sum(amplitudes) / math.sqrt(2.0), "cosB": 0.0,
                     "sinusoidAmplitude": sum(amplitudes) / math.sqrt(2.0),
                     "coherentModelRMS": sum(amplitudes) / 2.0,
+                    "sinCosCovariance": [[1e-4, 0.0], [0.0, 1e-4]],
                     "pointSourceLeakageCoupling": coupling_map,
                 })
                 status.append({
@@ -1333,13 +1344,28 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
                 ))
 
         noisy = interpret(
-            (1.0, 1.0), (0.05, 0.05), 0.20,
+            (1.0, 1.0), (0.20, 0.20), 0.20,
             total_rms={"target": 1.0, "offset-1": 5.0},
         )
         noisy_summaries = {item["componentID"]: item
                            for item in noisy["componentSummaries"]}
         self.assertEqual(0, noisy_summaries["offset-1"]["independentSupportCount"])
         self.assertEqual("TARGET_RESIDUAL_COMPONENT_DOMINANT", noisy["classification"])
+
+        different_phase = interpret(
+            (1.0, 1.0), (0.20, 0.20), 0.05,
+            phases={"offset-1": math.pi / 2.0},
+        )
+        self.assertEqual("MULTIPLE_RESIDUAL_SOURCES_SUPPORTED",
+                         different_phase["classification"])
+
+        unrelated = interpret(
+            (1.0, 1.0), (0.20, 0.20), 0.20,
+            frequencies={"target": 0.25, "offset-1": 0.31},
+        )
+        self.assertEqual("MULTIPLE_RESIDUAL_SOURCES_SUPPORTED", unrelated["classification"])
+        self.assertTrue(all(not item["leakagePredictors"]
+                            for item in unrelated["componentResults"] if not item["combined"]))
 
     def test_transient_recommendation_does_not_route_to_nonstationary(self):
         request = time_frequency_continuation(

@@ -39,6 +39,8 @@ MIN_COMPONENT_SAMPLES = 80
 MIN_COMPONENT_POWER = 0.08
 MIN_INDEPENDENT_SUPPORT = 2
 DOMINANCE_POWER_RATIO = 1.25
+SPATIAL_SUPPORT_CONFIDENCE = 0.99
+SPATIAL_SUPPORT_CHI2_THRESHOLD = -2.0 * math.log(1.0 - SPATIAL_SUPPORT_CONFIDENCE)
 
 
 def _design_matrix(times: np.ndarray, physical_frequency: float) -> np.ndarray:
@@ -307,13 +309,13 @@ def _decompose_residual_cube(
                     weight = x_weight
                 point[y_pixel * cols + x_pixel] += weight
         response = pinv @ point
-        own = abs(float(response[source_index]))
+        own = float(response[source_index])
         source_id = str(source_component["componentID"])
         coupling[source_id] = {}
         for measured_index, measured_component in enumerate(usable_components):
             measured_id = str(measured_component["componentID"])
             coupling[source_id][measured_id] = (
-                abs(float(response[measured_index])) / own if own > 1e-12 else math.inf
+                float(response[measured_index]) / own if abs(own) > 1e-12 else math.inf
             )
     flat = residual_cube.reshape(len(residual_cube), -1).astype(np.float64)
     coefficients = (pinv @ flat.T).T
@@ -644,14 +646,17 @@ def _accepted(dataset: dict[str, Any]) -> bool:
     )
 
 
-def _coherent_fit(meta: dict[str, Any], frequency: float | None) -> dict[str, float | None]:
+def _coherent_fit(meta: dict[str, Any], frequency: float | None) -> dict[str, Any]:
     if frequency is None or frequency <= 0:
         return {"sinusoidAmplitude": None, "coherentModelRMS": None}
     path = meta.get("coefficientSeriesPath")
     if not path:
         return {
+            "sinA": _float(meta.get("sinA")),
+            "cosB": _float(meta.get("cosB")),
             "sinusoidAmplitude": _float(meta.get("sinusoidAmplitude")),
             "coherentModelRMS": _float(meta.get("coherentModelRMS")),
+            "sinCosCovariance": meta.get("sinCosCovariance"),
         }
     raw = _load_json(path)
     times = np.asarray(raw.get("times") or [], dtype=np.float64)
@@ -660,12 +665,36 @@ def _coherent_fit(meta: dict[str, Any], frequency: float | None) -> dict[str, fl
         return {"sinusoidAmplitude": None, "coherentModelRMS": None}
     design = _sinusoid_design_matrix(times, [frequency])
     coefficients, _, _, _ = np.linalg.lstsq(design, values, rcond=None)
+    residual = values - design @ coefficients
+    degrees_of_freedom = len(values) - design.shape[1]
+    covariance = None
+    residual_variance = None
+    if degrees_of_freedom > 0:
+        residual_variance = float(np.sum(np.square(residual)) / degrees_of_freedom)
+        gram_inverse = np.linalg.pinv(design.T @ design)
+        covariance = (residual_variance * gram_inverse[1:, 1:]).tolist()
     sinusoid = design[:, 1:] @ coefficients[1:]
     sinusoid -= float(np.mean(sinusoid))
     return {
+        "sinA": float(coefficients[1]),
+        "cosB": float(coefficients[2]),
         "sinusoidAmplitude": math.hypot(float(coefficients[1]), float(coefficients[2])),
         "coherentModelRMS": float(np.sqrt(np.mean(np.square(sinusoid)))),
+        "sinCosCovariance": covariance,
+        "fitResidualVariance": residual_variance,
+        "fitDegreesOfFreedom": degrees_of_freedom,
     }
+
+
+def _sinusoid_rms(meta: dict[str, Any], frequency: float, sin_a: float, cos_b: float) -> float:
+    path = meta.get("coefficientSeriesPath")
+    if not path:
+        return math.hypot(sin_a, cos_b) / math.sqrt(2.0)
+    times = np.asarray((_load_json(path).get("times") or []), dtype=np.float64)
+    model = sin_a * np.sin(2.0 * math.pi * frequency * times)
+    model += cos_b * np.cos(2.0 * math.pi * frequency * times)
+    model -= float(np.mean(model))
+    return float(np.sqrt(np.mean(np.square(model))))
 
 
 def interpret_multisource_residual_project(
@@ -696,7 +725,12 @@ def interpret_multisource_residual_project(
     for result in results:
         sector = _int(result.get("sector"))
         coherent = _float(result.get("coherentModelRMS"))
-        predicted = 0.0
+        frequency = _float(result.get("candidateFrequency"))
+        measured_vector = [
+            _float(result.get("sinA")) or 0.0,
+            _float(result.get("cosB")) or 0.0,
+        ]
+        predicted_vector = [0.0, 0.0]
         predictors: list[dict[str, Any]] = []
         if sector is not None and coherent is not None:
             coupling = result.get("pointSourceLeakageCoupling") or {}
@@ -708,7 +742,6 @@ def interpret_multisource_residual_project(
                 if other_coherent is None or other_coherent <= coherent:
                     continue
                 other_frequency = _float(other.get("candidateFrequency"))
-                frequency = _float(result.get("candidateFrequency"))
                 step = _float((preparation.get("frequencySearch") or {}).get("frequencyStep"))
                 tolerance = 1.5 * step if step is not None and step > 0 else 1e-9
                 if frequency is None or other_frequency is None or abs(frequency - other_frequency) > tolerance:
@@ -717,25 +750,71 @@ def interpret_multisource_residual_project(
                 ratio = _float((coupling.get(source_id) or {}).get(measured_id))
                 if ratio is None or not math.isfinite(ratio):
                     continue
-                allowance = ratio * other_coherent
-                predicted = max(predicted, allowance)
+                predicted_sin = ratio * float(other.get("sinA") or 0.0)
+                predicted_cos = ratio * float(other.get("cosB") or 0.0)
+                predicted_vector[0] += predicted_sin
+                predicted_vector[1] += predicted_cos
                 predictors.append({
                     "sourceComponentID": source_id,
                     "couplingRatio": ratio,
                     "sourceCoherentModelRMS": other_coherent,
-                    "allowedLeakageModelRMS": allowance,
+                    "predictedSinA": predicted_sin,
+                    "predictedCosB": predicted_cos,
                 })
-        result["predictedPointSourceLeakageRMS"] = predicted
-        result["leakagePredictors"] = predictors
-        limiting = max(predictors, key=lambda item: item["allowedLeakageModelRMS"], default=None)
-        result["leakageSourceComponentID"] = (
-            limiting.get("sourceComponentID") if limiting else None
+        residual_vector = [measured_vector[index] - predicted_vector[index] for index in range(2)]
+        predicted_amplitude = math.hypot(*predicted_vector)
+        residual_amplitude = math.hypot(*residual_vector)
+        result["predictedLeakageSinA"] = float(predicted_vector[0])
+        result["predictedLeakageCosB"] = float(predicted_vector[1])
+        result["predictedLeakageAmplitude"] = predicted_amplitude
+        result["predictedPointSourceLeakageRMS"] = (
+            _sinusoid_rms(result, frequency, *predicted_vector)
+            if frequency is not None else None
         )
+        result["residualSinA"] = float(residual_vector[0])
+        result["residualCosB"] = float(residual_vector[1])
+        result["residualCoherentAmplitude"] = residual_amplitude
+        result["residualCoherentModelRMS"] = (
+            _sinusoid_rms(result, frequency, *residual_vector)
+            if frequency is not None else None
+        )
+        result["leakagePredictors"] = predictors
+        result["leakageSourceComponentID"] = (
+            predictors[0].get("sourceComponentID") if len(predictors) == 1 else None
+        )
+        covariance = result.get("sinCosCovariance")
+        residual_covariance = [list(row) for row in covariance] if covariance is not None else None
+        for predictor in predictors:
+            source = next((item for item in results if item.get("componentID") == predictor["sourceComponentID"] and _int(item.get("sector")) == sector), None)
+            source_covariance = (source or {}).get("sinCosCovariance")
+            if residual_covariance is not None and source_covariance is not None:
+                scale = float(predictor["couplingRatio"]) ** 2
+                residual_covariance = [
+                    [residual_covariance[row][column] + scale * source_covariance[row][column]
+                     for column in range(2)] for row in range(2)
+                ]
+            else:
+                residual_covariance = None
+        significance = None
+        if residual_covariance is not None:
+            aa, ab = residual_covariance[0]
+            ba, bb = residual_covariance[1]
+            determinant = aa * bb - ab * ba
+            if math.isfinite(determinant) and abs(determinant) > 1e-30:
+                x, y = residual_vector
+                significance = (bb * x * x - (ab + ba) * x * y + aa * y * y) / determinant
+        result["residualSinCosCovariance"] = residual_covariance
+        result["residualCoherentChiSquare"] = significance
+        result["spatialSupportConfidence"] = SPATIAL_SUPPORT_CONFIDENCE
+        result["spatialSupportChiSquareThreshold"] = SPATIAL_SUPPORT_CHI2_THRESHOLD
         result["amplitudeQualified"] = bool(
             result.get("combined") or (
-                coherent is not None
-                and coherent > predicted
-                and not math.isclose(coherent, predicted, rel_tol=1e-6, abs_tol=1e-12)
+                coherent is not None and (
+                    not predictors or (
+                        significance is not None
+                        and significance > SPATIAL_SUPPORT_CHI2_THRESHOLD
+                    )
+                )
             )
         )
         result["countedAsIndependentSupport"] = bool(
@@ -823,10 +902,13 @@ def interpret_multisource_residual_project(
         "supportQualification": {
             "minimumCandidatePower": MIN_COMPONENT_POWER,
             "minimumIndependentSupport": MIN_INDEPENDENT_SUPPORT,
+            "spatialResidualConfidence": SPATIAL_SUPPORT_CONFIDENCE,
+            "spatialResidualChiSquareThreshold": SPATIAL_SUPPORT_CHI2_THRESHOLD,
             "reason": (
                 "A normalized component periodogram is not independent-source evidence unless "
-                "its coherent pre-normalization coefficient RMS exceeds the point-source leakage "
-                "predicted from the actual sector spatial design and stronger fitted components."
+                "its directly fitted sine/cosine vector has a statistically significant residual "
+                "after subtracting same-frequency point-source leakage predicted from the actual "
+                "sector spatial design and stronger fitted components."
             ),
         },
         "spatialComponents": preparation.get("spatialComponents") or [],
