@@ -1262,6 +1262,9 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
                  "targetDetectorPosition": positions["target"],
                  "offsetDetectorPosition": positions["offset-1"],
                  "templateCorrelation": item["templateCorrelation"],
+                 "primaryOnlyResidualDiagnostics": item["primaryOnlyResidualDiagnostics"],
+                 "empiricalCrossPixelCovarianceDiagnostic":
+                     item["empiricalCrossPixelCovarianceDiagnostic"],
                  "bestModel": item["bestModel"]},
             )
             for model_id in ("TARGET_ONLY", "OFFSET_ONLY", "TARGET_PLUS_OFFSET"):

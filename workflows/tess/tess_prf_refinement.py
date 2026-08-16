@@ -202,6 +202,102 @@ def compare_prf_hypotheses(*, coherent_coefficients: np.ndarray,
             "bestModelIdentifiable": identifiable}
 
 
+def _primary_residual_diagnostics(*, coherent_coefficients: np.ndarray,
+                                  pixel_covariances: np.ndarray,
+                                  template_matrix: np.ndarray,
+                                  models: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Describe whether the alternate PRF absorbs a one-source model residual."""
+    primary_id = min(("TARGET_ONLY", "OFFSET_ONLY"), key=lambda name: models[name]["bic"])
+    primary_index = 0 if primary_id == "TARGET_ONLY" else 1
+    alternative_index = 1 - primary_index
+    observed = np.asarray(coherent_coefficients, dtype=float)
+    vector = np.asarray(models[primary_id]["parameterEstimates"], dtype=float)
+    prediction = template_matrix[:, primary_index, None] * vector[None, :]
+    residual = observed - prediction
+    alternative = template_matrix[:, alternative_index]
+    projection_vectors = []
+    weighted_improvement = 0.0
+    for phase_index in range(2):
+        weights = np.asarray([np.linalg.pinv(cov, hermitian=True)[phase_index, phase_index]
+                              for cov in pixel_covariances])
+        denominator = float(np.sum(weights * alternative * alternative))
+        coefficient = (float(np.sum(weights * alternative * residual[:, phase_index])) / denominator
+                       if denominator > 0 else 0.0)
+        projected = alternative * coefficient
+        projection_vectors.append({"coefficient": coefficient,
+                                   "projectedNorm": float(np.linalg.norm(projected))})
+        weighted_improvement += float(np.sum(weights * (
+            residual[:, phase_index] ** 2 - (residual[:, phase_index] - projected) ** 2
+        )))
+    joint_improvement = float(models[primary_id]["chiSquare"]
+                              - models["TARGET_PLUS_OFFSET"]["chiSquare"])
+    return {
+        "primaryModel": primary_id,
+        "observedCoherentMapNorm": float(np.linalg.norm(observed)),
+        "primaryPredictionNorm": float(np.linalg.norm(prediction)),
+        "primaryOnlyResidualNorm": float(np.linalg.norm(residual)),
+        "residualToPrimaryPredictionNormRatio": (
+            float(np.linalg.norm(residual) / np.linalg.norm(prediction))
+            if np.linalg.norm(prediction) > 0 else None
+        ),
+        "alternativeTemplateProjectionByPhase": projection_vectors,
+        "alternativeProjectionWeightedChiSquareImprovement": weighted_improvement,
+        "jointModelChiSquareImprovement": joint_improvement,
+        "projectionFractionOfJointImprovement": (
+            weighted_improvement / joint_improvement if joint_improvement > 0 else None
+        ),
+        "observedSinMap": observed[:, 0].tolist(),
+        "observedCosMap": observed[:, 1].tolist(),
+        "primaryPredictionSinMap": prediction[:, 0].tolist(),
+        "primaryPredictionCosMap": prediction[:, 1].tolist(),
+        "primaryResidualSinMap": residual[:, 0].tolist(),
+        "primaryResidualCosMap": residual[:, 1].tolist(),
+    }
+
+
+def _empirical_cross_pixel_diagnostic(*, temporal_errors: np.ndarray,
+                                      temporal_normal_inverse: np.ndarray,
+                                      coherent_coefficients: np.ndarray,
+                                      template_matrix: np.ndarray,
+                                      component_ids: list[str]) -> dict[str, Any]:
+    """Compare joint-source Q using empirical cross-pixel covariance, without regularization."""
+    spatial_covariance = np.cov(temporal_errors, rowvar=False, ddof=1)
+    covariance = np.kron(spatial_covariance, temporal_normal_inverse)
+    eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+    tolerance = (np.finfo(float).eps * max(covariance.shape)
+                 * max(float(np.max(np.abs(eigenvalues))), 1.0))
+    keep = eigenvalues > tolerance
+    if int(np.count_nonzero(keep)) < covariance.shape[0]:
+        return {"available": False, "reason": "empirical covariance is not full rank",
+                "rank": int(np.count_nonzero(keep)), "dimension": int(covariance.shape[0]),
+                "eigenvalues": eigenvalues.tolist()}
+    whitener = ((eigenvectors[:, keep] / np.sqrt(eigenvalues[keep]))
+                @ eigenvectors[:, keep].T)
+    pixel_count = len(template_matrix)
+    design = np.zeros((pixel_count * 2, 4), dtype=float)
+    design[0::2, 0::2] = template_matrix
+    design[1::2, 1::2] = template_matrix
+    whitened_design = whitener @ design
+    whitened_observed = whitener @ np.asarray(coherent_coefficients).reshape(-1)
+    coefficients, _, rank, singular = np.linalg.lstsq(
+        whitened_design, whitened_observed, rcond=None
+    )
+    parameter_covariance = np.linalg.pinv(
+        whitened_design.T @ whitened_design, hermitian=True
+    )
+    sources = []
+    for index, component_id in enumerate(component_ids):
+        selection = slice(2 * index, 2 * index + 2)
+        vector = coefficients[selection]
+        source_covariance = parameter_covariance[selection, selection]
+        q = float(vector @ np.linalg.pinv(source_covariance, hermitian=True) @ vector)
+        sources.append({"componentID": component_id, "coherentVectorChiSquare": q,
+                        "covariance": source_covariance.tolist()})
+    return {"available": True, "rank": int(rank), "singularValues": singular.tolist(),
+            "sources": sources,
+            "assumption": "Empirical cadence-residual cross-pixel covariance; no shrinkage or regularization."}
+
+
 def run_prf_deblending(preparation: dict[str, Any]) -> dict[str, Any]:
     sector_results = []
     errors = []
@@ -278,6 +374,19 @@ def run_prf_deblending(preparation: dict[str, Any]) -> dict[str, Any]:
             )
             models = comparison["models"]
             best_model = comparison["bestModel"]
+            primary_residual_diagnostics = _primary_residual_diagnostics(
+                coherent_coefficients=temporal_coefficients[:2].T,
+                pixel_covariances=pixel_covariances,
+                template_matrix=template_matrix,
+                models=models,
+            )
+            empirical_cross_pixel = _empirical_cross_pixel_diagnostic(
+                temporal_errors=temporal_errors,
+                temporal_normal_inverse=temporal_normal_inverse,
+                coherent_coefficients=temporal_coefficients[:2].T,
+                template_matrix=template_matrix,
+                component_ids=component_ids,
+            )
             historical_guard = bool(
                 math.isfinite(condition)
                 and condition <= MAX_OFFICIAL_PRF_DESIGN_CONDITION
@@ -288,6 +397,8 @@ def run_prf_deblending(preparation: dict[str, Any]) -> dict[str, Any]:
                 "tpfPhysicalRow": tpf_row, "tpfPhysicalColumn": tpf_col,
                 "sampleCount": len(times), "actualResidualPixelCount": int(np.count_nonzero(valid)),
                 "calibration": calibration_provenance, "models": models,
+                "primaryOnlyResidualDiagnostics": primary_residual_diagnostics,
+                "empiricalCrossPixelCovarianceDiagnostic": empirical_cross_pixel,
                 "executionProvenance": {
                     "officialDetectorGridInterpolationExecuted": True,
                     "prfStampRenderingExecuted": True,
