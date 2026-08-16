@@ -12,7 +12,6 @@ M_SUN_KG = 1.98847e30
 R_SUN_M = 6.957e8
 SECONDS_PER_DAY = 86400.0
 
-
 def _float(value: Any) -> float | None:
     try:
         result = float(value)
@@ -516,6 +515,7 @@ def interpret_independent_sectors(
     sector_results: list[dict[str, Any]] = []
     eligible_count = 0
     support_count = 0
+    resolution_limited_count = 0
     supported_periods: list[float] = []
 
     for dataset in project_status.get("datasets") or []:
@@ -525,6 +525,9 @@ def interpret_independent_sectors(
         baseline = _float(spec.get("baselineDays"))
         candidate_period = _float(dataset.get("candidatePeriodDays"))
         candidate_frequency = _float(dataset.get("candidateFrequency"))
+        frequency_interval = dataset.get("candidateFrequencyConfidenceInterval") or {}
+        frequency_interval_lower = _float(frequency_interval.get("lower"))
+        frequency_interval_upper = _float(frequency_interval.get("upper"))
         status = str(dataset.get("periodStatus") or "").upper()
         confidence = str(dataset.get("periodConfidence") or "none").lower()
         coverage = cycle_coverage(candidate_period, baseline)
@@ -547,8 +550,56 @@ def interpret_independent_sectors(
                 boundary = "maximum"
 
         relative_error = None
+        target_frequency = 1.0 / target_period
+        frequency_relative_error = None
         if candidate_period is not None:
             relative_error = abs(candidate_period - target_period) / target_period
+        if candidate_frequency is not None:
+            frequency_relative_error = (
+                abs(candidate_frequency - target_frequency) / target_frequency
+            )
+
+        rayleigh_resolution = (
+            1.0 / baseline
+            if baseline is not None and baseline > 0
+            else None
+        )
+        frequency_separation = (
+            abs(candidate_frequency - target_frequency)
+            if candidate_frequency is not None
+            else None
+        )
+        resolution_limited = (
+            frequency_separation is not None
+            and rayleigh_resolution is not None
+            and frequency_separation < rayleigh_resolution
+        )
+
+        # The grid step describes numerical sampling, not peak uncertainty.
+        # A targeted search can confirm recurrence only when its result carries
+        # a statistically estimated frequency confidence interval.  In its
+        # absence, the Rayleigh scale can show that two peaks are resolvably
+        # different, but cannot turn an unresolved nearby peak into affirmative
+        # evidence.
+        has_frequency_interval = (
+            frequency_interval_lower is not None
+            and frequency_interval_upper is not None
+            and frequency_interval_lower <= frequency_interval_upper
+        )
+        interval_contains_target = (
+            has_frequency_interval
+            and frequency_interval_lower <= target_frequency <= frequency_interval_upper
+        )
+        frequency_interval_width = (
+            frequency_interval_upper - frequency_interval_lower
+            if has_frequency_interval
+            else None
+        )
+        frequency_interval_resolved = (
+            frequency_interval_width is not None
+            and rayleigh_resolution is not None
+            and frequency_interval_width <= rayleigh_resolution
+        )
 
         coverage_ok = (coverage.get("observedCycles") or 0.0) >= 1.5
         reliable = status == "RELIABLE" and confidence in {"high", "medium"}
@@ -556,15 +607,35 @@ def interpret_independent_sectors(
         supports = (
             eligible
             and reliable
-            and relative_error is not None
-            and relative_error <= 0.15
+            and interval_contains_target
+            and frequency_interval_resolved
         )
+        inconclusive = (
+            eligible
+            and reliable
+            and (
+                (not has_frequency_interval and resolution_limited)
+                or (
+                    has_frequency_interval
+                    and interval_contains_target
+                    and not frequency_interval_resolved
+                )
+            )
+        )
+        if supports:
+            recurrence_classification = "SUPPORTING"
+        elif inconclusive:
+            recurrence_classification = "RESOLUTION_LIMITED"
+        else:
+            recurrence_classification = "NONSUPPORTING"
 
         if eligible:
             eligible_count += 1
         if supports and candidate_period is not None:
             support_count += 1
             supported_periods.append(candidate_period)
+        if inconclusive:
+            resolution_limited_count += 1
 
         sector_results.append({
             "sector": sector,
@@ -574,11 +645,29 @@ def interpret_independent_sectors(
             "candidatePeriodDays": candidate_period,
             "candidateFrequency": candidate_frequency,
             "targetRelativeError": relative_error,
+            "targetFrequency": target_frequency,
+            "targetFrequencyRelativeError": frequency_relative_error,
+            "frequencySeparation": frequency_separation,
+            "rayleighFrequencyResolution": rayleigh_resolution,
+            "resolutionLimited": resolution_limited,
+            "candidateFrequencyConfidenceInterval": (
+                {
+                    "lower": frequency_interval_lower,
+                    "upper": frequency_interval_upper,
+                }
+                if has_frequency_interval
+                else None
+            ),
+            "frequencyIntervalContainsTarget": interval_contains_target,
+            "frequencyIntervalWidth": frequency_interval_width,
+            "frequencyIntervalResolved": frequency_interval_resolved,
+            "harmonicOrAliasAccepted": False,
             "boundaryHit": boundary_hit,
             "boundary": boundary,
             "cycleCoverage": coverage,
             "eligibleForRecurrence": eligible,
             "supportsTarget": supports,
+            "recurrenceClassification": recurrence_classification,
         })
 
     required_support = (eligible_count // 2 + 1) if eligible_count else 0
@@ -597,6 +686,13 @@ def interpret_independent_sectors(
             "At least one independent TESS sector supported the candidate, but recurrence was not strong enough across the eligible independent sectors to upgrade the claim.",
             f"Supporting independent sectors: {support_count}/{eligible_count} eligible sectors; required support: {required_support}.",
         )
+    elif resolution_limited_count > 0:
+        selected = target_period
+        claim = decision(
+            "HUMAN_REVIEW_REQUIRED",
+            "Independent TESS sector verification recovered a nearby reliable peak, but the available baseline could not resolve it from the target frequency and no statistical frequency confidence interval was available.",
+            "Resolution-limited sectors are inconclusive and do not count as affirmative recurrence evidence.",
+        )
     else:
         selected = target_period
         claim = decision(
@@ -611,6 +707,7 @@ def interpret_independent_sectors(
         "targetPeriodDays": target_period,
         "eligibleSectorCount": eligible_count,
         "supportingSectorCount": support_count,
+        "resolutionLimitedSectorCount": resolution_limited_count,
         "requiredSupportingSectorCount": required_support,
         "sectorResults": sector_results,
     }
