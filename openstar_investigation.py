@@ -67,6 +67,9 @@ class InvestigationStage:
     artifacts: tuple[ArtifactReference, ...] = ()
     provenance: StageProvenance | None = None
     next_stage: dict[str, Any] | None = None
+    # Preserve the workflow handler's explicit StageOutcome.stop decision.
+    # This is distinct from merely having no persisted continuation.
+    stop: bool = False
 
 
 @dataclass(frozen=True)
@@ -314,6 +317,7 @@ class InvestigationStore:
         artifacts: tuple[ArtifactReference, ...] = (),
         started_at: str | None = None,
         next_stage: dict[str, Any] | None = None,
+        stop: bool = False,
     ) -> InvestigationStage:
         return InvestigationStage(
             id=stage_id,
@@ -336,6 +340,7 @@ class InvestigationStore:
                 project_ids=project_ids,
             ),
             next_stage=dict(next_stage) if next_stage is not None else None,
+            stop=stop,
         )
 
     @staticmethod
@@ -419,6 +424,9 @@ class InvestigationStore:
                         if stage_raw.get("next_stage") is not None
                         else None
                     ),
+                    # Snapshots written before terminal outcome persistence do
+                    # not contain this field and remain safely nonterminal.
+                    stop=stage_raw.get("stop", False) is True,
                 )
             )
 

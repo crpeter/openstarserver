@@ -83,6 +83,62 @@ class AutonomousTessEntryPointTests(unittest.TestCase):
         self.assertIn("disposition=RESUMING target=validation:first", output)
         self.assertNotIn("disposition=STARTED", output)
 
+    def test_restart_repairs_legacy_terminal_wait_and_advances_once(self):
+        def waiting(investigation, target):
+            return (
+                ScientificBranch(
+                    "obsolete-wait",
+                    StageRequest("obsolete-wait", "test.execute", {}),
+                    required_stage_ids=("tess-continuation-decision",),
+                ),
+            )
+
+        self.invoke(waiting)
+        store = InvestigationStore(self.root / "state/investigations")
+        investigation = store.load("tess-validation-first")
+        running = InvestigationStage(
+            "006-finalize", "openstar.tess.finalize", "RUNNING", None, {}
+        )
+        investigation = store.append_running_stage(investigation, running)
+        terminal = store.build_terminal_stage(
+            stage_id=running.id,
+            handler_id=running.handler_id,
+            status="COMPLETE",
+            triggered_by_stage_id=None,
+            parameters={},
+            result={"scientificConclusion": "FINAL"},
+            error=None,
+            software_id="legacy",
+            software_version="20.28",
+        )
+        investigation = store.complete_current_stage(investigation, terminal)
+        investigation = store.set_control_state(
+            investigation,
+            status="BLOCKED",
+            control_state={"schedulerAction": "WAIT_FOR_PREREQUISITES"},
+        )
+        snapshot_path = store.path_for(investigation.id)
+        snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+        del snapshot["stages"][-1]["stop"]
+        snapshot_path.write_text(json.dumps(snapshot), encoding="utf-8")
+
+        code, output = self.invoke()
+
+        self.assertEqual(0, code)
+        self.assertIn("disposition=RESUMING target=validation:first", output)
+        self.assertEqual("COMPLETE", store.load("tess-validation-first").status)
+        self.assertEqual(
+            ["006-finalize"],
+            [stage.id for stage in store.load("tess-validation-first").stages],
+        )
+        state = json.loads((self.root / "state/lifecycle.json").read_text())
+        self.assertEqual("validation:second", state["currentTarget"]["id"])
+        portfolio = json.loads((self.root / "state/portfolio.json").read_text())
+        self.assertEqual(
+            ["validation:first", "validation:second"],
+            [item["selectedTargetID"] for item in portfolio["selections"]],
+        )
+
     def test_advances_to_another_target(self):
         def planner(investigation, target):
             if target.id.endswith(":first"):
