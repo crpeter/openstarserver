@@ -757,6 +757,17 @@ BROAD_MAX_PROMOTION_CLUSTER_SPAN_RELATIVE = 0.08
 BROAD_MIN_PROMOTION_SECTORS = 3
 BROAD_MIN_PROMOTION_PEAK_PROMINENCE = 1.5
 BROAD_CANDIDATE_MIN_SECTORS = 2
+
+
+def broad_independent_next_handler(interpreted: dict[str, Any]) -> str:
+    """Select characterization only when persisted broad evidence warrants it."""
+
+    characterization = interpreted.get("variabilityCharacterization") or {}
+    if characterization.get("warranted") is True:
+        return str(characterization["nextHandler"])
+    return "openstar.tess.finalize"
+
+
 HARMONIC_CONTEXT_TOLERANCE_RELATIVE = 0.15
 
 
@@ -1147,6 +1158,22 @@ def interpret_broad_independent_sectors(
         )
         source = "independent-broad-no-stable-cluster"
 
+    characterization_reasons = [
+        blocker
+        for blocker in promotion_blockers
+        if blocker in {
+            "insufficient-independent-sector-support",
+            "cluster-spread-too-wide",
+            "supporting-peak-prominence-too-weak",
+        }
+    ]
+    characterization_warranted = bool(
+        claim.claim == "CANDIDATE_PERIOD"
+        and harmonic_family is not None
+        and cluster_count >= BROAD_CANDIDATE_MIN_SECTORS
+        and characterization_reasons
+    )
+
     return {
         "claimDecision": claim.as_dict(),
         "selectedPeriodDays": selected,
@@ -1164,6 +1191,24 @@ def interpret_broad_independent_sectors(
         ),
         "promotionEligible": promotion_eligible,
         "promotionBlockers": promotion_blockers,
+        "variabilityCharacterization": {
+            "state": (
+                "RECURRENT_BUT_UNRESOLVED_CROSS_SECTOR_VARIABILITY"
+                if characterization_warranted
+                else "NOT_WARRANTED_BY_BROAD_CLUSTERING"
+            ),
+            "warranted": characterization_warranted,
+            "reasons": characterization_reasons,
+            "nextHandler": (
+                "openstar.tess.morphology.analyze"
+                if characterization_warranted
+                else None
+            ),
+            "scientificQuestion": (
+                "Is the recurrent family a stable periodic source, evolving or "
+                "nonstationary variability, contamination or blending, or a mixture?"
+            ),
+        },
         "bestCluster": best_cluster,
         "clusters": clusters,
         "harmonicFamily": harmonic_family,
