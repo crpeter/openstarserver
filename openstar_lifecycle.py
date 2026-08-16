@@ -10,6 +10,7 @@ from typing import Any
 from openstar_autonomy import AutonomousInvestigationEngine
 from openstar_dispatch import InvestigationDispatcher
 from openstar_investigation import Investigation, InvestigationStore
+from openstar_workflow import StageRequest
 from openstar_targets import (
     BranchPlanner,
     InvestigationTarget,
@@ -125,6 +126,45 @@ class InvestigationLifecycleLoop:
         )
         return updated
 
+    @staticmethod
+    def _retryable_failure(investigation: Investigation):
+        """Return only the latest retryable failure, including legacy records.
+
+        Older snapshots predate ``failure_classification``.  Their serialized
+        exception *type* is the narrow compatibility contract; the error
+        message itself is deliberately never inspected.
+        """
+        if not investigation.stages:
+            return None
+        stage = investigation.stages[-1]
+        if stage.status != "FAILED":
+            return None
+        if stage.failure_classification == "TRANSIENT_INFRASTRUCTURE":
+            return stage
+        if stage.failure_classification is None and stage.error:
+            exception_type, separator, _ = stage.error.partition(":")
+            if separator and exception_type == "CoordinatorClientError":
+                return stage
+        return None
+
+    @staticmethod
+    def _retry_request(investigation: Investigation, failed) -> StageRequest:
+        prefixes = []
+        for stage in investigation.stages:
+            prefix, separator, _ = stage.id.partition("-")
+            if separator and prefix.isdigit():
+                prefixes.append(int(prefix))
+        failed_prefix, separator, label = failed.id.partition("-")
+        if not separator or not failed_prefix.isdigit():
+            raise ValueError(f"Stage id must begin with an integer prefix: {failed.id}")
+        next_number = max(prefixes, default=int(failed_prefix)) + 1
+        return StageRequest(
+            id=f"{next_number:03d}-{label}",
+            handler_id=failed.handler_id,
+            parameters=dict(failed.parameters),
+            triggered_by_stage_id=failed.id,
+        )
+
     def run(self, *, max_transitions: int = 100) -> LifecycleResult:
         """Run until a durable wait, terminal state, recovery, or checkpoint."""
         if max_transitions < 1:
@@ -141,6 +181,41 @@ class InvestigationLifecycleLoop:
                 return LifecycleResult(
                     investigation, "EXPERIMENT_RECOVERY_REQUIRED", transitions
                 )
+
+            failed = self._retryable_failure(investigation)
+            if failed is not None:
+                control = investigation.metadata.get("controlState")
+                selected = (
+                    control.get("selectedExperiment")
+                    if isinstance(control, dict)
+                    else None
+                )
+                retry_already_planned = (
+                    isinstance(selected, dict)
+                    and control.get("schedulerAction") == "RUN_EXPERIMENT"
+                    and selected.get("triggered_by_stage_id") == failed.id
+                    and not any(stage.id == selected.get("id") for stage in investigation.stages)
+                )
+                if retry_already_planned:
+                    failed = None
+            if failed is not None:
+                retry = self._retry_request(investigation, failed)
+                investigation = self.store.set_control_state(
+                    investigation,
+                    status="RUNNING",
+                    control_state={
+                        "branchAssessments": [],
+                        "selectedExperiment": asdict(retry),
+                        "schedulerAction": "RUN_EXPERIMENT",
+                        "recovery": "TRANSIENT_INFRASTRUCTURE_RETRY",
+                    },
+                )
+                transitions += 1
+                if transitions >= max_transitions:
+                    return LifecycleResult(
+                        investigation, "LIFECYCLE_CHECKPOINT", transitions
+                    )
+                continue
 
             control = investigation.metadata.get("controlState")
             if not isinstance(control, dict):
