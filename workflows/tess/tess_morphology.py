@@ -16,6 +16,7 @@ DOUBLE_SUPPORT_MIN_HALF_DIFFERENCE = 0.12
 RAW_SUPPORT_MAX_IMPROVEMENT = 0.025
 RAW_SUPPORT_MAX_HALF_DIFFERENCE = 0.10
 MIN_RESOLUTION_SECTORS = 3
+EVOLUTION_FOLLOWUP_MIN_INDEPENDENT_SECTORS = 2
 
 
 def _float(value: Any) -> float | None:
@@ -354,6 +355,19 @@ def analyze_morphology(
         ),
     }
 
+    # A failed majority vote is not, by itself, evidence for evolution.  It may
+    # simply mean that too few sectors were informative.  Continue only when
+    # multiple independent, well-covered sectors give genuinely different
+    # morphology answers.  The doubled candidate is the least-assumptive
+    # reference cycle for the next experiment: its fundamental plus first
+    # harmonic spans both members of the unresolved raw/double family.
+    represented_classes = sum(1 for count in independent_classes.values() if count)
+    evolution_followup_warranted = bool(
+        not physical_cycle_resolved
+        and independent_eligible_count >= EVOLUTION_FOLLOWUP_MIN_INDEPENDENT_SECTORS
+        and represented_classes >= 2
+    )
+
     duty_cycles = [
         _float((item.get("doubleProfile") or {}).get("minimumDutyCycle"))
         for item in eligible_results
@@ -385,6 +399,17 @@ def analyze_morphology(
         "resolvedPhysicalPeriodDays": resolved_period,
         "morphologyClass": morphology_class,
         "phenomenology": phenomenology,
+        "continuationEvidence": {
+            "timeFrequencyEvolutionWarranted": evolution_followup_warranted,
+            "analysisReferencePeriodDays": double_period if evolution_followup_warranted else None,
+            "independentEvidenceClassCount": represented_classes,
+            "minimumIndependentSectors": EVOLUTION_FOLLOWUP_MIN_INDEPENDENT_SECTORS,
+            "scientificQuestion": (
+                "Does temporal evolution/nonstationarity or an additional periodic component "
+                "explain the cross-sector morphology inconsistency?"
+                if evolution_followup_warranted else None
+            ),
+        },
         "rationale": list(rationale),
         "eligibleSectorCount": eligible_count,
         "independentEligibleSectorCount": independent_eligible_count,

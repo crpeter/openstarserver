@@ -1939,14 +1939,25 @@ def build_engine(
             if path:
                 input_hashes[f"independentSector{sector}"] = sha256_file(Path(path))
 
-        return StageOutcome(
-            result=morphology,
-            next_stage=StageRequest(
+        continuation = morphology.get("continuationEvidence") or {}
+        if continuation.get("timeFrequencyEvolutionWarranted"):
+            next_stage = StageRequest(
+                id=_next_stage_id(request.id, "prepare-time-frequency"),
+                handler_id="openstar.tess.time-frequency.prepare",
+                parameters={"entryReason": "UNRESOLVED_EVOLVING_MORPHOLOGY"},
+                triggered_by_stage_id=request.id,
+            )
+        else:
+            next_stage = StageRequest(
                 id=_next_stage_id(request.id, "finalize"),
                 handler_id="openstar.tess.finalize",
                 parameters={"outputSuffix": "v20.4"},
                 triggered_by_stage_id=request.id,
-            ),
+            )
+
+        return StageOutcome(
+            result=morphology,
+            next_stage=next_stage,
             input_hashes=input_hashes,
             artifacts=(_artifact(artifact_path, "application/json"),),
         )
@@ -2370,15 +2381,24 @@ def build_engine(
         )
         if independent_prepare is None:
             raise RuntimeError("v20.8 requires the frozen independent-sector preparation.")
-        if morphology is None or not morphology.get("physicalCycleResolved"):
-            raise RuntimeError("v20.8 requires a morphology-resolved physical period.")
-        if multimode is None or multimode.get("recommendedNextTest") != "TIME_FREQUENCY_EVOLUTION_ANALYSIS":
-            raise RuntimeError("v20.8 requires v20.7 to recommend TIME_FREQUENCY_EVOLUTION_ANALYSIS.")
-
-        physical_period = float(morphology["resolvedPhysicalPeriodDays"])
+        if morphology is None:
+            raise RuntimeError("v20.8 requires completed morphology analysis.")
+        morphology_entry = request.parameters.get("entryReason") == "UNRESOLVED_EVOLVING_MORPHOLOGY"
+        continuation = morphology.get("continuationEvidence") or {}
+        if morphology_entry:
+            if not continuation.get("timeFrequencyEvolutionWarranted"):
+                raise RuntimeError("Time-frequency continuation is not warranted by morphology evidence.")
+            physical_period = float(continuation["analysisReferencePeriodDays"])
+        else:
+            if not morphology.get("physicalCycleResolved"):
+                raise RuntimeError("v20.8 requires a morphology-resolved physical period.")
+            if multimode is None or multimode.get("recommendedNextTest") != "TIME_FREQUENCY_EVOLUTION_ANALYSIS":
+                raise RuntimeError("v20.8 requires v20.7 to recommend TIME_FREQUENCY_EVOLUTION_ANALYSIS.")
+            physical_period = float(morphology["resolvedPhysicalPeriodDays"])
         artifact_root = store.directory_for(investigation.id) / "artifacts"
         print("🪟 Preparing sliding-window residual time-frequency search")
-        print(f"   resolved physical period: {physical_period} days")
+        reference_label = "unresolved family analysis reference" if morphology_entry else "resolved physical period"
+        print(f"   {reference_label}: {physical_period} days")
         print("   fitting/subtracting the established fundamental + first harmonic locally")
         spec = build_time_frequency_project(
             source_project_path=prepared["sourceProjectPath"],
@@ -2422,6 +2442,7 @@ def build_engine(
                 "morphology": sha256_json(morphology),
                 "multimode": sha256_json(multimode),
                 "independentPreparation": sha256_json(independent_prepare),
+                "continuationEvidence": sha256_json(continuation),
             },
             artifacts=tuple(artifacts),
         )
@@ -2496,14 +2517,30 @@ def build_engine(
             investigation,
             "openstar.tess.time-frequency.interpret",
         )
-        if morphology is None or not morphology.get("physicalCycleResolved"):
-            raise RuntimeError("Time-frequency summary requires a resolved physical period.")
+        if morphology is None:
+            raise RuntimeError("Time-frequency summary requires morphology evidence.")
         if interpreted is None:
             raise RuntimeError("Time-frequency summary requires the interpreted window search.")
+        continuation = morphology.get("continuationEvidence") or {}
+        analysis_period = morphology.get("resolvedPhysicalPeriodDays")
+        if analysis_period is None and continuation.get("timeFrequencyEvolutionWarranted"):
+            analysis_period = continuation.get("analysisReferencePeriodDays")
+        if analysis_period is None:
+            raise RuntimeError("Time-frequency summary has no justified family reference period.")
         summary = summarize_time_frequency_evolution(
             interpretation=interpreted,
-            physical_period_days=float(morphology["resolvedPhysicalPeriodDays"]),
+            physical_period_days=float(analysis_period),
         )
+        unresolved_reference = not bool(morphology.get("physicalCycleResolved"))
+        summary["periodReference"] = {
+            "periodDays": float(analysis_period),
+            "kind": (
+                "UNRESOLVED_FAMILY_ANALYSIS_REFERENCE"
+                if unresolved_reference
+                else "MORPHOLOGY_RESOLVED_PHYSICAL_PERIOD"
+            ),
+            "physicalCycleResolved": not unresolved_reference,
+        }
         residual = summary.get("residualEvolution") or {}
         family = summary.get("familyEvolution") or {}
         print("🌊 Time-frequency evolution analysis")
