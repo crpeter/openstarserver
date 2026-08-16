@@ -242,6 +242,29 @@ def broad_independent_continuation(
     )
 
 
+def time_frequency_continuation(summary: dict[str, Any], *, request_id: str) -> StageRequest:
+    """Continue only the explicitly recommended, still-unresolved experiment."""
+
+    run_nonstationary = (
+        summary.get("recommendedNextTest")
+        == "LONG_BASELINE_NONSTATIONARY_MODE_MODELING"
+        and summary.get("physicalMechanismResolved") is False
+    )
+    return StageRequest(
+        id=_next_stage_id(
+            request_id,
+            "prepare-nonstationary" if run_nonstationary else "finalize",
+        ),
+        handler_id=(
+            "openstar.tess.nonstationary.prepare"
+            if run_nonstationary
+            else "openstar.tess.finalize"
+        ),
+        parameters={} if run_nonstationary else {"outputSuffix": "v20.8"},
+        triggered_by_stage_id=request_id,
+    )
+
+
 def _build_period_evidence(
     *,
     claim_decision: dict[str, Any],
@@ -2579,12 +2602,7 @@ def build_engine(
         _write_json(artifact_path, summary)
         return StageOutcome(
             result=summary,
-            next_stage=StageRequest(
-                id=_next_stage_id(request.id, "finalize"),
-                handler_id="openstar.tess.finalize",
-                parameters={"outputSuffix": "v20.8"},
-                triggered_by_stage_id=request.id,
-            ),
+            next_stage=time_frequency_continuation(summary, request_id=request.id),
             input_hashes={
                 "morphology": sha256_json(morphology),
                 "timeFrequencyInterpretation": sha256_json(interpreted),
