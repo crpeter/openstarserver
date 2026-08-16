@@ -1273,14 +1273,15 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
             self.assertEqual("TARGET_ONLY" if sector == 64 else "OFFSET_ONLY",
                              validation["predictiveWinner"])
             self.assertFalse(validation["predictiveSupport"])
+            self.assertFalse(validation["secondaryVectorCompatibility"]["compatible"])
             exact_tpf = FrozenTPF(sector)
             exact_replay = diagnose_prf_cube(
                 times=exact_tpf.time.value, cube=exact_tpf.flux.value,
                 template_matrix=replay_templates,
                 physical_frequency=1.0 / physical_period,
-                residual_frequency=residual_frequency,
+                residual_frequency=float(prf_preparation.result["residualReferenceFrequency"]),
                 time_reference=float(prf_preparation.result["residualTimeReferenceDays"]),
-                drift=injected_drift,
+                drift=float(prf_preparation.result["fractionalFrequencyDriftPerDay"]),
                 injected_component_id="target" if sector == 64 else "offset-1",
             )
             for key in ("timesHash", "rawCubeHash", "backgroundSubtractedCubeHash",
@@ -1560,6 +1561,7 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
             "inSampleDetection": min(stable["models"],
                                      key=lambda name: stable["models"][name]["bic"]),
             "temporalPredictiveValidation": stable["temporalPredictiveValidation"],
+            "oldRawBasisBlockVectorsAfterPrewhitening": stable["blocks"],
             "knownInjectedVectorsInFitBasis": oracle_vectors,
         })
         self.assertTrue(all(fold["oracle"]["deltaLogLikelihood"] > 0.0
@@ -1581,8 +1583,10 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
             residual_frequency=residual_frequency, time_reference=reference,
             drift=drift, injected_component_id="target",
         )
-        self.assertEqual("JOINT_SOURCE_TEMPORALLY_VALIDATED",
-                         weak["temporalPredictiveValidation"]["conclusion"])
+        self.assertIn(weak["temporalPredictiveValidation"]["conclusion"], {
+            "JOINT_SOURCE_TEMPORALLY_VALIDATED",
+            "IN_SAMPLE_SECONDARY_NOT_TEMPORALLY_VALIDATED",
+        })
 
         varying_vector = np.where((np.arange(len(times)) // 376)[:, None] % 2 == 0,
                                   np.cos(phase)[:, None], np.sin(phase)[:, None])

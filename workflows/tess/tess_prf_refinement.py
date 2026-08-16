@@ -14,7 +14,7 @@ from typing import Any
 
 import numpy as np
 
-from .tess_multisource_residual import _prewhiten_cube_raw
+from .tess_multisource_residual import _design_matrix as _physical_design_matrix, _prewhiten_cube_raw
 from .tess_residual_localization import (
     _background_subtract_cube, _download_tpf, _uniform_indices, MAX_CADENCES,
     _write_json,
@@ -300,11 +300,14 @@ def _empirical_cross_pixel_diagnostic(*, temporal_errors: np.ndarray,
 
 
 def _coherent_pixel_fit(*, times: np.ndarray, cube: np.ndarray, frequency: float,
-                        time_reference: float, drift: float) -> dict[str, Any]:
-    warped = _drift_corrected_times(times, time_reference_days=time_reference,
-                                    fractional_frequency_drift_per_day=drift)
-    phase = 2.0 * math.pi * frequency * warped
-    design = np.column_stack((np.sin(phase), np.cos(phase), np.ones(len(phase))))
+                        time_reference: float, drift: float,
+                        coherent_basis: np.ndarray | None = None) -> dict[str, Any]:
+    if coherent_basis is None:
+        warped = _drift_corrected_times(times, time_reference_days=time_reference,
+                                        fractional_frequency_drift_per_day=drift)
+        phase = 2.0 * math.pi * frequency * warped
+        coherent_basis = np.column_stack((np.sin(phase), np.cos(phase)))
+    design = np.column_stack((coherent_basis, np.ones(len(times))))
     flat = np.asarray(cube, dtype=float).reshape(len(times), -1)
     coefficients, _, rank, singular = np.linalg.lstsq(design, flat, rcond=None)
     errors = flat - design @ coefficients
@@ -315,6 +318,18 @@ def _coherent_pixel_fit(*, times: np.ndarray, cube: np.ndarray, frequency: float
     covariances = np.asarray([normal_inverse * max(float(value), floor) for value in variances])
     return {"coefficients": coefficients[:2].T, "covariances": covariances,
             "errors": errors, "rank": int(rank), "singularValues": singular}
+
+
+def _prewhitened_coherent_basis(*, times: np.ndarray, physical_frequency: float,
+                                residual_frequency: float, time_reference: float,
+                                drift: float) -> np.ndarray:
+    """Apply the frozen full-sector physical-family residual maker to the PRF basis."""
+    warped = _drift_corrected_times(times, time_reference_days=time_reference,
+                                    fractional_frequency_drift_per_day=drift)
+    phase = 2.0 * math.pi * residual_frequency * warped
+    coherent = np.column_stack((np.sin(phase), np.cos(phase)))
+    physical = _physical_design_matrix(times, physical_frequency)
+    return coherent - physical @ (np.linalg.pinv(physical) @ coherent)
 
 
 def _projection_on_templates(coefficients: np.ndarray, templates: np.ndarray) -> dict[str, Any]:
@@ -335,7 +350,8 @@ def _temporal_predictive_validation(*, times: np.ndarray, prewhitened: np.ndarra
                                     residual_frequency: float, time_reference: float,
                                     drift: float, primary_model_id: str,
                                     block_count: int = 4,
-                                    oracle_source_vectors: dict[str, list[float]] | None = None) -> dict[str, Any]:
+                                    oracle_source_vectors: dict[str, list[float]] | None = None,
+                                    coherent_basis: np.ndarray | None = None) -> dict[str, Any]:
     """Contiguous-fold prediction with training amplitudes frozen on held-out data."""
     injected_index = 0 if primary_model_id == "TARGET_ONLY" else 1
     secondary_index = 1 - injected_index
@@ -351,10 +367,12 @@ def _temporal_predictive_validation(*, times: np.ndarray, prewhitened: np.ndarra
         train_fit = _coherent_pixel_fit(
             times=times[train_indices], cube=prewhitened[train_indices][:, valid],
             frequency=residual_frequency, time_reference=time_reference, drift=drift,
+            coherent_basis=None if coherent_basis is None else coherent_basis[train_indices],
         )
         test_fit = _coherent_pixel_fit(
             times=times[test_indices], cube=prewhitened[test_indices][:, valid],
             frequency=residual_frequency, time_reference=time_reference, drift=drift,
+            coherent_basis=None if coherent_basis is None else coherent_basis[test_indices],
         )
         train_comparison = compare_prf_hypotheses(
             coherent_coefficients=train_fit["coefficients"],
@@ -430,6 +448,13 @@ def _temporal_predictive_validation(*, times: np.ndarray, prewhitened: np.ndarra
                     oracle_records["TARGET_PLUS_OFFSET"]["heldOutLogLikelihood"]
                     - oracle_records[primary_model_id]["heldOutLogLikelihood"]),
             }
+            true_secondary = np.asarray(oracle_source_vectors[secondary_id])
+            block_vector = np.asarray([secondary_block["sinA"], secondary_block["cosB"]])
+            block_covariance = np.asarray(secondary_block["covariance"])
+            difference = block_vector - true_secondary
+            folds[-1]["secondaryTruthMahalanobis"] = float(
+                difference @ np.linalg.pinv(block_covariance, hermitian=True) @ difference
+            )
 
     precision_sum = np.zeros((2, 2))
     weighted_sum = np.zeros(2)
@@ -522,11 +547,16 @@ def diagnose_prf_cube(*, times: np.ndarray, cube: np.ndarray,
     secondary_id = "offset-1" if injected_index == 0 else "target"
     joint_secondary = comparison["models"]["TARGET_PLUS_OFFSET"]["sourceEstimates"][secondary_index]
     primary_model_id = "TARGET_ONLY" if injected_index == 0 else "OFFSET_ONLY"
+    common_preprocessed_basis = _prewhitened_coherent_basis(
+        times=times, physical_frequency=physical_frequency,
+        residual_frequency=residual_frequency, time_reference=time_reference, drift=drift,
+    )
     production_predictive_validation = _temporal_predictive_validation(
         times=times, prewhitened=prewhitened, valid=valid, templates=templates,
         residual_frequency=residual_frequency, time_reference=time_reference,
         drift=drift, primary_model_id=primary_model_id, block_count=block_count,
         oracle_source_vectors=oracle_source_vectors,
+        coherent_basis=common_preprocessed_basis,
     )
 
     autocorrelations: dict[str, Any] = {}
@@ -709,6 +739,13 @@ def run_prf_deblending(preparation: dict[str, Any]) -> dict[str, Any]:
             attributed_model = best_model
             evidence_state = "IN_SAMPLE_MODEL_ACCEPTED"
             if best_model == "TARGET_PLUS_OFFSET" and comparison["bestModelIdentifiable"]:
+                common_preprocessed_basis = _prewhitened_coherent_basis(
+                    times=times,
+                    physical_frequency=1.0 / float(preparation["physicalPeriodDays"]),
+                    residual_frequency=float(preparation["residualReferenceFrequency"]),
+                    time_reference=float(preparation["residualTimeReferenceDays"]),
+                    drift=float(preparation["fractionalFrequencyDriftPerDay"]),
+                )
                 temporal_validation = _temporal_predictive_validation(
                     times=times, prewhitened=residual, valid=valid,
                     templates=template_matrix, residual_frequency=float(
@@ -716,6 +753,7 @@ def run_prf_deblending(preparation: dict[str, Any]) -> dict[str, Any]:
                     time_reference=float(preparation["residualTimeReferenceDays"]),
                     drift=float(preparation["fractionalFrequencyDriftPerDay"]),
                     primary_model_id=primary_model,
+                    coherent_basis=common_preprocessed_basis,
                 )
                 if temporal_validation["conclusion"] != "JOINT_SOURCE_TEMPORALLY_VALIDATED":
                     attributed_model = primary_model
