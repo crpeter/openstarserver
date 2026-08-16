@@ -1247,6 +1247,12 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
         print("PRF_SECTOR_RESULTS", prf_run.result.get("sectorResults"))
         self.assertEqual(2, len(prf_run.result["sectorResults"]))
         self.assertFalse(prf_run.result["workerProtocolUsed"])
+        replay_templates = _real_numpy.column_stack([
+            _render_prf_template(
+                image=frozen_prf, header=frozen_header, source_x=x, source_y=y,
+                rows=5, cols=5, valid_pixels=_real_numpy.ones((5, 5), dtype=bool),
+            ) for x, y in ((1.0, 1.0), (3.0, 3.0))
+        ])
         for item in prf_run.result["sectorResults"]:
             self.assertEqual({"TARGET_ONLY", "OFFSET_ONLY", "TARGET_PLUS_OFFSET"},
                              set(item["models"]))
@@ -1256,6 +1262,35 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
             self.assertIn("coherentCoefficientCovariances", item["temporalFit"])
             self.assertTrue(item["executionProvenance"]["officialDetectorGridInterpolationExecuted"])
             self.assertTrue(item["executionProvenance"]["prfStampRenderingExecuted"])
+            sector = int(item["sector"])
+            exact_tpf = FrozenTPF(sector)
+            exact_replay = diagnose_prf_cube(
+                times=exact_tpf.time.value, cube=exact_tpf.flux.value,
+                template_matrix=replay_templates,
+                physical_frequency=1.0 / physical_period,
+                residual_frequency=residual_frequency,
+                time_reference=float(prf_preparation.result["residualTimeReferenceDays"]),
+                drift=injected_drift,
+                injected_component_id="target" if sector == 64 else "offset-1",
+            )
+            for key in ("timesHash", "rawCubeHash", "backgroundSubtractedCubeHash",
+                        "physicalPrewhitenedCubeHash", "driftPhaseHash"):
+                self.assertEqual(item["equivalence"][key], exact_replay["equivalence"][key])
+            _real_numpy.testing.assert_allclose(
+                item["equivalence"]["observedCoherentCoefficients"],
+                exact_replay["equivalence"]["observedCoherentCoefficients"],
+                rtol=0.0, atol=1e-14,
+            )
+            for model_id in ("TARGET_ONLY", "OFFSET_ONLY", "TARGET_PLUS_OFFSET"):
+                actual_model = item["models"][model_id]
+                replay_model = exact_replay["models"][model_id]
+                for metric in ("chiSquare", "logLikelihood", "bic"):
+                    self.assertAlmostEqual(actual_model[metric], replay_model[metric], places=9)
+                _real_numpy.testing.assert_allclose(
+                    actual_model["parameterEstimates"], replay_model["parameterEstimates"],
+                    rtol=0.0, atol=1e-14,
+                )
+            print("PRF_EXACT_SECTOR_REPLAY", {"sector": sector, **exact_replay})
             positions = {entry["componentID"]: entry for entry in item["calibration"]}
             print(
                 "PRF_SECTOR_EVIDENCE",
@@ -1432,7 +1467,6 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
         residual_frequency = 1.0 / 4.260988860233214
         drift = 0.0004
         reference = 1715.0
-        times = np.arange(1501, dtype=float) * 0.02 + 1700.0
         frozen_prf = np.zeros((11, 11), dtype=float)
         frozen_prf[5, 5] = 1.0
         header = {"CRPIX1": 6.0, "CRPIX2": 6.0, "OVERSAMP": 1}
@@ -1442,28 +1476,32 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
                                  rows=5, cols=5, valid_pixels=valid)
             for x, y in ((1.0, 1.0), (3.0, 3.0))
         ])
-        phase = 2.0 * math.pi * residual_frequency * (
-            times + 0.5 * drift * (times - reference) ** 2
-        )
-        physical = 0.01 * np.sin(2.0 * math.pi * times / physical_period)[:, None, None]
-        structured = np.zeros((len(times), 5, 5), dtype=float)
-        for row in range(5):
-            for column in range(5):
-                structured[:, row, column] = 0.001 * np.sin(
-                    2.0 * math.pi * times / (2.3 + 0.07 * row + 0.03 * column)
-                    + 0.2 * row - 0.1 * column
-                )
-        iid = np.random.default_rng(20260816).normal(0.0, 0.001, structured.shape)
-        nuisance_cases = {
-            "source-only": np.zeros_like(structured),
-            "iid": iid,
-            "structured": structured,
-            "physical": physical + np.zeros_like(structured),
-            "structured-plus-physical": structured + physical,
-            "full-current": structured + physical,
-        }
         matrix = []
-        for injected_id, template_index in (("target", 0), ("offset-1", 1)):
+        for sector, origin, injected_id, template_index in (
+            (64, 1700.0, "target", 0), (65, 2400.0, "offset-1", 1),
+        ):
+            times = np.arange(1501, dtype=float) * 0.02 + origin
+            phase = 2.0 * math.pi * residual_frequency * (
+                times + 0.5 * drift * (times - reference) ** 2
+            )
+            physical = 0.01 * np.sin(2.0 * math.pi * times / physical_period)[:, None, None]
+            structured = np.zeros((len(times), 5, 5), dtype=float)
+            for row in range(5):
+                for column in range(5):
+                    structured[:, row, column] = 0.001 * np.sin(
+                        2.0 * math.pi * times / (2.3 + 0.07 * row + 0.03 * column)
+                        + 0.2 * row - 0.1 * column
+                    )
+            iid = np.random.default_rng(20260816 + sector).normal(
+                0.0, 0.001, structured.shape
+            )
+            nuisance_cases = {
+                "source-only": np.zeros_like(structured), "iid": iid,
+                "structured": structured,
+                "physical": physical + np.zeros_like(structured),
+                "structured-plus-physical": structured + physical,
+                "full-current": structured + physical,
+            }
             source = (0.04 * np.sin(phase))[:, None] * templates[:, template_index][None, :]
             source = source.reshape(len(times), 5, 5)
             for nuisance_id, nuisance in nuisance_cases.items():
@@ -1476,7 +1514,8 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
                     residual_frequency=residual_frequency, time_reference=reference,
                     drift=drift, injected_component_id=injected_id,
                 )
-                matrix.append({"injected": injected_id, "nuisance": nuisance_id, **result})
+                matrix.append({"sector": sector, "injected": injected_id,
+                               "nuisance": nuisance_id, **result})
         print("PRF_FULL_CUBE_ABLATION_MATRIX", matrix)
         clean = [item for item in matrix if item["nuisance"] == "source-only"]
         self.assertTrue(all(not item["secondary"]["individuallyIdentifiable"] for item in clean))

@@ -8,6 +8,7 @@ image; rendering, fitting, BIC comparison, and interpretation remain real.
 from __future__ import annotations
 
 import math
+import hashlib
 from pathlib import Path
 from typing import Any
 
@@ -321,6 +322,11 @@ def _projection_on_templates(coefficients: np.ndarray, templates: np.ndarray) ->
     return {"target": fitted[0].tolist(), "offset": fitted[1].tolist()}
 
 
+def _array_hash(value: np.ndarray) -> str:
+    array = np.ascontiguousarray(np.asarray(value, dtype=np.float64))
+    return hashlib.sha256(array.tobytes()).hexdigest()
+
+
 def diagnose_prf_cube(*, times: np.ndarray, cube: np.ndarray,
                       template_matrix: np.ndarray, physical_frequency: float,
                       residual_frequency: float, time_reference: float, drift: float,
@@ -438,6 +444,16 @@ def diagnose_prf_cube(*, times: np.ndarray, cube: np.ndarray,
         "effectiveSampleSizeReason": "Not reported: deterministic multi-frequency residuals do not justify AR(1).",
         "blocks": block_results, "heldOut": held_out,
         "models": comparison["models"],
+        "equivalence": {
+            "timesHash": _array_hash(times), "rawCubeHash": _array_hash(cube),
+            "backgroundSubtractedCubeHash": _array_hash(corrected),
+            "physicalPrewhitenedCubeHash": _array_hash(prewhitened),
+            "driftPhaseHash": _array_hash(_drift_corrected_times(
+                times, time_reference_days=time_reference,
+                fractional_frequency_drift_per_day=drift)),
+            "observedCoherentCoefficients": final_fit["coefficients"].tolist(),
+            "coherentCoefficientCovariances": final_fit["covariances"].tolist(),
+        },
     }
 
 
@@ -458,6 +474,7 @@ def run_prf_deblending(preparation: dict[str, Any]) -> dict[str, Any]:
             times, cube = times[indices], cube[indices]
             if len(times) < MIN_SAMPLES:
                 raise RuntimeError(f"Only {len(times)} usable cadences.")
+            raw_cube = np.array(cube, copy=True)
             corrected, _ = _background_subtract_cube(cube)
             residual, valid = _prewhiten_cube_raw(
                 absolute_times=times, cube=corrected,
@@ -564,6 +581,14 @@ def run_prf_deblending(preparation: dict[str, Any]) -> dict[str, Any]:
                         "within-pixel sin/cos covariance are estimated; preprocessing-induced cross-pixel "
                         "covariance is not estimated."
                     )},
+                "equivalence": {
+                    "timesHash": _array_hash(times), "rawCubeHash": _array_hash(raw_cube),
+                    "backgroundSubtractedCubeHash": _array_hash(corrected),
+                    "physicalPrewhitenedCubeHash": _array_hash(residual),
+                    "driftPhaseHash": _array_hash(warped),
+                    "observedCoherentCoefficients": temporal_coefficients[:2].T.tolist(),
+                    "coherentCoefficientCovariances": pixel_covariances.tolist(),
+                },
                 "degenerate": not (comparison["bestModelIdentifiable"] and historical_guard),
                 "decisive": bool(comparison["bestModelIdentifiable"] and historical_guard),
             })
