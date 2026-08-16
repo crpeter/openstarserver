@@ -21,6 +21,7 @@ from .tess_followup import (
 )
 from .tess_hypotheses import (
     analyze,
+    broad_independent_next_handler,
     interpret_broad_independent_sectors,
     interpret_followup,
     interpret_independent_sectors,
@@ -219,6 +220,26 @@ def _next_stage_id(current_id: str, label: str) -> str:
         raise ValueError(f"Stage id must begin with an integer prefix: {current_id}")
     return f"{number:03d}-{label}"
 
+
+def broad_independent_continuation(
+    interpreted: dict[str, Any],
+    *,
+    request_id: str,
+    finalize_parameters: dict[str, Any] | None = None,
+) -> StageRequest:
+    """Choose the next scientific question from persisted broad-cluster evidence."""
+
+    next_handler = broad_independent_next_handler(interpreted)
+    warranted = next_handler != "openstar.tess.finalize"
+    return StageRequest(
+        id=_next_stage_id(
+            request_id,
+            "characterize-variability" if warranted else "finalize",
+        ),
+        handler_id=next_handler,
+        parameters={} if warranted else dict(finalize_parameters or {}),
+        triggered_by_stage_id=request_id,
+    )
 
 
 def _build_period_evidence(
@@ -1781,11 +1802,10 @@ def build_engine(
 
         return StageOutcome(
             result=interpreted,
-            next_stage=StageRequest(
-                id=_next_stage_id(request.id, "finalize"),
-                handler_id="openstar.tess.finalize",
-                parameters=finalize_parameters,
-                triggered_by_stage_id=request.id,
+            next_stage=broad_independent_continuation(
+                interpreted,
+                request_id=request.id,
+                finalize_parameters=finalize_parameters,
             ),
             input_hashes={"broadIndependentProjectResult": sha256_json(run)},
         )
@@ -1836,11 +1856,10 @@ def build_engine(
 
         return StageOutcome(
             result=interpreted,
-            next_stage=StageRequest(
-                id=_next_stage_id(request.id, "finalize"),
-                handler_id="openstar.tess.finalize",
-                parameters={"outputSuffix": "v20.3.1"},
-                triggered_by_stage_id=request.id,
+            next_stage=broad_independent_continuation(
+                interpreted,
+                request_id=request.id,
+                finalize_parameters={"outputSuffix": "v20.3.1"},
             ),
             input_hashes={"broadIndependentProjectResult": sha256_json(run)},
         )
