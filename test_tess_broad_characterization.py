@@ -38,7 +38,8 @@ from workflows.tess.tess_investigation import residual_mode_localization_review_
 from workflows.tess.tess_investigation import multisource_residual_continuation
 from workflows.tess.tess_time_frequency import _fit_family_python
 from workflows.tess.tess_multisource_residual import interpret_multisource_residual_project
-from workflows.tess.tess_prf_refinement import compare_prf_hypotheses
+from workflows.tess.tess_prf_refinement import compare_prf_hypotheses, diagnose_prf_cube
+from workflows.tess.tess_spoc_prf import _render_prf_template
 
 
 class BroadIndependentCharacterizationTests(unittest.TestCase):
@@ -1423,6 +1424,64 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
         high_noise = compare((0.08, 0.02), noise=0.20)
         self.assertTrue(low_noise["bestModelIdentifiable"])
         self.assertFalse(high_noise["bestModelIdentifiable"])
+
+    @unittest.skipUnless(_real_numpy is not None, "full-cube PRF diagnostics require NumPy")
+    def test_full_cube_prf_nuisance_ablation_diagnostics(self):
+        np = _real_numpy
+        physical_period = 13.717836472675433
+        residual_frequency = 1.0 / 4.260988860233214
+        drift = 0.0004
+        reference = 1715.0
+        times = np.arange(1501, dtype=float) * 0.02 + 1700.0
+        frozen_prf = np.zeros((11, 11), dtype=float)
+        frozen_prf[5, 5] = 1.0
+        header = {"CRPIX1": 6.0, "CRPIX2": 6.0, "OVERSAMP": 1}
+        valid = np.ones((5, 5), dtype=bool)
+        templates = np.column_stack([
+            _render_prf_template(image=frozen_prf, header=header, source_x=x, source_y=y,
+                                 rows=5, cols=5, valid_pixels=valid)
+            for x, y in ((1.0, 1.0), (3.0, 3.0))
+        ])
+        phase = 2.0 * math.pi * residual_frequency * (
+            times + 0.5 * drift * (times - reference) ** 2
+        )
+        physical = 0.01 * np.sin(2.0 * math.pi * times / physical_period)[:, None, None]
+        structured = np.zeros((len(times), 5, 5), dtype=float)
+        for row in range(5):
+            for column in range(5):
+                structured[:, row, column] = 0.001 * np.sin(
+                    2.0 * math.pi * times / (2.3 + 0.07 * row + 0.03 * column)
+                    + 0.2 * row - 0.1 * column
+                )
+        iid = np.random.default_rng(20260816).normal(0.0, 0.001, structured.shape)
+        nuisance_cases = {
+            "source-only": np.zeros_like(structured),
+            "iid": iid,
+            "structured": structured,
+            "physical": physical + np.zeros_like(structured),
+            "structured-plus-physical": structured + physical,
+            "full-current": structured + physical,
+        }
+        matrix = []
+        for injected_id, template_index in (("target", 0), ("offset-1", 1)):
+            source = (0.04 * np.sin(phase))[:, None] * templates[:, template_index][None, :]
+            source = source.reshape(len(times), 5, 5)
+            for nuisance_id, nuisance in nuisance_cases.items():
+                # A vanishing deterministic floor keeps uninjected pixels
+                # numerically observable without altering the source model.
+                cube = 1.0 + source + nuisance + iid * (1e-9 if nuisance_id == "source-only" else 0.0)
+                result = diagnose_prf_cube(
+                    times=times, cube=cube, template_matrix=templates,
+                    physical_frequency=1.0 / physical_period,
+                    residual_frequency=residual_frequency, time_reference=reference,
+                    drift=drift, injected_component_id=injected_id,
+                )
+                matrix.append({"injected": injected_id, "nuisance": nuisance_id, **result})
+        print("PRF_FULL_CUBE_ABLATION_MATRIX", matrix)
+        clean = [item for item in matrix if item["nuisance"] == "source-only"]
+        self.assertTrue(all(not item["secondary"]["individuallyIdentifiable"] for item in clean))
+        self.assertTrue(all(len(item["blocks"]) == 4 and len(item["heldOut"]) == 4
+                            for item in matrix))
 
     def test_geometry_aware_multisource_support_controls(self):
         def interpret(target_amplitudes, offset_amplitudes, coupling, *, total_rms=None,

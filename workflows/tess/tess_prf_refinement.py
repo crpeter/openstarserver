@@ -298,6 +298,149 @@ def _empirical_cross_pixel_diagnostic(*, temporal_errors: np.ndarray,
             "assumption": "Empirical cadence-residual cross-pixel covariance; no shrinkage or regularization."}
 
 
+def _coherent_pixel_fit(*, times: np.ndarray, cube: np.ndarray, frequency: float,
+                        time_reference: float, drift: float) -> dict[str, Any]:
+    warped = _drift_corrected_times(times, time_reference_days=time_reference,
+                                    fractional_frequency_drift_per_day=drift)
+    phase = 2.0 * math.pi * frequency * warped
+    design = np.column_stack((np.sin(phase), np.cos(phase), np.ones(len(phase))))
+    flat = np.asarray(cube, dtype=float).reshape(len(times), -1)
+    coefficients, _, rank, singular = np.linalg.lstsq(design, flat, rcond=None)
+    errors = flat - design @ coefficients
+    dof = len(times) - int(rank)
+    variances = np.sum(errors * errors, axis=0) / dof
+    normal_inverse = np.linalg.pinv(design.T @ design, hermitian=True)[:2, :2]
+    floor = np.finfo(float).eps * max(float(np.nanmedian(variances)), 1.0)
+    covariances = np.asarray([normal_inverse * max(float(value), floor) for value in variances])
+    return {"coefficients": coefficients[:2].T, "covariances": covariances,
+            "errors": errors, "rank": int(rank), "singularValues": singular}
+
+
+def _projection_on_templates(coefficients: np.ndarray, templates: np.ndarray) -> dict[str, Any]:
+    fitted = np.linalg.lstsq(templates, coefficients, rcond=None)[0]
+    return {"target": fitted[0].tolist(), "offset": fitted[1].tolist()}
+
+
+def diagnose_prf_cube(*, times: np.ndarray, cube: np.ndarray,
+                      template_matrix: np.ndarray, physical_frequency: float,
+                      residual_frequency: float, time_reference: float, drift: float,
+                      injected_component_id: str, block_count: int = 4) -> dict[str, Any]:
+    """Diagnostic-only full-cube ablation and contiguous held-out validation."""
+    times = np.asarray(times, dtype=float)
+    cube = np.asarray(cube, dtype=float)
+    raw_fit = _coherent_pixel_fit(times=times, cube=cube, frequency=residual_frequency,
+                                  time_reference=time_reference, drift=drift)
+    corrected, background_meta = _background_subtract_cube(cube)
+    background_fit = _coherent_pixel_fit(
+        times=times, cube=corrected, frequency=residual_frequency,
+        time_reference=time_reference, drift=drift,
+    )
+    prewhitened, valid = _prewhiten_cube_raw(
+        absolute_times=times, cube=corrected, physical_frequency=physical_frequency,
+    )
+    valid_flat = valid.reshape(-1)
+    templates = np.asarray(template_matrix, dtype=float)[valid_flat]
+    final_fit = _coherent_pixel_fit(
+        times=times, cube=prewhitened[:, valid], frequency=residual_frequency,
+        time_reference=time_reference, drift=drift,
+    )
+    comparison = compare_prf_hypotheses(
+        coherent_coefficients=final_fit["coefficients"],
+        pixel_covariances=final_fit["covariances"], template_matrix=templates,
+        component_ids=["target", "offset-1"],
+    )
+    injected_index = 0 if injected_component_id == "target" else 1
+    secondary_index = 1 - injected_index
+    secondary_id = "offset-1" if injected_index == 0 else "target"
+    joint_secondary = comparison["models"]["TARGET_PLUS_OFFSET"]["sourceEstimates"][secondary_index]
+    primary_model_id = "TARGET_ONLY" if injected_index == 0 else "OFFSET_ONLY"
+
+    autocorrelations: dict[str, Any] = {}
+    for lag in (1, 2, 5, 10):
+        values = []
+        for pixel in range(final_fit["errors"].shape[1]):
+            series = final_fit["errors"][:, pixel]
+            if len(series) <= lag or np.std(series) <= 0:
+                continue
+            values.append(float(np.corrcoef(series[:-lag], series[lag:])[0, 1]))
+        autocorrelations[str(lag)] = {
+            "median": float(np.nanmedian(values)), "minimum": float(np.nanmin(values)),
+            "maximum": float(np.nanmax(values)), "pixelValues": values,
+        }
+
+    block_results = []
+    held_out = []
+    indices_by_block = [item for item in np.array_split(np.arange(len(times)), block_count)
+                        if len(item) >= 10]
+    for block_index, test_indices in enumerate(indices_by_block):
+        block_fit = _coherent_pixel_fit(
+            times=times[test_indices], cube=prewhitened[test_indices][:, valid],
+            frequency=residual_frequency, time_reference=time_reference, drift=drift,
+        )
+        block_comparison = compare_prf_hypotheses(
+            coherent_coefficients=block_fit["coefficients"],
+            pixel_covariances=block_fit["covariances"], template_matrix=templates,
+            component_ids=["target", "offset-1"],
+        )
+        secondary = block_comparison["models"]["TARGET_PLUS_OFFSET"]["sourceEstimates"][secondary_index]
+        secondary = {**secondary, "phaseRad": float(math.atan2(secondary["cosB"], secondary["sinA"]))}
+        block_results.append({"blockIndex": block_index,
+                              "startTime": float(times[test_indices[0]]),
+                              "endTime": float(times[test_indices[-1]]),
+                              "sampleCount": len(test_indices),
+                              "preferredModel": block_comparison["bestModel"],
+                              "secondary": secondary})
+
+        train_indices = np.setdiff1d(np.arange(len(times)), test_indices)
+        train_fit = _coherent_pixel_fit(
+            times=times[train_indices], cube=prewhitened[train_indices][:, valid],
+            frequency=residual_frequency, time_reference=time_reference, drift=drift,
+        )
+        train_comparison = compare_prf_hypotheses(
+            coherent_coefficients=train_fit["coefficients"],
+            pixel_covariances=train_fit["covariances"], template_matrix=templates,
+            component_ids=["target", "offset-1"],
+        )
+        observed = block_fit["coefficients"].reshape(-1)
+        inverse_blocks = [np.linalg.pinv(item, hermitian=True) for item in block_fit["covariances"]]
+        def held_out_chi(model_id: str) -> float:
+            indices = [injected_index] if model_id == primary_model_id else [0, 1]
+            parameters = np.asarray(train_comparison["models"][model_id]["parameterEstimates"])
+            prediction = (templates[:, indices, None]
+                          * parameters.reshape(len(indices), 2)[None, :, :]).sum(axis=1).reshape(-1)
+            residual_vector = (observed - prediction).reshape(-1, 2)
+            return float(sum(value @ inverse @ value for value, inverse
+                             in zip(residual_vector, inverse_blocks)))
+        primary_chi = held_out_chi(primary_model_id)
+        joint_chi = held_out_chi("TARGET_PLUS_OFFSET")
+        held_out.append({"blockIndex": block_index, "primaryChiSquare": primary_chi,
+                         "jointChiSquare": joint_chi,
+                         "jointMinusPrimaryLogLikelihood": -0.5 * (joint_chi - primary_chi)})
+
+    return {
+        "injectedComponentID": injected_component_id, "secondaryComponentID": secondary_id,
+        "backgroundSubtraction": background_meta,
+        "stageTemplateProjections": {
+            "raw": _projection_on_templates(raw_fit["coefficients"], template_matrix),
+            "afterBackgroundSubtraction": _projection_on_templates(
+                background_fit["coefficients"], template_matrix),
+            "afterPhysicalPrewhiteningAndDriftProjection": _projection_on_templates(
+                final_fit["coefficients"], templates),
+        },
+        "secondary": joint_secondary,
+        "primaryVsJointChiSquareImprovement": float(
+            comparison["models"][primary_model_id]["chiSquare"]
+            - comparison["models"]["TARGET_PLUS_OFFSET"]["chiSquare"]),
+        "jointMinusPrimaryBIC": float(comparison["models"]["TARGET_PLUS_OFFSET"]["bic"]
+                                      - comparison["models"][primary_model_id]["bic"]),
+        "autocorrelation": autocorrelations,
+        "effectiveSampleSize": None,
+        "effectiveSampleSizeReason": "Not reported: deterministic multi-frequency residuals do not justify AR(1).",
+        "blocks": block_results, "heldOut": held_out,
+        "models": comparison["models"],
+    }
+
+
 def run_prf_deblending(preparation: dict[str, Any]) -> dict[str, Any]:
     sector_results = []
     errors = []
