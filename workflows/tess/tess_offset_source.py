@@ -39,11 +39,13 @@ def _coordinate_separation_arcsec(
     ra2_deg: float,
     dec2_deg: float,
 ) -> float:
-    return float(
-        _skycoord(ra1_deg, dec1_deg)
-        .separation(_skycoord(ra2_deg, dec2_deg))
-        .arcsec
-    )
+    # Numerically stable great-circle separation; keeping catalog
+    # interpretation dependency-free also makes frozen-response replay robust.
+    ra1, dec1, ra2, dec2 = map(math.radians, (ra1_deg, dec1_deg, ra2_deg, dec2_deg))
+    delta_ra, delta_dec = ra2 - ra1, dec2 - dec1
+    value = (math.sin(delta_dec / 2.0) ** 2
+             + math.cos(dec1) * math.cos(dec2) * math.sin(delta_ra / 2.0) ** 2)
+    return math.degrees(2.0 * math.asin(min(1.0, math.sqrt(value)))) * 3600.0
 
 
 def _component_position(
