@@ -1176,11 +1176,14 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
                 f"sinusoidAmplitude={item['sinusoidAmplitude']:.12g} "
                 f"coherentModelRMS={item['coherentModelRMS']:.12g} "
                 f"sinA={item['sinA']:.12g} cosB={item['cosB']:.12g} "
+                f"sinCosCovariance={item['sinCosCovariance']} "
                 f"power={item['candidatePower']:.12g} frequency={item['candidateFrequency']:.12g} "
                 f"period={item['candidatePeriodDays']:.12g} predictedLeakage="
                 f"{item['predictedPointSourceLeakageRMS']:.12g} "
                 f"residualAmplitude={item['residualCoherentAmplitude']:.12g} "
                 f"residualChiSquare={item['residualCoherentChiSquare']} "
+                f"jointCovarianceBlocks={item['jointCovarianceBlocks']} "
+                f"residualCovariance={item['residualSinCosCovariance']} "
                 f"support={item['countedAsIndependentSupport']}"
             )
             if item["sector"] is not None:
@@ -1259,13 +1262,15 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
 
     def test_geometry_aware_multisource_support_controls(self):
         def interpret(target_amplitudes, offset_amplitudes, coupling, *, total_rms=None,
-                      frequencies=None, phases=None):
+                      frequencies=None, phases=None, cross_covariance=None):
             prepared = []
             status = []
             coupling_map = {
                 "target": {"target": 1.0, "offset-1": coupling},
                 "offset-1": {"target": coupling, "offset-1": 1.0},
             }
+            variance = [[1e-4, 0.0], [0.0, 1e-4]]
+            cross = cross_covariance or [[0.0, 0.0], [0.0, 0.0]]
             for component_id, component_type, amplitudes in (
                 ("target", "TARGET", target_amplitudes),
                 ("offset-1", "OFFSET", offset_amplitudes),
@@ -1283,7 +1288,11 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
                         "cosB": amplitude * math.sqrt(2.0) * math.sin(phase),
                         "sinusoidAmplitude": amplitude * math.sqrt(2.0),
                         "coherentModelRMS": amplitude,
-                        "sinCosCovariance": [[1e-4, 0.0], [0.0, 1e-4]],
+                        "sinCosCovariance": variance,
+                        "jointSinCosCrossCovariance": {
+                            component_id: variance,
+                            "offset-1" if component_id == "target" else "target": cross,
+                        },
                         "pointSourceLeakageCoupling": coupling_map,
                     })
                     status.append({
@@ -1366,6 +1375,20 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
         self.assertEqual("MULTIPLE_RESIDUAL_SOURCES_SUPPORTED", unrelated["classification"])
         self.assertTrue(all(not item["leakagePredictors"]
                             for item in unrelated["componentResults"] if not item["combined"]))
+
+        correlated = interpret(
+            (1.0, 1.0), (0.205, 0.205), 0.20,
+            cross_covariance=[[9e-5, 0.0], [0.0, 9e-5]],
+        )
+        correlated_offset = next(item for item in correlated["componentResults"]
+                                 if item["componentID"] == "offset-1" and item["sector"] == 1)
+        independent_variance_chi2 = (
+            correlated_offset["residualCoherentAmplitude"] ** 2
+            / (1e-4 + 0.20 ** 2 * 1e-4)
+        )
+        self.assertNotAlmostEqual(independent_variance_chi2,
+                                  correlated_offset["residualCoherentChiSquare"])
+        self.assertFalse(correlated_offset["independentSpatialSupport"])
 
     def test_transient_recommendation_does_not_route_to_nonstationary(self):
         request = time_frequency_continuation(

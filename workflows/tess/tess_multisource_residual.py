@@ -319,6 +319,13 @@ def _decompose_residual_cube(
             )
     flat = residual_cube.reshape(len(residual_cube), -1).astype(np.float64)
     coefficients = (pinv @ flat.T).T
+    spatial_residual = flat - coefficients @ spatial.T
+    spatial_degrees_of_freedom = spatial.shape[0] - int(np.linalg.matrix_rank(spatial))
+    spatial_residual_variance = (
+        np.sum(np.square(spatial_residual), axis=1) / spatial_degrees_of_freedom
+        if spatial_degrees_of_freedom > 0 else np.full(len(flat), np.nan)
+    )
+    spatial_covariance_factor = np.linalg.pinv(spatial.T @ spatial)
 
     series: dict[str, np.ndarray] = {}
     for index, component in enumerate(usable_components):
@@ -332,6 +339,17 @@ def _decompose_residual_cube(
         component["spatialDesignConditionNumber"] = condition_number
         component["normalizedTemplateOverlap"] = template_overlap
         component["pointSourceLeakageCoupling"] = coupling
+        component["spatialComponentOrder"] = [
+            str(item["componentID"]) for item in usable_components
+        ]
+        component["spatialCovarianceFactor"] = spatial_covariance_factor[
+            :len(usable_components), :len(usable_components)
+        ].tolist()
+        component["spatialResidualVarianceByCadence"] = spatial_residual_variance.tolist()
+        component["spatialVarianceAssumption"] = (
+            "conditional independent homoscedastic pixel errors within each cadence; "
+            "cadence variance estimated from the joint spatial-fit pixel residuals"
+        )
     return series, usable_components
 
 
@@ -469,6 +487,11 @@ def build_multisource_residual_project(
                 _write_json(coefficient_path, {
                     "times": np.asarray(local_times, dtype=np.float64).tolist(),
                     "coefficients": np.asarray(values, dtype=np.float64).tolist(),
+                    "componentID": component_id,
+                    "spatialComponentOrder": component.get("spatialComponentOrder"),
+                    "spatialCovarianceFactor": component.get("spatialCovarianceFactor"),
+                    "spatialResidualVarianceByCadence": component.get("spatialResidualVarianceByCadence"),
+                    "spatialVarianceAssumption": component.get("spatialVarianceAssumption"),
                 })
                 dataset = {
                     "id": dataset_id,
@@ -675,12 +698,18 @@ def _coherent_fit(meta: dict[str, Any], frequency: float | None) -> dict[str, An
         covariance = (residual_variance * gram_inverse[1:, 1:]).tolist()
     sinusoid = design[:, 1:] @ coefficients[1:]
     sinusoid -= float(np.mean(sinusoid))
+    joint_covariance = _joint_sin_cos_covariance(meta, frequency, meta, frequency)
     return {
         "sinA": float(coefficients[1]),
         "cosB": float(coefficients[2]),
         "sinusoidAmplitude": math.hypot(float(coefficients[1]), float(coefficients[2])),
         "coherentModelRMS": float(np.sqrt(np.mean(np.square(sinusoid)))),
-        "sinCosCovariance": covariance,
+        "sinCosCovariance": joint_covariance,
+        "temporalOLSSinCosCovariance": covariance,
+        "covarianceInterpretation": (
+            "conditional on the spatial pixel-noise model and worker-selected frequency; "
+            "not a calibrated physical-source probability"
+        ),
         "fitResidualVariance": residual_variance,
         "fitDegreesOfFreedom": degrees_of_freedom,
     }
@@ -695,6 +724,45 @@ def _sinusoid_rms(meta: dict[str, Any], frequency: float, sin_a: float, cos_b: f
     model += cos_b * np.cos(2.0 * math.pi * frequency * times)
     model -= float(np.mean(model))
     return float(np.sqrt(np.mean(np.square(model))))
+
+
+def _joint_sin_cos_covariance(
+    left: dict[str, Any], left_frequency: float,
+    right: dict[str, Any], right_frequency: float,
+) -> list[list[float]] | None:
+    left_path = left.get("coefficientSeriesPath")
+    right_path = right.get("coefficientSeriesPath")
+    if not left_path or not right_path:
+        cross = left.get("jointSinCosCrossCovariance") or {}
+        value = cross.get(str(right.get("componentID")))
+        if value is not None:
+            return value
+        return left.get("sinCosCovariance") if left is right else None
+    left_raw, right_raw = _load_json(left_path), _load_json(right_path)
+    left_times = np.asarray(left_raw.get("times") or [], dtype=np.float64)
+    right_times = np.asarray(right_raw.get("times") or [], dtype=np.float64)
+    variances = np.asarray(
+        left_raw.get("spatialResidualVarianceByCadence") or [], dtype=np.float64
+    )
+    if (
+        len(left_times) == 0 or len(left_times) != len(right_times)
+        or len(variances) != len(left_times)
+        or not np.allclose(left_times, right_times, rtol=0.0, atol=1e-10)
+    ):
+        return None
+    order = [str(value) for value in left_raw.get("spatialComponentOrder") or []]
+    if order != [str(value) for value in right_raw.get("spatialComponentOrder") or []]:
+        return None
+    try:
+        left_index = order.index(str(left.get("componentID")))
+        right_index = order.index(str(right.get("componentID")))
+        factor = float(left_raw["spatialCovarianceFactor"][left_index][right_index])
+    except (ValueError, KeyError, IndexError, TypeError):
+        return None
+    left_operator = np.linalg.pinv(_sinusoid_design_matrix(left_times, [left_frequency]))[1:, :]
+    right_operator = np.linalg.pinv(_sinusoid_design_matrix(right_times, [right_frequency]))[1:, :]
+    covariance = factor * ((left_operator * variances[None, :]) @ right_operator.T)
+    return covariance.tolist()
 
 
 def interpret_multisource_residual_project(
@@ -782,19 +850,40 @@ def interpret_multisource_residual_project(
         result["leakageSourceComponentID"] = (
             predictors[0].get("sourceComponentID") if len(predictors) == 1 else None
         )
-        covariance = result.get("sinCosCovariance")
-        residual_covariance = [list(row) for row in covariance] if covariance is not None else None
+        terms: list[tuple[dict[str, Any], float]] = [(result, 1.0)]
         for predictor in predictors:
             source = next((item for item in results if item.get("componentID") == predictor["sourceComponentID"] and _int(item.get("sector")) == sector), None)
-            source_covariance = (source or {}).get("sinCosCovariance")
-            if residual_covariance is not None and source_covariance is not None:
-                scale = float(predictor["couplingRatio"]) ** 2
+            if source is not None:
+                terms.append((source, -float(predictor["couplingRatio"])))
+        residual_covariance = [[0.0, 0.0], [0.0, 0.0]]
+        joint_blocks: list[dict[str, Any]] = []
+        covariance_available = True
+        for left, left_weight in terms:
+            for right, right_weight in terms:
+                block = _joint_sin_cos_covariance(
+                    left, float(left.get("candidateFrequency")),
+                    right, float(right.get("candidateFrequency")),
+                )
+                if block is None:
+                    covariance_available = False
+                    break
+                scale = left_weight * right_weight
                 residual_covariance = [
-                    [residual_covariance[row][column] + scale * source_covariance[row][column]
+                    [residual_covariance[row][column] + scale * block[row][column]
                      for column in range(2)] for row in range(2)
                 ]
-            else:
-                residual_covariance = None
+                joint_blocks.append({
+                    "leftComponentID": left.get("componentID"),
+                    "rightComponentID": right.get("componentID"),
+                    "leftWeight": left_weight,
+                    "rightWeight": right_weight,
+                    "sinCosCrossCovariance": block,
+                })
+            if not covariance_available:
+                break
+        if not covariance_available:
+            residual_covariance = None
+        result["jointCovarianceBlocks"] = joint_blocks
         significance = None
         if residual_covariance is not None:
             aa, ab = residual_covariance[0]
