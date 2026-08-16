@@ -38,6 +38,7 @@ MIN_COMPONENT_SAMPLES = 80
 MIN_COMPONENT_POWER = 0.08
 MIN_INDEPENDENT_SUPPORT = 2
 DOMINANCE_POWER_RATIO = 1.25
+MIN_SECTOR_COMPONENT_RMS_FRACTION = 0.25
 
 
 def _design_matrix(times: np.ndarray, physical_frequency: float) -> np.ndarray:
@@ -282,6 +283,12 @@ def _decompose_residual_cube(
         templates.append(background)
 
     spatial = np.column_stack(templates)
+    component_spatial = spatial[:, :len(usable_components)]
+    template_overlap = (
+        float(np.dot(component_spatial[:, 0], component_spatial[:, 1]))
+        if component_spatial.shape[1] == 2 else None
+    )
+    condition_number = float(np.linalg.cond(spatial))
     pinv = np.linalg.pinv(spatial)
     flat = residual_cube.reshape(len(residual_cube), -1).astype(np.float64)
     coefficients = (pinv @ flat.T).T
@@ -294,6 +301,9 @@ def _decompose_residual_cube(
         if not math.isfinite(std) or std <= 1e-12:
             continue
         series[str(component["componentID"])] = values / std
+        component["coefficientRMS"] = std
+        component["spatialDesignConditionNumber"] = condition_number
+        component["normalizedTemplateOverlap"] = template_overlap
     return series, usable_components
 
 
@@ -442,6 +452,7 @@ def build_multisource_residual_project(
                         "sectorRole": role,
                         "referenceFrequency": float(reference_frequency),
                         "fractionalFrequencyDriftPerDay": float(q),
+                        "coefficientRMS": component.get("coefficientRMS"),
                     },
                     "source": {
                         "mission": "TESS",
@@ -465,7 +476,11 @@ def build_multisource_residual_project(
                         "sector": int(sector),
                         "role": role,
                         "combined": False,
+                        "sampleCount": int(len(values)),
                         "pixelCenter": component.get("pixelCenter"),
+                        "coefficientRMS": component.get("coefficientRMS"),
+                        "spatialDesignConditionNumber": component.get("spatialDesignConditionNumber"),
+                        "normalizedTemplateOverlap": component.get("normalizedTemplateOverlap"),
                     }
                 )
                 combined.setdefault(component_id, []).append((np.asarray(warped, dtype=np.float64), np.asarray(values, dtype=np.float64)))
@@ -506,6 +521,7 @@ def build_multisource_residual_project(
                 "componentType": component.get("componentType"),
                 "referenceFrequency": float(reference_frequency),
                 "fractionalFrequencyDriftPerDay": float(q),
+                "coefficientRMS": std,
             },
             "source": {
                 "mission": "TESS",
@@ -525,6 +541,8 @@ def build_multisource_residual_project(
                 "sector": None,
                 "role": "combined",
                 "combined": True,
+                "sampleCount": int(len(all_flux)),
+                "coefficientRMS": std,
             }
         )
 
@@ -610,14 +628,43 @@ def interpret_multisource_residual_project(
         result["accepted"] = _accepted(dataset)
         results.append(result)
 
+    sector_max_rms: dict[int, float] = {}
+    for result in results:
+        sector = _int(result.get("sector"))
+        rms = _float(result.get("coefficientRMS"))
+        if sector is not None and rms is not None:
+            sector_max_rms[sector] = max(sector_max_rms.get(sector, 0.0), rms)
+    for result in results:
+        sector = _int(result.get("sector"))
+        rms = _float(result.get("coefficientRMS"))
+        maximum = sector_max_rms.get(sector, 0.0) if sector is not None else 0.0
+        fraction = rms / maximum if rms is not None and maximum > 0 else None
+        result["componentRMSFractionOfSectorMaximum"] = fraction
+        result["supportRMSFractionThreshold"] = MIN_SECTOR_COMPONENT_RMS_FRACTION
+        result["amplitudeQualified"] = bool(
+            result.get("combined") or (
+                fraction is not None and fraction >= MIN_SECTOR_COMPONENT_RMS_FRACTION
+            )
+        )
+        result["countedAsIndependentSupport"] = bool(
+            result.get("role") == "independent"
+            and result.get("accepted")
+            and result.get("amplitudeQualified")
+        )
+
     summaries: list[dict[str, Any]] = []
     for component in preparation.get("spatialComponents") or []:
         component_id = str(component.get("componentID"))
         component_results = [item for item in results if item.get("componentID") == component_id]
         sector_results = [item for item in component_results if not item.get("combined")]
         independent = [item for item in sector_results if item.get("role") == "independent"]
-        accepted_independent = [item for item in independent if item.get("accepted")]
-        accepted_all = [item for item in sector_results if item.get("accepted")]
+        accepted_independent = [
+            item for item in independent if item.get("countedAsIndependentSupport")
+        ]
+        accepted_all = [
+            item for item in sector_results
+            if item.get("accepted") and item.get("amplitudeQualified")
+        ]
         combined = next((item for item in component_results if item.get("combined")), None)
         powers = [float(item["candidatePower"]) for item in accepted_all if _float(item.get("candidatePower")) is not None]
         summaries.append(
@@ -677,6 +724,16 @@ def interpret_multisource_residual_project(
             "workerSemantics": preparation.get("workerSemantics"),
             "totalWorkUnits": preparation.get("totalWorkUnits"),
             "frequencySearch": preparation.get("frequencySearch"),
+        },
+        "supportQualification": {
+            "minimumCandidatePower": MIN_COMPONENT_POWER,
+            "minimumIndependentSupport": MIN_INDEPENDENT_SUPPORT,
+            "minimumSectorComponentRMSFraction": MIN_SECTOR_COMPONENT_RMS_FRACTION,
+            "reason": (
+                "A normalized component periodogram is not independent-source evidence unless "
+                "the component's pre-normalization coefficient RMS is also a material fraction "
+                "of the strongest fitted spatial component in that sector."
+            ),
         },
         "spatialComponents": preparation.get("spatialComponents") or [],
         "componentResults": results,

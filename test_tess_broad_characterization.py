@@ -1106,6 +1106,20 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
             dataset = json.loads(Path(item["datasetPath"]).read_text(encoding="utf-8"))
             self.assertIn(dataset["science"]["componentID"], {"target", "offset-1"})
             self.assertNotAlmostEqual(1.0 / physical_period, residual_frequency)
+        sector_prepared = [item for item in decomposition_preparation.result["preparedSeries"]
+                           if not item["combined"]]
+        self.assertTrue(all(item["sampleCount"] == 1501 for item in sector_prepared))
+        for sector in (64, 65):
+            sector_items = [item for item in sector_prepared if item["sector"] == sector]
+            centers = {item["componentID"]: item["pixelCenter"] for item in sector_items}
+            separation = math.hypot(
+                centers["target"]["x"] - centers["offset-1"]["x"],
+                centers["target"]["y"] - centers["offset-1"]["y"],
+            )
+            self.assertAlmostEqual(math.sqrt(8.0), separation, places=5)
+            self.assertAlmostEqual(0.0589694868,
+                                   sector_items[0]["normalizedTemplateOverlap"], places=6)
+            self.assertLess(sector_items[0]["spatialDesignConditionNumber"], 4.0)
 
         restarted = store.load(current.id)
         self.assertEqual(request, plan_tess_branches(restarted, target)[0].experiment)
@@ -1145,6 +1159,34 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
         self.assertEqual(1, summaries["offset-1"]["independentSupportCount"])
         self.assertGreater(summaries["target"]["combinedPower"], 0.08)
         self.assertGreater(summaries["offset-1"]["combinedPower"], 0.08)
+        component_results = decomposition.result["componentResults"]
+        self.assertEqual(6, len(component_results))
+        matrix = {}
+        for item in component_results:
+            self.assertIn("sampleCount", item)
+            self.assertGreater(item["sampleCount"], 0)
+            self.assertGreater(item["coefficientRMS"], 0.0)
+            self.assertAlmostEqual(residual_frequency, item["candidateFrequency"])
+            self.assertAlmostEqual(1.0 / residual_frequency, item["candidatePeriodDays"])
+            self.assertEqual(0.25, item["supportRMSFractionThreshold"])
+            print(
+                "MULTISOURCE_COMPONENT_EVIDENCE "
+                f"component={item['componentID']} sector={item['sector']} role={item['role']} "
+                f"samples={item['sampleCount']} rms={item['coefficientRMS']:.12g} "
+                f"power={item['candidatePower']:.12g} frequency={item['candidateFrequency']:.12g} "
+                f"period={item['candidatePeriodDays']:.12g} threshold="
+                f"{item['supportRMSFractionThreshold']} support={item['countedAsIndependentSupport']}"
+            )
+            if item["sector"] is not None:
+                matrix[(item["componentID"], item["sector"])] = item
+        self.assertGreater(matrix[("target", 64)]["candidatePower"], 0.08)
+        self.assertGreater(matrix[("offset-1", 64)]["candidatePower"], 0.08)
+        self.assertGreater(matrix[("target", 65)]["candidatePower"], 0.08)
+        self.assertGreater(matrix[("offset-1", 65)]["candidatePower"], 0.08)
+        self.assertTrue(matrix[("target", 64)]["countedAsIndependentSupport"])
+        self.assertFalse(matrix[("offset-1", 64)]["countedAsIndependentSupport"])
+        self.assertFalse(matrix[("target", 65)]["countedAsIndependentSupport"])
+        self.assertTrue(matrix[("offset-1", 65)]["countedAsIndependentSupport"])
 
     def test_other_nonstationary_recommendations_do_not_enter_localization(self):
         localization = nonstationary_continuation(
