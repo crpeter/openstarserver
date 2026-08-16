@@ -127,6 +127,31 @@ def plan_tess_branches(
 ) -> tuple[ScientificBranch, ...]:
     """Translate persisted TESS evidence into domain-neutral branch declarations."""
 
+    prf_interpretation = _latest_complete(
+        investigation, "openstar.tess.official-spoc-prf-forward-modeling.interpret"
+    )
+    catalog_identification = _latest_complete(
+        investigation, "openstar.tess.catalog-counterpart-identification.analyze"
+    )
+    if (
+        prf_interpretation is not None
+        and catalog_identification is None
+        and (prf_interpretation.result or {}).get("recommendedNextTest")
+        == "CATALOG_COUNTERPART_IDENTIFICATION"
+        and (prf_interpretation.result or {}).get("physicalMechanismResolved") is False
+    ):
+        return (
+            ScientificBranch(
+                id=f"continue-catalog-after-{prf_interpretation.id}",
+                experiment=StageRequest(
+                    id=f"{len(investigation.stages) + 1:03d}-catalog-counterpart",
+                    handler_id="openstar.tess.catalog-counterpart-identification.analyze",
+                    parameters={},
+                    triggered_by_stage_id=prf_interpretation.id,
+                ),
+            ),
+        )
+
     if _has_terminal_tess_evidence(investigation):
         return ()
 

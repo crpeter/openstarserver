@@ -86,6 +86,7 @@ from .tess_prf_refinement import (
     run_prf_deblending,
     interpret_prf_deblending,
 )
+from .tess_catalog_counterpart import identify_catalog_counterparts
 from .tess_external_highres import (
     build_external_high_resolution_project,
     interpret_external_high_resolution_project,
@@ -357,6 +358,23 @@ def multisource_residual_continuation(
             if run_prf else "openstar.tess.finalize"
         ),
         parameters={} if run_prf else {"outputSuffix": "v20.12"},
+        triggered_by_stage_id=request_id,
+    )
+
+
+def prf_catalog_counterpart_continuation(
+    summary: dict[str, Any], *, request_id: str
+) -> StageRequest:
+    """Continue exact unresolved official-PRF recommendations into catalog lookup."""
+    run_catalog = (
+        summary.get("recommendedNextTest") == "CATALOG_COUNTERPART_IDENTIFICATION"
+        and summary.get("physicalMechanismResolved") is False
+    )
+    return StageRequest(
+        id=_next_stage_id(request_id, "catalog-counterpart" if run_catalog else "finalize"),
+        handler_id=("openstar.tess.catalog-counterpart-identification.analyze"
+                    if run_catalog else "openstar.tess.finalize"),
+        parameters={} if run_catalog else {"outputSuffix": "v20.13-prf"},
         triggered_by_stage_id=request_id,
     )
 
@@ -3416,9 +3434,36 @@ def build_engine(
         _write_json(path, summary)
         return StageOutcome(
             result=summary,
-            next_stage=StageRequest(_next_stage_id(request.id, "finalize"),
-                                    "openstar.tess.finalize", {"outputSuffix": "v20.13-prf"}, request.id),
+            next_stage=prf_catalog_counterpart_continuation(summary, request_id=request.id),
             input_hashes={"preparation": sha256_json(preparation), "run": sha256_json(run)},
+            artifacts=(_artifact(path, "application/json"),),
+        )
+
+    def catalog_counterpart_identification_stage(investigation, request):
+        prepared = _latest_result_for_handler(investigation, "openstar.tess.prepare-target")
+        prf_preparation = _latest_result_for_handler(
+            investigation, "openstar.tess.official-spoc-prf-forward-modeling.prepare")
+        prf_summary = _latest_result_for_handler(
+            investigation, "openstar.tess.official-spoc-prf-forward-modeling.interpret")
+        if prepared is None or prf_preparation is None or prf_summary is None:
+            raise RuntimeError("Catalog identification requires persisted target and official PRF evidence.")
+        summary = identify_catalog_counterparts(
+            tic_id=int(prepared["ticID"]), preparation=prf_preparation,
+            prf_summary=prf_summary,
+        )
+        path = (store.directory_for(investigation.id) / "artifacts" /
+                "catalog-counterpart-identification" / "catalog-counterpart-identification.json")
+        _write_json(path, summary)
+        unavailable = summary["classification"] == "EXTERNAL_CATALOG_DATA_UNAVAILABLE"
+        return StageOutcome(
+            result=summary,
+            next_stage=(None if unavailable else StageRequest(
+                _next_stage_id(request.id, "finalize"), "openstar.tess.finalize",
+                {"outputSuffix": "catalog-counterpart"}, request.id)),
+            stop=unavailable,
+            final_status=("QUIESCENT_AWAITING_DATA" if unavailable else "COMPLETE"),
+            input_hashes={"prfPreparation": sha256_json(prf_preparation),
+                          "prfSummary": sha256_json(prf_summary)},
             artifacts=(_artifact(path, "application/json"),),
         )
 
@@ -7438,6 +7483,10 @@ def build_engine(
     engine.register_handler(
         "openstar.tess.offset-source-identification.analyze",
         offset_source_identification_stage,
+    )
+    engine.register_handler(
+        "openstar.tess.catalog-counterpart-identification.analyze",
+        catalog_counterpart_identification_stage,
     )
     engine.register_handler(
         "openstar.tess.offset-source-variability.prepare",
