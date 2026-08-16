@@ -615,6 +615,7 @@ def interpret_independent_sectors(
             and reliable
             and (
                 (not has_frequency_interval and resolution_limited)
+                or (resolution_limited and not interval_contains_target)
                 or (
                     has_frequency_interval
                     and interval_contains_target
@@ -654,6 +655,8 @@ def interpret_independent_sectors(
                 {
                     "lower": frequency_interval_lower,
                     "upper": frequency_interval_upper,
+                    "method": frequency_interval.get("method"),
+                    "confidenceLevel": frequency_interval.get("confidenceLevel"),
                 }
                 if has_frequency_interval
                 else None
