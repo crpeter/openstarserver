@@ -841,15 +841,37 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
                          request.handler_id)
 
         class FrozenWCS:
+            def __init__(self):
+                from astropy.wcs import WCS
+
+                self._wcs = WCS(naxis=2)
+                self._wcs.wcs.crpix = [2.0, 2.0]
+                self._wcs.wcs.cdelt = [-21.0 / 3600.0, 21.0 / 3600.0]
+                self._wcs.wcs.crval = [100.0, -30.0]
+                self._wcs.wcs.ctype = ["RA---TAN", "DEC--TAN"]
+
+            @property
+            def wcs(self):
+                return self._wcs.wcs
+
+            def __getattr__(self, name):
+                return getattr(self._wcs, name)
+
             def world_to_pixel(self, _target):
-                return 1.0, 1.0
+                return self._wcs.world_to_pixel(_target)
 
             def pixel_to_world(self, x, y):
-                return types.SimpleNamespace(x=x, y=y)
+                return self._wcs.pixel_to_world(x, y)
+
+            def proj_plane_pixel_scales(self):
+                return self._wcs.proj_plane_pixel_scales()
 
         class FrozenTPF:
             def __init__(self, sector):
-                absolute = _real_numpy.arange(360, dtype=float) * 0.08 + {
+                # Match the absolute timeline and cadence of the frozen sector
+                # light curves above.  Real TPF times are absolute mission
+                # times, not a sector-local zero-based axis.
+                absolute = _real_numpy.arange(1501, dtype=float) * 0.02 + {
                     64: 1700.0, 65: 2400.0,
                 }[sector]
                 cube = _real_numpy.ones((len(absolute), 5, 5), dtype=float)
@@ -873,13 +895,10 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
         def frozen_tpf(**kwargs):
             return FrozenTPF(kwargs["sector"]), {
                 "sourceType": "frozen-synthetic-tpf", "author": "regression",
-                "cadenceSeconds": 6912.0,
+                "cadenceSeconds": 1728.0,
             }
 
         with mock.patch(
-            "workflows.tess.tess_residual_localization._target_coordinate",
-            return_value=types.SimpleNamespace(),
-        ), mock.patch(
             "workflows.tess.tess_residual_localization._download_tpf",
             side_effect=frozen_tpf,
         ):
@@ -937,15 +956,6 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
         with mock.patch(
             "workflows.tess.tess_residual_localization_review._download_tpf",
             side_effect=frozen_tpf,
-        ), mock.patch(
-            "workflows.tess.tess_residual_localization_review._pixel_scale_arcsec",
-            return_value=21.0,
-        ), mock.patch(
-            "workflows.tess.tess_residual_localization_review._local_sky_jacobian",
-            return_value={"eastArcsecPerPixelX": 21.0,
-                          "eastArcsecPerPixelY": 0.0,
-                          "northArcsecPerPixelX": 0.0,
-                          "northArcsecPerPixelY": 21.0},
         ):
             current, request = engine.run_stage(
                 current, request, software_id="integration", software_version="20.30"
@@ -969,6 +979,49 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
         })
         self.assertTrue(all(item.get("skyJacobian")
                             for item in review_preparation.result["windowMetadata"]))
+        self.assertTrue(all(
+            all(value is not None for value in item["skyJacobian"].values())
+            for item in review_preparation.result["windowMetadata"]
+        ))
+        windows_by_sector = {}
+        for item in review_preparation.result["windowMetadata"]:
+            windows_by_sector.setdefault(item["sector"], []).append(item)
+            coverage_start = {64: 1700.0, 65: 2400.0}[item["sector"]]
+            coverage_end = coverage_start + 30.0
+            self.assertGreaterEqual(item["windowStartDays"], coverage_start)
+            self.assertLessEqual(item["windowEndDays"], coverage_end)
+            self.assertGreaterEqual(item["windowMidpointDays"], item["windowStartDays"])
+            self.assertLessEqual(item["windowMidpointDays"], item["windowEndDays"])
+            self.assertGreaterEqual(item["sampleCount"], 600)
+            self.assertEqual(25, item["preparedPixelCount"])
+        self.assertEqual({64, 65}, set(windows_by_sector))
+        self.assertEqual({64: 3, 65: 3},
+                         {sector: len(items) for sector, items in windows_by_sector.items()})
+        for sector, expected_starts in (
+            (64, (1700.0, 1709.0, 1718.0)),
+            (65, (2400.0, 2409.0, 2418.0)),
+        ):
+            self.assertEqual(expected_starts, tuple(
+                round(item["windowStartDays"], 6)
+                for item in windows_by_sector[sector]
+            ))
+            self.assertEqual(tuple(value + 12.0 for value in expected_starts), tuple(
+                round(item["windowEndDays"], 6)
+                for item in windows_by_sector[sector]
+            ))
+        self.assertEqual(150, len(review_preparation.result["preparedPixels"]))
+        manifest = json.loads(Path(
+            review_preparation.result["projectPath"]
+        ).read_text(encoding="utf-8"))
+        self.assertEqual("openstar.lomb-scargle.v1", manifest["workloadID"])
+        self.assertEqual(150, len(manifest["datasets"]))
+        self.assertTrue(all(Path(item["datasetPath"]).is_file()
+                            for item in review_preparation.result["preparedPixels"]))
+        self.assertEqual(
+            [{"sector": 62, "role": "primary", "stage": "sector-preparation",
+              "error": "KeyError: 62"}],
+            review_preparation.result["errors"],
+        )
 
         restarted = store.load(current.id)
         self.assertEqual(request, plan_tess_branches(restarted, target)[0].experiment)

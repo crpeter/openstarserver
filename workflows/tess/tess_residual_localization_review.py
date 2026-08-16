@@ -198,7 +198,21 @@ def build_residual_mode_localization_review_project(
                     mask = (absolute_times >= start_day) & (absolute_times <= end_day)
                 else:
                     mask = (absolute_times >= start_day) & (absolute_times < end_day)
-                if int(np.sum(mask)) < MIN_WINDOW_CADENCES:
+                sample_count = int(np.sum(mask))
+                if sample_count < MIN_WINDOW_CADENCES:
+                    errors.append(
+                        {
+                            "sector": int(sector),
+                            "role": role,
+                            "stage": "window-selection",
+                            "windowIndex": int(window_index),
+                            "windowStartDays": float(start_day),
+                            "windowEndDays": float(end_day),
+                            "sampleCount": sample_count,
+                            "minimumSampleCount": MIN_WINDOW_CADENCES,
+                            "error": "insufficient-window-cadences",
+                        }
+                    )
                     continue
 
                 window_times = absolute_times[mask]
@@ -292,7 +306,7 @@ def build_residual_mode_localization_review_project(
                             "windowStartDays": float(start_day),
                             "windowEndDays": float(end_day),
                             "windowMidpointDays": float(midpoint_day),
-                            "sampleCount": int(np.sum(mask)),
+                            "sampleCount": sample_count,
                             "shape": [int(rows), int(cols)],
                             "targetPixel": {"x": float(target_x), "y": float(target_y)},
                             "pixelScaleArcsec": pixel_scale,
@@ -308,11 +322,18 @@ def build_residual_mode_localization_review_project(
                         }
                     )
                     print(
-                        f"      window {window_index}: samples={int(np.sum(mask))}, pixel datasets={prepared_count}",
+                        f"      window {window_index}: samples={sample_count}, pixel datasets={prepared_count}",
                         flush=True,
                     )
         except Exception as exc:
-            errors.append({"sector": int(sector), "error": f"{type(exc).__name__}: {exc}"})
+            errors.append(
+                {
+                    "sector": int(sector),
+                    "role": role,
+                    "stage": "sector-preparation",
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
             print(f"      unavailable: {type(exc).__name__}: {exc}", flush=True)
 
     if not dataset_entries:
