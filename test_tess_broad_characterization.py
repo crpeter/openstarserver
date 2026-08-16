@@ -22,10 +22,15 @@ from workflows.tess.tess_morphology import _stationarity_evidence
 # full adapter also registers optional NumPy-backed archival handlers; keep
 # those unavailable branches importable in the dependency-minimal server test
 # environment without pretending to execute them.
-if "numpy" not in sys.modules:
+try:
+    import numpy as _real_numpy
+except ModuleNotFoundError:
+    _real_numpy = None
+if _real_numpy is None:
     sys.modules["numpy"] = types.ModuleType("numpy")
 
 from workflows.tess.tess_investigation import build_engine
+from workflows.tess.tess_investigation import time_frequency_continuation
 from workflows.tess.tess_time_frequency import _fit_family_python
 
 
@@ -607,6 +612,222 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
         self.assertEqual("MORPHOLOGY_RESOLVED_PHYSICAL_PERIOD", prepared["periodReference"]["kind"])
         self.assertNotEqual("UNRESOLVED_FAMILY_ANALYSIS_REFERENCE", prepared["periodReference"]["kind"])
         self.assertEqual("openstar.tess.time-frequency.run", next_request.handler_id)
+
+    @unittest.skipUnless(_real_numpy is not None, "real nonstationary integration requires NumPy")
+    def test_blind_c_shaped_summary_routes_and_prepares_nonstationary_model(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        store = InvestigationStore(root / "investigations")
+        investigation = store.create("blind-c-shaped", WORKFLOW_ID, WORKFLOW_VERSION)
+        physical_period = 13.717836472675433
+
+        paths = []
+        origins = (1000.0, 1700.0, 2400.0)
+        residual_frequency = 1.0 / 4.260988860233214
+        injected_drift = 0.0004
+        for index, (sector, origin) in enumerate(zip((62, 64, 65), origins)):
+            path = root / f"frozen-{sector}.json"
+            times = [sample * 0.02 for sample in range(1501)]
+            absolute_times = [origin + value for value in times]
+            residual_amplitude = (0.008, 0.020, 0.035)[index]
+            flux = [
+                1.0
+                + 0.025 * math.sin(2.0 * math.pi * absolute / physical_period + 0.2 * index)
+                + 0.012 * math.sin(4.0 * math.pi * absolute / physical_period - 0.1 * index)
+                + residual_amplitude * math.sin(
+                    2.0 * math.pi * residual_frequency
+                    * (absolute + 0.5 * injected_drift * (absolute - 1715.0) ** 2)
+                    + 0.7 * index
+                )
+                for absolute in absolute_times
+            ]
+            path.write_text(json.dumps({
+                "id": f"frozen-{sector}", "targetName": "Frozen source",
+                "source": {"sector": sector, "baselineDays": 30.0,
+                           "originalTimeOriginDays": origin},
+                "times": times, "flux": flux,
+            }), encoding="utf-8")
+            paths.append(path)
+        source_project = root / "source-project.json"
+        source_project.write_text(json.dumps({
+            "id": "frozen-source", "name": "Frozen source",
+            "workloadID": "openstar.lomb-scargle.v1", "datasets": [],
+        }), encoding="utf-8")
+        independent = {"preparedSectors": [
+            {"datasetID": f"sector-{sector}", "sector": sector,
+             "baselineDays": 30.0, "datasetPath": str(path)}
+            for sector, path in zip((64, 65), paths[1:])
+        ]}
+        morphology = {
+            "physicalCycleResolved": True,
+            "resolvedPhysicalPeriodDays": physical_period,
+        }
+        drift_indices = list(range(8)) + [25, 26]
+        frequencies = [0.224687793443882 + 0.003 * index for index in drift_indices]
+        interpretation = {
+            "windowResults": [
+                {
+                    "sector": 64 if position < 4 else (65 if position < 8 else 66),
+                    "role": "independent-time-frequency-window",
+                    "windowIndex": position % 5,
+                    "absoluteWindowCenterDays": 1100.0 + 100.0 * index,
+                    "candidateFrequency": frequency,
+                    "candidatePeriodDays": 1.0 / frequency,
+                    "candidatePeakProminenceRatio": 2.0,
+                    "acceptedTimeFrequencyFeature": True,
+                    "nearEstablishedFamily": False,
+                }
+                for position, (index, frequency) in enumerate(zip(drift_indices, frequencies))
+            ] + [
+                {"sector": 62, "role": "primary-time-frequency-window",
+                 "windowIndex": index, "absoluteWindowCenterDays": 1000.0 + 20.0 * index,
+                 "candidateFrequency": 0.18, "candidatePeriodDays": 1.0 / 0.18,
+                 "candidatePeakProminenceRatio": 1.0,
+                 "acceptedTimeFrequencyFeature": False, "nearEstablishedFamily": False}
+                for index in range(5)
+            ],
+            "familyTrack": [
+                {"absoluteWindowCenterDays": 1100.0 + 350.0 * index,
+                 "familyFit": {"fundamentalAmplitude": 0.01 * (index + 1),
+                               "firstHarmonicAmplitude": 0.02,
+                               "fundamentalPhaseRad": 0.8 * index,
+                               "firstHarmonicPhaseRad": 0.4 * index}}
+                for index in range(5)
+            ],
+        }
+        for stage_id, handler, result in (
+            ("001-prepare-target", "openstar.tess.prepare-target", {
+                "datasetPath": str(paths[0]), "sector": 62,
+                "sourceProjectPath": str(source_project),
+                "sourceDatasetEntry": {"id": "primary", "targetName": "Frozen source"},
+            }),
+            ("006-prepare-independent", "openstar.tess.independent.prepare", independent),
+            ("010-morphology", "openstar.tess.morphology.analyze", morphology),
+            ("013-interpret-time-frequency", "openstar.tess.time-frequency.interpret", interpretation),
+        ):
+            investigation = self._complete(store, investigation, stage_id, handler, result)
+
+        class DeterministicDriftCoordinator:
+            def run_project(self, project_path, **_kwargs):
+                manifest = json.loads(Path(project_path).read_text(encoding="utf-8"))
+                datasets = []
+                for entry in manifest["datasets"]:
+                    dataset = json.loads(Path(entry["path"]).read_text(encoding="utf-8"))
+                    q = float(dataset["science"]["fractionalFrequencyDriftPerDay"])
+                    datasets.append({
+                        "datasetID": entry["id"], "periodStatus": "RELIABLE",
+                        "periodConfidence": "high", "candidateFrequency": residual_frequency,
+                        "candidatePeriodDays": 1.0 / residual_frequency,
+                        "candidatePower": 1.0 - abs(q - injected_drift) * 1000.0,
+                        "candidatePeakProminenceRatio": 3.0,
+                    })
+                return types.SimpleNamespace(
+                    status={"datasets": datasets}, node_contributions={"synthetic-worker": len(datasets)},
+                    project_id=manifest["id"],
+                )
+
+        engine = build_engine(store, coordinator=DeterministicDriftCoordinator(),
+                              poll_interval=0.0, timeout=None)
+        engine.chain_stages = False
+        summarized, prepare_request = engine.run_stage(
+            investigation,
+            StageRequest("014-summarize-time-frequency", "openstar.tess.time-frequency.summarize", {},
+                         "013-interpret-time-frequency"),
+            software_id="integration", software_version="20.30",
+        )
+        summary_stage = summarized.stages[-1]
+        self.assertEqual("DRIFTING_RESIDUAL_MODE", summary_stage.result["classification"])
+        self.assertEqual(15, summary_stage.result["windowCount"])
+        self.assertEqual(10, summary_stage.result["acceptedFeatureCount"])
+        self.assertEqual("LONG_BASELINE_NONSTATIONARY_MODE_MODELING",
+                         summary_stage.result["recommendedNextTest"])
+        self.assertFalse(summary_stage.result["physicalMechanismResolved"])
+        self.assertEqual("MORPHOLOGY_RESOLVED_PHYSICAL_PERIOD",
+                         summary_stage.result["periodReference"]["kind"])
+        self.assertEqual("openstar.tess.nonstationary.prepare", prepare_request.handler_id)
+
+        restarted = store.load(summarized.id)
+        target = InvestigationTarget("synthetic:blind-c-shaped", restarted.id, WORKFLOW_ID,
+                                     WORKFLOW_VERSION, 0, True, {})
+        replayed = plan_tess_branches(restarted, target)[0].experiment
+        self.assertEqual(prepare_request, replayed)
+        self.assertEqual(len(summarized.stages), len(restarted.stages))
+        prepared, run_request = engine.run_stage(
+            restarted, replayed, software_id="integration", software_version="20.30"
+        )
+        preparation = prepared.stages[-1]
+        self.assertEqual("openstar.tess.nonstationary.prepare", preparation.handler_id)
+        self.assertAlmostEqual(physical_period, preparation.result["physicalPeriodDays"])
+        self.assertEqual([64, 65], preparation.result["supportingSectors"])
+        self.assertEqual({"morphology", "timeFrequency", "independentPreparation"},
+                         set(preparation.provenance.input_hashes))
+        self.assertEqual(33 * 2, len(preparation.result["preparedDatasets"]))
+        self.assertEqual(33, preparation.result["driftGrid"]["count"])
+        self.assertEqual(66 * 64, preparation.result["totalWorkUnits"])
+        self.assertTrue(Path(preparation.result["projectPath"]).is_file())
+        self.assertTrue(Path(preparation.result["analysisSeriesPath"]).is_file())
+        self.assertTrue(all(Path(item["datasetPath"]).is_file()
+                            for item in preparation.result["preparedDatasets"]))
+        series = json.loads(Path(preparation.result["analysisSeriesPath"]).read_text(encoding="utf-8"))
+        self.assertEqual(4503, len(series["absoluteTimes"]))
+        self.assertEqual({62, 64, 65}, set(series["sectorIDs"]))
+        self.assertTrue(all(item["residualStdDevBeforeNormalization"] > 0
+                            for item in preparation.result["sectorResiduals"]))
+        self.assertEqual("openstar.tess.nonstationary.run", run_request.handler_id)
+        restarted_prepared = store.load(prepared.id)
+        self.assertEqual(run_request, plan_tess_branches(restarted_prepared, target)[0].experiment)
+        self.assertEqual(len(prepared.stages), len(restarted_prepared.stages))
+
+        current = restarted_prepared
+        request = run_request
+        for expected_handler in (
+            "openstar.tess.nonstationary.run",
+            "openstar.tess.nonstationary.interpret",
+            "openstar.tess.nonstationary.summarize",
+        ):
+            before = len(current.stages)
+            current, request = engine.run_stage(
+                current, request, software_id="integration", software_version="20.30"
+            )
+            self.assertEqual(expected_handler, current.stages[-1].handler_id)
+            self.assertEqual(before + 1, len(current.stages))
+            if expected_handler == "openstar.tess.nonstationary.interpret":
+                interpreted = current.stages[-1].result
+                self.assertEqual(len(preparation.result["preparedDatasets"]),
+                                 len(interpreted["candidateResults"]))
+                self.assertEqual(
+                    {item["datasetID"] for item in preparation.result["preparedDatasets"]},
+                    {item["datasetID"] for item in interpreted["candidateResults"]},
+                )
+                self.assertTrue(all(group["candidateCount"] == 33
+                                    for group in interpreted["groups"].values()))
+            restarted_boundary = store.load(current.id)
+            self.assertEqual(request, plan_tess_branches(restarted_boundary, target)[0].experiment)
+            self.assertEqual(len(current.stages), len(restarted_boundary.stages))
+            current = restarted_boundary
+
+        nonstationary = current.stages[-1].result
+        self.assertEqual("NONSTATIONARY_DRIFT_WITH_SECTOR_EVOLUTION",
+                         nonstationary["classification"])
+        self.assertEqual("DRIFT_SECTOR_EVOLVING_MODE",
+                         nonstationary["modelComparison"]["bestModelID"])
+        self.assertEqual("RESIDUAL_MODE_PIXEL_LOCALIZATION",
+                         nonstationary["recommendedNextTest"])
+        self.assertFalse(nonstationary["physicalMechanismResolved"])
+        self.assertNotIn("physicalPeriodDays", nonstationary["preferredModel"])
+        self.assertAlmostEqual(physical_period, preparation.result["physicalPeriodDays"])
+        self.assertAlmostEqual(residual_frequency,
+                               nonstationary["preferredFrequencyAtReference"])
+        self.assertEqual("openstar.tess.finalize", request.handler_id)
+
+    def test_transient_recommendation_does_not_route_to_nonstationary(self):
+        request = time_frequency_continuation(
+            {"recommendedNextTest": "TRANSIENT_MODE_VALIDATION",
+             "physicalMechanismResolved": False},
+            request_id="014-summarize-time-frequency",
+        )
+        self.assertEqual("openstar.tess.finalize", request.handler_id)
 
     def test_weak_uninformative_morphology_does_not_continue(self):
         temporary = tempfile.TemporaryDirectory()
