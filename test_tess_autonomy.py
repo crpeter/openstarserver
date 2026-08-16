@@ -97,6 +97,47 @@ class TessAutonomyIntegrationTests(unittest.TestCase):
         )
         self.assertEqual("blind-c", branches[0].experiment.parameters["datasetID"])
 
+    def test_legacy_invalid_low_frequency_failure_resumes_independent_branch(self):
+        target = self.source.enumerate_targets()[0]
+        investigation = self.store.create(
+            target.investigation_id,
+            WORKFLOW_ID,
+            WORKFLOW_VERSION,
+            metadata=target.metadata,
+        )
+        running = InvestigationStage(
+            "006-prepare-followup",
+            "openstar.tess.followup.prepare-low-frequency",
+            "RUNNING",
+            "005-planner",
+            {},
+        )
+        investigation = self.store.append_running_stage(investigation, running)
+        failed = self.store.build_terminal_stage(
+            stage_id=running.id,
+            handler_id=running.handler_id,
+            status="FAILED",
+            triggered_by_stage_id=running.triggered_by_stage_id,
+            parameters={},
+            result=None,
+            error=(
+                "ValueError: Follow-up frequency window is invalid: "
+                "0.8123914343264318..0.098."
+            ),
+            software_id="legacy",
+            software_version="20.2",
+            started_at=running.started_at,
+        )
+        investigation = self.store.complete_current_stage(investigation, failed)
+
+        branches = plan_tess_branches(investigation, target)
+
+        self.assertEqual(1, len(branches))
+        self.assertEqual(
+            "openstar.tess.independent.prepare", branches[0].experiment.handler_id
+        )
+        self.assertEqual(running.id, branches[0].experiment.triggered_by_stage_id)
+
     def test_blind_c_v20_28_replay_is_quiescent_and_next_target_is_eligible(self):
         blind_c, next_target = self.source.enumerate_targets()
         investigation = self.store.create(

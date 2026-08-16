@@ -185,6 +185,7 @@ def analyze(
     identity: dict[str, Any],
     *,
     observation_baseline_days: float | None = None,
+    primary_minimum_frequency: float | None = None,
 ) -> dict[str, Any]:
     period = _float(primary.get("preferredPhysicalPeriodDays"))
     if period is None:
@@ -207,6 +208,19 @@ def analyze(
     raw_candidate_period = _float(primary.get("candidatePeriodDays"))
     preferred_coverage = cycle_coverage(period, observation_baseline_days)
     raw_coverage = cycle_coverage(raw_candidate_period, observation_baseline_days)
+
+    minimum_primary_frequency = _float(primary_minimum_frequency)
+    preferred_frequency = 1.0 / period if period is not None and period > 0 else None
+    harmonic_low_frequency_applicable = (
+        preferred_relation != "1x"
+        and preferred_frequency is not None
+        and minimum_primary_frequency is not None
+        # The complete targeted window must be novel low-frequency territory;
+        # trimming it at the primary boundary would change the scientific test.
+        and preferred_frequency * 1.35 < minimum_primary_frequency
+        and max(0.005, preferred_frequency * 0.65)
+        < preferred_frequency * 1.35
+    )
 
     hypotheses: list[dict[str, Any]] = []
     if best_catalog_match is not None:
@@ -261,6 +275,16 @@ def analyze(
         "catalogCoverageComplete": catalog_coverage_complete(identity),
         "rotationSanity": rotation,
         "preferredPhysicalPeriodRelation": preferred_relation,
+        "harmonicLowFrequencyFollowup": {
+            "applicable": harmonic_low_frequency_applicable,
+            "preferredFrequency": preferred_frequency,
+            "primaryMinimumFrequency": minimum_primary_frequency,
+            "reason": (
+                "target-window-is-inside-low-frequency-domain"
+                if harmonic_low_frequency_applicable
+                else "target-window-is-not-inside-low-frequency-domain"
+            ),
+        },
         "hypotheses": hypotheses,
     }
 
@@ -328,10 +352,21 @@ def plan(analysis: dict[str, Any], identity: dict[str, Any]) -> dict[str, Any]:
                 "reason": "harmonic-cycle-undercovered-needs-independent-sector",
                 "claimDecision": claim.as_dict(),
             }
+        if (analysis.get("harmonicLowFrequencyFollowup") or {}).get("applicable"):
+            return {
+                "action": "LOW_FREQUENCY_FOLLOWUP",
+                "reason": "harmonic-cycle-preferred",
+                "claimDecision": None,
+            }
+        claim = decision(
+            "CANDIDATE_PERIOD",
+            "The reliable primary result prefers a harmonic/full-cycle interpretation, but that cycle is already inside the primary search domain rather than the novel low-frequency domain.",
+            "OpenStar will test recurrence in independent observing sectors instead of running an inapplicable same-sector low-frequency extension.",
+        )
         return {
-            "action": "LOW_FREQUENCY_FOLLOWUP",
-            "reason": "harmonic-cycle-preferred",
-            "claimDecision": None,
+            "action": "INDEPENDENT_SECTOR_FOLLOWUP",
+            "reason": "harmonic-cycle-needs-independent-sector",
+            "claimDecision": claim.as_dict(),
         }
 
     claim = decision(

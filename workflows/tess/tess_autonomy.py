@@ -130,6 +130,28 @@ def plan_tess_branches(
     if _has_terminal_tess_evidence(investigation):
         return ()
 
+    # v20.2 could persist this preparation failure before preparation had a
+    # structured non-executable result.  Preserve the immutable failed record,
+    # but resume at the scientifically appropriate independent-sector branch.
+    latest = investigation.stages[-1] if investigation.stages else None
+    if (
+        latest is not None
+        and latest.status == "FAILED"
+        and latest.handler_id == "openstar.tess.followup.prepare-low-frequency"
+        and "Follow-up frequency window is invalid" in (latest.error or "")
+    ):
+        return (
+            ScientificBranch(
+                id="recover-unavailable-low-frequency-followup",
+                experiment=StageRequest(
+                    id=f"{len(investigation.stages) + 1:03d}-prepare-independent-sectors",
+                    handler_id="openstar.tess.independent.prepare",
+                    parameters={},
+                    triggered_by_stage_id=latest.id,
+                ),
+            ),
+        )
+
     targeted = _latest_complete(
         investigation, "openstar.tess.targeted-observation-planning.generate"
     )

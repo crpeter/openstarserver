@@ -175,10 +175,22 @@ def build_low_frequency_followup(
         target_period_days = None
 
     if maximum_frequency <= minimum_frequency:
-        raise ValueError(
-            "Follow-up frequency window is invalid: "
-            f"{minimum_frequency}..{maximum_frequency}."
-        )
+        return {
+            "executable": False,
+            "reason": "frequency-window-outside-low-frequency-domain",
+            "triggerReason": str(trigger_reason or "lower-frequency-extension"),
+            "followupMode": followup_mode,
+            "targetPeriodDays": target_period_days,
+            "sourceBaselineDays": source_baseline_days,
+            "attemptedWindow": {
+                "minimumFrequency": minimum_frequency,
+                "maximumFrequency": maximum_frequency,
+            },
+            "validDomain": {
+                "minimumFrequency": 0.005,
+                "maximumFrequencyExclusive": original_min,
+            },
+        }
 
     total_frequencies = 262144
     per_work_unit = int(original_search.get("frequenciesPerWorkUnit") or 4096)
@@ -233,6 +245,7 @@ def build_low_frequency_followup(
     _write_json(manifest_path, manifest)
 
     return {
+        "executable": True,
         "projectID": project_id,
         "projectPath": str(manifest_path.resolve()),
         "datasetID": follow_dataset_id,
