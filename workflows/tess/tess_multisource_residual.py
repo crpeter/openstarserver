@@ -26,6 +26,7 @@ from .tess_residual_localization import (
     _uniform_indices,
     _write_json,
 )
+from .tess_time_frequency import _design_matrix as _sinusoid_design_matrix
 
 TOTAL_FREQUENCIES = 8_192
 FREQUENCIES_PER_WORK_UNIT = 2_048
@@ -324,7 +325,7 @@ def _decompose_residual_cube(
         std = float(np.std(values))
         if not math.isfinite(std) or std <= 1e-12:
             continue
-        series[str(component["componentID"])] = values / std
+        series[str(component["componentID"])] = values
         component["coefficientRMS"] = std
         component["spatialDesignConditionNumber"] = condition_number
         component["normalizedTemplateOverlap"] = template_overlap
@@ -462,11 +463,16 @@ def build_multisource_residual_project(
                     f"multi-source residual {component_id} sector {sector}"
                 )
                 output_path = root / f"{_safe(dataset_id)}.json"
+                coefficient_path = root / f"{_safe(dataset_id)}-coefficients.json"
+                _write_json(coefficient_path, {
+                    "times": np.asarray(local_times, dtype=np.float64).tolist(),
+                    "coefficients": np.asarray(values, dtype=np.float64).tolist(),
+                })
                 dataset = {
                     "id": dataset_id,
                     "targetName": target_name,
                     "times": np.asarray(local_times, dtype=np.float32).tolist(),
-                    "flux": np.asarray(values, dtype=np.float32).tolist(),
+                    "flux": np.asarray(values / float(component["coefficientRMS"]), dtype=np.float32).tolist(),
                     "frequencySearch": search,
                     "reference": {},
                     "science": {
@@ -496,6 +502,7 @@ def build_multisource_residual_project(
                     {
                         "datasetID": dataset_id,
                         "datasetPath": str(output_path.resolve()),
+                        "coefficientSeriesPath": str(coefficient_path.resolve()),
                         "componentID": component_id,
                         "componentType": component.get("componentType"),
                         "sector": int(sector),
@@ -534,6 +541,11 @@ def build_multisource_residual_project(
         dataset_id = f"{source_base_id}-multisource-{component_id}-combined-v1"
         target_name = f"{source_dataset_entry.get('targetName') or source_base_id} multi-source residual {component_id} combined"
         output_path = root / f"{_safe(dataset_id)}.json"
+        coefficient_path = root / f"{_safe(dataset_id)}-coefficients.json"
+        _write_json(coefficient_path, {
+            "times": np.asarray(all_times, dtype=np.float64).tolist(),
+            "coefficients": np.asarray(all_flux * std, dtype=np.float64).tolist(),
+        })
         dataset = {
             "id": dataset_id,
             "targetName": target_name,
@@ -562,6 +574,7 @@ def build_multisource_residual_project(
             {
                 "datasetID": dataset_id,
                 "datasetPath": str(output_path.resolve()),
+                "coefficientSeriesPath": str(coefficient_path.resolve()),
                 "componentID": component_id,
                 "componentType": component.get("componentType"),
                 "sector": None,
@@ -631,6 +644,30 @@ def _accepted(dataset: dict[str, Any]) -> bool:
     )
 
 
+def _coherent_fit(meta: dict[str, Any], frequency: float | None) -> dict[str, float | None]:
+    if frequency is None or frequency <= 0:
+        return {"sinusoidAmplitude": None, "coherentModelRMS": None}
+    path = meta.get("coefficientSeriesPath")
+    if not path:
+        return {
+            "sinusoidAmplitude": _float(meta.get("sinusoidAmplitude")),
+            "coherentModelRMS": _float(meta.get("coherentModelRMS")),
+        }
+    raw = _load_json(path)
+    times = np.asarray(raw.get("times") or [], dtype=np.float64)
+    values = np.asarray(raw.get("coefficients") or [], dtype=np.float64)
+    if len(times) != len(values) or len(times) < MIN_COMPONENT_SAMPLES:
+        return {"sinusoidAmplitude": None, "coherentModelRMS": None}
+    design = _sinusoid_design_matrix(times, [frequency])
+    coefficients, _, _, _ = np.linalg.lstsq(design, values, rcond=None)
+    sinusoid = design[:, 1:] @ coefficients[1:]
+    sinusoid -= float(np.mean(sinusoid))
+    return {
+        "sinusoidAmplitude": math.hypot(float(coefficients[1]), float(coefficients[2])),
+        "coherentModelRMS": float(np.sqrt(np.mean(np.square(sinusoid)))),
+    }
+
+
 def interpret_multisource_residual_project(
     *,
     project_status: dict[str, Any],
@@ -652,20 +689,13 @@ def interpret_multisource_residual_project(
             "periodConfidence": str(dataset.get("periodConfidence") or "none").lower(),
         }
         result["accepted"] = _accepted(dataset)
+        result.update(_coherent_fit(meta, result["candidateFrequency"]))
+        result["lombScargleAccepted"] = result["accepted"]
         results.append(result)
 
     for result in results:
         sector = _int(result.get("sector"))
-        rms = _float(result.get("coefficientRMS"))
-        power = _float(result.get("candidatePower"))
-        result["coherentCoefficientRMS"] = (
-            rms * math.sqrt(max(0.0, power))
-            if rms is not None and power is not None else None
-        )
-
-    for result in results:
-        sector = _int(result.get("sector"))
-        coherent = _float(result.get("coherentCoefficientRMS"))
+        coherent = _float(result.get("coherentModelRMS"))
         predicted = 0.0
         predictors: list[dict[str, Any]] = []
         if sector is not None and coherent is not None:
@@ -674,8 +704,14 @@ def interpret_multisource_residual_project(
             for other in results:
                 if _int(other.get("sector")) != sector or other.get("combined"):
                     continue
-                other_coherent = _float(other.get("coherentCoefficientRMS"))
+                other_coherent = _float(other.get("coherentModelRMS"))
                 if other_coherent is None or other_coherent <= coherent:
+                    continue
+                other_frequency = _float(other.get("candidateFrequency"))
+                frequency = _float(result.get("candidateFrequency"))
+                step = _float((preparation.get("frequencySearch") or {}).get("frequencyStep"))
+                tolerance = 1.5 * step if step is not None and step > 0 else 1e-9
+                if frequency is None or other_frequency is None or abs(frequency - other_frequency) > tolerance:
                     continue
                 source_id = str(other.get("componentID"))
                 ratio = _float((coupling.get(source_id) or {}).get(measured_id))
@@ -686,11 +722,15 @@ def interpret_multisource_residual_project(
                 predictors.append({
                     "sourceComponentID": source_id,
                     "couplingRatio": ratio,
-                    "sourceCoherentCoefficientRMS": other_coherent,
-                    "allowedLeakageRMS": allowance,
+                    "sourceCoherentModelRMS": other_coherent,
+                    "allowedLeakageModelRMS": allowance,
                 })
         result["predictedPointSourceLeakageRMS"] = predicted
         result["leakagePredictors"] = predictors
+        limiting = max(predictors, key=lambda item: item["allowedLeakageModelRMS"], default=None)
+        result["leakageSourceComponentID"] = (
+            limiting.get("sourceComponentID") if limiting else None
+        )
         result["amplitudeQualified"] = bool(
             result.get("combined") or (
                 coherent is not None
@@ -703,6 +743,7 @@ def interpret_multisource_residual_project(
             and result.get("accepted")
             and result.get("amplitudeQualified")
         )
+        result["independentSpatialSupport"] = result["countedAsIndependentSupport"]
 
     summaries: list[dict[str, Any]] = []
     for component in preparation.get("spatialComponents") or []:
@@ -749,8 +790,8 @@ def interpret_multisource_residual_project(
     offset_support = int((best_offset or {}).get("independentSupportCount") or 0)
     target_combined = next((item for item in results if item.get("combined") and item.get("componentType") == "TARGET"), None)
     offset_combined = next((item for item in results if item.get("combined") and item.get("componentID") == (best_offset or {}).get("componentID")), None)
-    target_strength = float((target_combined or {}).get("coherentCoefficientRMS") or 0.0)
-    offset_strength = float((offset_combined or {}).get("coherentCoefficientRMS") or 0.0)
+    target_strength = float((target_combined or {}).get("coherentModelRMS") or 0.0)
+    offset_strength = float((offset_combined or {}).get("coherentModelRMS") or 0.0)
     target_present = target_support >= MIN_INDEPENDENT_SUPPORT and bool((target or {}).get("combinedAccepted"))
     offset_present = offset_support >= MIN_INDEPENDENT_SUPPORT and bool((best_offset or {}).get("combinedAccepted"))
 

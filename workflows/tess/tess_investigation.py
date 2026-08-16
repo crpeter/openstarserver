@@ -3241,6 +3241,11 @@ def build_engine(
             for item in spec.get("preparedSeries") or []
             if item.get("datasetPath")
         ]
+        artifacts.extend(
+            _artifact(Path(item["coefficientSeriesPath"]), "application/json")
+            for item in spec.get("preparedSeries") or []
+            if item.get("coefficientSeriesPath")
+        )
         artifacts.append(_artifact(Path(spec["projectPath"]), "application/json"))
         return StageOutcome(
             result=spec,
