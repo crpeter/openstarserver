@@ -114,6 +114,7 @@ class WorkflowEngine:
             next_stage=(
                 asdict(outcome.next_stage) if outcome.next_stage is not None else None
             ),
+            stop=outcome.stop,
         )
         investigation = self.store.complete_current_stage(
             investigation,

@@ -19,6 +19,7 @@ from workflows.tess.tess_autonomy import (
     TessInvestigationTargetSource,
     plan_tess_branches,
     register_tess_workflow_handlers,
+    repair_obsolete_terminal_wait,
 )
 
 SOFTWARE_ID = "openstar.autonomous-tess-runner"
@@ -93,6 +94,7 @@ def run_autonomous_tess(
             metadata={**(target.metadata or {}), "targetSelection": provenance},
         )
         lifecycle.start(target)
+        current_investigation_id = target.investigation_id
         print(
             "OpenStar lifecycle: disposition=STARTED "
             f"target={target.id} investigation={target.investigation_id}"
@@ -100,11 +102,19 @@ def run_autonomous_tess(
     else:
         persisted = json.loads(lifecycle_path.read_text(encoding="utf-8"))
         target = persisted.get("currentTarget", {})
+        current_investigation_id = str(target.get("investigation_id", ""))
         print(
             "OpenStar lifecycle: disposition=RESUMING "
             f"target={target.get('id', 'unknown')} "
             f"investigation={target.get('investigation_id', 'unknown')}"
         )
+
+    # Compatibility migration for the one obsolete decision emitted by the
+    # previous TESS adapter. The repair predicate is deliberately TESS-specific
+    # and leaves all other durable lifecycle actions untouched.
+    if current_investigation_id:
+        investigation = store.load(current_investigation_id)
+        repair_obsolete_terminal_wait(store, investigation)
 
     while True:
         result = lifecycle.run()

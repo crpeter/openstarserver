@@ -5,7 +5,11 @@ import re
 from pathlib import Path
 from typing import Sequence
 
-from openstar_autonomy import ExternalDataDependency, ScientificBranch
+from openstar_autonomy import (
+    AutonomousInvestigationEngine,
+    ExternalDataDependency,
+    ScientificBranch,
+)
 from openstar_investigation import Investigation, InvestigationStore
 from openstar_targets import InvestigationTarget
 from openstar_workflow import StageRequest, WorkflowEngine
@@ -87,10 +91,44 @@ def _latest_complete(investigation: Investigation, handler_id: str):
     )
 
 
+def _has_terminal_tess_evidence(investigation: Investigation) -> bool:
+    if not investigation.stages:
+        return False
+    latest = investigation.stages[-1]
+    return latest.status == "COMPLETE" and (
+        latest.stop
+        # Backward compatibility for terminal TESS evidence persisted before
+        # InvestigationStage retained StageOutcome.stop.
+        or latest.handler_id == "openstar.tess.finalize"
+    )
+
+
+def repair_obsolete_terminal_wait(
+    store: InvestigationStore, investigation: Investigation
+) -> Investigation:
+    """Replace only the obsolete terminal-TESS wait decision from older code."""
+
+    control = investigation.metadata.get("controlState")
+    if (
+        investigation.workflow_id != WORKFLOW_ID
+        or investigation.status != "BLOCKED"
+        or not isinstance(control, dict)
+        or control.get("schedulerAction") != "WAIT_FOR_PREREQUISITES"
+        or not _has_terminal_tess_evidence(investigation)
+    ):
+        return investigation
+
+    repaired, _ = AutonomousInvestigationEngine(store).decide(investigation, ())
+    return repaired
+
+
 def plan_tess_branches(
     investigation: Investigation, target: InvestigationTarget
 ) -> tuple[ScientificBranch, ...]:
     """Translate persisted TESS evidence into domain-neutral branch declarations."""
+
+    if _has_terminal_tess_evidence(investigation):
+        return ()
 
     targeted = _latest_complete(
         investigation, "openstar.tess.targeted-observation-planning.generate"

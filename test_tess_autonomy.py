@@ -6,12 +6,14 @@ from pathlib import Path
 from openstar_autonomy import AutonomousInvestigationEngine
 from openstar_dispatch import InvestigationDispatcher
 from openstar_investigation import InvestigationStage, InvestigationStore
+from openstar_lifecycle import InvestigationLifecycleLoop
 from openstar_targets import InvestigationTargetPortfolio
 from openstar_workflow import StageOutcome, WorkflowEngine
 from openstar_workflow import StageRequest
 from workflows.tess.tess_autonomy import (
     TessInvestigationTargetSource,
     plan_tess_branches,
+    repair_obsolete_terminal_wait,
 )
 from workflows.tess.tess_autonomy import WORKFLOW_ID, WORKFLOW_VERSION
 
@@ -48,7 +50,9 @@ class TessAutonomyIntegrationTests(unittest.TestCase):
         )
         self.source = TessInvestigationTargetSource((self.project,))
 
-    def _complete(self, investigation, stage_id, handler_id, result, next_stage=None):
+    def _complete(
+        self, investigation, stage_id, handler_id, result, next_stage=None, stop=False
+    ):
         running = InvestigationStage(stage_id, handler_id, "RUNNING", None, {})
         investigation = self.store.append_running_stage(investigation, running)
         terminal = self.store.build_terminal_stage(
@@ -72,6 +76,7 @@ class TessAutonomyIntegrationTests(unittest.TestCase):
                 if next_stage is not None
                 else None
             ),
+            stop=stop,
         )
         return self.store.complete_current_stage(investigation, terminal)
 
@@ -251,6 +256,192 @@ class TessAutonomyIntegrationTests(unittest.TestCase):
         self.assertEqual(
             ["openstar.tess.prepare-target", "openstar.tess.primary-project.run"],
             calls,
+        )
+
+    def test_terminal_finalize_is_complete_but_unknown_state_still_waits(self):
+        target = self.source.enumerate_targets()[0]
+        terminal = self.store.create(
+            target.investigation_id,
+            WORKFLOW_ID,
+            WORKFLOW_VERSION,
+            metadata=target.metadata,
+        )
+        terminal = self._complete(
+            terminal,
+            "006-finalize",
+            "openstar.tess.finalize",
+            {"scientificConclusion": "ANY_VALID_FINAL_CONCLUSION"},
+            stop=True,
+        )
+        terminal = self.store.load(terminal.id)
+        self.assertTrue(terminal.stages[-1].stop)
+        terminal_record = json.loads(
+            self.store.stage_path_for(terminal.id, "006-finalize").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertIs(True, terminal_record["stop"])
+        autonomy = AutonomousInvestigationEngine(self.store)
+        decision = autonomy.inspect(terminal, plan_tess_branches(terminal, target))
+        self.assertEqual((), plan_tess_branches(terminal, target))
+        self.assertEqual("INVESTIGATION_COMPLETE", decision.scheduler_action)
+
+        unknown_target = self.source.enumerate_targets()[1]
+        unknown = self.store.create(
+            unknown_target.investigation_id,
+            WORKFLOW_ID,
+            WORKFLOW_VERSION,
+            metadata=unknown_target.metadata,
+        )
+        unknown = self._complete(
+            unknown,
+            "006-unknown",
+            "openstar.tess.unrecognized-nonterminal",
+            {"status": "COMPLETE"},
+        )
+        decision = autonomy.inspect(
+            unknown, plan_tess_branches(unknown, unknown_target)
+        )
+        self.assertEqual("WAIT_FOR_PREREQUISITES", decision.scheduler_action)
+        unknown, _ = autonomy.decide(
+            unknown, plan_tess_branches(unknown, unknown_target)
+        )
+        before_repair = self.store.path_for(unknown.id).read_bytes()
+        self.assertEqual(unknown, repair_obsolete_terminal_wait(self.store, unknown))
+        self.assertEqual(before_repair, self.store.path_for(unknown.id).read_bytes())
+        self.assertEqual("BLOCKED", self.store.load(unknown.id).status)
+
+    def test_legacy_completed_finalize_without_stop_is_terminal(self):
+        target = self.source.enumerate_targets()[0]
+        investigation = self.store.create(
+            target.investigation_id,
+            WORKFLOW_ID,
+            WORKFLOW_VERSION,
+            metadata=target.metadata,
+        )
+        investigation = self._complete(
+            investigation,
+            "006-finalize",
+            "openstar.tess.finalize",
+            {"scientificConclusion": "LEGACY_FINAL_CONCLUSION"},
+        )
+        snapshot_path = self.store.path_for(investigation.id)
+        snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+        del snapshot["stages"][-1]["stop"]
+        snapshot_path.write_text(json.dumps(snapshot), encoding="utf-8")
+
+        reloaded = self.store.load(investigation.id)
+        self.assertFalse(reloaded.stages[-1].stop)
+        self.assertEqual((), plan_tess_branches(reloaded, target))
+
+    def test_restart_after_terminal_finalize_advances_once_without_rerun(self):
+        finished_target, next_target = self.source.enumerate_targets()
+        investigation = self.store.create(
+            finished_target.investigation_id,
+            WORKFLOW_ID,
+            WORKFLOW_VERSION,
+            metadata=finished_target.metadata,
+        )
+        investigation = self._complete(
+            investigation,
+            "006-finalize",
+            "openstar.tess.finalize",
+            {"scientificConclusion": "FINAL"},
+            stop=True,
+        )
+        snapshot_path = self.store.path_for(investigation.id)
+        snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+        del snapshot["stages"][-1]["stop"]
+        snapshot_path.write_text(json.dumps(snapshot), encoding="utf-8")
+        investigation = self.store.load(investigation.id)
+        investigation = self.store.set_control_state(
+            investigation,
+            status="BLOCKED",
+            control_state={
+                "branchAssessments": [
+                    {
+                        "branch_id": "unresolved-tess-continuation",
+                        "state": "NOT_READY",
+                        "missing_stage_ids": ["tess-continuation-decision"],
+                        "unavailable_external_data": [],
+                    }
+                ],
+                "selectedExperiment": None,
+                "schedulerAction": "WAIT_FOR_PREREQUISITES",
+            },
+        )
+
+        workflow = WorkflowEngine(self.store)
+        workflow.chain_stages = False
+        executions = []
+
+        def prepare(current, request):
+            executions.append((current.id, request.handler_id))
+            return StageOutcome(
+                result={"projectPath": "next-primary.json"},
+                next_stage=StageRequest(
+                    "002-primary-distributed-search",
+                    "openstar.tess.primary-project.run",
+                    {"projectPath": "next-primary.json"},
+                    request.id,
+                ),
+            )
+
+        workflow.register_handler("openstar.tess.prepare-target", prepare)
+        dispatcher = InvestigationDispatcher(self.store, workflow)
+
+        def loop():
+            return InvestigationLifecycleLoop(
+                self.root / "lifecycle.json",
+                self.store,
+                dispatcher,
+                InvestigationTargetPortfolio(
+                    self.root / "portfolio.json", self.store, dispatcher
+                ),
+                self.source,
+                {WORKFLOW_ID: plan_tess_branches},
+                software_id="test",
+                software_version="20.28",
+            )
+
+        loop().start(finished_target)
+        # Process restart runs the narrow TESS compatibility repair before the
+        # generic lifecycle consumes its durable action.
+        repaired = repair_obsolete_terminal_wait(
+            self.store, self.store.load(finished_target.investigation_id)
+        )
+        self.assertEqual("COMPLETE", repaired.status)
+        self.assertEqual(
+            "INVESTIGATION_COMPLETE",
+            self.store.load(finished_target.investigation_id)
+            .metadata["controlState"]["schedulerAction"],
+        )
+
+        # Reapplying the repair is a no-op, including across another restart.
+        self.assertEqual(repaired, repair_obsolete_terminal_wait(self.store, repaired))
+
+        advanced = loop().run(max_transitions=2)
+        self.assertEqual("LIFECYCLE_CHECKPOINT", advanced.disposition)
+        state = json.loads(
+            (self.root / "lifecycle.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(next_target.id, state["currentTarget"]["id"])
+        self.assertEqual(
+            [(next_target.investigation_id, "openstar.tess.prepare-target")],
+            executions,
+        )
+        portfolio = json.loads(
+            (self.root / "portfolio.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(1, len(portfolio["selections"]))
+        self.assertEqual(
+            ["006-finalize"],
+            [
+                stage.id
+                for stage in self.store.load(
+                    finished_target.investigation_id
+                ).stages
+            ],
         )
 
 
