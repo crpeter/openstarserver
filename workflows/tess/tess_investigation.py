@@ -81,6 +81,11 @@ from .tess_spoc_prf import (
     build_official_spoc_prf_project,
     interpret_official_spoc_prf_project,
 )
+from .tess_prf_refinement import (
+    prepare_prf_deblending,
+    run_prf_deblending,
+    interpret_prf_deblending,
+)
 from .tess_external_highres import (
     build_external_high_resolution_project,
     interpret_external_high_resolution_project,
@@ -129,7 +134,7 @@ from .tess_multisector import (
 WORKFLOW_ID = "openstar.workflow.tess-investigation.v1"
 WORKFLOW_VERSION = "20.2"
 SOFTWARE_ID = "openstar.tess-investigation-plugin"
-SOFTWARE_VERSION = "20.28"
+SOFTWARE_VERSION = "20.29"
 
 
 def _stage(investigation: Investigation, stage_id: str):
@@ -332,6 +337,26 @@ def residual_mode_localization_review_continuation(
             else "openstar.tess.finalize"
         ),
         parameters={} if run_decomposition else {"outputSuffix": "v20.11"},
+        triggered_by_stage_id=request_id,
+    )
+
+
+def multisource_residual_continuation(
+    summary: dict[str, Any], *, request_id: str
+) -> StageRequest:
+    """Enter the historical official-SPOC PRF path only on its exact request."""
+
+    run_prf = (
+        summary.get("recommendedNextTest") == "PIXEL_RESPONSE_FUNCTION_DEBLENDING"
+        and summary.get("physicalMechanismResolved") is False
+    )
+    return StageRequest(
+        id=_next_stage_id(request_id, "prepare-prf-deblending" if run_prf else "finalize"),
+        handler_id=(
+            "openstar.tess.official-spoc-prf-forward-modeling.prepare"
+            if run_prf else "openstar.tess.finalize"
+        ),
+        parameters={} if run_prf else {"outputSuffix": "v20.12"},
         triggered_by_stage_id=request_id,
     )
 
@@ -3322,17 +3347,79 @@ def build_engine(
         _write_json(artifact_path, summary)
         return StageOutcome(
             result=summary,
-            next_stage=StageRequest(
-                id=_next_stage_id(request.id, "finalize"),
-                handler_id="openstar.tess.finalize",
-                parameters={"outputSuffix": "v20.12"},
-                triggered_by_stage_id=request.id,
-            ),
+            next_stage=multisource_residual_continuation(summary, request_id=request.id),
             input_hashes={
                 "preparation": sha256_json(preparation),
                 "projectResult": sha256_json(run),
             },
             artifacts=(_artifact(artifact_path, "application/json"),),
+        )
+
+    def prf_deblending_prepare_stage(investigation, request):
+        required_handlers = {
+            "targetPreparation": "openstar.tess.prepare-target",
+            "targetIdentity": "openstar.tess.catalog-identity",
+            "physicalMorphology": "openstar.tess.morphology.analyze",
+            "nonstationaryResidual": "openstar.tess.nonstationary.summarize",
+            "staticLocalization": "openstar.tess.residual-mode-localization.interpret",
+            "localizationReview": "openstar.tess.residual-mode-localization-review.interpret",
+            "decompositionPreparation": "openstar.tess.multi-source-residual.prepare",
+            "multiSourceDecomposition": "openstar.tess.multi-source-residual.interpret",
+        }
+        evidence = {name: _latest_result_for_handler(investigation, handler)
+                    for name, handler in required_handlers.items()}
+        missing = [name for name, value in evidence.items() if value is None]
+        if missing:
+            raise RuntimeError("PRF deblending requires persisted prior evidence: " + ", ".join(missing))
+        decomposition = evidence["multiSourceDecomposition"]
+        if (decomposition.get("recommendedNextTest") != "PIXEL_RESPONSE_FUNCTION_DEBLENDING"
+                or decomposition.get("physicalMechanismResolved") is not False):
+            raise RuntimeError("Multi-source decomposition did not request unresolved PRF deblending.")
+        morphology = evidence["physicalMorphology"]
+        if not morphology.get("physicalCycleResolved"):
+            raise RuntimeError("PRF deblending requires the established morphology-resolved physical cycle.")
+        spec = prepare_prf_deblending(
+            evidence=evidence,
+            output_dir=store.directory_for(investigation.id) / "artifacts",
+            investigation_id=investigation.id,
+        )
+        return StageOutcome(
+            result=spec,
+            next_stage=StageRequest(_next_stage_id(request.id, "run-prf-deblending"),
+                                    "openstar.tess.official-spoc-prf-forward-modeling.run", {}, request.id),
+            input_hashes={name: sha256_json(value) for name, value in evidence.items()},
+            artifacts=(_artifact(Path(spec["preparationPath"]), "application/json"),),
+        )
+
+    def prf_deblending_run_stage(investigation, request):
+        preparation = _latest_result_for_handler(investigation, "openstar.tess.official-spoc-prf-forward-modeling.prepare")
+        if preparation is None:
+            raise RuntimeError("PRF run requires completed preparation.")
+        result = run_prf_deblending(preparation)
+        path = Path(preparation["artifactRoot"]) / "prf-deblending-run.json"
+        _write_json(path, result)
+        return StageOutcome(
+            result=result,
+            next_stage=StageRequest(_next_stage_id(request.id, "interpret-prf-deblending"),
+                                    "openstar.tess.official-spoc-prf-forward-modeling.interpret", {}, request.id),
+            input_hashes={"preparation": sha256_json(preparation)},
+            artifacts=(_artifact(path, "application/json"),),
+        )
+
+    def prf_deblending_interpret_stage(investigation, request):
+        preparation = _latest_result_for_handler(investigation, "openstar.tess.official-spoc-prf-forward-modeling.prepare")
+        run = _latest_result_for_handler(investigation, "openstar.tess.official-spoc-prf-forward-modeling.run")
+        if preparation is None or run is None:
+            raise RuntimeError("PRF interpretation requires completed prepare and run stages.")
+        summary = interpret_prf_deblending(preparation, run)
+        path = Path(preparation["artifactRoot"]) / "prf-deblending-summary.json"
+        _write_json(path, summary)
+        return StageOutcome(
+            result=summary,
+            next_stage=StageRequest(_next_stage_id(request.id, "finalize"),
+                                    "openstar.tess.finalize", {"outputSuffix": "v20.13-prf"}, request.id),
+            input_hashes={"preparation": sha256_json(preparation), "run": sha256_json(run)},
+            artifacts=(_artifact(path, "application/json"),),
         )
 
     def offset_source_identification_stage(investigation, request):
@@ -3991,6 +4078,13 @@ def build_engine(
         )
 
     def official_spoc_prf_prepare_stage(investigation, request):
+        direct_multisource = _latest_result_for_handler(
+            investigation, "openstar.tess.multi-source-residual.interpret"
+        )
+        if (direct_multisource is not None
+                and direct_multisource.get("recommendedNextTest") == "PIXEL_RESPONSE_FUNCTION_DEBLENDING"
+                and direct_multisource.get("physicalMechanismResolved") is False):
+            return prf_deblending_prepare_stage(investigation, request)
         prepared = _latest_result_for_handler(investigation, "openstar.tess.prepare-target")
         identity = _latest_result_for_handler(investigation, "openstar.tess.catalog-identity")
         independent_prepare = _latest_result_for_handler(
@@ -4077,6 +4171,11 @@ def build_engine(
         )
 
     def official_spoc_prf_run_stage(investigation, request):
+        preparation = _latest_result_for_handler(
+            investigation, "openstar.tess.official-spoc-prf-forward-modeling.prepare"
+        )
+        if preparation is not None and preparation.get("version") == "openstar.tess-prf-deblending.v1":
+            return prf_deblending_run_stage(investigation, request)
         print("⚙️ Activating generic official-PRF-separated source work units")
         run = coordinator.run_project(
             request.parameters["projectPath"],
@@ -4101,6 +4200,8 @@ def build_engine(
         preparation = _latest_result_for_handler(
             investigation, "openstar.tess.official-spoc-prf-forward-modeling.prepare"
         )
+        if preparation is not None and preparation.get("version") == "openstar.tess-prf-deblending.v1":
+            return prf_deblending_interpret_stage(investigation, request)
         run = _latest_result_for_handler(
             investigation, "openstar.tess.official-spoc-prf-forward-modeling.run"
         )
