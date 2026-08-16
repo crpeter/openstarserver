@@ -12,6 +12,10 @@ from openstar_investigation import (
 )
 
 
+class RetryableExecutionError(RuntimeError):
+    """An execution dependency failed transiently; science did not fail."""
+
+
 @dataclass(frozen=True)
 class StageRequest:
     id: str
@@ -85,6 +89,11 @@ class WorkflowEngine:
                 parameters=request.parameters,
                 result=None,
                 error=f"{type(error).__name__}: {error}",
+                failure_classification=(
+                    "TRANSIENT_INFRASTRUCTURE"
+                    if isinstance(error, RetryableExecutionError)
+                    else "NON_RETRYABLE"
+                ),
                 software_id=software_id,
                 software_version=software_version,
                 started_at=running.started_at,

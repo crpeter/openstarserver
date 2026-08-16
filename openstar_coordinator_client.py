@@ -8,9 +8,15 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from openstar_workflow import RetryableExecutionError
+
 
 class CoordinatorClientError(RuntimeError):
     pass
+
+
+class CoordinatorUnavailableError(CoordinatorClientError, RetryableExecutionError):
+    """The coordinator could not be reached and execution may be retried."""
 
 
 @dataclass(frozen=True)
@@ -141,7 +147,7 @@ class OpenStarCoordinatorClient:
                 f"Coordinator HTTP {error.code}: {message}"
             ) from error
         except URLError as error:
-            raise CoordinatorClientError(
+            raise CoordinatorUnavailableError(
                 f"Coordinator unavailable: {error.reason}"
             ) from error
 

@@ -1,7 +1,7 @@
 import json
 import tempfile
 import unittest
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from openstar_autonomy import ExternalDataDependency, ScientificBranch
@@ -9,7 +9,12 @@ from openstar_dispatch import InvestigationDispatcher
 from openstar_investigation import InvestigationStage, InvestigationStore
 from openstar_lifecycle import InvestigationLifecycleLoop
 from openstar_targets import InvestigationTarget, InvestigationTargetPortfolio
-from openstar_workflow import StageOutcome, StageRequest, WorkflowEngine
+from openstar_workflow import (
+    RetryableExecutionError,
+    StageOutcome,
+    StageRequest,
+    WorkflowEngine,
+)
 
 
 @dataclass(frozen=True)
@@ -152,6 +157,138 @@ class InvestigationLifecycleLoopTests(unittest.TestCase):
         self.assertEqual("EXPERIMENT_RECOVERY_REQUIRED", result.disposition)
         self.assertEqual([], self.executions)
         self.assertEqual("RUNNING", self.store.load(investigation.id).stages[-1].status)
+
+    def test_retryable_failed_execution_appends_deterministic_attempt_and_continues(self):
+        available = False
+        executions = []
+
+        def run_stage(investigation, request):
+            executions.append(request.id)
+            if not available:
+                raise RetryableExecutionError("coordinator is unavailable")
+            return StageOutcome(
+                result={"computed": True},
+                next_stage=StageRequest(
+                    f"{int(request.id[:3]) + 1:03d}-interpret",
+                    "test.interpret",
+                    {},
+                    request.id,
+                ),
+            )
+
+        def interpret(investigation, request):
+            return StageOutcome(
+                result={"interpreted": True},
+                next_stage=StageRequest(
+                    f"{int(request.id[:3]) + 1:03d}-finalize",
+                    "test.finalize",
+                    {},
+                    request.id,
+                ),
+            )
+
+        self.workflow.register_handler("test.run", run_stage)
+        self.workflow.register_handler("test.interpret", interpret)
+        self.workflow.register_handler(
+            "test.finalize", lambda investigation, request: StageOutcome({}, stop=True)
+        )
+        loop = self.loop(planners={"test": lambda investigation, target: ()})
+        investigation = loop.start(self.initial)
+        self.store.append_running_stage(
+            investigation,
+            InvestigationStage("002-prepare", "test.prepare", "RUNNING", None, {}),
+        )
+        investigation = self.store.load(investigation.id)
+        prepared = self.store.build_terminal_stage(
+            stage_id="002-prepare", handler_id="test.prepare", status="COMPLETE",
+            triggered_by_stage_id=None, parameters={}, result={"prepared": True},
+            error=None, software_id="test", software_version="1",
+        )
+        investigation = self.store.complete_current_stage(investigation, prepared)
+        # A sparse historical id proves allocation uses the durable maximum,
+        # rather than the failed stage's immediate successor.
+        self.store.append_running_stage(
+            investigation,
+            InvestigationStage("009-audit", "test.audit", "RUNNING", None, {}),
+        )
+        investigation = self.store.load(investigation.id)
+        audit = self.store.build_terminal_stage(
+            stage_id="009-audit", handler_id="test.audit", status="COMPLETE",
+            triggered_by_stage_id=None, parameters={}, result={}, error=None,
+            software_id="test", software_version="1",
+        )
+        investigation = self.store.complete_current_stage(investigation, audit)
+
+        with self.assertRaises(RetryableExecutionError):
+            self.workflow.run(
+                investigation, StageRequest("003-run", "test.run", {"project": "p"}),
+                software_id="test", software_version="1",
+            )
+        failed_before = self.store.load(investigation.id).stages[-1]
+        legacy_failure = replace(
+            failed_before,
+            failure_classification=None,
+            error="CoordinatorClientError: Coordinator unavailable: connection refused",
+        )
+        self.assertEqual(
+            legacy_failure,
+            InvestigationLifecycleLoop._retryable_failure(
+                replace(
+                    self.store.load(investigation.id),
+                    stages=(legacy_failure,),
+                )
+            ),
+        )
+        failed_file_before = self.store.stage_path_for(
+            investigation.id, failed_before.id
+        ).read_bytes()
+
+        # Repeated recovery while the dependency is down appends a distinct,
+        # deterministic failed attempt and never rewrites either predecessor.
+        with self.assertRaises(RetryableExecutionError):
+            loop.run()
+        first_retry = self.store.load(investigation.id).stages[-1]
+        self.assertEqual("010-run", first_retry.id)
+        self.assertEqual("003-run", first_retry.triggered_by_stage_id)
+        self.assertEqual(failed_file_before, self.store.stage_path_for(
+            investigation.id, failed_before.id
+        ).read_bytes())
+
+        available = True
+        result = loop.run()
+        stages = self.store.load(investigation.id).stages
+        self.assertEqual("INVESTIGATION_COMPLETE_NO_NEXT_TARGET", result.disposition)
+        self.assertEqual(
+            [("003-run", "FAILED"), ("010-run", "FAILED"),
+             ("011-run", "COMPLETE"), ("012-interpret", "COMPLETE"),
+             ("013-finalize", "COMPLETE")],
+            [(stage.id, stage.status) for stage in stages if stage.handler_id.startswith("test.run")
+             or stage.handler_id in {"test.interpret", "test.finalize"}],
+        )
+        self.assertEqual("010-run", stages[-3].triggered_by_stage_id)
+        execution_count = len(executions)
+        self.assertEqual("INVESTIGATION_COMPLETE_NO_NEXT_TARGET", loop.run().disposition)
+        self.assertEqual(execution_count, len(executions))
+
+    def test_non_retryable_failed_stage_is_not_automatically_retried(self):
+        loop = self.loop(planners={"test": lambda investigation, target: ()})
+        investigation = loop.start(self.initial)
+        def fail_science(investigation, request):
+            raise ValueError("bad data")
+
+        self.workflow.register_handler("test.scientific-failure", fail_science)
+        with self.assertRaises(ValueError):
+            self.workflow.run(
+                investigation,
+                StageRequest("001-science", "test.scientific-failure", {}),
+                software_id="test",
+                software_version="1",
+            )
+        failed = self.store.load(investigation.id).stages[-1]
+        self.assertEqual("NON_RETRYABLE", failed.failure_classification)
+        result = loop.run(max_transitions=1)
+        self.assertEqual("LIFECYCLE_CHECKPOINT", result.disposition)
+        self.assertEqual(1, len(self.store.load(investigation.id).stages))
 
     def test_target_advance_is_durable_and_continues_same_lifecycle(self):
         def advancing_planner(investigation, target):

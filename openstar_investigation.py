@@ -64,6 +64,9 @@ class InvestigationStage:
     completed_at: str | None = None
     result: dict[str, Any] | None = None
     error: str | None = None
+    # Machine-readable execution semantics.  The human-readable error remains
+    # immutable evidence, while this field lets recovery avoid parsing it.
+    failure_classification: str | None = None
     artifacts: tuple[ArtifactReference, ...] = ()
     provenance: StageProvenance | None = None
     next_stage: dict[str, Any] | None = None
@@ -309,6 +312,7 @@ class InvestigationStore:
         parameters: dict[str, Any],
         result: dict[str, Any] | None,
         error: str | None,
+        failure_classification: str | None = None,
         software_id: str,
         software_version: str,
         input_hashes: dict[str, str] | None = None,
@@ -329,6 +333,7 @@ class InvestigationStore:
             completed_at=utc_now_iso(),
             result=dict(result) if result is not None else None,
             error=error,
+            failure_classification=failure_classification,
             artifacts=artifacts,
             provenance=StageProvenance(
                 software_id=software_id,
@@ -417,6 +422,7 @@ class InvestigationStore:
                     completed_at=stage_raw.get("completed_at"),
                     result=stage_raw.get("result"),
                     error=stage_raw.get("error"),
+                    failure_classification=stage_raw.get("failure_classification"),
                     artifacts=artifacts,
                     provenance=provenance,
                     next_stage=(
