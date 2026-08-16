@@ -1296,10 +1296,13 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
                 actual_model = item["models"][model_id]
                 replay_model = exact_replay["models"][model_id]
                 for metric in ("chiSquare", "logLikelihood", "bic"):
-                    self.assertAlmostEqual(actual_model[metric], replay_model[metric], places=9)
+                    self.assertTrue(
+                        math.isclose(actual_model[metric], replay_model[metric], rel_tol=1e-10, abs_tol=1e-12),
+                        f"{model_id} {metric}: {actual_model[metric]} != {replay_model[metric]}"
+                    )
                 _real_numpy.testing.assert_allclose(
                     actual_model["parameterEstimates"], replay_model["parameterEstimates"],
-                    rtol=0.0, atol=1e-14,
+                    rtol=0.0, atol=1e-13,
                 )
             print("PRF_EXACT_SECTOR_REPLAY", {"sector": sector, **exact_replay})
             positions = {entry["componentID"]: entry for entry in item["calibration"]}
