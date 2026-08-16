@@ -33,6 +33,7 @@ if _real_numpy is None:
 from workflows.tess.tess_investigation import build_engine
 from workflows.tess.tess_investigation import time_frequency_continuation
 from workflows.tess.tess_investigation import nonstationary_continuation
+from workflows.tess.tess_investigation import residual_mode_localization_continuation
 from workflows.tess.tess_time_frequency import _fit_family_python
 
 
@@ -721,7 +722,10 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
                 for entry in manifest["datasets"]:
                     dataset = json.loads(Path(entry["path"]).read_text(encoding="utf-8"))
                     q = float(dataset["science"]["fractionalFrequencyDriftPerDay"])
-                    if dataset["science"].get("role") == "residual-mode-pixel-localization":
+                    if dataset["science"].get("role") in (
+                        "residual-mode-pixel-localization",
+                        "residual-mode-time-resolved-pixel-localization",
+                    ):
                         sector = int(dataset["science"]["sector"])
                         row = int(dataset["science"]["pixelRow"])
                         column = int(dataset["science"]["pixelColumn"])
@@ -837,15 +841,37 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
                          request.handler_id)
 
         class FrozenWCS:
+            def __init__(self):
+                from astropy.wcs import WCS
+
+                self._wcs = WCS(naxis=2)
+                self._wcs.wcs.crpix = [2.0, 2.0]
+                self._wcs.wcs.cdelt = [-21.0 / 3600.0, 21.0 / 3600.0]
+                self._wcs.wcs.crval = [100.0, -30.0]
+                self._wcs.wcs.ctype = ["RA---TAN", "DEC--TAN"]
+
+            @property
+            def wcs(self):
+                return self._wcs.wcs
+
+            def __getattr__(self, name):
+                return getattr(self._wcs, name)
+
             def world_to_pixel(self, _target):
-                return 1.0, 1.0
+                return self._wcs.world_to_pixel(_target)
 
             def pixel_to_world(self, x, y):
-                return types.SimpleNamespace(x=x, y=y)
+                return self._wcs.pixel_to_world(x, y)
+
+            def proj_plane_pixel_scales(self):
+                return self._wcs.proj_plane_pixel_scales()
 
         class FrozenTPF:
             def __init__(self, sector):
-                absolute = _real_numpy.arange(360, dtype=float) * 0.08 + {
+                # Match the absolute timeline and cadence of the frozen sector
+                # light curves above.  Real TPF times are absolute mission
+                # times, not a sector-local zero-based axis.
+                absolute = _real_numpy.arange(1501, dtype=float) * 0.02 + {
                     64: 1700.0, 65: 2400.0,
                 }[sector]
                 cube = _real_numpy.ones((len(absolute), 5, 5), dtype=float)
@@ -869,13 +895,10 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
         def frozen_tpf(**kwargs):
             return FrozenTPF(kwargs["sector"]), {
                 "sourceType": "frozen-synthetic-tpf", "author": "regression",
-                "cadenceSeconds": 6912.0,
+                "cadenceSeconds": 1728.0,
             }
 
         with mock.patch(
-            "workflows.tess.tess_residual_localization._target_coordinate",
-            return_value=types.SimpleNamespace(),
-        ), mock.patch(
             "workflows.tess.tess_residual_localization._download_tpf",
             side_effect=frozen_tpf,
         ):
@@ -925,9 +948,112 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
         self.assertEqual("RESIDUAL_MODE_SOURCE_LOCALIZATION_REVIEW",
                          localization.result["recommendedNextTest"])
         self.assertFalse(localization.result["physicalMechanismResolved"])
-        self.assertEqual("openstar.tess.finalize", request.handler_id)
+        self.assertEqual("openstar.tess.residual-mode-localization-review.prepare",
+                         request.handler_id)
         self.assertEqual(sha256_json(nonstationary),
                          localization.provenance.input_hashes["nonstationaryModeling"])
+
+        with mock.patch(
+            "workflows.tess.tess_residual_localization_review._download_tpf",
+            side_effect=frozen_tpf,
+        ):
+            current, request = engine.run_stage(
+                current, request, software_id="integration", software_version="20.30"
+            )
+        review_preparation = current.stages[-1]
+        self.assertEqual("openstar.tess.residual-mode-localization-review.prepare",
+                         review_preparation.handler_id)
+        self.assertEqual(sha256_json(localization.result),
+                         review_preparation.provenance.input_hashes["residualModeLocalization"])
+        self.assertEqual(sha256_json(nonstationary),
+                         review_preparation.provenance.input_hashes["nonstationaryModeling"])
+        self.assertAlmostEqual(physical_period,
+                               review_preparation.result["physicalPeriodDays"])
+        self.assertAlmostEqual(residual_frequency,
+                               review_preparation.result["residualFrequencyAtReference"])
+        self.assertNotAlmostEqual(1.0 / physical_period,
+                                  review_preparation.result["residualFrequencyAtReference"])
+        self.assertEqual({"TARGET_CONSISTENT", "OFF_TARGET"}, {
+            item["v20_10StaticClassification"]
+            for item in review_preparation.result["windowMetadata"]
+        })
+        self.assertTrue(all(item.get("skyJacobian")
+                            for item in review_preparation.result["windowMetadata"]))
+        self.assertTrue(all(
+            all(value is not None for value in item["skyJacobian"].values())
+            for item in review_preparation.result["windowMetadata"]
+        ))
+        windows_by_sector = {}
+        for item in review_preparation.result["windowMetadata"]:
+            windows_by_sector.setdefault(item["sector"], []).append(item)
+            coverage_start = {64: 1700.0, 65: 2400.0}[item["sector"]]
+            coverage_end = coverage_start + 30.0
+            self.assertGreaterEqual(item["windowStartDays"], coverage_start)
+            self.assertLessEqual(item["windowEndDays"], coverage_end)
+            self.assertGreaterEqual(item["windowMidpointDays"], item["windowStartDays"])
+            self.assertLessEqual(item["windowMidpointDays"], item["windowEndDays"])
+            self.assertGreaterEqual(item["sampleCount"], 600)
+            self.assertEqual(25, item["preparedPixelCount"])
+        self.assertEqual({64, 65}, set(windows_by_sector))
+        self.assertEqual({64: 3, 65: 3},
+                         {sector: len(items) for sector, items in windows_by_sector.items()})
+        for sector, expected_starts in (
+            (64, (1700.0, 1709.0, 1718.0)),
+            (65, (2400.0, 2409.0, 2418.0)),
+        ):
+            self.assertEqual(expected_starts, tuple(
+                round(item["windowStartDays"], 6)
+                for item in windows_by_sector[sector]
+            ))
+            self.assertEqual(tuple(value + 12.0 for value in expected_starts), tuple(
+                round(item["windowEndDays"], 6)
+                for item in windows_by_sector[sector]
+            ))
+        self.assertEqual(150, len(review_preparation.result["preparedPixels"]))
+        manifest = json.loads(Path(
+            review_preparation.result["projectPath"]
+        ).read_text(encoding="utf-8"))
+        self.assertEqual("openstar.lomb-scargle.v1", manifest["workloadID"])
+        self.assertEqual(150, len(manifest["datasets"]))
+        self.assertTrue(all(Path(item["datasetPath"]).is_file()
+                            for item in review_preparation.result["preparedPixels"]))
+        self.assertEqual(
+            [{"sector": 62, "role": "primary", "stage": "sector-preparation",
+              "error": "KeyError: 62"}],
+            review_preparation.result["errors"],
+        )
+
+        restarted = store.load(current.id)
+        self.assertEqual(request, plan_tess_branches(restarted, target)[0].experiment)
+        current = restarted
+        for expected_handler in (
+            "openstar.tess.residual-mode-localization-review.run",
+            "openstar.tess.residual-mode-localization-review.interpret",
+        ):
+            before = len(current.stages)
+            current, request = engine.run_stage(
+                current, request, software_id="integration", software_version="20.30"
+            )
+            self.assertEqual(expected_handler, current.stages[-1].handler_id)
+            self.assertEqual(before + 1, len(current.stages))
+            restarted = store.load(current.id)
+            self.assertEqual(request, plan_tess_branches(restarted, target)[0].experiment)
+            self.assertEqual(len(current.stages), len(restarted.stages))
+            current = restarted
+
+        review = current.stages[-1].result
+        self.assertEqual("RESIDUAL_MODE_SOURCE_SWITCHING_OR_BLEND",
+                         review["crossTime"]["classification"])
+        self.assertEqual("TIME_VARIABLE_OR_BLENDED",
+                         review["crossTime"]["residualModeOrigin"])
+        self.assertEqual("MULTI_SOURCE_RESIDUAL_DECOMPOSITION",
+                         review["recommendedNextTest"])
+        self.assertFalse(review["physicalMechanismResolved"])
+        self.assertEqual("openstar.tess.finalize", request.handler_id)
+        self.assertTrue(any(item["skySeparationArcsec"] > 0
+                            for item in review["windowResults"]))
+        self.assertTrue(any(item["offsetPixels"] > 0
+                            for item in review["windowResults"]))
 
     def test_other_nonstationary_recommendations_do_not_enter_localization(self):
         localization = nonstationary_continuation(
@@ -947,6 +1073,27 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
                     {"recommendedNextTest": recommendation,
                      "physicalMechanismResolved": resolved},
                     request_id="017-summarize-nonstationary",
+                )
+                self.assertEqual("openstar.tess.finalize", request.handler_id)
+
+    def test_only_unresolved_source_review_recommendation_enters_review(self):
+        review = residual_mode_localization_continuation(
+            {"recommendedNextTest": "RESIDUAL_MODE_SOURCE_LOCALIZATION_REVIEW",
+             "physicalMechanismResolved": False},
+            request_id="020-interpret-residual-mode-localization",
+        )
+        self.assertEqual("openstar.tess.residual-mode-localization-review.prepare",
+                         review.handler_id)
+        for recommendation, resolved in (
+            ("MULTI_SOURCE_RESIDUAL_DECOMPOSITION", False),
+            ("RESIDUAL_MODE_PIXEL_LOCALIZATION", False),
+            ("RESIDUAL_MODE_SOURCE_LOCALIZATION_REVIEW", True),
+        ):
+            with self.subTest(recommendation=recommendation, resolved=resolved):
+                request = residual_mode_localization_continuation(
+                    {"recommendedNextTest": recommendation,
+                     "physicalMechanismResolved": resolved},
+                    request_id="020-interpret-residual-mode-localization",
                 )
                 self.assertEqual("openstar.tess.finalize", request.handler_id)
 
