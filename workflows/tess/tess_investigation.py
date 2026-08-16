@@ -1320,6 +1320,11 @@ def build_engine(
             primary,
             identity,
             observation_baseline_days=prepared.get("observationBaselineDays"),
+            primary_minimum_frequency=(
+                (_load_json(Path(prepared["datasetPath"])).get("frequencySearch") or {}).get(
+                    "minimumFrequency"
+                )
+            ),
         )
         print("🧠 Deterministic TESS hypotheses evaluated")
         print(f"   reliable primary: {analysis.get('primaryReliable')}")
@@ -1391,6 +1396,19 @@ def build_engine(
             trigger_reason=planner.get("reason"),
             primary_period_days=analysis.get("observedPeriodDays"),
         )
+        if not follow.get("executable", True):
+            print("🔬 Same-sector low-frequency follow-up is not executable")
+            print(f"   reason: {follow.get('reason')}")
+            return StageOutcome(
+                result=follow,
+                next_stage=StageRequest(
+                    id=_next_stage_id(request.id, "prepare-independent-sectors"),
+                    handler_id="openstar.tess.independent.prepare",
+                    parameters={},
+                    triggered_by_stage_id=request.id,
+                ),
+                input_hashes={"sourceDataset": sha256_file(prepared["datasetPath"])},
+            )
         dataset_path = Path(follow["datasetPath"])
         manifest_path = Path(follow["projectPath"])
         print("🔬 Decisive same-sector frequency follow-up prepared")
