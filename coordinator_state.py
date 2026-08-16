@@ -6,6 +6,8 @@ import uuid
 from collections import deque
 from pathlib import Path
 
+from frequency_uncertainty import estimate_frequency_interval
+
 
 LEASE_SECONDS = 120.0
 RETRY_COOLDOWN_SECONDS = 1.0
@@ -2222,6 +2224,47 @@ class CoordinatorState:
 
         return selected
 
+    def _distributed_chunk_mode_coverage_locked(self, dataset_id):
+        """Return every raw chunk winner before display candidate reduction."""
+        chunks = []
+        work_ids = self.work_ids_by_dataset.get(dataset_id, [])
+        for work_id in work_ids:
+            work_unit = self.work_units[work_id]
+            result = self.completed.get(work_id)
+            if result is None or result.get("bestFrequency") is None:
+                continue
+            start = float(work_unit["startFrequency"])
+            step = float(work_unit["frequencyStep"])
+            count = int(work_unit["frequencyCount"])
+            chunks.append({
+                "frequency": float(result["bestFrequency"]),
+                "power": float(result["bestPower"]),
+                "startFrequency": start,
+                "endFrequency": start + max(count - 1, 0) * step,
+                "workID": work_id,
+            })
+        dataset = self.datasets[dataset_id]
+        has_measurement_uncertainties = any(
+            dataset.get(key) is not None
+            for key in (
+                "measurementUncertainties",
+                "fluxUncertainties",
+                "valueUncertainties",
+            )
+        )
+        return {
+            "chunks": chunks,
+            "complete": len(chunks) == len(work_ids),
+            # Existing Lomb-Scargle workers do not declare that their chunk
+            # winner used absolute heteroscedastic uncertainties. Refuse the
+            # global-mode guarantee in that case rather than assuming it.
+            "objectiveMatches": not has_measurement_uncertainties,
+            "selectedPower": max(
+                (chunk["power"] for chunk in chunks),
+                default=None,
+            ),
+        }
+
     def _dataset_result_diagnostics_locked(self, dataset_id):
         pending, assigned, completed, total = self._dataset_counts_locked(
             dataset_id
@@ -2335,6 +2378,19 @@ class CoordinatorState:
             ),
             "independentPeakProminenceRatio": prominence_ratio,
         }
+
+        frequency_interval, frequency_interval_diagnostics = (
+            estimate_frequency_interval(
+                dataset,
+                best_frequency,
+                (),
+                self._distributed_chunk_mode_coverage_locked(dataset_id),
+            )
+        )
+        candidate["frequencyConfidenceInterval"] = frequency_interval
+        candidate["frequencyUncertaintyDiagnostics"] = (
+            frequency_interval_diagnostics
+        )
 
         harmonic_candidates = []
 
@@ -2628,6 +2684,16 @@ class CoordinatorState:
                     candidate.get(
                         "independentPeakProminenceRatio"
                     )
+                    if candidate
+                    else None
+                ),
+                "candidateFrequencyConfidenceInterval": (
+                    candidate.get("frequencyConfidenceInterval")
+                    if candidate
+                    else None
+                ),
+                "candidateFrequencyUncertaintyDiagnostics": (
+                    candidate.get("frequencyUncertaintyDiagnostics")
                     if candidate
                     else None
                 ),

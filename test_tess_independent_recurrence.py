@@ -51,6 +51,22 @@ class IndependentRecurrenceTests(unittest.TestCase):
         self.assertEqual(1, result["resolutionLimitedSectorCount"])
         self.assertEqual("HUMAN_REVIEW_REQUIRED", result["claimDecision"]["claim"])
 
+    def test_blind_a_narrow_local_interval_does_not_hide_resolution_limit(self):
+        recovered_period = 9.97870593974828
+        recovered_frequency = 1.0 / recovered_period
+        result = interpretation(
+            recovered_period,
+            confidence_interval={
+                "lower": recovered_frequency - 0.0001,
+                "upper": recovered_frequency + 0.0001,
+                "method": "sinusoid-profile-likelihood",
+                "confidenceLevel": 0.95,
+            },
+        )
+        sector = result["sectorResults"][0]
+        self.assertEqual("RESOLUTION_LIMITED", sector["recurrenceClassification"])
+        self.assertFalse(sector["supportsTarget"])
+
     def test_well_resolved_close_recurrence_passes(self):
         target_frequency = 1.0 / PRIMARY
         result = interpretation(
