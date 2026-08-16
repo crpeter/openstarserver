@@ -23,6 +23,7 @@ except ModuleNotFoundError:
     HAS_NUMPY = False
 
 from workflows.tess.tess_offset_variability import (
+    MIN_COMPONENT_SAMPLES,
     _catalog_candidate,
     build_offset_source_variability_project,
     interpret_offset_source_variability_project,
@@ -169,17 +170,19 @@ class CatalogCounterpartTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            sample_count = MIN_COMPONENT_SAMPLES + 8
             source_project = root / "source.json"
             source_project.write_text(json.dumps({
                 "id": "blind", "name": "Blind", "workloadID": "openstar.lomb-scargle.v1"
             }), encoding="utf-8")
             fake_tpf = types.SimpleNamespace(
-                time=types.SimpleNamespace(value=np.arange(8, dtype=float)),
-                flux=types.SimpleNamespace(value=np.ones((8, 2, 2), dtype=float)),
+                time=types.SimpleNamespace(value=np.arange(sample_count, dtype=float)),
+                flux=types.SimpleNamespace(
+                    value=np.ones((sample_count, 2, 2), dtype=float)),
             )
             series = {
-                "target-control": np.linspace(-1, 1, 8),
-                "catalog-counterpart": np.linspace(1, -1, 8),
+                "target-control": np.linspace(-1, 1, sample_count),
+                "catalog-counterpart": np.linspace(1, -1, sample_count),
             }
             with mock.patch.multiple(
                 "workflows.tess.tess_offset_variability",
@@ -192,9 +195,9 @@ class CatalogCounterpartTest(unittest.TestCase):
                     fake_tpf, {"sourceType": "TPF", "author": "SPOC", "cadenceSeconds": 120}
                 )
                 patched["_background_subtract_cube"].return_value = (
-                    np.ones((8, 2, 2)), {})
+                    np.ones((sample_count, 2, 2)), {})
                 patched["_prewhiten_cube_raw"].return_value = (
-                    np.ones((8, 2, 2)), np.ones((2, 2), dtype=bool))
+                    np.ones((sample_count, 2, 2)), np.ones((2, 2), dtype=bool))
                 patched["_catalog_guided_series"].return_value = (series, {})
                 spec = build_offset_source_variability_project(
                     source_project_path=source_project,
@@ -226,6 +229,19 @@ class CatalogCounterpartTest(unittest.TestCase):
             self.assertEqual(100.01, spec["catalogCounterpart"]["raDeg"])
             roles = {item["componentID"] for item in spec["preparedSeries"]}
             self.assertEqual({"target-control", "catalog-counterpart"}, roles)
+            per_sector = [item for item in spec["preparedSeries"] if not item["combined"]]
+            self.assertEqual({1, 2}, {item["sector"] for item in per_sector})
+            self.assertEqual(
+                {(component, sector)
+                 for component in ("target-control", "catalog-counterpart")
+                 for sector in (1, 2)},
+                {(item["componentID"], item["sector"]) for item in per_sector},
+            )
+            combined = [item for item in spec["preparedSeries"] if item["combined"]]
+            self.assertEqual(
+                {"target-control", "catalog-counterpart"},
+                {item["componentID"] for item in combined},
+            )
 
     def test_new_contract_interpretation_persists_component_evidence(self):
         prepared_series = []
