@@ -318,6 +318,7 @@ class CatalogCounterpartTest(unittest.TestCase):
             self.assertEqual(1, len(branches))
             self.assertEqual("openstar.tess.catalog-counterpart-identification.analyze",
                              branches[0].experiment.handler_id)
+            self.assertEqual("036-catalog-counterpart", branches[0].experiment.id)
             self.assertEqual(prf.id, branches[0].experiment.triggered_by_stage_id)
 
             catalog = InvestigationStage(
@@ -352,6 +353,8 @@ class CatalogCounterpartTest(unittest.TestCase):
             self.assertEqual(1, len(branches))
             self.assertEqual("openstar.tess.offset-source-variability.prepare",
                              branches[0].experiment.handler_id)
+            self.assertEqual("038-prepare-offset-source-variability",
+                             branches[0].experiment.id)
             self.assertEqual(catalog.id, branches[0].experiment.triggered_by_stage_id)
 
             completed = InvestigationStage(
