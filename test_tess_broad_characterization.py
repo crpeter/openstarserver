@@ -34,6 +34,7 @@ from workflows.tess.tess_investigation import build_engine
 from workflows.tess.tess_investigation import time_frequency_continuation
 from workflows.tess.tess_investigation import nonstationary_continuation
 from workflows.tess.tess_investigation import residual_mode_localization_continuation
+from workflows.tess.tess_investigation import residual_mode_localization_review_continuation
 from workflows.tess.tess_time_frequency import _fit_family_python
 
 
@@ -722,7 +723,8 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
                 for entry in manifest["datasets"]:
                     dataset = json.loads(Path(entry["path"]).read_text(encoding="utf-8"))
                     q = float(dataset["science"]["fractionalFrequencyDriftPerDay"])
-                    if dataset["science"].get("role") in (
+                    role = dataset["science"].get("role")
+                    if role in (
                         "residual-mode-pixel-localization",
                         "residual-mode-time-resolved-pixel-localization",
                     ):
@@ -731,11 +733,32 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
                         column = int(dataset["science"]["pixelColumn"])
                         source_pixel = (1, 1) if sector == 64 else (3, 3)
                         power = 1.0 if (row, column) == source_pixel else 0.01
+                    elif role in (
+                        "multi-source-residual-component",
+                        "multi-source-residual-component-combined",
+                    ):
+                        # Exercise the component comparison with evidence from
+                        # the extracted light curve, rather than prescribing a
+                        # component's worker result or science classification.
+                        times = _real_numpy.asarray(dataset["times"], dtype=float)
+                        values = _real_numpy.asarray(dataset["flux"], dtype=float)
+                        design = _real_numpy.column_stack((
+                            _real_numpy.ones(len(times)),
+                            _real_numpy.sin(2.0 * math.pi * residual_frequency * times),
+                            _real_numpy.cos(2.0 * math.pi * residual_frequency * times),
+                        ))
+                        fitted = design @ (_real_numpy.linalg.pinv(design) @ values)
+                        total = float(_real_numpy.sum((values - _real_numpy.mean(values)) ** 2))
+                        power = max(0.0, min(1.0, 1.0 - float(
+                            _real_numpy.sum((values - fitted) ** 2)
+                        ) / total)) if total > 0 else 0.0
                     else:
                         power = 1.0 - abs(q - injected_drift) * 1000.0
                     datasets.append({
-                        "datasetID": entry["id"], "periodStatus": "RELIABLE",
-                        "periodConfidence": "high", "candidateFrequency": residual_frequency,
+                        "datasetID": entry["id"],
+                        "periodStatus": "RELIABLE" if power >= 0.08 else "LOW_CONFIDENCE",
+                        "periodConfidence": "high" if power >= 0.08 else "low",
+                        "candidateFrequency": residual_frequency,
                         "candidatePeriodDays": 1.0 / residual_frequency,
                         "candidatePower": power,
                         "candidatePeakProminenceRatio": 3.0,
@@ -1049,11 +1072,79 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
         self.assertEqual("MULTI_SOURCE_RESIDUAL_DECOMPOSITION",
                          review["recommendedNextTest"])
         self.assertFalse(review["physicalMechanismResolved"])
-        self.assertEqual("openstar.tess.finalize", request.handler_id)
+        self.assertEqual("openstar.tess.multi-source-residual.prepare", request.handler_id)
         self.assertTrue(any(item["skySeparationArcsec"] > 0
                             for item in review["windowResults"]))
         self.assertTrue(any(item["offsetPixels"] > 0
                             for item in review["windowResults"]))
+
+        with mock.patch(
+            "workflows.tess.tess_multisource_residual._download_tpf",
+            side_effect=frozen_tpf,
+        ):
+            current, request = engine.run_stage(
+                current, request, software_id="integration", software_version="20.30"
+            )
+        decomposition_preparation = current.stages[-1]
+        self.assertEqual("openstar.tess.multi-source-residual.prepare",
+                         decomposition_preparation.handler_id)
+        self.assertEqual(sha256_json(review),
+                         decomposition_preparation.provenance.input_hashes["localizationReview"])
+        components = decomposition_preparation.result["spatialComponents"]
+        self.assertEqual(["target", "offset-1"],
+                         [item["componentID"] for item in components])
+        self.assertEqual([0.0, 0.0],
+                         [components[0]["eastArcsec"], components[0]["northArcsec"]])
+        self.assertGreater(math.hypot(components[1]["eastArcsec"],
+                                     components[1]["northArcsec"]), 0.0)
+        self.assertEqual("openstar.lomb-scargle.v1",
+                         decomposition_preparation.result["workloadID"])
+        self.assertEqual(6, len(decomposition_preparation.result["preparedSeries"]))
+        self.assertTrue(all(Path(item["datasetPath"]).is_file()
+                            for item in decomposition_preparation.result["preparedSeries"]))
+        for item in decomposition_preparation.result["preparedSeries"]:
+            dataset = json.loads(Path(item["datasetPath"]).read_text(encoding="utf-8"))
+            self.assertIn(dataset["science"]["componentID"], {"target", "offset-1"})
+            self.assertNotAlmostEqual(1.0 / physical_period, residual_frequency)
+
+        restarted = store.load(current.id)
+        self.assertEqual(request, plan_tess_branches(restarted, target)[0].experiment)
+        current = restarted
+        for expected_handler in (
+            "openstar.tess.multi-source-residual.run",
+            "openstar.tess.multi-source-residual.interpret",
+        ):
+            before = len(current.stages)
+            current, request = engine.run_stage(
+                current, request, software_id="integration", software_version="20.30"
+            )
+            self.assertEqual(expected_handler, current.stages[-1].handler_id)
+            self.assertEqual(before + 1, len(current.stages))
+            restarted = store.load(current.id)
+            self.assertEqual(request, plan_tess_branches(restarted, target)[0].experiment)
+            self.assertEqual(len(current.stages), len(restarted.stages))
+            current = restarted
+
+        decomposition = current.stages[-1]
+        self.assertEqual("MULTI_SOURCE_DECOMPOSITION_UNRESOLVED",
+                         decomposition.result["classification"])
+        self.assertEqual("UNRESOLVED",
+                         decomposition.result["residualModeOrigin"])
+        self.assertFalse(decomposition.result["physicalMechanismResolved"])
+        self.assertEqual("PIXEL_RESPONSE_FUNCTION_DEBLENDING",
+                         decomposition.result["recommendedNextTest"])
+        self.assertEqual("openstar.tess.finalize", request.handler_id)
+        self.assertEqual(sha256_json(decomposition_preparation.result),
+                         decomposition.provenance.input_hashes["preparation"])
+        summaries = {item["componentID"]: item
+                     for item in decomposition.result["componentSummaries"]}
+        self.assertEqual({"target", "offset-1"}, set(summaries))
+        self.assertEqual([64], summaries["target"]["allSupportingSectors"])
+        self.assertEqual([65], summaries["offset-1"]["allSupportingSectors"])
+        self.assertEqual(1, summaries["target"]["independentSupportCount"])
+        self.assertEqual(1, summaries["offset-1"]["independentSupportCount"])
+        self.assertGreater(summaries["target"]["combinedPower"], 0.08)
+        self.assertGreater(summaries["offset-1"]["combinedPower"], 0.08)
 
     def test_other_nonstationary_recommendations_do_not_enter_localization(self):
         localization = nonstationary_continuation(
@@ -1094,6 +1185,26 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
                     {"recommendedNextTest": recommendation,
                      "physicalMechanismResolved": resolved},
                     request_id="020-interpret-residual-mode-localization",
+                )
+                self.assertEqual("openstar.tess.finalize", request.handler_id)
+
+    def test_only_unresolved_multisource_recommendation_enters_decomposition(self):
+        request = residual_mode_localization_review_continuation(
+            {"recommendedNextTest": "MULTI_SOURCE_RESIDUAL_DECOMPOSITION",
+             "physicalMechanismResolved": False},
+            request_id="023-interpret-residual-mode-localization-review",
+        )
+        self.assertEqual("openstar.tess.multi-source-residual.prepare", request.handler_id)
+        for recommendation, resolved in (
+            ("NEIGHBOR_SOURCE_IDENTIFICATION_AND_CATALOG_CROSSMATCH", False),
+            ("RESIDUAL_MODE_SOURCE_LOCALIZATION_REVIEW", False),
+            ("MULTI_SOURCE_RESIDUAL_DECOMPOSITION", True),
+        ):
+            with self.subTest(recommendation=recommendation, resolved=resolved):
+                request = residual_mode_localization_review_continuation(
+                    {"recommendedNextTest": recommendation,
+                     "physicalMechanismResolved": resolved},
+                    request_id="023-interpret-residual-mode-localization-review",
                 )
                 self.assertEqual("openstar.tess.finalize", request.handler_id)
 

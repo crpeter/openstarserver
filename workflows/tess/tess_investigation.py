@@ -312,6 +312,30 @@ def residual_mode_localization_continuation(
     )
 
 
+def residual_mode_localization_review_continuation(
+    summary: dict[str, Any], *, request_id: str
+) -> StageRequest:
+    """Route only a persisted, unresolved multi-source decomposition request."""
+
+    run_decomposition = (
+        summary.get("recommendedNextTest") == "MULTI_SOURCE_RESIDUAL_DECOMPOSITION"
+        and summary.get("physicalMechanismResolved") is False
+    )
+    return StageRequest(
+        id=_next_stage_id(
+            request_id,
+            "prepare-multi-source-residual" if run_decomposition else "finalize",
+        ),
+        handler_id=(
+            "openstar.tess.multi-source-residual.prepare"
+            if run_decomposition
+            else "openstar.tess.finalize"
+        ),
+        parameters={} if run_decomposition else {"outputSuffix": "v20.11"},
+        triggered_by_stage_id=request_id,
+    )
+
+
 def _build_period_evidence(
     *,
     claim_decision: dict[str, Any],
@@ -3151,11 +3175,8 @@ def build_engine(
         _write_json(artifact_path, review)
         return StageOutcome(
             result=review,
-            next_stage=StageRequest(
-                id=_next_stage_id(request.id, "finalize"),
-                handler_id="openstar.tess.finalize",
-                parameters={"outputSuffix": "v20.11"},
-                triggered_by_stage_id=request.id,
+            next_stage=residual_mode_localization_review_continuation(
+                review, request_id=request.id
             ),
             input_hashes={
                 "preparation": sha256_json(preparation),
