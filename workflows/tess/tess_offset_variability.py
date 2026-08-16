@@ -81,20 +81,30 @@ def _best_offset_summary(multisource_summary: dict[str, Any]) -> dict[str, Any]:
     return summary
 
 
-def _catalog_candidate(offset_source_identification: dict[str, Any]) -> dict[str, Any]:
-    if offset_source_identification.get("classification") not in {
+def _catalog_candidate(catalog_identification: dict[str, Any]) -> dict[str, Any]:
+    historical_contract = catalog_identification.get("classification") in {
         "CATALOG_COUNTERPART_IDENTIFIED",
         "KNOWN_VARIABLE_CATALOG_COUNTERPART_IDENTIFIED",
-    }:
-        raise RuntimeError("v20.14 requires v20.13 to identify a unique catalog counterpart.")
-    candidate = offset_source_identification.get("bestCandidate") or {}
+    }
+    authoritative_contract = (
+        catalog_identification.get("recommendedNextTest")
+        == "INDEPENDENT_COUNTERPART_PHOTOMETRIC_VARIABILITY_VALIDATION"
+        and catalog_identification.get("physicalMechanismResolved") is False
+    )
+    if not historical_contract and not authoritative_contract:
+        raise RuntimeError("v20.14 requires a justified preferred catalog counterpart.")
+    candidate = (
+        catalog_identification.get("preferredCandidate")
+        if authoritative_contract
+        else catalog_identification.get("bestCandidate")
+    ) or {}
     ra = _float(candidate.get("raDeg"))
     dec = _float(candidate.get("decDeg"))
     ids = candidate.get("catalogIDs") or {}
     if ra is None or dec is None:
-        raise RuntimeError("v20.14 requires RA/Dec for the v20.13 best catalog counterpart.")
+        raise RuntimeError("v20.14 requires RA/Dec for the preferred catalog counterpart.")
     if _int(ids.get("ticID")) is None and _int(ids.get("gaiaDR3SourceID")) is None:
-        raise RuntimeError("v20.14 requires a TIC or Gaia identifier for the v20.13 counterpart.")
+        raise RuntimeError("v20.14 requires a TIC or Gaia identifier for the preferred counterpart.")
     return candidate
 
 
@@ -259,6 +269,7 @@ def build_offset_source_variability_project(
     if offset_source_identification.get("recommendedNextTest") not in {
         "OFFSET_SOURCE_VARIABILITY_VALIDATION",
         "OFFSET_SOURCE_VARIABILITY_MATCH_TEST",
+        "INDEPENDENT_COUNTERPART_PHOTOMETRIC_VARIABILITY_VALIDATION",
     }:
         raise RuntimeError("v20.14 requires v20.13 to recommend offset-source variability validation.")
 
@@ -545,6 +556,10 @@ def build_offset_source_variability_project(
             "decDeg": candidate_dec,
             "catalogSeparationArcsec": _float(candidate.get("separationArcsec")),
         },
+        "catalogCounterpartIdentification": {
+            "classification": offset_source_identification.get("classification"),
+            "motivatingComponentID": candidate.get("motivatingComponentID"),
+        },
         "bestOffsetComponentID": multisource_summary.get("bestOffsetComponentID"),
         "referenceFrequency": float(reference_frequency),
         "referencePeriodDays": float(1.0 / reference_frequency),
@@ -674,6 +689,14 @@ def interpret_offset_source_variability_project(
 
     target = _component_summary("target-control", results)
     counterpart = _component_summary("catalog-counterpart", results)
+    target_sector_results = [
+        item for item in results
+        if item.get("componentID") == "target-control" and not item.get("combined")
+    ]
+    counterpart_sector_results = [
+        item for item in results
+        if item.get("componentID") == "catalog-counterpart" and not item.get("combined")
+    ]
     target_support = int(target.get("independentSupportCount") or 0)
     candidate_support = int(counterpart.get("independentSupportCount") or 0)
     target_power = float(target.get("combinedPower") or 0.0)
@@ -700,15 +723,15 @@ def interpret_offset_source_variability_project(
     elif target_present and not candidate_present:
         classification = "OFFSET_COUNTERPART_VARIABILITY_NOT_SUPPORTED"
         origin = "TARGET_CONTROL_DOMINANT"
-        next_test = "CALIBRATED_PRF_SOURCE_DEBLENDING"
+        next_test = "INDEPENDENT_SOURCE_RESOLVED_COUNTERPART_PHOTOMETRY"
     elif candidate_support >= 2:
         classification = "OFFSET_COUNTERPART_VARIABILITY_SUGGESTIVE"
         origin = "CATALOG_COUNTERPART_SUGGESTIVE"
-        next_test = "CALIBRATED_PRF_SOURCE_DEBLENDING"
+        next_test = "INDEPENDENT_SOURCE_RESOLVED_COUNTERPART_PHOTOMETRY"
     else:
         classification = "OFFSET_COUNTERPART_VARIABILITY_UNRESOLVED"
         origin = "UNRESOLVED"
-        next_test = "CALIBRATED_PRF_SOURCE_DEBLENDING"
+        next_test = "INDEPENDENT_SOURCE_RESOLVED_COUNTERPART_PHOTOMETRY"
 
     return {
         "version": "openstar.tess-offset-source-variability-validation.v1",
@@ -724,16 +747,26 @@ def interpret_offset_source_variability_project(
         "referencePeriodDays": preparation.get("referencePeriodDays"),
         "fractionalFrequencyDriftPerDay": preparation.get("fractionalFrequencyDriftPerDay"),
         "componentResults": results,
+        "counterpartPerSectorResults": counterpart_sector_results,
+        "targetControlPerSectorResults": target_sector_results,
         "targetControl": target,
         "catalogCounterpartEvidence": counterpart,
         "classification": classification,
         "residualModeOrigin": origin,
         "offsetCounterpartVariabilitySupported": classification == "OFFSET_COUNTERPART_VARIABILITY_SUPPORTED",
+        "variabilityConfirmed": candidate_dominant,
         "physicalMechanismResolved": False,
         "claimLevelChanged": False,
         "recommendedNextTest": next_test,
         "preparationErrors": preparation.get("errors") or [],
         "decompositionDiagnostics": preparation.get("decompositionDiagnostics") or [],
+        "provenance": {
+            "instrument": "TESS",
+            "method": "catalog-guided Gaussian-template spatial decomposition",
+            "independentTelescopeEvidence": False,
+            "establishedFamilyPrewhitened": True,
+            "nonstationaryDriftCorrected": True,
+        },
         "interpretationGuard": (
             "v20.14 validates only whether the v20.13 catalog counterpart carries residual variability matching "
             "the v20.12 offset component after established-family subtraction and v20.9 drift correction. "

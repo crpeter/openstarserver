@@ -379,6 +379,38 @@ def prf_catalog_counterpart_continuation(
     )
 
 
+def catalog_counterpart_variability_continuation(
+    summary: dict[str, Any], *, request_id: str
+) -> StageRequest:
+    """Enter catalog-guided variability validation only for a justified candidate."""
+    candidate = summary.get("preferredCandidate") or {}
+    ids = candidate.get("catalogIDs") or {}
+    justified = (
+        candidate.get("raDeg") is not None
+        and candidate.get("decDeg") is not None
+        and (ids.get("ticID") is not None or ids.get("gaiaDR3SourceID") is not None)
+    )
+    run_validation = (
+        summary.get("recommendedNextTest")
+        == "INDEPENDENT_COUNTERPART_PHOTOMETRIC_VARIABILITY_VALIDATION"
+        and summary.get("physicalMechanismResolved") is False
+        and justified
+    )
+    return StageRequest(
+        id=_next_stage_id(
+            request_id,
+            "prepare-offset-source-variability" if run_validation else "finalize",
+        ),
+        handler_id=(
+            "openstar.tess.offset-source-variability.prepare"
+            if run_validation
+            else "openstar.tess.finalize"
+        ),
+        parameters={} if run_validation else {"outputSuffix": "catalog-counterpart"},
+        triggered_by_stage_id=request_id,
+    )
+
+
 def _build_period_evidence(
     *,
     claim_decision: dict[str, Any],
@@ -902,6 +934,7 @@ def _render_report(conclusion: dict[str, Any]) -> str:
             f"- Counterpart combined period: {candidate_evidence.get('combinedPeriodDays')} days",
             f"- Target-control independent support: {target_control.get('independentSupportCount')}",
             f"- Target-control combined power: {target_control.get('combinedPower')}",
+            f"- Variability confirmed: {offset_variability.get('variabilityConfirmed')}",
             f"- Physical mechanism resolved: {offset_variability.get('physicalMechanismResolved')}",
             f"- Recommended next test: {offset_variability.get('recommendedNextTest')}",
             "- Guard: this is catalog-guided Gaussian deblending, not a calibrated TESS PRF solution.",
@@ -1074,6 +1107,24 @@ def _render_report(conclusion: dict[str, Any]) -> str:
         lines.append(
             "- Guard: official SPOC PRF source attribution still requires recurring independent-sector residual-frequency evidence; an unresolved result is retained as a TESS spatial-attribution limit."
         )
+
+    catalog_counterpart = conclusion.get("catalogCounterpartIdentification")
+    if catalog_counterpart is not None:
+        preferred = catalog_counterpart.get("preferredCandidate") or {}
+        catalog_ids = preferred.get("catalogIDs") or {}
+        ranking = preferred.get("rankingEvidence") or {}
+        lines.extend([
+            "",
+            "## Catalog counterpart identification",
+            "",
+            f"- Catalog counterpart classification: {catalog_counterpart.get('classification')}",
+            f"- Counterpart TIC: {catalog_ids.get('ticID')}",
+            f"- Counterpart Gaia DR3: {catalog_ids.get('gaiaDR3SourceID')}",
+            f"- Residual-position separation: {ranking.get('residualPositionSeparationArcsec')} arcsec",
+            f"- Target-to-counterpart separation: {ranking.get('targetSeparationArcsec')} arcsec",
+            f"- Variability confirmed: {catalog_counterpart.get('variabilityConfirmed')}",
+            f"- Recommended next test: {catalog_counterpart.get('recommendedNextTest')}",
+        ])
 
     external_high_resolution = conclusion.get("externalHighResolutionVariabilityValidation")
     if external_high_resolution is not None:
@@ -3457,9 +3508,9 @@ def build_engine(
         unavailable = summary["classification"] == "EXTERNAL_CATALOG_DATA_UNAVAILABLE"
         return StageOutcome(
             result=summary,
-            next_stage=(None if unavailable else StageRequest(
-                _next_stage_id(request.id, "finalize"), "openstar.tess.finalize",
-                {"outputSuffix": "catalog-counterpart"}, request.id)),
+            next_stage=(None if unavailable else
+                        catalog_counterpart_variability_continuation(
+                            summary, request_id=request.id)),
             stop=unavailable,
             final_status=("QUIESCENT_AWAITING_DATA" if unavailable else "COMPLETE"),
             input_hashes={"prfPreparation": sha256_json(prf_preparation),
@@ -3539,22 +3590,26 @@ def build_engine(
         nonstationary = _latest_result_for_handler(investigation, "openstar.tess.nonstationary.summarize")
         independent_prepare = _latest_result_for_handler(investigation, "openstar.tess.independent.prepare")
         multisource = _latest_result_for_handler(investigation, "openstar.tess.multi-source-residual.interpret")
-        offset_source = _latest_result_for_handler(
-            investigation, "openstar.tess.offset-source-identification.analyze"
+        catalog_counterpart = _latest_result_for_handler(
+            investigation, "openstar.tess.catalog-counterpart-identification.analyze"
         )
+        offset_source = catalog_counterpart or _latest_result_for_handler(
+            investigation, "openstar.tess.offset-source-identification.analyze")
         if prepared is None or identity is None or independent_prepare is None:
             raise RuntimeError("v20.14 requires frozen target, identity, and independent-sector preparation.")
         if morphology is None or not morphology.get("physicalCycleResolved"):
             raise RuntimeError("v20.14 requires the morphology-resolved physical period.")
         if nonstationary is None or multisource is None or offset_source is None:
-            raise RuntimeError("v20.14 requires completed v20.9, v20.12, and v20.13 results.")
+            raise RuntimeError("v20.14 requires completed drift, decomposition, and catalog results.")
         if offset_source.get("recommendedNextTest") not in {
             "OFFSET_SOURCE_VARIABILITY_VALIDATION",
             "OFFSET_SOURCE_VARIABILITY_MATCH_TEST",
+            "INDEPENDENT_COUNTERPART_PHOTOMETRIC_VARIABILITY_VALIDATION",
         }:
             raise RuntimeError("v20.13 did not recommend direct offset-source variability validation.")
 
-        candidate = offset_source.get("bestCandidate") or {}
+        candidate = (offset_source.get("preferredCandidate")
+                     or offset_source.get("bestCandidate") or {})
         ids = candidate.get("catalogIDs") or {}
         artifact_root = store.directory_for(investigation.id) / "artifacts"
         print("🧪 Preparing direct variability validation of the catalog-matched offset source")
@@ -6017,6 +6072,10 @@ def build_engine(
             investigation,
             "openstar.tess.official-spoc-prf-forward-modeling.interpret",
         )
+        catalog_counterpart_identification = _latest_result_for_handler(
+            investigation,
+            "openstar.tess.catalog-counterpart-identification.analyze",
+        )
         external_high_resolution_validation = _latest_result_for_handler(
             investigation,
             "openstar.tess.external-high-resolution-variability-validation.interpret",
@@ -6932,7 +6991,12 @@ def build_engine(
                 "OFF_TARGET_VARIABLE_SOURCE_SUPPORTED",
             }
 
-        if targeted_observation_plan is not None:
+        if (catalog_counterpart_identification is not None
+                and offset_source_variability is not None):
+            # This validation is appended after historical finalization, so
+            # its recommendation supersedes stale pre-catalog conclusions.
+            recommended_next_test = offset_source_variability.get("recommendedNextTest")
+        elif targeted_observation_plan is not None:
             recommended_next_test = targeted_observation_plan.get("recommendedNextTest")
         elif atlas_fixed_window is not None:
             recommended_next_test = atlas_fixed_window.get("recommendedNextTest")
@@ -6952,6 +7016,10 @@ def build_engine(
             recommended_next_test = skymapper_resolved_photometry.get("recommendedNextTest")
         elif external_high_resolution_validation is not None:
             recommended_next_test = external_high_resolution_validation.get("recommendedNextTest")
+        elif offset_source_variability is not None:
+            recommended_next_test = offset_source_variability.get("recommendedNextTest")
+        elif catalog_counterpart_identification is not None:
+            recommended_next_test = catalog_counterpart_identification.get("recommendedNextTest")
         elif official_spoc_prf_forward_modeling is not None:
             recommended_next_test = official_spoc_prf_forward_modeling.get("recommendedNextTest")
         elif frequency_localized_pixel_response is not None:
@@ -6960,8 +7028,6 @@ def build_engine(
             recommended_next_test = difference_image_localization.get("recommendedNextTest")
         elif calibrated_prf_deblending is not None:
             recommended_next_test = calibrated_prf_deblending.get("recommendedNextTest")
-        elif offset_source_variability is not None:
-            recommended_next_test = offset_source_variability.get("recommendedNextTest")
         elif offset_source_identification is not None:
             recommended_next_test = offset_source_identification.get("recommendedNextTest")
         elif multisource_residual is not None:
@@ -7022,6 +7088,7 @@ def build_engine(
             "differenceImageSourceLocalization": difference_image_localization,
             "frequencyLocalizedPixelResponse": frequency_localized_pixel_response,
             "officialSpocPrfForwardModeling": official_spoc_prf_forward_modeling,
+            "catalogCounterpartIdentification": catalog_counterpart_identification,
             "externalHighResolutionVariabilityValidation": external_high_resolution_validation,
             "skyMapperResolvedPhotometryScreen": skymapper_resolved_photometry,
             "nscResolvedPhotometryScreen": nsc_resolved_photometry,
@@ -7078,6 +7145,32 @@ def build_engine(
             print(
                 "   physical mechanism resolved: "
                 f"{physical_interpretation.get('physicalMechanismResolved')}"
+            )
+        if catalog_counterpart_identification is not None:
+            preferred = catalog_counterpart_identification.get("preferredCandidate") or {}
+            catalog_ids = preferred.get("catalogIDs") or {}
+            ranking = preferred.get("rankingEvidence") or {}
+            print(
+                "   catalog counterpart classification: "
+                f"{catalog_counterpart_identification.get('classification')}"
+            )
+            print(f"   counterpart TIC: {catalog_ids.get('ticID')}")
+            print(f"   counterpart Gaia DR3: {catalog_ids.get('gaiaDR3SourceID')}")
+            print(
+                "   residual-position separation: "
+                f"{ranking.get('residualPositionSeparationArcsec')} arcsec"
+            )
+            print(
+                "   target-to-counterpart separation: "
+                f"{ranking.get('targetSeparationArcsec')} arcsec"
+            )
+            print(
+                "   variability confirmed: "
+                f"{catalog_counterpart_identification.get('variabilityConfirmed')}"
+            )
+            print(
+                "   recommended next test: "
+                f"{catalog_counterpart_identification.get('recommendedNextTest')}"
             )
         if source_localization is not None:
             cross = source_localization.get("crossSector") or {}
@@ -7153,6 +7246,8 @@ def build_engine(
             print(f"   counterpart combined power: {candidate.get('combinedPower')}")
             print(f"   target-control independent support: {target_control.get('independentSupportCount')}")
             print(f"   target-control combined power: {target_control.get('combinedPower')}")
+            print(f"   variability confirmed: {offset_source_variability.get('variabilityConfirmed')}")
+            print(f"   physical mechanism resolved: {offset_source_variability.get('physicalMechanismResolved')}")
             if calibrated_prf_deblending is None:
                 print(f"   recommended next test: {offset_source_variability.get('recommendedNextTest')}")
         if calibrated_prf_deblending is not None:

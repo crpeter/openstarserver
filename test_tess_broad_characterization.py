@@ -1344,10 +1344,18 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
         self.assertEqual("CATALOG_COUNTERPART_IDENTIFICATION",
                          prf_summary["recommendedNextTest"])
         self.assertFalse(prf_summary["followingHandlerActivated"])
-        self.assertEqual("openstar.tess.finalize", request.handler_id)
+        self.assertEqual(
+            "openstar.tess.catalog-counterpart-identification.analyze",
+            request.handler_id,
+        )
+        self.assertEqual(current.stages[-1].id, request.triggered_by_stage_id)
         restarted = store.load(current.id)
-        self.assertEqual(request, plan_tess_branches(restarted, target)[0].experiment)
         self.assertEqual(len(current.stages), len(restarted.stages))
+        self.assertEqual(
+            [(stage.id, stage.handler_id, stage.status) for stage in current.stages],
+            [(stage.id, stage.handler_id, stage.status) for stage in restarted.stages],
+        )
+        self.assertEqual(request, plan_tess_branches(restarted, target)[0].experiment)
 
     def test_other_nonstationary_recommendations_do_not_enter_localization(self):
         localization = nonstationary_continuation(

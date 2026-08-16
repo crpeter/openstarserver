@@ -91,6 +91,15 @@ def _latest_complete(investigation: Investigation, handler_id: str):
     )
 
 
+def _continuation_stage_id(stage, label: str) -> str:
+    """Reconstruct the workflow continuation ID from its triggering stage."""
+    try:
+        number = int(str(stage.id).split("-", 1)[0]) + 1
+    except (TypeError, ValueError):
+        raise ValueError(f"Stage id must begin with an integer prefix: {stage.id}")
+    return f"{number:03d}-{label}"
+
+
 def _has_terminal_tess_evidence(investigation: Investigation) -> bool:
     if not investigation.stages:
         return False
@@ -133,6 +142,9 @@ def plan_tess_branches(
     catalog_identification = _latest_complete(
         investigation, "openstar.tess.catalog-counterpart-identification.analyze"
     )
+    variability_interpretation = _latest_complete(
+        investigation, "openstar.tess.offset-source-variability.interpret"
+    )
     if (
         prf_interpretation is not None
         and catalog_identification is None
@@ -144,13 +156,54 @@ def plan_tess_branches(
             ScientificBranch(
                 id=f"continue-catalog-after-{prf_interpretation.id}",
                 experiment=StageRequest(
-                    id=f"{len(investigation.stages) + 1:03d}-catalog-counterpart",
+                    id=_continuation_stage_id(
+                        prf_interpretation, "catalog-counterpart"
+                    ),
                     handler_id="openstar.tess.catalog-counterpart-identification.analyze",
                     parameters={},
                     triggered_by_stage_id=prf_interpretation.id,
                 ),
             ),
         )
+
+    catalog_result = (catalog_identification.result or {}) if catalog_identification else {}
+    preferred = catalog_result.get("preferredCandidate") or {}
+    preferred_ids = preferred.get("catalogIDs") or {}
+    justified_preferred = (
+        preferred.get("raDeg") is not None
+        and preferred.get("decDeg") is not None
+        and (preferred_ids.get("ticID") is not None
+             or preferred_ids.get("gaiaDR3SourceID") is not None)
+    )
+    if (
+        catalog_identification is not None
+        and variability_interpretation is None
+        and catalog_result.get("recommendedNextTest")
+        == "INDEPENDENT_COUNTERPART_PHOTOMETRIC_VARIABILITY_VALIDATION"
+        and catalog_result.get("physicalMechanismResolved") is False
+        and justified_preferred
+        and not any(
+            stage.handler_id == "openstar.tess.offset-source-variability.prepare"
+            and stage.status in {"RUNNING", "COMPLETE"}
+            for stage in investigation.stages
+        )
+    ):
+        return (
+            ScientificBranch(
+                id=f"continue-counterpart-variability-after-{catalog_identification.id}",
+                experiment=StageRequest(
+                    id=_continuation_stage_id(
+                        catalog_identification, "prepare-offset-source-variability"
+                    ),
+                    handler_id="openstar.tess.offset-source-variability.prepare",
+                    parameters={},
+                    triggered_by_stage_id=catalog_identification.id,
+                ),
+            ),
+        )
+
+    if variability_interpretation is not None:
+        return ()
 
     if _has_terminal_tess_evidence(investigation):
         return ()
