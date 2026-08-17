@@ -4,6 +4,7 @@ import csv
 import io
 import math
 import urllib.parse
+import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -38,6 +39,40 @@ MIN_CROSS_BAND_SUPPORT = 2
 MAX_CROSS_BAND_RELATIVE_FREQUENCY_SPREAD = 0.12
 SUPPORTED_BANDS = ("g", "r", "i", "z")
 BAND_NEIGHBOR_BIAS_BITS = {"g": 8, "r": 4, "i": 2, "z": 1}
+NEXT_ARCHIVE_TEST = "NSC_RESOLVED_COUNTERPART_PHOTOMETRY"
+CURRENT_TRIGGER = "SKYMAPPER_RESOLVED_COUNTERPART_PHOTOMETRY"
+
+
+class SkyMapperArchiveUnavailable(RuntimeError):
+    """The SkyMapper service failed transiently before a scientific result existed."""
+
+
+def _retryable_service_error(error: BaseException) -> bool:
+    current: BaseException | None = error
+    while current is not None:
+        if isinstance(current, (TimeoutError, ConnectionError, urllib.error.URLError)):
+            if isinstance(current, urllib.error.HTTPError):
+                return current.code in {408, 425, 429} or current.code >= 500
+            return True
+        module = type(current).__module__.lower()
+        name = type(current).__name__.lower()
+        if module.startswith(("requests.", "httpx", "urllib3.")) and any(
+            token in name for token in ("timeout", "connection", "network")
+        ):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def _archive_query(query, *args):
+    try:
+        return query(*args)
+    except Exception as exc:
+        if _retryable_service_error(exc):
+            raise SkyMapperArchiveUnavailable(
+                f"SkyMapper DR4 service unavailable: {type(exc).__name__}: {exc}"
+            ) from exc
+        raise
 
 
 def _python_value(value: Any) -> Any:
@@ -143,8 +178,27 @@ def _source_records_by_role(
 def _frozen_source_pair(
     external_high_resolution_summary: dict[str, Any],
 ) -> tuple[list[dict[str, Any]], float]:
-    records = _source_records_by_role(external_high_resolution_summary)
     pair = external_high_resolution_summary.get("sourcePair") or {}
+    if pair.get("version") == "openstar.current-source-pair.v1":
+        definitions = []
+        for key, default_role in (("target", "target-control"),
+                                  ("counterpart", "catalog-counterpart")):
+            source = pair.get(key) or {}
+            source_id = _int(source.get("gaiaDR3SourceID"))
+            ra = _float(source.get("raDeg"))
+            dec = _float(source.get("decDeg"))
+            if source_id is None or ra is None or dec is None:
+                raise RuntimeError("Current Gaia sourcePair has incomplete archive coordinates.")
+            definitions.append({"sourceRole": str(source.get("sourceRole") or default_role),
+                                "gaiaDR3SourceID": source_id, "raDeg": ra, "decDeg": dec})
+        separation = _float(pair.get("separationArcsec"))
+        if separation is None or separation <= 0:
+            separation = _angular_separation_arcsec(
+                definitions[0]["raDeg"], definitions[0]["decDeg"],
+                definitions[1]["raDeg"], definitions[1]["decDeg"])
+        return definitions, float(separation)
+
+    records = _source_records_by_role(external_high_resolution_summary)
     target_id = _int(pair.get("targetGaiaDR3SourceID"))
     counterpart_id = _int(pair.get("counterpartGaiaDR3SourceID"))
     if target_id is None or counterpart_id is None:
@@ -529,7 +583,9 @@ def build_skymapper_resolved_project(
     output_dir: str | Path,
     investigation_id: str,
 ) -> dict[str, Any]:
-    if external_high_resolution_summary.get("recommendedNextTest") != "TARGETED_HIGH_RESOLUTION_TIME_SERIES_PHOTOMETRY":
+    if external_high_resolution_summary.get("recommendedNextTest") not in {
+        CURRENT_TRIGGER, "TARGETED_HIGH_RESOLUTION_TIME_SERIES_PHOTOMETRY"
+    }:
         raise RuntimeError(
             "v20.20 requires v20.19 to recommend TARGETED_HIGH_RESOLUTION_TIME_SERIES_PHOTOMETRY."
         )
@@ -537,7 +593,7 @@ def build_skymapper_resolved_project(
     source_definitions, pair_separation = _frozen_source_pair(external_high_resolution_summary)
     source_ids = [int(item["gaiaDR3SourceID"]) for item in source_definitions]
     print("   querying SkyMapper DR4 master objects for the frozen Gaia pair", flush=True)
-    master_rows = _query_master_matches(source_ids)
+    master_rows = _archive_query(_query_master_matches, source_ids)
 
     master_matches: dict[str, dict[str, Any] | None] = {}
     for source in source_definitions:
@@ -560,9 +616,8 @@ def build_skymapper_resolved_project(
         and int(target_master["objectID"]) != int(counterpart_master["objectID"])
     )
 
-    search = dict(
-        ((external_high_resolution_summary.get("distributedValidation") or {}).get("frequencySearch") or {})
-    )
+    search = dict(external_high_resolution_summary.get("frequencySearch") or
+                  ((external_high_resolution_summary.get("distributedValidation") or {}).get("frequencySearch") or {}))
     total_frequencies = _int(search.get("totalFrequencies"))
     per_work = _int(search.get("frequenciesPerWorkUnit"))
     if not search or total_frequencies is None or per_work is None or total_frequencies <= 0 or per_work <= 0:
@@ -583,7 +638,7 @@ def build_skymapper_resolved_project(
             f"   pair has distinct SkyMapper objects; loading per-image PSF photometry with seeing <= {seeing_limit:.3f} arcsec",
             flush=True,
         )
-        rows = _query_epoch_detections(object_ids)
+        rows = _archive_query(_query_epoch_detections, object_ids)
         for source in source_definitions:
             role = str(source["sourceRole"])
             master = master_matches[role]
@@ -595,7 +650,9 @@ def build_skymapper_resolved_project(
                     master=master,
                     pair_separation_arcsec=pair_separation,
                 )
-            except Exception as exc:
+            except RuntimeError as exc:
+                if "no finite variability scale" not in str(exc):
+                    raise
                 errors.append({"sourceRole": role, "error": f"{type(exc).__name__}: {exc}"})
                 band_series = {}
 
@@ -765,11 +822,11 @@ def interpret_skymapper_resolved_project(
     if not preparation.get("pairSeparatelyResolvedInSkyMapperMaster"):
         classification = "SKYMAPPER_DR4_PAIR_NOT_SEPARATELY_RESOLVED"
         origin = "UNRESOLVED_SKYMAPPER_SPATIAL_RESOLUTION_LIMIT"
-        next_test = "TARGETED_HIGH_RESOLUTION_TIME_SERIES_PHOTOMETRY"
+        next_test = NEXT_ARCHIVE_TEST
     elif not preparation.get("preparedSeries"):
         classification = "SKYMAPPER_DR4_NO_QUALIFYING_RESOLVED_EPOCH_SERIES"
         origin = "UNRESOLVED_SKYMAPPER_NO_CLEAN_GOOD_SEEING_TIME_SERIES"
-        next_test = "TARGETED_HIGH_RESOLUTION_TIME_SERIES_PHOTOMETRY"
+        next_test = NEXT_ARCHIVE_TEST
     elif counterpart_supported and not target_supported:
         classification = "SKYMAPPER_DR4_COUNTERPART_RESIDUAL_BAND_VARIABILITY_SUPPORTED"
         origin = "CATALOG_COUNTERPART_SUPPORTED_BY_SKYMAPPER_RESOLVED_PHOTOMETRY"
@@ -785,15 +842,15 @@ def interpret_skymapper_resolved_project(
     elif counterpart_suggestive and not target_suggestive:
         classification = "SKYMAPPER_DR4_COUNTERPART_RESIDUAL_BAND_VARIABILITY_SUGGESTIVE"
         origin = "CATALOG_COUNTERPART_SUGGESTIVE_BY_SKYMAPPER_RESOLVED_PHOTOMETRY"
-        next_test = "TARGETED_HIGH_RESOLUTION_TIME_SERIES_PHOTOMETRY"
+        next_test = NEXT_ARCHIVE_TEST
     elif target_suggestive and not counterpart_suggestive:
         classification = "SKYMAPPER_DR4_TARGET_RESIDUAL_BAND_VARIABILITY_SUGGESTIVE"
         origin = "TARGET_SUGGESTIVE_BY_SKYMAPPER_RESOLVED_PHOTOMETRY"
-        next_test = "TARGETED_HIGH_RESOLUTION_TIME_SERIES_PHOTOMETRY"
+        next_test = NEXT_ARCHIVE_TEST
     else:
         classification = "SKYMAPPER_DR4_RESOLVED_VARIABILITY_UNRESOLVED"
         origin = "ARCHIVAL_SKYMAPPER_SOURCE_ATTRIBUTION_UNRESOLVED"
-        next_test = "TARGETED_HIGH_RESOLUTION_TIME_SERIES_PHOTOMETRY"
+        next_test = NEXT_ARCHIVE_TEST
 
     return {
         "version": "openstar.tess-skymapper-resolved-photometry-screen.v1",

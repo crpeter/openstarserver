@@ -112,16 +112,18 @@ def _has_terminal_tess_evidence(investigation: Investigation) -> bool:
     )
 
 
-def _persisted_gaia_continuation(investigation: Investigation):
-    """Return an unattempted continuation recorded by a completed Gaia stage."""
+def _persisted_archive_continuation(investigation: Investigation):
+    """Return an unattempted continuation recorded by an archive prepare/run stage."""
     attempted_ids = {stage.id for stage in investigation.stages}
-    gaia_handlers = {
+    archive_handlers = {
         "openstar.tess.gaia-source-resolved-counterpart-photometry.prepare",
         "openstar.tess.gaia-source-resolved-counterpart-photometry.run",
+        "openstar.tess.skymapper-resolved-counterpart-photometry.prepare",
+        "openstar.tess.skymapper-resolved-counterpart-photometry.run",
     }
     for stage in reversed(investigation.stages):
         if (
-            stage.handler_id in gaia_handlers
+            stage.handler_id in archive_handlers
             and stage.status == "COMPLETE"
             and stage.next_stage is not None
             and str(stage.next_stage.get("id")) not in attempted_ids
@@ -159,7 +161,7 @@ def repair_obsolete_terminal_wait(
         repaired, _ = AutonomousInvestigationEngine(store).decide(investigation, ())
         return repaired
 
-    gaia_continuation = _persisted_gaia_continuation(investigation)
+    gaia_continuation = _persisted_archive_continuation(investigation)
     if (
         investigation.status == "COMPLETE"
         and control.get("schedulerAction") == "INVESTIGATION_COMPLETE"
@@ -188,14 +190,29 @@ def repair_obsolete_terminal_wait(
         for stage in investigation.stages
     )
     offset_result = (offset_variability.result or {}) if offset_variability else {}
+    gaia_interpretation = _latest_complete(
+        investigation, "openstar.tess.gaia-source-resolved-counterpart-photometry.interpret"
+    )
+    skymapper_attempted = any(stage.handler_id.startswith(
+        "openstar.tess.skymapper-resolved-counterpart-photometry."
+    ) for stage in investigation.stages)
+    gaia_result = (gaia_interpretation.result or {}) if gaia_interpretation else {}
+    obsolete_gaia_terminal = (
+        gaia_interpretation is not None
+        and gaia_result.get("recommendedNextTest") == "SKYMAPPER_RESOLVED_COUNTERPART_PHOTOMETRY"
+        and gaia_result.get("physicalMechanismResolved") is False
+        and not skymapper_attempted
+    )
     if not (
         investigation.status == "COMPLETE"
         and control.get("schedulerAction") == "INVESTIGATION_COMPLETE"
-        and offset_variability is not None
-        and offset_result.get("recommendedNextTest")
-        == "INDEPENDENT_SOURCE_RESOLVED_COUNTERPART_PHOTOMETRY"
-        and offset_result.get("physicalMechanismResolved") is False
-        and not gaia_attempted
+        and (obsolete_gaia_terminal or (
+            offset_variability is not None
+            and offset_result.get("recommendedNextTest")
+            == "INDEPENDENT_SOURCE_RESOLVED_COUNTERPART_PHOTOMETRY"
+            and offset_result.get("physicalMechanismResolved") is False
+            and not gaia_attempted
+        ))
     ):
         return investigation
 
@@ -231,18 +248,40 @@ def plan_tess_branches(
         investigation,
         "openstar.tess.gaia-source-resolved-counterpart-photometry.interpret",
     )
-    if gaia_interpretation is not None:
-        return ()
-
-    gaia_continuation = _persisted_gaia_continuation(investigation)
-    if gaia_continuation is not None:
-        completed, raw = gaia_continuation
+    archive_continuation = _persisted_archive_continuation(investigation)
+    if archive_continuation is not None:
+        completed, raw = archive_continuation
         return (
             ScientificBranch(
                 id=f"continue-after-{completed.id}",
                 experiment=_request_from_persisted(raw),
             ),
         )
+
+    skymapper_interpretation = _latest_complete(
+        investigation, "openstar.tess.skymapper-resolved-counterpart-photometry.interpret"
+    )
+    skymapper_started = any(stage.handler_id.startswith(
+        "openstar.tess.skymapper-resolved-counterpart-photometry."
+    ) for stage in investigation.stages)
+    gaia_result = (gaia_interpretation.result or {}) if gaia_interpretation else {}
+    if (gaia_interpretation is not None and skymapper_interpretation is None
+            and not skymapper_started
+            and gaia_result.get("recommendedNextTest") == "SKYMAPPER_RESOLVED_COUNTERPART_PHOTOMETRY"
+            and gaia_result.get("physicalMechanismResolved") is False):
+        return (ScientificBranch(
+            id=f"continue-skymapper-after-{gaia_interpretation.id}",
+            experiment=StageRequest(
+                id=_continuation_stage_id(
+                    gaia_interpretation, "prepare-skymapper-resolved-counterpart-photometry"
+                ),
+                handler_id="openstar.tess.skymapper-resolved-counterpart-photometry.prepare",
+                parameters={}, triggered_by_stage_id=gaia_interpretation.id,
+            ),
+        ),)
+    if gaia_interpretation is not None:
+        return ()
+
     if (
         prf_interpretation is not None
         and catalog_identification is None
