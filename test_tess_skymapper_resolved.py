@@ -266,6 +266,18 @@ class CurrentSkyMapperResolvedTests(unittest.TestCase):
                                 final_status="BLOCKED")
         workflow.register_handler(
             "openstar.tess.skymapper-resolved-counterpart-photometry.interpret", interpret_stage)
+        workflow.register_handler(
+            "openstar.tess.nsc-resolved-photometry.prepare",
+            lambda current, request: StageOutcome(result={}, next_stage=StageRequest(
+                "047-interpret-nsc-resolved-counterpart-photometry",
+                "openstar.tess.nsc-resolved-photometry.interpret",
+                {"distributedRunExpected": False}, request.id)))
+        workflow.register_handler(
+            "openstar.tess.nsc-resolved-photometry.interpret",
+            lambda current, request: StageOutcome(
+                result={"recommendedNextTest": "NOIRLAB_IMAGE_LEVEL_FORCED_PHOTOMETRY",
+                        "physicalMechanismResolved": False}, stop=True,
+                final_status="BLOCKED"))
         dispatcher = InvestigationDispatcher(store, workflow)
         lifecycle = InvestigationLifecycleLoop(
             self.root / f"lifecycle-{suffix}.json", store, dispatcher,
