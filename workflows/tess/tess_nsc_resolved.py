@@ -4,6 +4,7 @@ import csv
 import io
 import math
 import urllib.parse
+import urllib.error
 import urllib.request
 from collections import defaultdict
 from pathlib import Path
@@ -34,6 +35,41 @@ MIN_PEAK_PROMINENCE_RATIO = 2.0
 MIN_CROSS_BAND_SUPPORT = 2
 MAX_CROSS_BAND_RELATIVE_FREQUENCY_SPREAD = 0.12
 MAX_ROWS = 10000
+CURRENT_TRIGGER = "NSC_RESOLVED_COUNTERPART_PHOTOMETRY"
+HISTORICAL_TRIGGER = "TARGETED_HIGH_RESOLUTION_TIME_SERIES_PHOTOMETRY"
+NEXT_ARCHIVE_TEST = "NOIRLAB_IMAGE_LEVEL_FORCED_PHOTOMETRY"
+
+
+class NSCArchiveUnavailable(RuntimeError):
+    """The NSC service failed transiently before a scientific result existed."""
+
+
+def _retryable_service_error(error: BaseException) -> bool:
+    current: BaseException | None = error
+    while current is not None:
+        if isinstance(current, (TimeoutError, ConnectionError, urllib.error.URLError)):
+            if isinstance(current, urllib.error.HTTPError):
+                return current.code in {408, 425, 429} or current.code >= 500
+            return True
+        module = type(current).__module__.lower()
+        name = type(current).__name__.lower()
+        if module.startswith(("requests.", "httpx", "urllib3.")) and any(
+            token in name for token in ("timeout", "connection", "network")
+        ):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def _archive_query(query, *args):
+    try:
+        return query(*args)
+    except Exception as exc:
+        if _retryable_service_error(exc):
+            raise NSCArchiveUnavailable(
+                f"NSC DR2 service unavailable: {type(exc).__name__}: {exc}"
+            ) from exc
+        raise
 
 
 def _python_value(value: Any) -> Any:
@@ -41,7 +77,11 @@ def _python_value(value: Any) -> Any:
         return None
     if isinstance(value, bytes):
         return value.decode("utf-8", errors="replace")
-    if isinstance(value, (np.integer, np.floating)):
+    numpy_scalars = tuple(
+        kind for kind in (getattr(np, "integer", None), getattr(np, "floating", None))
+        if isinstance(kind, type)
+    )
+    if numpy_scalars and isinstance(value, numpy_scalars):
         value = value.item()
     if isinstance(value, float) and not math.isfinite(value):
         return None
@@ -141,8 +181,32 @@ def _source_records_by_role(
 def _frozen_source_pair(
     external_high_resolution_summary: dict[str, Any],
 ) -> tuple[list[dict[str, Any]], float]:
-    records = _source_records_by_role(external_high_resolution_summary)
     pair = external_high_resolution_summary.get("sourcePair") or {}
+    if pair.get("version") == "openstar.current-source-pair.v1":
+        definitions = []
+        for key, expected_role in (
+            ("target", "target-control"),
+            ("counterpart", "catalog-counterpart"),
+        ):
+            source = pair.get(key) or {}
+            source_id = _int(source.get("gaiaDR3SourceID"))
+            ra = _float(source.get("raDeg"))
+            dec = _float(source.get("decDeg"))
+            if source_id is None or ra is None or dec is None:
+                raise RuntimeError(f"Current sourcePair lacks Gaia ID/coordinates for {key}.")
+            definitions.append({
+                "sourceRole": str(source.get("sourceRole") or expected_role),
+                "gaiaDR3SourceID": int(source_id), "raDeg": float(ra), "decDeg": float(dec),
+            })
+        separation = _float(pair.get("separationArcsec"))
+        if separation is None or separation <= 0:
+            separation = _angular_separation_arcsec(
+                definitions[0]["raDeg"], definitions[0]["decDeg"],
+                definitions[1]["raDeg"], definitions[1]["decDeg"],
+            )
+        return definitions, float(separation)
+
+    records = _source_records_by_role(external_high_resolution_summary)
     target_id = _int(pair.get("targetGaiaDR3SourceID"))
     counterpart_id = _int(pair.get("counterpartGaiaDR3SourceID"))
     if target_id is None or counterpart_id is None:
@@ -528,14 +592,18 @@ def build_nsc_resolved_project(
     output_dir: str | Path,
     investigation_id: str,
 ) -> dict[str, Any]:
-    if skymapper_summary.get("recommendedNextTest") != "TARGETED_HIGH_RESOLUTION_TIME_SERIES_PHOTOMETRY":
+    if skymapper_summary.get("recommendedNextTest") not in {CURRENT_TRIGGER, HISTORICAL_TRIGGER}:
         raise RuntimeError(
             "v20.21 requires v20.20 to leave the investigation at targeted high-resolution follow-up."
         )
 
     sources, pair_separation = _frozen_source_pair(external_high_resolution_summary)
     search = dict(
-        ((external_high_resolution_summary.get("distributedValidation") or {}).get("frequencySearch") or {})
+        external_high_resolution_summary.get("frequencySearch")
+        or (external_high_resolution_summary.get("distributedValidation") or {}).get("frequencySearch")
+        or skymapper_summary.get("frequencySearch")
+        or (skymapper_summary.get("distributedValidation") or {}).get("frequencySearch")
+        or {}
     )
     total_frequencies = _int(search.get("totalFrequencies"))
     per_work = _int(search.get("frequenciesPerWorkUnit"))
@@ -547,21 +615,16 @@ def build_nsc_resolved_project(
     errors: list[dict[str, Any]] = []
     for source in sources:
         role = str(source["sourceRole"])
-        try:
-            rows = _query_object_candidates(source)
-            match = _select_object_match(rows, source)
-            matches[role] = match
-            if match is None:
-                print(f"      {role}: no NSC DR2 object within {MAX_OBJECT_MATCH_ARCSEC:.2f} arcsec", flush=True)
-            else:
-                print(
-                    f"      {role}: NSC object {match['objectID']} | Gaia distance={match['gaiaDistanceArcsec']:.3f} arcsec | ndet={match.get('ndet')}",
-                    flush=True,
-                )
-        except Exception as exc:
-            matches[role] = None
-            errors.append({"sourceRole": role, "error": f"{type(exc).__name__}: {exc}"})
-            print(f"      {role}: unavailable: {type(exc).__name__}: {exc}", flush=True)
+        rows = _archive_query(_query_object_candidates, source)
+        match = _select_object_match(rows, source)
+        matches[role] = match
+        if match is None:
+            print(f"      {role}: no NSC DR2 object within {MAX_OBJECT_MATCH_ARCSEC:.2f} arcsec", flush=True)
+        else:
+            print(
+                f"      {role}: NSC object {match['objectID']} | Gaia distance={match['gaiaDistanceArcsec']:.3f} arcsec | ndet={match.get('ndet')}",
+                flush=True,
+            )
 
     target_match = matches.get("target-control")
     counterpart_match = matches.get("catalog-counterpart")
@@ -592,21 +655,12 @@ def build_nsc_resolved_project(
     if pair_separately_resolved:
         object_ids = [str(target_match["objectID"]), str(counterpart_match["objectID"])]
         print("   loading NSC per-exposure measurements for both resolved objects", flush=True)
-        try:
-            rows = _query_measurements(object_ids)
-            source_series, co_detection_diagnostics = _prepare_codetected_series(
-                rows,
-                sources=sources,
-                matches={
-                    "target-control": target_match,
-                    "catalog-counterpart": counterpart_match,
-                },
-                pair_separation_arcsec=pair_separation,
-            )
-        except Exception as exc:
-            errors.append({"stage": "measurements", "error": f"{type(exc).__name__}: {exc}"})
-            source_series = {"target-control": {}, "catalog-counterpart": {}}
-            print(f"   NSC measurements unavailable: {type(exc).__name__}: {exc}", flush=True)
+        rows = _archive_query(_query_measurements, object_ids)
+        source_series, co_detection_diagnostics = _prepare_codetected_series(
+            rows, sources=sources,
+            matches={"target-control": target_match, "catalog-counterpart": counterpart_match},
+            pair_separation_arcsec=pair_separation,
+        )
 
         source_by_role = {str(item["sourceRole"]): item for item in sources}
         for role in ("target-control", "catalog-counterpart"):
@@ -768,11 +822,11 @@ def interpret_nsc_resolved_project(
     if not preparation.get("pairSeparatelyResolvedInNSC"):
         classification = "NSC_DR2_PAIR_NOT_SEPARATELY_RESOLVED"
         origin = "UNRESOLVED_NSC_SPATIAL_MATCH_LIMIT"
-        next_test = "TARGETED_HIGH_RESOLUTION_TIME_SERIES_PHOTOMETRY"
+        next_test = NEXT_ARCHIVE_TEST
     elif not preparation.get("preparedSeries"):
         classification = "NSC_DR2_NO_QUALIFYING_CODETECTED_RESOLVED_SERIES"
         origin = "UNRESOLVED_NSC_NO_CLEAN_CODETECTED_TIME_SERIES"
-        next_test = "TARGETED_HIGH_RESOLUTION_TIME_SERIES_PHOTOMETRY"
+        next_test = NEXT_ARCHIVE_TEST
     elif counterpart_supported and not target_supported:
         classification = "NSC_DR2_COUNTERPART_RESIDUAL_BAND_VARIABILITY_SUPPORTED"
         origin = "CATALOG_COUNTERPART_SUPPORTED_BY_NSC_RESOLVED_PHOTOMETRY"
@@ -788,15 +842,15 @@ def interpret_nsc_resolved_project(
     elif counterpart_suggestive and not target_suggestive:
         classification = "NSC_DR2_COUNTERPART_RESIDUAL_BAND_VARIABILITY_SUGGESTIVE"
         origin = "CATALOG_COUNTERPART_SUGGESTIVE_BY_NSC_RESOLVED_PHOTOMETRY"
-        next_test = "TARGETED_HIGH_RESOLUTION_TIME_SERIES_PHOTOMETRY"
+        next_test = NEXT_ARCHIVE_TEST
     elif target_suggestive and not counterpart_suggestive:
         classification = "NSC_DR2_TARGET_RESIDUAL_BAND_VARIABILITY_SUGGESTIVE"
         origin = "TARGET_SUGGESTIVE_BY_NSC_RESOLVED_PHOTOMETRY"
-        next_test = "TARGETED_HIGH_RESOLUTION_TIME_SERIES_PHOTOMETRY"
+        next_test = NEXT_ARCHIVE_TEST
     else:
         classification = "NSC_DR2_RESOLVED_VARIABILITY_UNRESOLVED"
         origin = "ARCHIVAL_NSC_SOURCE_ATTRIBUTION_UNRESOLVED"
-        next_test = "TARGETED_HIGH_RESOLUTION_TIME_SERIES_PHOTOMETRY"
+        next_test = NEXT_ARCHIVE_TEST
 
     return {
         "version": "openstar.tess-nsc-dr2-resolved-photometry-screen.v1",

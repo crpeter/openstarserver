@@ -266,6 +266,10 @@ class CurrentSkyMapperResolvedTests(unittest.TestCase):
                                 final_status="BLOCKED")
         workflow.register_handler(
             "openstar.tess.skymapper-resolved-counterpart-photometry.interpret", interpret_stage)
+        workflow.register_handler(
+            "openstar.tess.nsc-resolved-photometry.prepare",
+            lambda current, request: StageOutcome(result={}, stop=True,
+                                                  final_status="BLOCKED"))
         dispatcher = InvestigationDispatcher(store, workflow)
         lifecycle = InvestigationLifecycleLoop(
             self.root / f"lifecycle-{suffix}.json", store, dispatcher,
@@ -280,7 +284,7 @@ class CurrentSkyMapperResolvedTests(unittest.TestCase):
         self.assertEqual(next_request, executions[0])
         self.assertEqual(persisted_prepare, store.load(investigation.id).stages[1])
         self.assertEqual(2 if distributed else 1, len(executions))
-        self.assertEqual("WAIT_FOR_PREREQUISITES",
+        self.assertEqual("INVESTIGATION_COMPLETE",
                          store.load(investigation.id).metadata["controlState"]["schedulerAction"])
 
     def test_prepare_run_interpret_restarts_without_repreparing_or_looping(self):

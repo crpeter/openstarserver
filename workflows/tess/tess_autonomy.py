@@ -129,6 +129,23 @@ def _awaiting_nsc_adapter(investigation: Investigation) -> bool:
     )
 
 
+def _awaiting_noirlab_adapter(investigation: Investigation) -> bool:
+    """Identify only the incremental NSC-to-image-level implementation boundary."""
+    stage = _latest_complete(
+        investigation, "openstar.tess.nsc-resolved-photometry.interpret"
+    )
+    result = (stage.result or {}) if stage is not None else {}
+    return bool(
+        stage is not None
+        and result.get("recommendedNextTest") == "NOIRLAB_IMAGE_LEVEL_FORCED_PHOTOMETRY"
+        and result.get("physicalMechanismResolved") is False
+        and not any(
+            item.handler_id.startswith("openstar.tess.noirlab-image-forced-photometry.")
+            for item in investigation.stages
+        )
+    )
+
+
 def _persisted_archive_continuation(investigation: Investigation):
     """Return an unattempted continuation recorded by an archive prepare/run stage."""
     attempted_ids = {stage.id for stage in investigation.stages}
@@ -137,6 +154,8 @@ def _persisted_archive_continuation(investigation: Investigation):
         "openstar.tess.gaia-source-resolved-counterpart-photometry.run",
         "openstar.tess.skymapper-resolved-counterpart-photometry.prepare",
         "openstar.tess.skymapper-resolved-counterpart-photometry.run",
+        "openstar.tess.nsc-resolved-photometry.prepare",
+        "openstar.tess.nsc-resolved-photometry.run",
     }
     for stage in reversed(investigation.stages):
         if (
@@ -173,8 +192,27 @@ def repair_obsolete_terminal_wait(
     if (
         investigation.status == "BLOCKED"
         and control.get("schedulerAction") == "WAIT_FOR_PREREQUISITES"
+        and _awaiting_nsc_adapter(investigation)
+    ):
+        metadata = investigation.metadata or {}
+        target = InvestigationTarget(
+            id=str(metadata.get("datasetID") or investigation.id),
+            investigation_id=investigation.id,
+            workflow_id=investigation.workflow_id,
+            workflow_version=investigation.workflow_version,
+            metadata=dict(metadata),
+        )
+        repaired, _ = AutonomousInvestigationEngine(store).decide(
+            investigation, plan_tess_branches(investigation, target)
+        )
+        return repaired
+
+    if (
+        investigation.status == "BLOCKED"
+        and control.get("schedulerAction") == "WAIT_FOR_PREREQUISITES"
         and _has_terminal_tess_evidence(investigation)
         and not _awaiting_nsc_adapter(investigation)
+        and not _awaiting_noirlab_adapter(investigation)
     ):
         repaired, _ = AutonomousInvestigationEngine(store).decide(investigation, ())
         return repaired
@@ -267,6 +305,23 @@ def plan_tess_branches(
         investigation,
         "openstar.tess.gaia-source-resolved-counterpart-photometry.interpret",
     )
+    nsc_interpretation = _latest_complete(
+        investigation, "openstar.tess.nsc-resolved-photometry.interpret"
+    )
+    if _awaiting_noirlab_adapter(investigation):
+        return (
+            ScientificBranch(
+                id=f"continue-noirlab-after-{nsc_interpretation.id}",
+                experiment=StageRequest(
+                    id=_continuation_stage_id(
+                        nsc_interpretation, "prepare-noirlab-image-level-forced-photometry"
+                    ),
+                    handler_id="openstar.tess.noirlab-image-forced-photometry.prepare",
+                    parameters={}, triggered_by_stage_id=nsc_interpretation.id,
+                ),
+                required_stage_ids=("openstar.capability.current-noirlab-source-pair-adapter",),
+            ),
+        )
     archive_continuation = _persisted_archive_continuation(investigation)
     if archive_continuation is not None:
         completed, raw = archive_continuation
@@ -285,10 +340,6 @@ def plan_tess_branches(
     ) for stage in investigation.stages)
     gaia_result = (gaia_interpretation.result or {}) if gaia_interpretation else {}
     if _awaiting_nsc_adapter(investigation):
-        # NSC's historical handler consumes the obsolete v20.19 source-pair
-        # contract.  Keep this recommendation durably blocked until a current
-        # adapter exists rather than either reviving that contract or claiming
-        # scientific completion.
         return (
             ScientificBranch(
                 id=f"continue-nsc-after-{skymapper_interpretation.id}",
@@ -301,7 +352,6 @@ def plan_tess_branches(
                     parameters={},
                     triggered_by_stage_id=skymapper_interpretation.id,
                 ),
-                required_stage_ids=("openstar.capability.current-nsc-source-pair-adapter",),
             ),
         )
     if (gaia_interpretation is not None and skymapper_interpretation is None

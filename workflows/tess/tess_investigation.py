@@ -107,6 +107,7 @@ from .tess_skymapper_resolved import (
     interpret_skymapper_resolved_project,
 )
 from .tess_nsc_resolved import (
+    NSCArchiveUnavailable,
     build_nsc_resolved_project,
     interpret_nsc_resolved_project,
 )
@@ -3976,6 +3977,69 @@ def build_engine(
             artifacts=(_artifact(artifact_path, "application/json"),),
         )
 
+    def nsc_resolved_prepare_stage(investigation, request):
+        prepared = _latest_result_for_handler(investigation, "openstar.tess.prepare-target")
+        gaia = _latest_result_for_handler(
+            investigation, "openstar.tess.gaia-source-resolved-counterpart-photometry.interpret")
+        skymapper = _latest_result_for_handler(
+            investigation, "openstar.tess.skymapper-resolved-counterpart-photometry.interpret")
+        if prepared is None or gaia is None or skymapper is None:
+            raise RuntimeError("NSC resolved photometry requires persisted target, Gaia, and SkyMapper evidence.")
+        try:
+            spec = build_nsc_resolved_project(
+                source_project_id=str(prepared["sourceProjectID"]),
+                source_dataset_id=str(prepared["datasetID"]),
+                external_high_resolution_summary=gaia, skymapper_summary=skymapper,
+                output_dir=store.directory_for(investigation.id) / "artifacts",
+                investigation_id=investigation.id)
+        except NSCArchiveUnavailable as exc:
+            raise RetryableExecutionError(str(exc)) from exc
+        paths = [spec.get("projectPath")] + [
+            item.get("datasetPath") for item in spec.get("preparedSeries") or []]
+        artifacts = tuple(_artifact(Path(path), "application/json") for path in paths if path)
+        run_work = bool(spec.get("available") and spec.get("projectPath"))
+        label = ("run-nsc-resolved-counterpart-photometry" if run_work
+                 else "interpret-nsc-resolved-counterpart-photometry")
+        return StageOutcome(result=spec, next_stage=StageRequest(
+            id=_next_stage_id(request.id, label),
+            handler_id=("openstar.tess.nsc-resolved-photometry.run" if run_work
+                        else "openstar.tess.nsc-resolved-photometry.interpret"),
+            parameters=({"projectPath": spec["projectPath"]} if run_work
+                        else {"distributedRunExpected": False}),
+            triggered_by_stage_id=request.id),
+            input_hashes={"gaiaInterpretation": sha256_json(gaia),
+                          "skymapperInterpretation": sha256_json(skymapper)}, artifacts=artifacts)
+
+    def nsc_resolved_run_stage(investigation, request):
+        run = coordinator.run_project(
+            request.parameters["projectPath"], poll_interval=poll_interval, timeout=timeout)
+        return StageOutcome(result=run.status, next_stage=StageRequest(
+            id=_next_stage_id(request.id, "interpret-nsc-resolved-counterpart-photometry"),
+            handler_id="openstar.tess.nsc-resolved-photometry.interpret",
+            parameters={"distributedRunExpected": True}, triggered_by_stage_id=request.id),
+            node_contributions=run.node_contributions, project_ids=(run.project_id,))
+
+    def nsc_resolved_interpret_stage(investigation, request):
+        preparation = _latest_result_for_handler(
+            investigation, "openstar.tess.nsc-resolved-photometry.prepare")
+        run = _latest_result_for_handler(investigation, "openstar.tess.nsc-resolved-photometry.run")
+        if preparation is None or (request.parameters.get("distributedRunExpected") and run is None):
+            raise RuntimeError("NSC interpretation lacks persisted inputs.")
+        summary = interpret_nsc_resolved_project(project_status=run, preparation=preparation)
+        artifact_path = (store.directory_for(investigation.id) / "artifacts" /
+                         "nsc-resolved-photometry" / "interpretation.json")
+        _write_json(artifact_path, summary)
+        awaiting_noirlab = (
+            summary.get("recommendedNextTest") == "NOIRLAB_IMAGE_LEVEL_FORCED_PHOTOMETRY"
+            and summary.get("physicalMechanismResolved") is False)
+        return StageOutcome(result=summary, next_stage=None if awaiting_noirlab else StageRequest(
+            id=_next_stage_id(request.id, "finalize"), handler_id="openstar.tess.finalize",
+            parameters={"outputSuffix": "nsc-resolved-counterpart"},
+            triggered_by_stage_id=request.id), stop=awaiting_noirlab,
+            final_status="BLOCKED" if awaiting_noirlab else "COMPLETE",
+            input_hashes={"preparation": sha256_json(preparation),
+                          **({"projectResult": sha256_json(run)} if run is not None else {})},
+            artifacts=(_artifact(artifact_path, "application/json"),))
     def calibrated_prf_deblending_prepare_stage(investigation, request):
         prepared = _latest_result_for_handler(investigation, "openstar.tess.prepare-target")
         identity = _latest_result_for_handler(investigation, "openstar.tess.catalog-identity")
@@ -4929,7 +4993,7 @@ def build_engine(
             artifacts=(_artifact(artifact_path, "application/json"),),
         )
 
-    def nsc_resolved_prepare_stage(investigation, request):
+    def legacy_nsc_resolved_prepare_stage(investigation, request):
         prepared = _latest_result_for_handler(investigation, "openstar.tess.prepare-target")
         external = _latest_result_for_handler(
             investigation, "openstar.tess.external-high-resolution-variability-validation.interpret"
@@ -5006,7 +5070,7 @@ def build_engine(
             artifacts=tuple(artifacts),
         )
 
-    def nsc_resolved_run_stage(investigation, request):
+    def legacy_nsc_resolved_run_stage(investigation, request):
         print("⚙️ Activating generic NSC DR2 resolved single-band Lomb-Scargle work")
         run = coordinator.run_project(
             request.parameters["projectPath"],
@@ -5027,7 +5091,7 @@ def build_engine(
             project_ids=(run.project_id,),
         )
 
-    def nsc_resolved_interpret_stage(investigation, request):
+    def legacy_nsc_resolved_interpret_stage(investigation, request):
         preparation = _latest_result_for_handler(
             investigation, "openstar.tess.nsc-resolved-photometry.prepare"
         )
