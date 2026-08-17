@@ -185,8 +185,7 @@ class CurrentNSCResolvedTests(unittest.TestCase):
         target = InvestigationTarget("t", "i", investigation.workflow_id, investigation.workflow_version)
         branches = plan_tess_branches(investigation, target)
         self.assertEqual(1, len(branches))
-        self.assertEqual(("openstar.capability.current-noirlab-source-pair-adapter",),
-                         branches[0].required_stage_ids)
+        self.assertEqual((), branches[0].required_stage_ids)
         self.assertEqual("openstar.tess.noirlab-image-forced-photometry.prepare",
                          branches[0].experiment.handler_id)
 
@@ -284,6 +283,19 @@ class CurrentNSCResolvedTests(unittest.TestCase):
                                         "physicalMechanismResolved": False},
                                 stop=True, final_status="BLOCKED")
         workflow.register_handler("openstar.tess.nsc-resolved-photometry.interpret", interpret_stage)
+        workflow.register_handler(
+            "openstar.tess.noirlab-image-forced-photometry.prepare",
+            lambda current, request: StageOutcome(
+                result={"available": False}, next_stage=StageRequest(
+                    "050-interpret-noirlab-image-forced-photometry",
+                    "openstar.tess.noirlab-image-forced-photometry.interpret",
+                    {"distributedRunExpected": False}, request.id)),
+        )
+        workflow.register_handler(
+            "openstar.tess.noirlab-image-forced-photometry.interpret",
+            lambda current, request: StageOutcome(result={
+                "recommendedNextTest": "DES_DR2_SINGLE_EPOCH_LOCAL_FORCED_PHOTOMETRY",
+                "physicalMechanismResolved": False}, stop=True, final_status="BLOCKED"))
         dispatcher = InvestigationDispatcher(store, workflow)
         lifecycle = InvestigationLifecycleLoop(
             self.root / "nsc-lifecycle.json", store, dispatcher,

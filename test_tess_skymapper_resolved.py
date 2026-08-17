@@ -278,6 +278,18 @@ class CurrentSkyMapperResolvedTests(unittest.TestCase):
                 result={"recommendedNextTest": "NOIRLAB_IMAGE_LEVEL_FORCED_PHOTOMETRY",
                         "physicalMechanismResolved": False}, stop=True,
                 final_status="BLOCKED"))
+        workflow.register_handler(
+            "openstar.tess.noirlab-image-forced-photometry.prepare",
+            lambda current, request: StageOutcome(result={"available": False},
+                next_stage=StageRequest(
+                    "049-interpret-noirlab-image-forced-photometry",
+                    "openstar.tess.noirlab-image-forced-photometry.interpret",
+                    {"distributedRunExpected": False}, request.id)))
+        workflow.register_handler(
+            "openstar.tess.noirlab-image-forced-photometry.interpret",
+            lambda current, request: StageOutcome(result={
+                "recommendedNextTest": "DES_DR2_SINGLE_EPOCH_LOCAL_FORCED_PHOTOMETRY",
+                "physicalMechanismResolved": False}, stop=True, final_status="BLOCKED"))
         dispatcher = InvestigationDispatcher(store, workflow)
         lifecycle = InvestigationLifecycleLoop(
             self.root / f"lifecycle-{suffix}.json", store, dispatcher,

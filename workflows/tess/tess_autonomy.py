@@ -146,6 +146,24 @@ def _awaiting_noirlab_adapter(investigation: Investigation) -> bool:
     )
 
 
+def _awaiting_current_des_adapter(investigation: Investigation) -> bool:
+    """Keep the intentional NOIRLab-to-current-DES boundary durable."""
+    stage = _latest_complete(
+        investigation, "openstar.tess.noirlab-image-forced-photometry.interpret"
+    )
+    result = (stage.result or {}) if stage is not None else {}
+    return bool(
+        stage is not None
+        and result.get("recommendedNextTest")
+        == "DES_DR2_SINGLE_EPOCH_LOCAL_FORCED_PHOTOMETRY"
+        and result.get("physicalMechanismResolved") is False
+        and not any(
+            item.handler_id.startswith("openstar.tess.des-dr2-se-local-forced-photometry.")
+            for item in investigation.stages
+        )
+    )
+
+
 def _persisted_archive_continuation(investigation: Investigation):
     """Return an unattempted continuation recorded by an archive prepare/run stage."""
     attempted_ids = {stage.id for stage in investigation.stages}
@@ -156,6 +174,8 @@ def _persisted_archive_continuation(investigation: Investigation):
         "openstar.tess.skymapper-resolved-counterpart-photometry.run",
         "openstar.tess.nsc-resolved-photometry.prepare",
         "openstar.tess.nsc-resolved-photometry.run",
+        "openstar.tess.noirlab-image-forced-photometry.prepare",
+        "openstar.tess.noirlab-image-forced-photometry.run",
     }
     for stage in reversed(investigation.stages):
         if (
@@ -183,6 +203,24 @@ def repair_obsolete_terminal_wait(
     """Repair only known obsolete terminal TESS decisions from older code."""
 
     control = investigation.metadata.get("controlState")
+    if (
+        investigation.status == "BLOCKED"
+        and control.get("schedulerAction") == "WAIT_FOR_PREREQUISITES"
+        and _awaiting_noirlab_adapter(investigation)
+    ):
+        metadata = investigation.metadata or {}
+        target = InvestigationTarget(
+            id=str(metadata.get("datasetID") or investigation.id),
+            investigation_id=investigation.id,
+            workflow_id=investigation.workflow_id,
+            workflow_version=investigation.workflow_version,
+            metadata=dict(metadata),
+        )
+        repaired, _ = AutonomousInvestigationEngine(store).decide(
+            investigation, plan_tess_branches(investigation, target)
+        )
+        return repaired
+
     if (
         investigation.workflow_id != WORKFLOW_ID
         or not isinstance(control, dict)
@@ -308,6 +346,23 @@ def plan_tess_branches(
     nsc_interpretation = _latest_complete(
         investigation, "openstar.tess.nsc-resolved-photometry.interpret"
     )
+    if _awaiting_current_des_adapter(investigation):
+        noirlab = _latest_complete(
+            investigation, "openstar.tess.noirlab-image-forced-photometry.interpret"
+        )
+        return (
+            ScientificBranch(
+                id=f"await-current-des-adapter-after-{noirlab.id}",
+                experiment=StageRequest(
+                    id=_continuation_stage_id(
+                        noirlab, "prepare-des-dr2-single-epoch-local-forced-photometry"
+                    ),
+                    handler_id="openstar.tess.des-dr2-se-local-forced-photometry.prepare",
+                    parameters={}, triggered_by_stage_id=noirlab.id,
+                ),
+                required_stage_ids=("openstar.capability.current-des-source-pair-adapter",),
+            ),
+        )
     if _awaiting_noirlab_adapter(investigation):
         return (
             ScientificBranch(
@@ -319,7 +374,7 @@ def plan_tess_branches(
                     handler_id="openstar.tess.noirlab-image-forced-photometry.prepare",
                     parameters={}, triggered_by_stage_id=nsc_interpretation.id,
                 ),
-                required_stage_ids=("openstar.capability.current-noirlab-source-pair-adapter",),
+                required_stage_ids=(),
             ),
         )
     archive_continuation = _persisted_archive_continuation(investigation)
