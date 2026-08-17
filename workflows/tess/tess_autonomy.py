@@ -112,6 +112,33 @@ def _has_terminal_tess_evidence(investigation: Investigation) -> bool:
     )
 
 
+def _persisted_gaia_continuation(investigation: Investigation):
+    """Return an unattempted continuation recorded by a completed Gaia stage."""
+    attempted_ids = {stage.id for stage in investigation.stages}
+    gaia_handlers = {
+        "openstar.tess.gaia-source-resolved-counterpart-photometry.prepare",
+        "openstar.tess.gaia-source-resolved-counterpart-photometry.run",
+    }
+    for stage in reversed(investigation.stages):
+        if (
+            stage.handler_id in gaia_handlers
+            and stage.status == "COMPLETE"
+            and stage.next_stage is not None
+            and str(stage.next_stage.get("id")) not in attempted_ids
+        ):
+            return stage, stage.next_stage
+    return None
+
+
+def _request_from_persisted(raw: dict) -> StageRequest:
+    return StageRequest(
+        id=str(raw["id"]),
+        handler_id=str(raw["handler_id"]),
+        parameters=dict(raw.get("parameters") or {}),
+        triggered_by_stage_id=raw.get("triggered_by_stage_id"),
+    )
+
+
 def repair_obsolete_terminal_wait(
     store: InvestigationStore, investigation: Investigation
 ) -> Investigation:
@@ -130,6 +157,25 @@ def repair_obsolete_terminal_wait(
         and _has_terminal_tess_evidence(investigation)
     ):
         repaired, _ = AutonomousInvestigationEngine(store).decide(investigation, ())
+        return repaired
+
+    gaia_continuation = _persisted_gaia_continuation(investigation)
+    if (
+        investigation.status == "COMPLETE"
+        and control.get("schedulerAction") == "INVESTIGATION_COMPLETE"
+        and gaia_continuation is not None
+    ):
+        metadata = investigation.metadata or {}
+        target = InvestigationTarget(
+            id=str(metadata.get("datasetID") or investigation.id),
+            investigation_id=investigation.id,
+            workflow_id=investigation.workflow_id,
+            workflow_version=investigation.workflow_version,
+            metadata=dict(metadata),
+        )
+        repaired, _ = AutonomousInvestigationEngine(store).decide(
+            investigation, plan_tess_branches(investigation, target)
+        )
         return repaired
 
     offset_variability = _latest_complete(
@@ -185,6 +231,18 @@ def plan_tess_branches(
         investigation,
         "openstar.tess.gaia-source-resolved-counterpart-photometry.interpret",
     )
+    if gaia_interpretation is not None:
+        return ()
+
+    gaia_continuation = _persisted_gaia_continuation(investigation)
+    if gaia_continuation is not None:
+        completed, raw = gaia_continuation
+        return (
+            ScientificBranch(
+                id=f"continue-after-{completed.id}",
+                experiment=_request_from_persisted(raw),
+            ),
+        )
     if (
         prf_interpretation is not None
         and catalog_identification is None
