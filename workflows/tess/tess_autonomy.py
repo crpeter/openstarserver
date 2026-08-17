@@ -164,6 +164,23 @@ def _awaiting_current_des_adapter(investigation: Investigation) -> bool:
     )
 
 
+def _awaiting_current_atlas_adapter(investigation: Investigation) -> bool:
+    """Identify only the DES-to-credential-aware ATLAS implementation boundary."""
+    stage = _latest_complete(
+        investigation, "openstar.tess.des-dr2-se-local-forced-photometry.interpret"
+    )
+    result = (stage.result or {}) if stage is not None else {}
+    return bool(
+        stage is not None
+        and result.get("recommendedNextTest") == "ATLAS_FORCED_PHOTOMETRY"
+        and result.get("physicalMechanismResolved") is False
+        and not any(
+            item.handler_id.startswith("openstar.tess.atlas-forced-photometry.")
+            for item in investigation.stages
+        )
+    )
+
+
 def _persisted_archive_continuation(investigation: Investigation):
     """Return an unattempted continuation recorded by an archive prepare/run stage."""
     attempted_ids = {stage.id for stage in investigation.stages}
@@ -176,6 +193,8 @@ def _persisted_archive_continuation(investigation: Investigation):
         "openstar.tess.nsc-resolved-photometry.run",
         "openstar.tess.noirlab-image-forced-photometry.prepare",
         "openstar.tess.noirlab-image-forced-photometry.run",
+        "openstar.tess.des-dr2-se-local-forced-photometry.prepare",
+        "openstar.tess.des-dr2-se-local-forced-photometry.run",
     }
     for stage in reversed(investigation.stages):
         if (
@@ -245,9 +264,28 @@ def repair_obsolete_terminal_wait(
     if (
         investigation.status == "BLOCKED"
         and control.get("schedulerAction") == "WAIT_FOR_PREREQUISITES"
+        and _awaiting_current_des_adapter(investigation)
+    ):
+        metadata = investigation.metadata or {}
+        target = InvestigationTarget(
+            id=str(metadata.get("datasetID") or investigation.id),
+            investigation_id=investigation.id,
+            workflow_id=investigation.workflow_id,
+            workflow_version=investigation.workflow_version,
+            metadata=dict(metadata),
+        )
+        repaired, _ = AutonomousInvestigationEngine(store).decide(
+            investigation, plan_tess_branches(investigation, target)
+        )
+        return repaired
+
+    if (
+        investigation.status == "BLOCKED"
+        and control.get("schedulerAction") == "WAIT_FOR_PREREQUISITES"
         and _has_terminal_tess_evidence(investigation)
         and not _awaiting_nsc_adapter(investigation)
         and not _awaiting_noirlab_adapter(investigation)
+        and not _awaiting_current_atlas_adapter(investigation)
     ):
         repaired, _ = AutonomousInvestigationEngine(store).decide(investigation, ())
         return repaired
@@ -343,10 +381,28 @@ def plan_tess_branches(
     nsc_interpretation = _latest_complete(
         investigation, "openstar.tess.nsc-resolved-photometry.interpret"
     )
+    if _awaiting_current_atlas_adapter(investigation):
+        des = _latest_complete(
+            investigation, "openstar.tess.des-dr2-se-local-forced-photometry.interpret"
+        )
+        return (
+            ScientificBranch(
+                id=f"await-current-atlas-adapter-after-{des.id}",
+                experiment=StageRequest(
+                    id=_continuation_stage_id(des, "prepare-atlas-forced-photometry"),
+                    handler_id="openstar.tess.atlas-forced-photometry.prepare",
+                    parameters={},
+                    triggered_by_stage_id=des.id,
+                ),
+                required_stage_ids=("openstar.capability.current-atlas-forced-photometry-adapter",),
+            ),
+        )
     if _awaiting_current_des_adapter(investigation):
         noirlab = _latest_complete(
             investigation, "openstar.tess.noirlab-image-forced-photometry.interpret"
         )
+        pair = ((noirlab.result or {}).get("sourcePair") or {})
+        adapter_ready = pair.get("version") == "openstar.current-source-pair.v1"
         return (
             ScientificBranch(
                 id=f"await-current-des-adapter-after-{noirlab.id}",
@@ -357,7 +413,9 @@ def plan_tess_branches(
                     handler_id="openstar.tess.des-dr2-se-local-forced-photometry.prepare",
                     parameters={}, triggered_by_stage_id=noirlab.id,
                 ),
-                required_stage_ids=("openstar.capability.current-des-source-pair-adapter",),
+                required_stage_ids=() if adapter_ready else (
+                    "openstar.capability.current-des-source-pair-adapter",
+                ),
             ),
         )
     if _awaiting_noirlab_adapter(investigation):
