@@ -51,6 +51,10 @@ class NOIRLabArchiveUnavailable(RuntimeError):
     """A transient NOIRLab service failure, rather than a scientific outcome."""
 
 
+class NOIRLabImageQualityRejected(RuntimeError):
+    """An expected per-image scientific or archive-quality rejection."""
+
+
 def _retryable_service_error(error: BaseException) -> bool:
     current: BaseException | None = error
     while current is not None:
@@ -78,7 +82,11 @@ def _python_value(value: Any) -> Any:
         pass
     if isinstance(value, bytes):
         return value.decode("utf-8", errors="replace")
-    if isinstance(value, (np.integer, np.floating)):
+    numpy_scalars = tuple(
+        kind for kind in (getattr(np, "integer", None), getattr(np, "floating", None))
+        if isinstance(kind, type)
+    )
+    if numpy_scalars and isinstance(value, numpy_scalars):
         value = value.item()
     if isinstance(value, float) and not math.isfinite(value):
         return None
@@ -227,7 +235,7 @@ def _query_sia(center_ra_deg: float, center_dec_deg: float) -> list[dict[str, An
     try:
         from astropy.io.votable import parse_single_table
     except Exception as exc:
-        raise RuntimeError(
+        raise ImportError(
             "v20.22 requires astropy.io.votable for the public NOIRLab SIA response."
         ) from exc
 
@@ -368,7 +376,7 @@ def _download_fits_cutout(url: str) -> bytes:
     with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
         body = response.read()
     if not body:
-        raise RuntimeError("NOIRLab SIA image cutout was empty.")
+        raise NOIRLabImageQualityRejected("NOIRLab SIA image cutout was empty.")
     return body
 
 
@@ -414,7 +422,9 @@ def _image_hdu_from_bytes(body: bytes):
             return np.asarray(array, dtype=np.float64), header, primary_header
     finally:
         hdul.close()
-    raise RuntimeError("Downloaded NOIRLab FITS cutout has no usable 2-D celestial image HDU.")
+    raise NOIRLabImageQualityRejected(
+        "Downloaded NOIRLab FITS cutout has no usable 2-D celestial image HDU."
+    )
 
 
 def _pixel_scale_arcsec(header: Any) -> float:
@@ -427,7 +437,9 @@ def _pixel_scale_arcsec(header: Any) -> float:
     scales = np.asarray(proj_plane_pixel_scales(wcs), dtype=np.float64) * 3600.0
     scales = scales[np.isfinite(scales) & (scales > 0)]
     if len(scales) == 0:
-        raise RuntimeError("NOIRLab cutout has no finite celestial pixel scale.")
+        raise NOIRLabImageQualityRejected(
+            "NOIRLab cutout has no finite celestial pixel scale."
+        )
     return float(np.median(scales))
 
 
@@ -441,7 +453,9 @@ def _world_to_pixel(header: Any, ra_deg: float, dec_deg: float) -> tuple[float, 
     x = float(x)
     y = float(y)
     if not math.isfinite(x) or not math.isfinite(y):
-        raise RuntimeError("Frozen Gaia coordinate does not map to a finite cutout pixel.")
+        raise NOIRLabImageQualityRejected(
+            "Frozen Gaia coordinate does not map to a finite cutout pixel."
+        )
     return x, y
 
 
@@ -470,7 +484,9 @@ def _saturation_level(headers: list[Any]) -> float | None:
 
 def _photometric_magnitude(amplitude: float, headers: list[Any]) -> tuple[float, str]:
     if not math.isfinite(amplitude) or amplitude <= 0:
-        raise RuntimeError("Forced-photometry amplitude is not positive and finite.")
+        raise NOIRLabImageQualityRejected(
+            "Forced-photometry amplitude is not positive and finite."
+        )
     magzero = _header_float(headers, "MAGZERO")
     if magzero is not None:
         return float(magzero - 2.5 * math.log10(amplitude)), "MAGZERO"
@@ -478,13 +494,17 @@ def _photometric_magnitude(amplitude: float, headers: list[Any]) -> tuple[float,
     exptime = _header_float(headers, "EXPTIME", "EXPOSURE")
     if magzpt is not None and exptime is not None and exptime > 0:
         return float(magzpt - 2.5 * math.log10(amplitude / exptime)), "MAGZPT"
-    raise RuntimeError("NOIRLab cutout lacks usable MAGZERO or MAGZPT+EXPTIME calibration.")
+    raise NOIRLabImageQualityRejected(
+        "NOIRLab cutout lacks usable MAGZERO or MAGZPT+EXPTIME calibration."
+    )
 
 
 def _scaled_linear_fit(design: np.ndarray, values: np.ndarray) -> tuple[np.ndarray, np.ndarray, float, float]:
     norms = np.linalg.norm(design, axis=0)
     if np.any(~np.isfinite(norms)) or np.any(norms <= 0):
-        raise RuntimeError("Forced-photometry design matrix has a degenerate column.")
+        raise NOIRLabImageQualityRejected(
+            "Forced-photometry design matrix has a degenerate column."
+        )
     scaled = design / norms
     condition = float(np.linalg.cond(scaled))
     coefficients_scaled, _, _, _ = np.linalg.lstsq(scaled, values, rcond=None)
@@ -515,7 +535,9 @@ def _gaussian_template(
     )
     total = float(np.sum(values))
     if not math.isfinite(total) or total <= 0:
-        raise RuntimeError("Forced-photometry Gaussian template is degenerate.")
+        raise NOIRLabImageQualityRejected(
+            "Forced-photometry Gaussian template is degenerate."
+        )
     return values / total
 
 
@@ -534,7 +556,7 @@ def _forced_two_source_fit(
     )
     pixel_scale = _pixel_scale_arcsec(header)
     if pixel_scale > MAX_PIXEL_SCALE_ARCSEC:
-        raise RuntimeError(
+        raise NOIRLabImageQualityRejected(
             f"pixel-scale-too-coarse:{pixel_scale:.4f}-arcsec-per-pixel"
         )
 
@@ -544,7 +566,7 @@ def _forced_two_source_fit(
     y0 = max(0, int(math.floor(min(target_y, counterpart_y))) - margin)
     y1 = min(data.shape[0], int(math.ceil(max(target_y, counterpart_y))) + margin + 1)
     if x1 - x0 < 12 or y1 - y0 < 12:
-        raise RuntimeError("pair-too-close-to-cutout-edge")
+        raise NOIRLabImageQualityRejected("pair-too-close-to-cutout-edge")
 
     headers = [header, primary_header]
     saturation = _saturation_level(headers)
@@ -552,9 +574,9 @@ def _forced_two_source_fit(
     counterpart_peak = _local_peak(data, counterpart_x, counterpart_y)
     if saturation is not None:
         if target_peak is not None and target_peak >= saturation * SATURATION_FRACTION:
-            raise RuntimeError("target-saturated")
+            raise NOIRLabImageQualityRejected("target-saturated")
         if counterpart_peak is not None and counterpart_peak >= saturation * SATURATION_FRACTION:
-            raise RuntimeError("counterpart-saturated")
+            raise NOIRLabImageQualityRejected("counterpart-saturated")
 
     crop = np.asarray(data[y0:y1, x0:x1], dtype=np.float64)
     yy, xx = np.indices(crop.shape, dtype=np.float64)
@@ -562,7 +584,7 @@ def _forced_two_source_fit(
     yy += float(y0)
     finite = np.isfinite(crop)
     if int(np.count_nonzero(finite)) < 120:
-        raise RuntimeError("too-few-finite-fit-pixels")
+        raise NOIRLabImageQualityRejected("too-few-finite-fit-pixels")
 
     normalized_x = (xx - float(np.mean(xx))) / max(1.0, float(np.std(xx)))
     normalized_y = (yy - float(np.mean(yy))) / max(1.0, float(np.std(yy)))
@@ -573,7 +595,9 @@ def _forced_two_source_fit(
     )
     min_fwhm_arcsec = max(0.55, pixel_scale * 2.2)
     if min_fwhm_arcsec >= max_fwhm_arcsec:
-        raise RuntimeError("no-valid-psf-width-range-for-pair-separation")
+        raise NOIRLabImageQualityRejected(
+            "no-valid-psf-width-range-for-pair-separation"
+        )
     fwhm_grid = np.linspace(min_fwhm_arcsec, max_fwhm_arcsec, 17)
     shift_grid = (-0.60, 0.0, 0.60)
 
@@ -611,7 +635,7 @@ def _forced_two_source_fit(
                 values = crop.ravel()[mask]
                 try:
                     coefficients, covariance, condition, _ = _scaled_linear_fit(design, values)
-                except Exception:
+                except (NOIRLabImageQualityRejected, np.linalg.LinAlgError):
                     continue
                 model = design @ coefficients
                 residual = values - model
@@ -628,7 +652,7 @@ def _forced_two_source_fit(
                             model = design[robust] @ coefficients
                             residual = values[robust] - model
                             fit_values = values[robust]
-                        except Exception:
+                        except (NOIRLabImageQualityRejected, np.linalg.LinAlgError):
                             continue
                     else:
                         fit_values = values
@@ -671,19 +695,19 @@ def _forced_two_source_fit(
                     best = candidate
 
     if best is None:
-        raise RuntimeError("no-positive-two-source-psf-fit")
+        raise NOIRLabImageQualityRejected("no-positive-two-source-psf-fit")
     if best["fwhmArcsec"] > max_fwhm_arcsec + 1e-9:
-        raise RuntimeError("psf-too-broad-for-source-resolution")
+        raise NOIRLabImageQualityRejected("psf-too-broad-for-source-resolution")
     if best["templateCorrelation"] > MAX_TEMPLATE_CORRELATION:
-        raise RuntimeError("source-templates-too-correlated")
+        raise NOIRLabImageQualityRejected("source-templates-too-correlated")
     if best["scaledDesignCondition"] > MAX_SCALED_DESIGN_CONDITION:
-        raise RuntimeError("two-source-fit-poorly-conditioned")
+        raise NOIRLabImageQualityRejected("two-source-fit-poorly-conditioned")
     if best["fitR2"] < MIN_FIT_R2:
-        raise RuntimeError("two-source-fit-low-explained-variance")
+        raise NOIRLabImageQualityRejected("two-source-fit-low-explained-variance")
     if best["targetAmplitudeSNR"] < MIN_TARGET_AMPLITUDE_SNR:
-        raise RuntimeError("target-amplitude-snr-too-low")
+        raise NOIRLabImageQualityRejected("target-amplitude-snr-too-low")
     if best["counterpartAmplitudeSNR"] < MIN_COUNTERPART_AMPLITUDE_SNR:
-        raise RuntimeError("counterpart-amplitude-snr-too-low")
+        raise NOIRLabImageQualityRejected("counterpart-amplitude-snr-too-low")
 
     target_mag, target_calibration = _photometric_magnitude(
         best["targetAmplitude"], headers
@@ -692,7 +716,9 @@ def _forced_two_source_fit(
         best["counterpartAmplitude"], headers
     )
     if target_calibration != counterpart_calibration:
-        raise RuntimeError("inconsistent-photometric-calibration-path")
+        raise NOIRLabImageQualityRejected(
+            "inconsistent-photometric-calibration-path"
+        )
 
     best.update(
         {
@@ -974,15 +1000,9 @@ def build_noirlab_image_forced_photometry_project(
                 f"SNR=({fit['targetAmplitudeSNR']:.1f},{fit['counterpartAmplitudeSNR']:.1f})",
                 flush=True,
             )
-        except (ImportError, ValueError):
-            # Missing local science dependencies and programming errors are
-            # not archive-quality rejections and must remain non-retryable.
-            raise
-        except Exception as exc:
+        except NOIRLabImageQualityRejected as exc:
             message = str(exc)
             reason = message.split(":", 1)[0] if message else type(exc).__name__
-            if _retryable_service_error(exc):
-                reason = "download-error"
             failure_counts[reason] += 1
             failures.append(
                 {
@@ -993,6 +1013,17 @@ def build_noirlab_image_forced_photometry_project(
                     "error": f"{type(exc).__name__}: {exc}",
                 }
             )
+            print(f"         rejected: {type(exc).__name__}: {exc}", flush=True)
+        except Exception as exc:
+            if not _retryable_service_error(exc):
+                raise
+            reason = "download-error"
+            failure_counts[reason] += 1
+            failures.append({
+                "identifier": exposure.get("identifier"), "band": band,
+                "mjd": exposure.get("mjd"), "reason": reason,
+                "error": f"{type(exc).__name__}: {exc}",
+            })
             print(f"         rejected: {type(exc).__name__}: {exc}", flush=True)
 
     if len(exposures) >= 3:

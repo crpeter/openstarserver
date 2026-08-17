@@ -203,6 +203,9 @@ def repair_obsolete_terminal_wait(
     """Repair only known obsolete terminal TESS decisions from older code."""
 
     control = investigation.metadata.get("controlState")
+    if investigation.workflow_id != WORKFLOW_ID or not isinstance(control, dict):
+        return investigation
+
     if (
         investigation.status == "BLOCKED"
         and control.get("schedulerAction") == "WAIT_FOR_PREREQUISITES"
@@ -220,12 +223,6 @@ def repair_obsolete_terminal_wait(
             investigation, plan_tess_branches(investigation, target)
         )
         return repaired
-
-    if (
-        investigation.workflow_id != WORKFLOW_ID
-        or not isinstance(control, dict)
-    ):
-        return investigation
 
     if (
         investigation.status == "BLOCKED"
