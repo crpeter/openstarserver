@@ -12,7 +12,12 @@ from openstar_investigation import (
     sha256_file,
     sha256_json,
 )
-from openstar_workflow import StageOutcome, StageRequest, WorkflowEngine
+from openstar_workflow import (
+    RetryableExecutionError,
+    StageOutcome,
+    StageRequest,
+    WorkflowEngine,
+)
 
 from .tess_claims import validate_claim
 from .tess_followup import (
@@ -90,6 +95,11 @@ from .tess_catalog_counterpart import identify_catalog_counterparts
 from .tess_external_highres import (
     build_external_high_resolution_project,
     interpret_external_high_resolution_project,
+)
+from .tess_gaia_counterpart import (
+    GaiaArchiveUnavailable,
+    build_current_gaia_counterpart_project,
+    interpret_current_gaia_counterpart_project,
 )
 from .tess_skymapper_resolved import (
     build_skymapper_resolved_project,
@@ -3726,15 +3736,147 @@ def build_engine(
         return StageOutcome(
             result=summary,
             next_stage=StageRequest(
-                id=_next_stage_id(request.id, "finalize"),
-                handler_id="openstar.tess.finalize",
-                parameters={"outputSuffix": "v20.14"},
+                id=_next_stage_id(
+                    request.id,
+                    "prepare-gaia-source-resolved-counterpart-photometry"
+                    if summary.get("recommendedNextTest")
+                    == "INDEPENDENT_SOURCE_RESOLVED_COUNTERPART_PHOTOMETRY"
+                    else "finalize",
+                ),
+                handler_id=(
+                    "openstar.tess.gaia-source-resolved-counterpart-photometry.prepare"
+                    if summary.get("recommendedNextTest")
+                    == "INDEPENDENT_SOURCE_RESOLVED_COUNTERPART_PHOTOMETRY"
+                    else "openstar.tess.finalize"
+                ),
+                parameters=(
+                    {}
+                    if summary.get("recommendedNextTest")
+                    == "INDEPENDENT_SOURCE_RESOLVED_COUNTERPART_PHOTOMETRY"
+                    else {"outputSuffix": "v20.14"}
+                ),
                 triggered_by_stage_id=request.id,
             ),
             input_hashes={
                 "preparation": sha256_json(preparation),
                 "projectResult": sha256_json(run),
             },
+            artifacts=(_artifact(artifact_path, "application/json"),),
+        )
+
+    def current_gaia_counterpart_prepare_stage(investigation, request):
+        prepared = _latest_result_for_handler(investigation, "openstar.tess.prepare-target")
+        identity = _latest_result_for_handler(investigation, "openstar.tess.catalog-identity")
+        catalog = _latest_result_for_handler(
+            investigation, "openstar.tess.catalog-counterpart-identification.analyze"
+        )
+        variability = _latest_result_for_handler(
+            investigation, "openstar.tess.offset-source-variability.interpret"
+        )
+        if any(value is None for value in (prepared, identity, catalog, variability)):
+            raise RuntimeError(
+                "Current Gaia counterpart photometry requires persisted target, identity, "
+                "catalog-counterpart, and offset-variability evidence."
+            )
+        artifact_root = store.directory_for(investigation.id) / "artifacts"
+        print("🔭 Preparing current Gaia DR3 source-resolved counterpart photometry")
+        try:
+            spec = build_current_gaia_counterpart_project(
+                source_project_id=str(prepared["sourceProjectID"]),
+                source_dataset_id=str(prepared["datasetID"]),
+                prepared_target=prepared,
+                identity=identity,
+                catalog_identification=catalog,
+                offset_variability=variability,
+                output_dir=artifact_root,
+                investigation_id=investigation.id,
+            )
+        except GaiaArchiveUnavailable as exc:
+            raise RetryableExecutionError(str(exc)) from exc
+
+        artifacts: list[ArtifactReference] = []
+        for item in spec.get("preparedSeries") or []:
+            for key, media_type in (("datasetPath", "application/json"),
+                                    ("rawEpochPath", "text/csv")):
+                path = item.get(key)
+                if path and Path(path).exists():
+                    artifacts.append(_artifact(Path(path), media_type))
+        project_path = spec.get("projectPath")
+        if project_path:
+            artifacts.append(_artifact(Path(project_path), "application/json"))
+        run_work = bool(spec.get("available") and project_path)
+        return StageOutcome(
+            result=spec,
+            next_stage=StageRequest(
+                id=_next_stage_id(
+                    request.id,
+                    "run-gaia-source-resolved-counterpart-photometry"
+                    if run_work else "interpret-gaia-source-resolved-counterpart-photometry",
+                ),
+                handler_id=(
+                    "openstar.tess.gaia-source-resolved-counterpart-photometry.run"
+                    if run_work
+                    else "openstar.tess.gaia-source-resolved-counterpart-photometry.interpret"
+                ),
+                parameters=(
+                    {"projectPath": project_path}
+                    if run_work else {"distributedRunExpected": False}
+                ),
+                triggered_by_stage_id=request.id,
+            ),
+            input_hashes={
+                "target": sha256_json(prepared), "identity": sha256_json(identity),
+                "catalogCounterpart": sha256_json(catalog),
+                "offsetVariability": sha256_json(variability),
+            },
+            artifacts=tuple(artifacts),
+        )
+
+    def current_gaia_counterpart_run_stage(investigation, request):
+        run = coordinator.run_project(
+            request.parameters["projectPath"], poll_interval=poll_interval, timeout=timeout
+        )
+        return StageOutcome(
+            result=run.status,
+            next_stage=StageRequest(
+                id=_next_stage_id(request.id, "interpret-gaia-source-resolved-counterpart-photometry"),
+                handler_id="openstar.tess.gaia-source-resolved-counterpart-photometry.interpret",
+                parameters={"distributedRunExpected": True},
+                triggered_by_stage_id=request.id,
+            ),
+            node_contributions=run.node_contributions,
+            project_ids=(run.project_id,),
+        )
+
+    def current_gaia_counterpart_interpret_stage(investigation, request):
+        preparation = _latest_result_for_handler(
+            investigation, "openstar.tess.gaia-source-resolved-counterpart-photometry.prepare"
+        )
+        run = _latest_result_for_handler(
+            investigation, "openstar.tess.gaia-source-resolved-counterpart-photometry.run"
+        )
+        if preparation is None:
+            raise RuntimeError("Current Gaia counterpart interpretation requires preparation.")
+        if request.parameters.get("distributedRunExpected") and run is None:
+            raise RuntimeError("Current Gaia counterpart interpretation expected distributed results.")
+        summary = interpret_current_gaia_counterpart_project(
+            project_status=run, preparation=preparation
+        )
+        artifact_path = (
+            store.directory_for(investigation.id) / "artifacts"
+            / "current-gaia-counterpart-photometry" / "interpretation.json"
+        )
+        _write_json(artifact_path, summary)
+        return StageOutcome(
+            result=summary,
+            next_stage=StageRequest(
+                id=_next_stage_id(request.id, "finalize"),
+                handler_id="openstar.tess.finalize",
+                parameters={"outputSuffix": "current-gaia-counterpart"},
+                triggered_by_stage_id=request.id,
+            ),
+            input_hashes={"preparation": sha256_json(preparation),
+                          **({"projectResult": sha256_json(run)} if run is not None else {})},
             artifacts=(_artifact(artifact_path, "application/json"),),
         )
 
@@ -7594,6 +7736,18 @@ def build_engine(
     engine.register_handler(
         "openstar.tess.offset-source-variability.interpret",
         offset_source_variability_interpret_stage,
+    )
+    engine.register_handler(
+        "openstar.tess.gaia-source-resolved-counterpart-photometry.prepare",
+        current_gaia_counterpart_prepare_stage,
+    )
+    engine.register_handler(
+        "openstar.tess.gaia-source-resolved-counterpart-photometry.run",
+        current_gaia_counterpart_run_stage,
+    )
+    engine.register_handler(
+        "openstar.tess.gaia-source-resolved-counterpart-photometry.interpret",
+        current_gaia_counterpart_interpret_stage,
     )
     engine.register_handler(
         "openstar.tess.calibrated-prf-deblending.prepare",

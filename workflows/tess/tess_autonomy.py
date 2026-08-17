@@ -115,19 +115,55 @@ def _has_terminal_tess_evidence(investigation: Investigation) -> bool:
 def repair_obsolete_terminal_wait(
     store: InvestigationStore, investigation: Investigation
 ) -> Investigation:
-    """Replace only the obsolete terminal-TESS wait decision from older code."""
+    """Repair only known obsolete terminal TESS decisions from older code."""
 
     control = investigation.metadata.get("controlState")
     if (
         investigation.workflow_id != WORKFLOW_ID
-        or investigation.status != "BLOCKED"
         or not isinstance(control, dict)
-        or control.get("schedulerAction") != "WAIT_FOR_PREREQUISITES"
-        or not _has_terminal_tess_evidence(investigation)
     ):
         return investigation
 
-    repaired, _ = AutonomousInvestigationEngine(store).decide(investigation, ())
+    if (
+        investigation.status == "BLOCKED"
+        and control.get("schedulerAction") == "WAIT_FOR_PREREQUISITES"
+        and _has_terminal_tess_evidence(investigation)
+    ):
+        repaired, _ = AutonomousInvestigationEngine(store).decide(investigation, ())
+        return repaired
+
+    offset_variability = _latest_complete(
+        investigation, "openstar.tess.offset-source-variability.interpret"
+    )
+    gaia_attempted = any(
+        stage.handler_id.startswith(
+            "openstar.tess.gaia-source-resolved-counterpart-photometry."
+        )
+        for stage in investigation.stages
+    )
+    offset_result = (offset_variability.result or {}) if offset_variability else {}
+    if not (
+        investigation.status == "COMPLETE"
+        and control.get("schedulerAction") == "INVESTIGATION_COMPLETE"
+        and offset_variability is not None
+        and offset_result.get("recommendedNextTest")
+        == "INDEPENDENT_SOURCE_RESOLVED_COUNTERPART_PHOTOMETRY"
+        and offset_result.get("physicalMechanismResolved") is False
+        and not gaia_attempted
+    ):
+        return investigation
+
+    metadata = investigation.metadata or {}
+    target = InvestigationTarget(
+        id=str(metadata.get("datasetID") or investigation.id),
+        investigation_id=investigation.id,
+        workflow_id=investigation.workflow_id,
+        workflow_version=investigation.workflow_version,
+        metadata=dict(metadata),
+    )
+    repaired, _ = AutonomousInvestigationEngine(store).decide(
+        investigation, plan_tess_branches(investigation, target)
+    )
     return repaired
 
 
@@ -144,6 +180,10 @@ def plan_tess_branches(
     )
     variability_interpretation = _latest_complete(
         investigation, "openstar.tess.offset-source-variability.interpret"
+    )
+    gaia_interpretation = _latest_complete(
+        investigation,
+        "openstar.tess.gaia-source-resolved-counterpart-photometry.interpret",
     )
     if (
         prf_interpretation is not None
@@ -198,6 +238,42 @@ def plan_tess_branches(
                     handler_id="openstar.tess.offset-source-variability.prepare",
                     parameters={},
                     triggered_by_stage_id=catalog_identification.id,
+                ),
+            ),
+        )
+
+    variability_result = (
+        variability_interpretation.result or {}
+        if variability_interpretation is not None
+        else {}
+    )
+    gaia_started = any(
+        stage.handler_id.startswith(
+            "openstar.tess.gaia-source-resolved-counterpart-photometry."
+        )
+        for stage in investigation.stages
+    )
+    if (
+        variability_interpretation is not None
+        and gaia_interpretation is None
+        and not gaia_started
+        and variability_result.get("recommendedNextTest")
+        == "INDEPENDENT_SOURCE_RESOLVED_COUNTERPART_PHOTOMETRY"
+        and variability_result.get("physicalMechanismResolved") is False
+    ):
+        return (
+            ScientificBranch(
+                id=f"continue-gaia-counterpart-after-{variability_interpretation.id}",
+                experiment=StageRequest(
+                    id=_continuation_stage_id(
+                        variability_interpretation,
+                        "prepare-gaia-source-resolved-counterpart-photometry",
+                    ),
+                    handler_id=(
+                        "openstar.tess.gaia-source-resolved-counterpart-photometry.prepare"
+                    ),
+                    parameters={},
+                    triggered_by_stage_id=variability_interpretation.id,
                 ),
             ),
         )
