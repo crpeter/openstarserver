@@ -12,10 +12,16 @@ except ModuleNotFoundError:
     sys.modules["numpy"] = types.ModuleType("numpy")
 
 from openstar_investigation import InvestigationStage, InvestigationStore
-from openstar_targets import InvestigationTarget
-from openstar_workflow import RetryableExecutionError, StageRequest
+from openstar_autonomy import AutonomousInvestigationEngine
+from openstar_dispatch import InvestigationDispatcher
+from openstar_lifecycle import InvestigationLifecycleLoop
+from openstar_targets import (
+    InvestigationTarget,
+    InvestigationTargetPortfolio,
+)
+from openstar_workflow import RetryableExecutionError, StageOutcome, StageRequest, WorkflowEngine
 from workflows.tess.tess_investigation import build_engine
-from workflows.tess.tess_autonomy import plan_tess_branches
+from workflows.tess.tess_autonomy import plan_tess_branches, repair_obsolete_terminal_wait
 from workflows.tess import tess_gaia_counterpart as gaia
 
 
@@ -30,6 +36,17 @@ class _NumpyStub:
     @staticmethod
     def asarray(values, dtype=None):
         return _Array(values)
+
+
+class _SingleTargetSource:
+    id = "gaia-test-targets"
+    version = "1"
+
+    def __init__(self, target):
+        self.target = target
+
+    def enumerate_targets(self):
+        return (self.target,)
 
 
 class CurrentGaiaCounterpartTests(unittest.TestCase):
@@ -204,6 +221,32 @@ class CurrentGaiaCounterpartTests(unittest.TestCase):
             self.build(query_metadata=unavailable)
         with self.assertRaises(gaia.GaiaArchiveUnavailable):
             self.build(download_epochs=lambda source_id: (_ for _ in ()).throw(TimeoutError("temporary")))
+        programming_error = RuntimeError("missing local dependency")
+        with self.assertRaises(RuntimeError) as raised:
+            self.build(query_metadata=lambda ids: (_ for _ in ()).throw(programming_error))
+        self.assertIs(programming_error, raised.exception)
+
+    def test_partial_control_recurrence_is_not_mislabeled_no_recurrence(self):
+        metadata = self.metadata()
+        metadata[self.target_gaia]["hasEpochPhotometry"] = False
+        spec = self.build(query_metadata=lambda ids: metadata)
+        result = gaia.interpret_current_gaia_counterpart_project(
+            project_status=self.status(spec, counterpart=True), preparation=spec)
+        self.assertEqual("COUNTERPART_RECURRENCE_CONTROL_UNAVAILABLE", result["classification"])
+        self.assertEqual("NO_EPOCH_PHOTOMETRY", result["sourceEpochStates"]["target-control"])
+        self.assertTrue(result["catalogCounterpartEvidence"]["acceptedResidualBandVariability"])
+
+        metadata = self.metadata()
+        metadata[self.counterpart_gaia]["hasEpochPhotometry"] = False
+        spec = self.build(query_metadata=lambda ids: metadata)
+        result = gaia.interpret_current_gaia_counterpart_project(
+            project_status=self.status(spec, target=True), preparation=spec)
+        self.assertEqual(
+            "TARGET_CONTROL_RECURRENCE_COUNTERPART_UNAVAILABLE", result["classification"]
+        )
+        self.assertEqual(
+            "NO_EPOCH_PHOTOMETRY", result["sourceEpochStates"]["catalog-counterpart"]
+        )
 
     def test_current_handler_records_transient_gaia_outage_for_generic_retry(self):
         store = InvestigationStore(self.root / "retry-store")
@@ -255,6 +298,126 @@ class CurrentGaiaCounterpartTests(unittest.TestCase):
         branches = plan_tess_branches(investigation, InvestigationTarget(
             "t", "generic", "openstar.workflow.tess-investigation.v1", "20.2"))
         self.assertEqual((), branches)
+
+    def test_any_failed_gaia_attempt_is_not_replanned_as_fresh_science(self):
+        for classification in ("TRANSIENT_INFRASTRUCTURE", "NON_RETRYABLE"):
+            store = InvestigationStore(self.root / f"failed-{classification}")
+            investigation = store.create(
+                f"generic-{classification}", "openstar.workflow.tess-investigation.v1", "20.2"
+            )
+            stages = (
+                InvestigationStage("041-interpret-offset-source-variability",
+                    "openstar.tess.offset-source-variability.interpret", "COMPLETE", None, {},
+                    result=self.variability),
+                InvestigationStage("042-prepare-gaia-source-resolved-counterpart-photometry",
+                    "openstar.tess.gaia-source-resolved-counterpart-photometry.prepare", "FAILED",
+                    "041-interpret-offset-source-variability", {}, error="RuntimeError: failed",
+                    failure_classification=classification),
+            )
+            investigation = type(investigation)(**{**investigation.__dict__, "stages": stages})
+            branches = plan_tess_branches(investigation, InvestigationTarget(
+                "t", investigation.id, "openstar.workflow.tess-investigation.v1", "20.2"))
+            self.assertEqual((), branches)
+
+    def test_terminal_current_investigation_is_durably_repaired_and_lifecycle_runs_gaia(self):
+        store = InvestigationStore(self.root / "terminal-resume-store")
+        target = InvestigationTarget(
+            "generic-target", "terminal-resume", "openstar.workflow.tess-investigation.v1", "20.2",
+            metadata={"datasetID": "dataset-x"},
+        )
+        investigation = store.create(
+            target.investigation_id, target.workflow_id, target.workflow_version,
+            metadata=target.metadata,
+        )
+        running = InvestigationStage(
+            "041-interpret-offset-source-variability",
+            "openstar.tess.offset-source-variability.interpret", "RUNNING", None, {},
+        )
+        investigation = store.append_running_stage(investigation, running)
+        completed = store.build_terminal_stage(
+            stage_id=running.id, handler_id=running.handler_id, status="COMPLETE",
+            triggered_by_stage_id=None, parameters={}, result=self.variability, error=None,
+            software_id="old", software_version="1", started_at=running.started_at,
+        )
+        investigation = store.complete_current_stage(investigation, completed)
+        investigation, _ = AutonomousInvestigationEngine(store).decide(investigation, ())
+        self.assertEqual("COMPLETE", investigation.status)
+        self.assertEqual(
+            "INVESTIGATION_COMPLETE",
+            investigation.metadata["controlState"]["schedulerAction"],
+        )
+
+        executions = []
+        workflow = WorkflowEngine(store)
+
+        def gaia_prepare(current, request):
+            executions.append((request.id, request.handler_id))
+            return StageOutcome(result={"archiveAttempted": True}, stop=True)
+
+        workflow.register_handler(
+            "openstar.tess.gaia-source-resolved-counterpart-photometry.prepare", gaia_prepare
+        )
+        dispatcher = InvestigationDispatcher(store, workflow)
+        lifecycle = InvestigationLifecycleLoop(
+            self.root / "terminal-resume-lifecycle.json", store, dispatcher,
+            InvestigationTargetPortfolio(self.root / "terminal-resume-portfolio.json", store, dispatcher),
+            _SingleTargetSource(target), {target.workflow_id: plan_tess_branches},
+            software_id="test", software_version="1",
+        )
+        lifecycle.start(target)
+
+        # This is the same narrow startup compatibility hook used by the normal
+        # autonomous TESS runner; no control state or prior stage is cleared.
+        repaired = repair_obsolete_terminal_wait(store, store.load(target.investigation_id))
+        self.assertEqual("RUNNING", repaired.status)
+        self.assertEqual("RUN_EXPERIMENT", repaired.metadata["controlState"]["schedulerAction"])
+        result = lifecycle.run(max_transitions=10)
+        self.assertNotEqual("LIFECYCLE_CHECKPOINT", result.disposition)
+        self.assertEqual([
+            ("042-prepare-gaia-source-resolved-counterpart-photometry",
+             "openstar.tess.gaia-source-resolved-counterpart-photometry.prepare")
+        ], executions)
+        self.assertEqual(2, len(store.load(target.investigation_id).stages))
+
+    def test_transient_failed_gaia_attempt_uses_generic_retry_id_without_loop(self):
+        store = InvestigationStore(self.root / "transient-retry-store")
+        target = InvestigationTarget(
+            "generic-target", "transient-retry", "openstar.workflow.tess-investigation.v1", "20.2"
+        )
+        investigation = store.create(target.investigation_id, target.workflow_id, target.workflow_version)
+        running = InvestigationStage(
+            "042-prepare-gaia-source-resolved-counterpart-photometry",
+            "openstar.tess.gaia-source-resolved-counterpart-photometry.prepare", "RUNNING",
+            "041-interpret-offset-source-variability", {},
+        )
+        investigation = store.append_running_stage(investigation, running)
+        failed = store.build_terminal_stage(
+            stage_id=running.id, handler_id=running.handler_id, status="FAILED",
+            triggered_by_stage_id=running.triggered_by_stage_id, parameters={}, result=None,
+            error="RetryableExecutionError: outage",
+            failure_classification="TRANSIENT_INFRASTRUCTURE",
+            software_id="test", software_version="1", started_at=running.started_at,
+        )
+        investigation = store.complete_current_stage(investigation, failed)
+        attempts = []
+        workflow = WorkflowEngine(store)
+
+        def retry(current, request):
+            attempts.append(request.id)
+            return StageOutcome(result={"retried": True}, stop=True)
+
+        workflow.register_handler(failed.handler_id, retry)
+        dispatcher = InvestigationDispatcher(store, workflow)
+        lifecycle = InvestigationLifecycleLoop(
+            self.root / "transient-retry-lifecycle.json", store, dispatcher,
+            InvestigationTargetPortfolio(self.root / "transient-retry-portfolio.json", store, dispatcher),
+            _SingleTargetSource(target), {target.workflow_id: lambda investigation, target: ()},
+            software_id="test", software_version="1",
+        )
+        lifecycle.start(target)
+        result = lifecycle.run(max_transitions=10)
+        self.assertNotEqual("LIFECYCLE_CHECKPOINT", result.disposition)
+        self.assertEqual(["043-prepare-gaia-source-resolved-counterpart-photometry"], attempts)
 
 
 if __name__ == "__main__":

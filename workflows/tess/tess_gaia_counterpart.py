@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import statistics
+import urllib.error
 from pathlib import Path
 from typing import Any, Callable
 
@@ -37,6 +38,33 @@ MAX_SEARCH_HALF_WIDTH_FRACTION = 0.20
 
 class GaiaArchiveUnavailable(RuntimeError):
     """The Gaia service failed transiently before a scientific result existed."""
+
+
+def _retryable_service_error(error: BaseException) -> bool:
+    """Recognize network/service failures without hiding local code defects."""
+    current: BaseException | None = error
+    while current is not None:
+        if isinstance(current, (TimeoutError, ConnectionError, urllib.error.URLError)):
+            if isinstance(current, urllib.error.HTTPError):
+                return current.code in {408, 425, 429} or current.code >= 500
+            return True
+        module = type(current).__module__.lower()
+        name = type(current).__name__.lower()
+        if (
+            module.startswith(("requests.", "httpx", "urllib3."))
+            and any(token in name for token in ("timeout", "connection", "network"))
+        ):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def _raise_archive_failure(context: str, error: Exception) -> None:
+    if _retryable_service_error(error):
+        raise GaiaArchiveUnavailable(
+            f"{context}: {type(error).__name__}: {error}"
+        ) from error
+    raise error
 
 
 def _frequency_search(offset_variability: dict[str, Any]) -> tuple[dict[str, Any], float]:
@@ -145,7 +173,7 @@ def build_current_gaia_counterpart_project(
     try:
         metadata = query_metadata(ids)
     except Exception as exc:
-        raise GaiaArchiveUnavailable(f"Gaia DR3 metadata query failed: {type(exc).__name__}: {exc}") from exc
+        _raise_archive_failure("Gaia DR3 metadata query failed", exc)
     missing = sorted(set(ids) - set(metadata))
     if missing:
         raise RuntimeError(f"Gaia DR3 metadata did not contain persisted source IDs: {missing}")
@@ -169,9 +197,7 @@ def build_current_gaia_counterpart_project(
         try:
             payload, content_type = download_epochs(source_id)
         except Exception as exc:
-            raise GaiaArchiveUnavailable(
-                f"Gaia DR3 epoch download failed for {role}: {type(exc).__name__}: {exc}"
-            ) from exc
+            _raise_archive_failure(f"Gaia DR3 epoch download failed for {role}", exc)
         raw_path = root / f"gaia-dr3-{source_id}-epoch-photometry.csv"
         raw_path.write_bytes(payload)
         try:
@@ -258,6 +284,12 @@ def interpret_current_gaia_counterpart_project(
     if counterpart_recurs and not target_recurs and both_usable:
         outcome = "COUNTERPART_RECURRENCE_SUPPORTED"
         next_test = "TARGET_RESIDUAL_REANALYSIS_AFTER_OFFSET_REMOVAL"
+    elif counterpart_recurs and states.get("target-control") != "USABLE_EPOCH_PHOTOMETRY":
+        outcome = "COUNTERPART_RECURRENCE_CONTROL_UNAVAILABLE"
+        next_test = NEXT_ARCHIVE_TEST
+    elif target_recurs and states.get("catalog-counterpart") != "USABLE_EPOCH_PHOTOMETRY":
+        outcome = "TARGET_CONTROL_RECURRENCE_COUNTERPART_UNAVAILABLE"
+        next_test = NEXT_ARCHIVE_TEST
     elif target_recurs and not counterpart_recurs:
         outcome = "TARGET_CONTROL_RECURRENCE_ONLY"
         next_test = NEXT_ARCHIVE_TEST
@@ -269,8 +301,11 @@ def interpret_current_gaia_counterpart_project(
                    if any(state == "INSUFFICIENT_EPOCH_PHOTOMETRY" for state in states.values())
                    else "GAIA_NO_EPOCH_PHOTOMETRY")
         next_test = NEXT_ARCHIVE_TEST
-    elif results:
+    elif results and both_usable:
         outcome = "GAIA_USABLE_NO_RECURRENCE"
+        next_test = NEXT_ARCHIVE_TEST
+    elif results:
+        outcome = "GAIA_INCOMPLETE_SOURCE_PAIR_EPOCH_PHOTOMETRY"
         next_test = NEXT_ARCHIVE_TEST
     else:
         outcome = "GAIA_INSUFFICIENT_EPOCH_PHOTOMETRY"
@@ -280,6 +315,7 @@ def interpret_current_gaia_counterpart_project(
             "archiveExhausted": next_test == NEXT_ARCHIVE_TEST,
             "externalDataState": "AVAILABLE", "sourcePair": preparation.get("sourcePair"),
             "frequencySearch": preparation.get("frequencySearch"), "tessDriftExtrapolated": False,
+            "sourceEpochStates": states,
             "targetControl": target, "catalogCounterpartEvidence": counterpart,
             "componentResults": results, "sourceRecords": records, "classification": outcome,
             "counterpartRecurrenceSupported": outcome == "COUNTERPART_RECURRENCE_SUPPORTED",
