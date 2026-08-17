@@ -123,6 +123,9 @@ from .tess_des_dr2_se_local_forced import (
     interpret_des_dr2_se_local_forced_project,
 )
 from .tess_atlas_forced_photometry import (
+    ATLASArchiveUnavailable,
+    CURRENT_TRIGGER as CURRENT_ATLAS_TRIGGER,
+    SIGNED_REANALYSIS as ATLAS_SIGNED_REANALYSIS,
     build_atlas_forced_photometry_project,
     interpret_atlas_forced_photometry_project,
 )
@@ -5498,6 +5501,10 @@ def build_engine(
 
     def atlas_forced_prepare_stage(investigation, request):
         prepared = _latest_result_for_handler(investigation, "openstar.tess.prepare-target")
+        gaia = _latest_result_for_handler(
+            investigation,
+            "openstar.tess.gaia-source-resolved-counterpart-photometry.interpret",
+        )
         external = _latest_result_for_handler(
             investigation,
             "openstar.tess.external-high-resolution-variability-validation.interpret",
@@ -5506,11 +5513,21 @@ def build_engine(
             investigation,
             "openstar.tess.des-dr2-se-local-forced-photometry.interpret",
         )
-        if prepared is None or external is None or des is None:
+        des_pair = (des or {}).get("sourcePair") or {}
+        gaia_pair = (gaia or {}).get("sourcePair") or {}
+        source_evidence = (
+            des if des_pair.get("version") == "openstar.current-source-pair.v1"
+            else gaia if gaia_pair.get("version") == "openstar.current-source-pair.v1"
+            else external
+        )
+        if prepared is None or des is None or source_evidence is None:
             raise RuntimeError(
-                "v20.24 requires the frozen target plus completed v20.19 and v20.23 archival results."
+                "v20.24 requires the frozen target, completed DES interpretation, and persisted source-pair evidence."
             )
-        if des.get("recommendedNextTest") != "TARGETED_HIGH_RESOLUTION_TIME_SERIES_PHOTOMETRY":
+        if des.get("recommendedNextTest") not in {
+            CURRENT_ATLAS_TRIGGER,
+            "TARGETED_HIGH_RESOLUTION_TIME_SERIES_PHOTOMETRY",
+        }:
             raise RuntimeError(
                 "v20.23 did not leave the investigation at TARGETED_HIGH_RESOLUTION_TIME_SERIES_PHOTOMETRY."
             )
@@ -5525,14 +5542,17 @@ def build_engine(
         print("   accepted nightly source-band series become ordinary openstar.lomb-scargle.v1 datasets")
         print("   the TESS drift law is NOT extrapolated into the ATLAS observing epochs")
 
-        spec = build_atlas_forced_photometry_project(
-            source_project_id=str(prepared["sourceProjectID"]),
-            source_dataset_id=str(prepared["datasetID"]),
-            external_high_resolution_summary=external,
-            des_dr2_se_summary=des,
-            output_dir=artifact_root,
-            investigation_id=investigation.id,
-        )
+        try:
+            spec = build_atlas_forced_photometry_project(
+                source_project_id=str(prepared["sourceProjectID"]),
+                source_dataset_id=str(prepared["datasetID"]),
+                external_high_resolution_summary=source_evidence,
+                des_dr2_se_summary=des,
+                output_dir=artifact_root,
+                investigation_id=investigation.id,
+            )
+        except ATLASArchiveUnavailable as exc:
+            raise RetryableExecutionError(str(exc)) from exc
 
         print(f"   corrected Gaia source separation: {spec.get('gaiaPairSeparationArcsec')} arcsec")
         print(f"   prepared ATLAS source-band datasets: {len(spec.get('preparedSeries') or [])}")
@@ -5572,7 +5592,7 @@ def build_engine(
             result=spec,
             next_stage=next_stage,
             input_hashes={
-                "externalHighResolutionValidation": sha256_json(external),
+                "sourcePairEvidence": sha256_json(source_evidence),
                 "desDr2SeLocalForcedPhotometry": sha256_json(des),
             },
             artifacts=tuple(artifacts),
@@ -5643,9 +5663,16 @@ def build_engine(
         if run is not None:
             input_hashes["projectResult"] = sha256_json(run)
 
+        awaiting_followup = (
+            summary.get("recommendedNextTest") in {
+                ATLAS_SIGNED_REANALYSIS,
+                "TARGETED_HIGH_RESOLUTION_TIME_SERIES_PHOTOMETRY",
+            }
+            and summary.get("physicalMechanismResolved") is False
+        )
         return StageOutcome(
             result=summary,
-            next_stage=StageRequest(
+            next_stage=None if awaiting_followup else StageRequest(
                 id=_next_stage_id(request.id, "finalize"),
                 handler_id="openstar.tess.finalize",
                 parameters={"outputSuffix": "v20.24"},
@@ -5653,6 +5680,8 @@ def build_engine(
             ),
             input_hashes=input_hashes,
             artifacts=(_artifact(artifact_path, "application/json"),),
+            stop=awaiting_followup,
+            final_status="BLOCKED" if awaiting_followup else None,
         )
 
     def atlas_reanalysis_prepare_stage(investigation, request):

@@ -1,0 +1,176 @@
+import os
+import sys
+import tempfile
+import types
+import unittest
+import urllib.error
+from dataclasses import asdict
+from pathlib import Path
+from unittest import mock
+
+try:
+    import numpy  # noqa: F401
+except ModuleNotFoundError:
+    stub = types.ModuleType("numpy")
+    stub.integer = int
+    stub.floating = float
+    stub.float64 = float
+    stub.float32 = float
+    stub.asarray = lambda values, dtype=None: list(values)
+    stub.median = lambda values: sorted(values)[len(values) // 2]
+    sys.modules["numpy"] = stub
+    _installed_numpy_stub = True
+else:
+    _installed_numpy_stub = False
+
+from openstar_investigation import Investigation, InvestigationStage, InvestigationStore
+from openstar_targets import InvestigationTarget
+from workflows.tess import tess_atlas_forced_photometry as atlas
+from workflows.tess.tess_autonomy import plan_tess_branches, repair_obsolete_terminal_wait
+
+if _installed_numpy_stub:
+    sys.modules.pop("numpy", None)
+
+
+class CurrentATLASForcedPhotometryTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.pair = {
+            "version": "openstar.current-source-pair.v1",
+            "target": {"sourceRole": "target-control", "gaiaDR3SourceID": 101,
+                       "raDeg": 10.0, "decDeg": -20.0},
+            "counterpart": {"sourceRole": "catalog-counterpart", "gaiaDR3SourceID": 202,
+                            "raDeg": 10.01, "decDeg": -20.0},
+            "separationArcsec": 999.0,
+        }
+
+    def test_current_source_pair_coordinates_define_geometry_and_guard(self):
+        sources, separation = atlas._frozen_sources({"sourcePair": self.pair})
+        expected = atlas._angular_separation_arcsec(10, -20, 10.01, -20)
+        self.assertAlmostEqual(expected, separation)
+        self.assertNotEqual(999, separation)
+        self.assertEqual([101, 202], [item["gaiaDR3SourceID"] for item in sources])
+        self.assertEqual(15.0, atlas.MIN_GAIA_PAIR_SEPARATION_ARCSEC)
+
+    def test_current_trigger_direct_frequency_search_and_generic_worker(self):
+        search = {"totalFrequencies": 10, "frequenciesPerWorkUnit": 2}
+        empty = "# MJD uJy duJy F err chi/N\n"
+        with mock.patch.object(atlas, "require_atlas_credentials"), \
+                mock.patch.object(atlas, "_atlas_headers", return_value={}), \
+                mock.patch.object(atlas, "_submit_atlas_job", return_value="task"), \
+                mock.patch.object(atlas, "_wait_for_atlas_job", return_value=("result", empty)):
+            result = atlas.build_atlas_forced_photometry_project(
+                source_project_id="p", source_dataset_id="d",
+                external_high_resolution_summary={"sourcePair": self.pair},
+                des_dr2_se_summary={"recommendedNextTest": atlas.CURRENT_TRIGGER,
+                                    "frequencySearch": search},
+                output_dir=self.root, investigation_id="generic")
+        self.assertEqual(search, result["frequencySearch"])
+        self.assertEqual("openstar.lomb-scargle.v1", result["workloadID"])
+        self.assertFalse(result["tessDriftExtrapolated"])
+        self.assertTrue(all(Path(item["rawPath"]).exists()
+                            for item in result["sourceRecords"]))
+
+    def test_transient_contract_and_no_unbounded_429_retry(self):
+        for code in (408, 425, 429, 500, 503):
+            self.assertTrue(atlas._retryable_service_error(
+                urllib.error.HTTPError("url", code, "x", {}, None)))
+        self.assertFalse(atlas._retryable_service_error(RuntimeError("bug")))
+        self.assertFalse(atlas._retryable_service_error(ValueError("parse bug")))
+        with mock.patch.object(atlas, "_json_request", return_value=(429, {"detail": "wait"})), \
+                mock.patch.object(atlas.time, "sleep") as sleep:
+            with self.assertRaises(atlas.ATLASArchiveUnavailable):
+                atlas._submit_atlas_job({}, ra_deg=1, dec_deg=2)
+            sleep.assert_not_called()
+
+    def _interpret(self, supported_role, include_control):
+        prepared, datasets = [], []
+        for role, prefix in (("target-control", "t"), ("catalog-counterpart", "c")):
+            for band in ("c", "o"):
+                prepared.append({"datasetID": prefix + band, "sourceRole": role, "band": band})
+                if role == supported_role or include_control:
+                    supported = role == supported_role
+                    datasets.append({"datasetID": prefix + band, "coverageComplete": True,
+                        "periodStatus": "RELIABLE" if supported else "NONRECURRENT",
+                        "candidateFrequency": 1.2 if supported else None,
+                        "candidatePeakProminenceRatio": 4 if supported else None})
+        return atlas.interpret_atlas_forced_photometry_project(
+            project_status={"datasets": datasets},
+            preparation={"preparedSeries": prepared, "workloadID": "openstar.lomb-scargle.v1"})
+
+    def test_missing_controls_are_nondecisive_and_nonrecurrent_controls_decisive(self):
+        self.assertEqual(atlas.HISTORICAL_TRIGGER,
+                         self._interpret("target-control", False)["recommendedNextTest"])
+        self.assertEqual(atlas.HISTORICAL_TRIGGER,
+                         self._interpret("catalog-counterpart", False)["recommendedNextTest"])
+        self.assertEqual("TARGET_INTRINSIC_RESIDUAL_MODELING",
+                         self._interpret("target-control", True)["recommendedNextTest"])
+        self.assertEqual("TARGET_RESIDUAL_REANALYSIS_AFTER_OFFSET_REMOVAL",
+                         self._interpret("catalog-counterpart", True)["recommendedNextTest"])
+
+    def test_no_qualifying_series_routes_to_signed_reanalysis_boundary(self):
+        summary = atlas.interpret_atlas_forced_photometry_project(
+            project_status=None, preparation={"preparedSeries": [],
+                                               "sourceRecords": [{"rawPath": "/immutable/raw"}]})
+        self.assertEqual(atlas.SIGNED_REANALYSIS, summary["recommendedNextTest"])
+        stage = InvestigationStage("053-interpret-atlas-forced-photometry",
+            "openstar.tess.atlas-forced-photometry.interpret", "COMPLETE", None, {},
+            result=summary, stop=True)
+        inv = Investigation("signed", "openstar.workflow.tess-investigation.v1", "20.2",
+                            "BLOCKED", "now", "now", {}, (stage,))
+        branch = plan_tess_branches(inv, InvestigationTarget(
+            "signed", "signed", inv.workflow_id, inv.workflow_version))[0]
+        self.assertEqual(("openstar.capability.current-atlas-signed-reanalysis-adapter",),
+                         branch.required_stage_ids)
+
+    def _blocked_051(self):
+        prior = tuple(InvestigationStage(str(i), handler, "COMPLETE", None, {}, result={})
+                      for i, handler in enumerate((
+            "openstar.tess.gaia-source-resolved-counterpart-photometry.interpret",
+            "openstar.tess.skymapper-resolved-counterpart-photometry.interpret",
+            "openstar.tess.nsc-resolved-photometry.interpret",
+            "openstar.tess.noirlab-image-forced-photometry.interpret"), 43))
+        des = InvestigationStage("051-interpret-des-dr2-se-local-forced-photometry",
+            "openstar.tess.des-dr2-se-local-forced-photometry.interpret", "COMPLETE", None, {},
+            result={"recommendedNextTest": atlas.CURRENT_TRIGGER,
+                    "physicalMechanismResolved": False, "sourcePair": self.pair}, stop=True)
+        return Investigation("blind", "openstar.workflow.tess-investigation.v1", "20.2",
+            "BLOCKED", "now", "now", {"datasetID": "blind", "controlState": {
+                "schedulerAction": "WAIT_FOR_PREREQUISITES"}}, prior + (des,))
+
+    def test_credentials_gate_exact_051_to_052_without_prior_archive_reruns(self):
+        inv = self._blocked_051()
+        target = InvestigationTarget("blind", "blind", inv.workflow_id, inv.workflow_version)
+        with mock.patch.dict(os.environ, {}, clear=True):
+            branch = plan_tess_branches(inv, target)[0]
+            self.assertEqual(("openstar.capability.atlas-forced-photometry-credentials",),
+                             branch.required_stage_ids)
+            store = InvestigationStore(self.root / "store"); store.save(inv)
+            self.assertEqual(inv, repair_obsolete_terminal_wait(store, inv))
+        with mock.patch.dict(os.environ, {"OPENSTAR_ATLAS_API_TOKEN": "token"}, clear=True):
+            branch = plan_tess_branches(inv, target)[0]
+            self.assertEqual("052-prepare-atlas-forced-photometry", branch.experiment.id)
+            self.assertEqual((), branch.required_stage_ids)
+            repaired = repair_obsolete_terminal_wait(store, inv)
+        self.assertEqual(branch.experiment.id,
+                         repaired.metadata["controlState"]["selectedExperiment"]["id"])
+        self.assertEqual([stage.id for stage in inv.stages],
+                         [stage.id for stage in repaired.stages])
+
+    def test_persisted_atlas_continuations_reuse_exact_next_stage(self):
+        for handler in ("openstar.tess.atlas-forced-photometry.run",
+                        "openstar.tess.atlas-forced-photometry.interpret"):
+            raw = {"id": "053-custom", "handler_id": handler,
+                   "parameters": {"sentinel": 7}, "triggered_by_stage_id": "052"}
+            stage = InvestigationStage("052", "openstar.tess.atlas-forced-photometry.prepare",
+                "COMPLETE", None, {}, result={"sourceRecords": [{"rawPath": "raw"}]},
+                next_stage=raw)
+            inv = Investigation("persisted", "openstar.workflow.tess-investigation.v1", "20.2",
+                                "COMPLETE", "now", "now", {}, (stage,))
+            branch = plan_tess_branches(inv, InvestigationTarget(
+                "persisted", "persisted", inv.workflow_id, inv.workflow_version))[0]
+            self.assertEqual(raw, asdict(branch.experiment))
+
+
+if __name__ == "__main__":
+    unittest.main()

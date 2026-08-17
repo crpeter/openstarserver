@@ -181,6 +181,22 @@ def _awaiting_current_atlas_adapter(investigation: Investigation) -> bool:
     )
 
 
+def _awaiting_atlas_signed_reanalysis_adapter(investigation: Investigation) -> bool:
+    stage = _latest_complete(
+        investigation, "openstar.tess.atlas-forced-photometry.interpret"
+    )
+    result = (stage.result or {}) if stage is not None else {}
+    return bool(
+        stage is not None
+        and result.get("recommendedNextTest")
+        == "ATLAS_SIGNED_FORCED_PHOTOMETRY_REANALYSIS"
+        and result.get("physicalMechanismResolved") is False
+        and not any(item.handler_id.startswith(
+            "openstar.tess.atlas-forced-photometry-reanalysis."
+        ) for item in investigation.stages)
+    )
+
+
 def _persisted_archive_continuation(investigation: Investigation):
     """Return an unattempted continuation recorded by an archive prepare/run stage."""
     attempted_ids = {stage.id for stage in investigation.stages}
@@ -195,6 +211,8 @@ def _persisted_archive_continuation(investigation: Investigation):
         "openstar.tess.noirlab-image-forced-photometry.run",
         "openstar.tess.des-dr2-se-local-forced-photometry.prepare",
         "openstar.tess.des-dr2-se-local-forced-photometry.run",
+        "openstar.tess.atlas-forced-photometry.prepare",
+        "openstar.tess.atlas-forced-photometry.run",
     }
     for stage in reversed(investigation.stages):
         if (
@@ -230,6 +248,27 @@ def repair_obsolete_terminal_wait(
         and control.get("schedulerAction") == "WAIT_FOR_PREREQUISITES"
         and _awaiting_noirlab_adapter(investigation)
     ):
+        metadata = investigation.metadata or {}
+        target = InvestigationTarget(
+            id=str(metadata.get("datasetID") or investigation.id),
+            investigation_id=investigation.id,
+            workflow_id=investigation.workflow_id,
+            workflow_version=investigation.workflow_version,
+            metadata=dict(metadata),
+        )
+        repaired, _ = AutonomousInvestigationEngine(store).decide(
+            investigation, plan_tess_branches(investigation, target)
+        )
+        return repaired
+
+    if (
+        investigation.status == "BLOCKED"
+        and control.get("schedulerAction") == "WAIT_FOR_PREREQUISITES"
+        and _awaiting_current_atlas_adapter(investigation)
+    ):
+        from .tess_atlas_forced_photometry import atlas_credentials_available
+        if not atlas_credentials_available():
+            return investigation
         metadata = investigation.metadata or {}
         target = InvestigationTarget(
             id=str(metadata.get("datasetID") or investigation.id),
@@ -286,6 +325,7 @@ def repair_obsolete_terminal_wait(
         and not _awaiting_nsc_adapter(investigation)
         and not _awaiting_noirlab_adapter(investigation)
         and not _awaiting_current_atlas_adapter(investigation)
+        and not _awaiting_atlas_signed_reanalysis_adapter(investigation)
     ):
         repaired, _ = AutonomousInvestigationEngine(store).decide(investigation, ())
         return repaired
@@ -382,6 +422,7 @@ def plan_tess_branches(
         investigation, "openstar.tess.nsc-resolved-photometry.interpret"
     )
     if _awaiting_current_atlas_adapter(investigation):
+        from .tess_atlas_forced_photometry import atlas_credentials_available
         des = _latest_complete(
             investigation, "openstar.tess.des-dr2-se-local-forced-photometry.interpret"
         )
@@ -394,7 +435,28 @@ def plan_tess_branches(
                     parameters={},
                     triggered_by_stage_id=des.id,
                 ),
-                required_stage_ids=("openstar.capability.current-atlas-forced-photometry-adapter",),
+                required_stage_ids=() if atlas_credentials_available() else (
+                    "openstar.capability.atlas-forced-photometry-credentials",
+                ),
+            ),
+        )
+    if _awaiting_atlas_signed_reanalysis_adapter(investigation):
+        atlas = _latest_complete(
+            investigation, "openstar.tess.atlas-forced-photometry.interpret"
+        )
+        return (
+            ScientificBranch(
+                id=f"await-current-atlas-signed-reanalysis-adapter-after-{atlas.id}",
+                experiment=StageRequest(
+                    id=_continuation_stage_id(
+                        atlas, "prepare-atlas-forced-photometry-reanalysis"
+                    ),
+                    handler_id="openstar.tess.atlas-forced-photometry-reanalysis.prepare",
+                    parameters={}, triggered_by_stage_id=atlas.id,
+                ),
+                required_stage_ids=(
+                    "openstar.capability.current-atlas-signed-reanalysis-adapter",
+                ),
             ),
         )
     if _awaiting_current_des_adapter(investigation):
