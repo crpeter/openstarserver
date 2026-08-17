@@ -6,6 +6,7 @@ import unittest
 import urllib.error
 from dataclasses import asdict
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 try:
@@ -25,11 +26,29 @@ else:
 
 from openstar_investigation import Investigation, InvestigationStage, InvestigationStore
 from openstar_targets import InvestigationTarget
+from openstar_workflow import RetryableExecutionError, StageRequest
 from workflows.tess import tess_atlas_forced_photometry as atlas
 from workflows.tess.tess_autonomy import plan_tess_branches, repair_obsolete_terminal_wait
 
 if _installed_numpy_stub:
     sys.modules.pop("numpy", None)
+
+
+def _workflow_module():
+    """Import the registered workflow lazily so discovery does not leak a tiny numpy stub."""
+    installed = "numpy" not in sys.modules
+    if installed:
+        sys.modules["numpy"] = atlas.np
+    try:
+        from workflows.tess import tess_investigation
+    finally:
+        if installed:
+            sys.modules.pop("numpy", None)
+    return tess_investigation
+
+
+def _build_engine(*args, **kwargs):
+    return _workflow_module().build_engine(*args, **kwargs)
 
 
 class CurrentATLASForcedPhotometryTests(unittest.TestCase):
@@ -146,7 +165,20 @@ class CurrentATLASForcedPhotometryTests(unittest.TestCase):
             self.assertEqual(("openstar.capability.atlas-forced-photometry-credentials",),
                              branch.required_stage_ids)
             store = InvestigationStore(self.root / "store"); store.save(inv)
-            self.assertEqual(inv, repair_obsolete_terminal_wait(store, inv))
+            migrated = repair_obsolete_terminal_wait(store, inv)
+            control = migrated.metadata["controlState"]
+            self.assertEqual("WAIT_FOR_PREREQUISITES", control["schedulerAction"])
+            self.assertEqual("052-prepare-atlas-forced-photometry",
+                             control["selectedExperiment"]["id"])
+            self.assertEqual(
+                ["openstar.capability.atlas-forced-photometry-credentials"],
+                control["missingPrerequisites"])
+            self.assertEqual([stage.id for stage in inv.stages],
+                             [stage.id for stage in migrated.stages])
+            again = repair_obsolete_terminal_wait(store, migrated)
+            self.assertEqual(migrated.metadata["controlState"],
+                             again.metadata["controlState"])
+            self.assertEqual(len(migrated.stages), len(again.stages))
         with mock.patch.dict(os.environ, {"OPENSTAR_ATLAS_API_TOKEN": "token"}, clear=True):
             branch = plan_tess_branches(inv, target)[0]
             self.assertEqual("052-prepare-atlas-forced-photometry", branch.experiment.id)
@@ -156,6 +188,150 @@ class CurrentATLASForcedPhotometryTests(unittest.TestCase):
                          repaired.metadata["controlState"]["selectedExperiment"]["id"])
         self.assertEqual([stage.id for stage in inv.stages],
                          [stage.id for stage in repaired.stages])
+
+    def test_old_adapter_prerequisite_is_migrated_without_credentials(self):
+        inv = self._blocked_051()
+        metadata = dict(inv.metadata)
+        metadata["controlState"] = {
+            "schedulerAction": "WAIT_FOR_PREREQUISITES",
+            "selectedExperiment": {"id": "052-prepare-atlas-forced-photometry"},
+            "missingPrerequisites": [
+                "openstar.capability.current-atlas-forced-photometry-adapter"
+            ],
+        }
+        inv = Investigation(inv.id, inv.workflow_id, inv.workflow_version, inv.status,
+            inv.created_at, inv.updated_at, metadata, inv.stages)
+        store = InvestigationStore(self.root / "migration"); store.save(inv)
+        with mock.patch.dict(os.environ, {}, clear=True):
+            migrated = repair_obsolete_terminal_wait(store, inv)
+            again = repair_obsolete_terminal_wait(store, migrated)
+        self.assertEqual(["openstar.capability.atlas-forced-photometry-credentials"],
+                         migrated.metadata["controlState"]["missingPrerequisites"])
+        self.assertEqual("BLOCKED", migrated.status)
+        self.assertEqual(migrated.metadata["controlState"], again.metadata["controlState"])
+        self.assertEqual(len(inv.stages), len(migrated.stages))
+
+    def test_post_atlas_targeted_observation_is_durable_and_not_completed(self):
+        stage = InvestigationStage("053-interpret-atlas-forced-photometry",
+            "openstar.tess.atlas-forced-photometry.interpret", "COMPLETE", None, {},
+            result={"recommendedNextTest": atlas.HISTORICAL_TRIGGER,
+                    "physicalMechanismResolved": False}, stop=True)
+        inv = Investigation("targeted", "openstar.workflow.tess-investigation.v1", "20.2",
+            "BLOCKED", "now", "now", {"datasetID": "targeted", "controlState": {
+                "schedulerAction": "WAIT_FOR_PREREQUISITES"}}, (stage,))
+        branch = plan_tess_branches(inv, InvestigationTarget(
+            "targeted", "targeted", inv.workflow_id, inv.workflow_version))[0]
+        self.assertEqual("openstar.tess.targeted-observation-planning.generate",
+                         branch.experiment.handler_id)
+        self.assertEqual(("openstar.capability.current-targeted-observation-planning-adapter",),
+                         branch.required_stage_ids)
+        store = InvestigationStore(self.root / "targeted"); store.save(inv)
+        repaired = repair_obsolete_terminal_wait(store, inv)
+        self.assertEqual("BLOCKED", repaired.status)
+        self.assertEqual("WAIT_FOR_PREREQUISITES",
+                         repaired.metadata["controlState"]["schedulerAction"])
+        self.assertEqual(
+            ("openstar.capability.current-targeted-observation-planning-adapter",),
+            repaired.metadata["controlState"]["branchAssessments"][0][
+                "missing_stage_ids"
+            ])
+
+    def _handler_evidence(self, investigation_id):
+        return Investigation(investigation_id,
+            "openstar.workflow.tess-investigation.v1", "20.2", "RUNNING",
+            "now", "now", {}, (
+                InvestigationStage("001", "openstar.tess.prepare-target", "COMPLETE",
+                    None, {}, result={"sourceProjectID": "p", "datasetID": "d"}),
+                InvestigationStage("043", "openstar.tess.gaia-source-resolved-counterpart-photometry.interpret",
+                    "COMPLETE", None, {}, result={"sourcePair": self.pair}),
+                InvestigationStage("051-interpret-des-dr2-se-local-forced-photometry",
+                    "openstar.tess.des-dr2-se-local-forced-photometry.interpret",
+                    "COMPLETE", None, {}, result={"sourcePair": self.pair,
+                        "recommendedNextTest": atlas.CURRENT_TRIGGER,
+                        "physicalMechanismResolved": False}),
+            ))
+
+    def test_registered_current_handlers_run_and_direct_interpret(self):
+        for distributed in (True, False):
+            store = InvestigationStore(self.root / f"handler-{distributed}")
+            inv = self._handler_evidence(f"handler-{distributed}"); store.save(inv)
+            project = self.root / f"atlas-project-{distributed}.json"
+            if distributed: project.write_text("{}", encoding="utf-8")
+            spec = {"available": distributed,
+                "projectPath": str(project) if distributed else None,
+                "preparedSeries": [], "sourceRecords": [],
+                "workloadID": "openstar.lomb-scargle.v1"}
+            coordinator = mock.Mock()
+            coordinator.run_project.return_value = SimpleNamespace(
+                status={"datasets": []}, node_contributions={}, project_id="generic")
+            summary = {"recommendedNextTest": atlas.HISTORICAL_TRIGGER,
+                       "physicalMechanismResolved": False}
+            workflow = _workflow_module()
+            with mock.patch.dict(os.environ, {"OPENSTAR_ATLAS_API_TOKEN": "token"}, clear=True), \
+                    mock.patch.object(workflow, "build_atlas_forced_photometry_project",
+                                      return_value=spec) as builder, \
+                    mock.patch.object(workflow, "interpret_atlas_forced_photometry_project",
+                                      return_value=summary):
+                completed = _build_engine(store, coordinator, poll_interval=0, timeout=1).run(
+                    inv, StageRequest("052-prepare-atlas-forced-photometry",
+                        "openstar.tess.atlas-forced-photometry.prepare", {},
+                        "051-interpret-des-dr2-se-local-forced-photometry"),
+                    software_id="test", software_version="1")
+            self.assertEqual(self.pair,
+                builder.call_args.kwargs["external_high_resolution_summary"]["sourcePair"])
+            self.assertFalse(any("external-high-resolution" in item.handler_id
+                                 for item in inv.stages))
+            handlers = [item.handler_id for item in completed.stages[len(inv.stages):]]
+            expected = ["openstar.tess.atlas-forced-photometry.prepare"]
+            if distributed: expected.append("openstar.tess.atlas-forced-photometry.run")
+            expected.append("openstar.tess.atlas-forced-photometry.interpret")
+            self.assertEqual(expected, handlers)
+            self.assertEqual(distributed, bool(coordinator.run_project.call_count))
+            self.assertEqual("BLOCKED", completed.status)
+
+    def test_registered_prepare_failure_classification_is_narrow(self):
+        for error, expected, raised in (
+            (atlas.ATLASArchiveUnavailable("outage"), "TRANSIENT_INFRASTRUCTURE",
+             RetryableExecutionError),
+            (RuntimeError("bug"), "NON_RETRYABLE", RuntimeError),
+        ):
+            store = InvestigationStore(self.root / expected)
+            inv = self._handler_evidence(expected); store.save(inv)
+            workflow = _workflow_module()
+            with mock.patch.object(workflow, "build_atlas_forced_photometry_project",
+                                   side_effect=error):
+                with self.assertRaises(raised):
+                    _build_engine(store, mock.Mock(), poll_interval=0, timeout=1).run(
+                        inv, StageRequest("052-prepare-atlas-forced-photometry",
+                            "openstar.tess.atlas-forced-photometry.prepare", {}, "051"),
+                        software_id="test", software_version="1")
+            self.assertEqual(expected, store.load(inv.id).stages[-1].failure_classification)
+
+    def test_registered_persisted_prepare_resumes_without_requery(self):
+        store = InvestigationStore(self.root / "persisted-handler")
+        preparation = {"preparedSeries": [], "sourceRecords": [{"rawPath": "/raw/immutable"}],
+                       "workloadID": "openstar.lomb-scargle.v1"}
+        next_stage = StageRequest("053-exact-interpret",
+            "openstar.tess.atlas-forced-photometry.interpret",
+            {"distributedRunExpected": False, "sentinel": 7}, "052")
+        stage = InvestigationStage("052", "openstar.tess.atlas-forced-photometry.prepare",
+            "COMPLETE", None, {}, result=preparation, next_stage=asdict(next_stage))
+        inv = Investigation("persisted-handler", "openstar.workflow.tess-investigation.v1",
+            "20.2", "COMPLETE", "now", "now", {}, (stage,)); store.save(inv)
+        request = plan_tess_branches(inv, InvestigationTarget(
+            inv.id, inv.id, inv.workflow_id, inv.workflow_version))[0].experiment
+        self.assertEqual(next_stage, request)
+        workflow = _workflow_module()
+        with mock.patch.object(workflow, "build_atlas_forced_photometry_project") as builder, \
+                mock.patch.object(workflow, "interpret_atlas_forced_photometry_project",
+                    return_value={"recommendedNextTest": atlas.HISTORICAL_TRIGGER,
+                                  "physicalMechanismResolved": False}):
+            completed = _build_engine(store, mock.Mock(), poll_interval=0, timeout=1).run(
+                inv, request, software_id="test", software_version="1")
+        builder.assert_not_called()
+        self.assertEqual("053-exact-interpret", completed.stages[-1].id)
+        self.assertEqual("/raw/immutable",
+                         completed.stages[0].result["sourceRecords"][0]["rawPath"])
 
     def test_persisted_atlas_continuations_reuse_exact_next_stage(self):
         for handler in ("openstar.tess.atlas-forced-photometry.run",
