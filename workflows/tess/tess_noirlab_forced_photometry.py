@@ -42,6 +42,34 @@ MIN_CROSS_BAND_SUPPORT = 2
 MAX_CROSS_BAND_RELATIVE_FREQUENCY_SPREAD = 0.12
 CUTOUT_MARGIN_PIXELS = 11
 SATURATION_FRACTION = 0.90
+CURRENT_TRIGGER = "NOIRLAB_IMAGE_LEVEL_FORCED_PHOTOMETRY"
+HISTORICAL_TRIGGER = "TARGETED_HIGH_RESOLUTION_TIME_SERIES_PHOTOMETRY"
+NEXT_ARCHIVE_TEST = "DES_DR2_SINGLE_EPOCH_LOCAL_FORCED_PHOTOMETRY"
+
+
+class NOIRLabArchiveUnavailable(RuntimeError):
+    """A transient NOIRLab service failure, rather than a scientific outcome."""
+
+
+class NOIRLabImageQualityRejected(RuntimeError):
+    """An expected per-image scientific or archive-quality rejection."""
+
+
+def _retryable_service_error(error: BaseException) -> bool:
+    current: BaseException | None = error
+    while current is not None:
+        if isinstance(current, (TimeoutError, ConnectionError, urllib.error.URLError)):
+            if isinstance(current, urllib.error.HTTPError):
+                return current.code in {408, 425, 429} or current.code >= 500
+            return True
+        module = type(current).__module__.lower()
+        name = type(current).__name__.lower()
+        if module.startswith(("requests.", "httpx", "urllib3.")) and any(
+            token in name for token in ("timeout", "connection", "network")
+        ):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
 
 
 def _python_value(value: Any) -> Any:
@@ -54,7 +82,11 @@ def _python_value(value: Any) -> Any:
         pass
     if isinstance(value, bytes):
         return value.decode("utf-8", errors="replace")
-    if isinstance(value, (np.integer, np.floating)):
+    numpy_scalars = tuple(
+        kind for kind in (getattr(np, "integer", None), getattr(np, "floating", None))
+        if isinstance(kind, type)
+    )
+    if numpy_scalars and isinstance(value, numpy_scalars):
         value = value.item()
     if isinstance(value, float) and not math.isfinite(value):
         return None
@@ -122,8 +154,28 @@ def _source_records_by_role(
 def _frozen_source_pair(
     external_high_resolution_summary: dict[str, Any],
 ) -> tuple[list[dict[str, Any]], float]:
-    records = _source_records_by_role(external_high_resolution_summary)
     pair = external_high_resolution_summary.get("sourcePair") or {}
+    if pair.get("version") == "openstar.current-source-pair.v1":
+        sources = []
+        for key, expected_role in (("target", "target-control"),
+                                   ("counterpart", "catalog-counterpart")):
+            current = pair.get(key) or {}
+            source_id = _int(current.get("gaiaDR3SourceID"))
+            ra = _float(current.get("raDeg"))
+            dec = _float(current.get("decDeg"))
+            if source_id is None or ra is None or dec is None:
+                raise RuntimeError(f"Current source pair lacks frozen Gaia data for {key}.")
+            if current.get("sourceRole") not in (None, expected_role):
+                raise RuntimeError(f"Current source pair has an invalid role for {key}.")
+            sources.append({"sourceRole": expected_role,
+                            "gaiaDR3SourceID": int(source_id), "raDeg": float(ra),
+                            "decDeg": float(dec)})
+        separation = _angular_separation_arcsec(
+            sources[0]["raDeg"], sources[0]["decDeg"],
+            sources[1]["raDeg"], sources[1]["decDeg"])
+        return sources, float(separation)
+
+    records = _source_records_by_role(external_high_resolution_summary)
     target_id = _int(pair.get("targetGaiaDR3SourceID"))
     counterpart_id = _int(pair.get("counterpartGaiaDR3SourceID"))
     if target_id is None or counterpart_id is None:
@@ -183,7 +235,7 @@ def _query_sia(center_ra_deg: float, center_dec_deg: float) -> list[dict[str, An
     try:
         from astropy.io.votable import parse_single_table
     except Exception as exc:
-        raise RuntimeError(
+        raise ImportError(
             "v20.22 requires astropy.io.votable for the public NOIRLab SIA response."
         ) from exc
 
@@ -199,8 +251,15 @@ def _query_sia(center_ra_deg: float, center_dec_deg: float) -> list[dict[str, An
         f"{SIA_URL}?{params}",
         headers={"User-Agent": USER_AGENT},
     )
-    with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
-        body = response.read()
+    try:
+        with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
+            body = response.read()
+    except Exception as exc:
+        if _retryable_service_error(exc):
+            raise NOIRLabArchiveUnavailable(
+                f"NOIRLab SIA service unavailable: {type(exc).__name__}: {exc}"
+            ) from exc
+        raise
     if not body:
         raise RuntimeError("NOIRLab NSC DR2 SIA returned an empty response.")
 
@@ -317,7 +376,7 @@ def _download_fits_cutout(url: str) -> bytes:
     with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
         body = response.read()
     if not body:
-        raise RuntimeError("NOIRLab SIA image cutout was empty.")
+        raise NOIRLabImageQualityRejected("NOIRLab SIA image cutout was empty.")
     return body
 
 
@@ -341,7 +400,7 @@ def _image_hdu_from_bytes(body: bytes):
         from astropy.io import fits
         from astropy.wcs import WCS
     except Exception as exc:
-        raise RuntimeError("v20.22 requires astropy FITS/WCS support.") from exc
+        raise ImportError("v20.22 requires astropy FITS/WCS support.") from exc
 
     hdul = fits.open(io.BytesIO(body), memmap=False)
     try:
@@ -363,7 +422,9 @@ def _image_hdu_from_bytes(body: bytes):
             return np.asarray(array, dtype=np.float64), header, primary_header
     finally:
         hdul.close()
-    raise RuntimeError("Downloaded NOIRLab FITS cutout has no usable 2-D celestial image HDU.")
+    raise NOIRLabImageQualityRejected(
+        "Downloaded NOIRLab FITS cutout has no usable 2-D celestial image HDU."
+    )
 
 
 def _pixel_scale_arcsec(header: Any) -> float:
@@ -371,12 +432,14 @@ def _pixel_scale_arcsec(header: Any) -> float:
         from astropy.wcs import WCS
         from astropy.wcs.utils import proj_plane_pixel_scales
     except Exception as exc:
-        raise RuntimeError("v20.22 requires astropy WCS utilities.") from exc
+        raise ImportError("v20.22 requires astropy WCS utilities.") from exc
     wcs = WCS(header).celestial
     scales = np.asarray(proj_plane_pixel_scales(wcs), dtype=np.float64) * 3600.0
     scales = scales[np.isfinite(scales) & (scales > 0)]
     if len(scales) == 0:
-        raise RuntimeError("NOIRLab cutout has no finite celestial pixel scale.")
+        raise NOIRLabImageQualityRejected(
+            "NOIRLab cutout has no finite celestial pixel scale."
+        )
     return float(np.median(scales))
 
 
@@ -384,13 +447,15 @@ def _world_to_pixel(header: Any, ra_deg: float, dec_deg: float) -> tuple[float, 
     try:
         from astropy.wcs import WCS
     except Exception as exc:
-        raise RuntimeError("v20.22 requires astropy WCS support.") from exc
+        raise ImportError("v20.22 requires astropy WCS support.") from exc
     wcs = WCS(header).celestial
     x, y = wcs.world_to_pixel_values(float(ra_deg), float(dec_deg))
     x = float(x)
     y = float(y)
     if not math.isfinite(x) or not math.isfinite(y):
-        raise RuntimeError("Frozen Gaia coordinate does not map to a finite cutout pixel.")
+        raise NOIRLabImageQualityRejected(
+            "Frozen Gaia coordinate does not map to a finite cutout pixel."
+        )
     return x, y
 
 
@@ -419,7 +484,9 @@ def _saturation_level(headers: list[Any]) -> float | None:
 
 def _photometric_magnitude(amplitude: float, headers: list[Any]) -> tuple[float, str]:
     if not math.isfinite(amplitude) or amplitude <= 0:
-        raise RuntimeError("Forced-photometry amplitude is not positive and finite.")
+        raise NOIRLabImageQualityRejected(
+            "Forced-photometry amplitude is not positive and finite."
+        )
     magzero = _header_float(headers, "MAGZERO")
     if magzero is not None:
         return float(magzero - 2.5 * math.log10(amplitude)), "MAGZERO"
@@ -427,13 +494,17 @@ def _photometric_magnitude(amplitude: float, headers: list[Any]) -> tuple[float,
     exptime = _header_float(headers, "EXPTIME", "EXPOSURE")
     if magzpt is not None and exptime is not None and exptime > 0:
         return float(magzpt - 2.5 * math.log10(amplitude / exptime)), "MAGZPT"
-    raise RuntimeError("NOIRLab cutout lacks usable MAGZERO or MAGZPT+EXPTIME calibration.")
+    raise NOIRLabImageQualityRejected(
+        "NOIRLab cutout lacks usable MAGZERO or MAGZPT+EXPTIME calibration."
+    )
 
 
 def _scaled_linear_fit(design: np.ndarray, values: np.ndarray) -> tuple[np.ndarray, np.ndarray, float, float]:
     norms = np.linalg.norm(design, axis=0)
     if np.any(~np.isfinite(norms)) or np.any(norms <= 0):
-        raise RuntimeError("Forced-photometry design matrix has a degenerate column.")
+        raise NOIRLabImageQualityRejected(
+            "Forced-photometry design matrix has a degenerate column."
+        )
     scaled = design / norms
     condition = float(np.linalg.cond(scaled))
     coefficients_scaled, _, _, _ = np.linalg.lstsq(scaled, values, rcond=None)
@@ -464,7 +535,9 @@ def _gaussian_template(
     )
     total = float(np.sum(values))
     if not math.isfinite(total) or total <= 0:
-        raise RuntimeError("Forced-photometry Gaussian template is degenerate.")
+        raise NOIRLabImageQualityRejected(
+            "Forced-photometry Gaussian template is degenerate."
+        )
     return values / total
 
 
@@ -483,7 +556,7 @@ def _forced_two_source_fit(
     )
     pixel_scale = _pixel_scale_arcsec(header)
     if pixel_scale > MAX_PIXEL_SCALE_ARCSEC:
-        raise RuntimeError(
+        raise NOIRLabImageQualityRejected(
             f"pixel-scale-too-coarse:{pixel_scale:.4f}-arcsec-per-pixel"
         )
 
@@ -493,7 +566,7 @@ def _forced_two_source_fit(
     y0 = max(0, int(math.floor(min(target_y, counterpart_y))) - margin)
     y1 = min(data.shape[0], int(math.ceil(max(target_y, counterpart_y))) + margin + 1)
     if x1 - x0 < 12 or y1 - y0 < 12:
-        raise RuntimeError("pair-too-close-to-cutout-edge")
+        raise NOIRLabImageQualityRejected("pair-too-close-to-cutout-edge")
 
     headers = [header, primary_header]
     saturation = _saturation_level(headers)
@@ -501,9 +574,9 @@ def _forced_two_source_fit(
     counterpart_peak = _local_peak(data, counterpart_x, counterpart_y)
     if saturation is not None:
         if target_peak is not None and target_peak >= saturation * SATURATION_FRACTION:
-            raise RuntimeError("target-saturated")
+            raise NOIRLabImageQualityRejected("target-saturated")
         if counterpart_peak is not None and counterpart_peak >= saturation * SATURATION_FRACTION:
-            raise RuntimeError("counterpart-saturated")
+            raise NOIRLabImageQualityRejected("counterpart-saturated")
 
     crop = np.asarray(data[y0:y1, x0:x1], dtype=np.float64)
     yy, xx = np.indices(crop.shape, dtype=np.float64)
@@ -511,7 +584,7 @@ def _forced_two_source_fit(
     yy += float(y0)
     finite = np.isfinite(crop)
     if int(np.count_nonzero(finite)) < 120:
-        raise RuntimeError("too-few-finite-fit-pixels")
+        raise NOIRLabImageQualityRejected("too-few-finite-fit-pixels")
 
     normalized_x = (xx - float(np.mean(xx))) / max(1.0, float(np.std(xx)))
     normalized_y = (yy - float(np.mean(yy))) / max(1.0, float(np.std(yy)))
@@ -522,7 +595,9 @@ def _forced_two_source_fit(
     )
     min_fwhm_arcsec = max(0.55, pixel_scale * 2.2)
     if min_fwhm_arcsec >= max_fwhm_arcsec:
-        raise RuntimeError("no-valid-psf-width-range-for-pair-separation")
+        raise NOIRLabImageQualityRejected(
+            "no-valid-psf-width-range-for-pair-separation"
+        )
     fwhm_grid = np.linspace(min_fwhm_arcsec, max_fwhm_arcsec, 17)
     shift_grid = (-0.60, 0.0, 0.60)
 
@@ -560,7 +635,7 @@ def _forced_two_source_fit(
                 values = crop.ravel()[mask]
                 try:
                     coefficients, covariance, condition, _ = _scaled_linear_fit(design, values)
-                except Exception:
+                except (NOIRLabImageQualityRejected, np.linalg.LinAlgError):
                     continue
                 model = design @ coefficients
                 residual = values - model
@@ -577,7 +652,7 @@ def _forced_two_source_fit(
                             model = design[robust] @ coefficients
                             residual = values[robust] - model
                             fit_values = values[robust]
-                        except Exception:
+                        except (NOIRLabImageQualityRejected, np.linalg.LinAlgError):
                             continue
                     else:
                         fit_values = values
@@ -620,19 +695,19 @@ def _forced_two_source_fit(
                     best = candidate
 
     if best is None:
-        raise RuntimeError("no-positive-two-source-psf-fit")
+        raise NOIRLabImageQualityRejected("no-positive-two-source-psf-fit")
     if best["fwhmArcsec"] > max_fwhm_arcsec + 1e-9:
-        raise RuntimeError("psf-too-broad-for-source-resolution")
+        raise NOIRLabImageQualityRejected("psf-too-broad-for-source-resolution")
     if best["templateCorrelation"] > MAX_TEMPLATE_CORRELATION:
-        raise RuntimeError("source-templates-too-correlated")
+        raise NOIRLabImageQualityRejected("source-templates-too-correlated")
     if best["scaledDesignCondition"] > MAX_SCALED_DESIGN_CONDITION:
-        raise RuntimeError("two-source-fit-poorly-conditioned")
+        raise NOIRLabImageQualityRejected("two-source-fit-poorly-conditioned")
     if best["fitR2"] < MIN_FIT_R2:
-        raise RuntimeError("two-source-fit-low-explained-variance")
+        raise NOIRLabImageQualityRejected("two-source-fit-low-explained-variance")
     if best["targetAmplitudeSNR"] < MIN_TARGET_AMPLITUDE_SNR:
-        raise RuntimeError("target-amplitude-snr-too-low")
+        raise NOIRLabImageQualityRejected("target-amplitude-snr-too-low")
     if best["counterpartAmplitudeSNR"] < MIN_COUNTERPART_AMPLITUDE_SNR:
-        raise RuntimeError("counterpart-amplitude-snr-too-low")
+        raise NOIRLabImageQualityRejected("counterpart-amplitude-snr-too-low")
 
     target_mag, target_calibration = _photometric_magnitude(
         best["targetAmplitude"], headers
@@ -641,7 +716,9 @@ def _forced_two_source_fit(
         best["counterpartAmplitude"], headers
     )
     if target_calibration != counterpart_calibration:
-        raise RuntimeError("inconsistent-photometric-calibration-path")
+        raise NOIRLabImageQualityRejected(
+            "inconsistent-photometric-calibration-path"
+        )
 
     best.update(
         {
@@ -682,6 +759,7 @@ def _prepare_band_series(
     successful: list[dict[str, Any]],
     *,
     role: str,
+    failure_counts: Counter[str] | None = None,
 ) -> dict[str, dict[str, Any]]:
     result: dict[str, dict[str, Any]] = {}
     for band in SUPPORTED_BANDS:
@@ -710,7 +788,14 @@ def _prepare_band_series(
         baseline = float(kept_times[-1] - kept_times[0])
         if baseline < MIN_BAND_BASELINE_DAYS:
             continue
-        flux = _robust_standardize_magnitudes(kept_mags)
+        try:
+            flux = _robust_standardize_magnitudes(kept_mags)
+        except RuntimeError as exc:
+            if str(exc) != "Forced-photometry magnitudes have no finite variability scale.":
+                raise
+            if failure_counts is not None:
+                failure_counts[f"{role}-{band}-flat-magnitude-series"] += 1
+            continue
         result[band] = {
             "times": kept_times - float(kept_times[0]),
             "flux": flux,
@@ -749,6 +834,17 @@ def _dataset_result(project_dataset: dict[str, Any], prepared: dict[str, Any]) -
     prominence = _float(project_dataset.get("candidatePeakProminenceRatio"))
     status = str(project_dataset.get("periodStatus") or "")
     coverage = project_dataset.get("coverageComplete")
+    interpretable = bool(
+        status
+        and coverage is not False
+        and status not in {
+            "SEARCHING",
+            "INCOMPLETE_COVERAGE",
+            "NO_DATASET",
+            "FAILED",
+            "ERROR",
+        }
+    )
     accepted = bool(
         status == "RELIABLE"
         and (coverage is None or bool(coverage))
@@ -765,6 +861,8 @@ def _dataset_result(project_dataset: dict[str, Any], prepared: dict[str, Any]) -
         "sampleCount": prepared.get("sampleCount"),
         "baselineDays": prepared.get("baselineDays"),
         "periodStatus": status or None,
+        "coverageComplete": coverage,
+        "searchInterpretable": interpretable,
         "periodConfidence": project_dataset.get("periodConfidence"),
         "candidateFrequency": frequency,
         "candidatePeriodDays": period,
@@ -776,6 +874,9 @@ def _dataset_result(project_dataset: dict[str, Any], prepared: dict[str, Any]) -
 
 def _summarize_source(role: str, results: list[dict[str, Any]]) -> dict[str, Any]:
     source_results = [item for item in results if item.get("sourceRole") == role]
+    scientifically_usable = any(
+        bool(item.get("searchInterpretable")) for item in source_results
+    )
     accepted = [item for item in source_results if item.get("acceptedResidualBandVariability")]
     frequencies = [
         float(item["candidateFrequency"])
@@ -803,6 +904,7 @@ def _summarize_source(role: str, results: list[dict[str, Any]]) -> dict[str, Any
         "crossBandRelativeFrequencySpread": relative_spread,
         "sourceSupported": supported,
         "sourceSuggestive": bool(accepted) and not supported,
+        "scientificallyUsableControl": scientifically_usable,
     }
 
 
@@ -815,13 +917,15 @@ def build_noirlab_image_forced_photometry_project(
     output_dir: str | Path,
     investigation_id: str,
 ) -> dict[str, Any]:
-    if nsc_summary.get("recommendedNextTest") != "TARGETED_HIGH_RESOLUTION_TIME_SERIES_PHOTOMETRY":
+    if nsc_summary.get("recommendedNextTest") not in {CURRENT_TRIGGER, HISTORICAL_TRIGGER}:
         raise RuntimeError(
             "v20.22 requires v20.21 to leave the investigation at targeted high-resolution follow-up."
         )
 
-    sources, pair_separation = _frozen_source_pair(external_high_resolution_summary)
-    external_pair = dict(external_high_resolution_summary.get("sourcePair") or {})
+    pair_evidence = (nsc_summary if (nsc_summary.get("sourcePair") or {}).get("version")
+                     == "openstar.current-source-pair.v1" else external_high_resolution_summary)
+    sources, pair_separation = _frozen_source_pair(pair_evidence)
+    external_pair = dict(pair_evidence.get("sourcePair") or {})
     catalog_association_separation = _float(external_pair.get("catalogSeparationArcsec"))
     source_pair = dict(external_pair)
     source_pair["gaiaPairSeparationArcsec"] = float(pair_separation)
@@ -831,9 +935,12 @@ def build_noirlab_image_forced_photometry_project(
     target = source_by_role["target-control"]
     counterpart = source_by_role["catalog-counterpart"]
 
-    search = dict(
-        ((external_high_resolution_summary.get("distributedValidation") or {}).get("frequencySearch") or {})
-    )
+    search = {}
+    for evidence in (nsc_summary, external_high_resolution_summary):
+        search = dict(evidence.get("frequencySearch") or
+                      (evidence.get("distributedValidation") or {}).get("frequencySearch") or {})
+        if search:
+            break
     total_frequencies = _int(search.get("totalFrequencies"))
     per_work = _int(search.get("frequenciesPerWorkUnit"))
     if not search or total_frequencies is None or per_work is None or total_frequencies <= 0 or per_work <= 0:
@@ -910,11 +1017,9 @@ def build_noirlab_image_forced_photometry_project(
                 f"SNR=({fit['targetAmplitudeSNR']:.1f},{fit['counterpartAmplitudeSNR']:.1f})",
                 flush=True,
             )
-        except Exception as exc:
+        except NOIRLabImageQualityRejected as exc:
             message = str(exc)
             reason = message.split(":", 1)[0] if message else type(exc).__name__
-            if isinstance(exc, (urllib.error.URLError, TimeoutError)):
-                reason = "download-error"
             failure_counts[reason] += 1
             failures.append(
                 {
@@ -926,21 +1031,27 @@ def build_noirlab_image_forced_photometry_project(
                 }
             )
             print(f"         rejected: {type(exc).__name__}: {exc}", flush=True)
+        except Exception as exc:
+            if not _retryable_service_error(exc):
+                raise
+            reason = "download-error"
+            failure_counts[reason] += 1
+            failures.append({
+                "identifier": exposure.get("identifier"), "band": band,
+                "mjd": exposure.get("mjd"), "reason": reason,
+                "error": f"{type(exc).__name__}: {exc}",
+            })
+            print(f"         rejected: {type(exc).__name__}: {exc}", flush=True)
 
-    if not successful and len(exposures) >= 3:
-        transport_like = sum(
-            count
-            for reason, count in failure_counts.items()
-            if reason in {"download-error", "HTTP Error 500", "HTTP Error 502", "HTTP Error 503", "HTTP Error 504"}
-            or "timed out" in reason.lower()
-        )
-        if transport_like >= max(3, len(exposures) // 2):
-            raise RuntimeError(
+    if len(exposures) >= 3:
+        transport_like = failure_counts["download-error"]
+        if transport_like >= max(3, math.ceil(len(exposures) / 2)):
+            raise NOIRLabArchiveUnavailable(
                 "v20.22 discovered public NOIRLab images but image retrieval failed broadly; retry rather than converting an archive/service failure into a scientific non-detection."
             )
 
     series_by_role = {
-        role: _prepare_band_series(successful, role=role)
+        role: _prepare_band_series(successful, role=role, failure_counts=failure_counts)
         for role in ("target-control", "catalog-counterpart")
     }
 
@@ -1137,6 +1248,8 @@ def interpret_noirlab_image_forced_photometry_project(
     counterpart_supported = bool(counterpart.get("sourceSupported"))
     target_suggestive = bool(target.get("sourceSuggestive"))
     counterpart_suggestive = bool(counterpart.get("sourceSuggestive"))
+    target_usable = bool(target.get("scientificallyUsableControl"))
+    counterpart_usable = bool(counterpart.get("scientificallyUsableControl"))
 
     failure_reasons = preparation.get("failureReasons") or {}
     successful_exposures = int(preparation.get("successfulForcedPhotometryExposures") or 0)
@@ -1145,7 +1258,7 @@ def interpret_noirlab_image_forced_photometry_project(
     if candidate_exposures == 0:
         classification = "NOIRLAB_IMAGE_ARCHIVE_NO_SINGLE_EPOCH_CANDIDATES"
         origin = "UNRESOLVED_NOIRLAB_IMAGE_ARCHIVE_EMPTY_FOR_STRICT_SCREEN"
-        next_test = "TARGETED_HIGH_RESOLUTION_TIME_SERIES_PHOTOMETRY"
+        next_test = NEXT_ARCHIVE_TEST
     elif not preparation.get("preparedSeries"):
         saturation_failures = sum(
             int(value)
@@ -1161,12 +1274,12 @@ def interpret_noirlab_image_forced_photometry_project(
         else:
             classification = "NOIRLAB_IMAGE_FORCED_PHOTOMETRY_INSUFFICIENT_TIME_SERIES"
             origin = "UNRESOLVED_NOIRLAB_IMAGE_TIME_SERIES_LIMIT"
-        next_test = "TARGETED_HIGH_RESOLUTION_TIME_SERIES_PHOTOMETRY"
-    elif counterpart_supported and not target_supported:
+        next_test = NEXT_ARCHIVE_TEST
+    elif counterpart_supported and not target_supported and target_usable:
         classification = "NOIRLAB_IMAGE_COUNTERPART_RESIDUAL_BAND_VARIABILITY_SUPPORTED"
         origin = "CATALOG_COUNTERPART_SUPPORTED_BY_IMAGE_LEVEL_FORCED_PHOTOMETRY"
         next_test = "TARGET_RESIDUAL_REANALYSIS_AFTER_OFFSET_REMOVAL"
-    elif target_supported and not counterpart_supported:
+    elif target_supported and not counterpart_supported and counterpart_usable:
         classification = "NOIRLAB_IMAGE_TARGET_RESIDUAL_BAND_VARIABILITY_SUPPORTED"
         origin = "TARGET_SUPPORTED_BY_IMAGE_LEVEL_FORCED_PHOTOMETRY"
         next_test = "TARGET_INTRINSIC_RESIDUAL_MODELING"
@@ -1177,15 +1290,15 @@ def interpret_noirlab_image_forced_photometry_project(
     elif counterpart_suggestive and not target_suggestive:
         classification = "NOIRLAB_IMAGE_COUNTERPART_RESIDUAL_BAND_VARIABILITY_SUGGESTIVE"
         origin = "CATALOG_COUNTERPART_SUGGESTIVE_BY_IMAGE_LEVEL_FORCED_PHOTOMETRY"
-        next_test = "TARGETED_HIGH_RESOLUTION_TIME_SERIES_PHOTOMETRY"
+        next_test = NEXT_ARCHIVE_TEST
     elif target_suggestive and not counterpart_suggestive:
         classification = "NOIRLAB_IMAGE_TARGET_RESIDUAL_BAND_VARIABILITY_SUGGESTIVE"
         origin = "TARGET_SUGGESTIVE_BY_IMAGE_LEVEL_FORCED_PHOTOMETRY"
-        next_test = "TARGETED_HIGH_RESOLUTION_TIME_SERIES_PHOTOMETRY"
+        next_test = NEXT_ARCHIVE_TEST
     else:
         classification = "NOIRLAB_IMAGE_FORCED_PHOTOMETRY_SOURCE_ATTRIBUTION_UNRESOLVED"
         origin = "ARCHIVAL_IMAGE_LEVEL_SOURCE_ATTRIBUTION_UNRESOLVED"
-        next_test = "TARGETED_HIGH_RESOLUTION_TIME_SERIES_PHOTOMETRY"
+        next_test = NEXT_ARCHIVE_TEST
 
     return {
         "version": "openstar.tess-noirlab-image-level-forced-photometry.v1",

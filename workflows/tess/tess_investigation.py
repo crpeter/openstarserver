@@ -112,6 +112,7 @@ from .tess_nsc_resolved import (
     interpret_nsc_resolved_project,
 )
 from .tess_noirlab_forced_photometry import (
+    NOIRLabArchiveUnavailable,
     build_noirlab_image_forced_photometry_project,
     interpret_noirlab_image_forced_photometry_project,
 )
@@ -5148,11 +5149,18 @@ def build_engine(
         nsc = _latest_result_for_handler(
             investigation, "openstar.tess.nsc-resolved-photometry.interpret"
         )
-        if prepared is None or external is None or nsc is None:
+        gaia = _latest_result_for_handler(
+            investigation, "openstar.tess.gaia-source-resolved-counterpart-photometry.interpret"
+        )
+        source_evidence = external or gaia
+        if prepared is None or source_evidence is None or nsc is None:
             raise RuntimeError(
                 "v20.22 requires the frozen target plus completed v20.19 and v20.21 archival results."
             )
-        if nsc.get("recommendedNextTest") != "TARGETED_HIGH_RESOLUTION_TIME_SERIES_PHOTOMETRY":
+        if nsc.get("recommendedNextTest") not in {
+            "NOIRLAB_IMAGE_LEVEL_FORCED_PHOTOMETRY",
+            "TARGETED_HIGH_RESOLUTION_TIME_SERIES_PHOTOMETRY",
+        }:
             raise RuntimeError(
                 "v20.21 did not leave the investigation at TARGETED_HIGH_RESOLUTION_TIME_SERIES_PHOTOMETRY."
             )
@@ -5166,14 +5174,17 @@ def build_engine(
         print("   accepted calibrated source series become ordinary openstar.lomb-scargle.v1 datasets")
         print("   the TESS drift law is NOT extrapolated into the NOIRLab image epochs")
 
-        spec = build_noirlab_image_forced_photometry_project(
-            source_project_id=str(prepared["sourceProjectID"]),
-            source_dataset_id=str(prepared["datasetID"]),
-            external_high_resolution_summary=external,
-            nsc_summary=nsc,
-            output_dir=artifact_root,
-            investigation_id=investigation.id,
-        )
+        try:
+            spec = build_noirlab_image_forced_photometry_project(
+                source_project_id=str(prepared["sourceProjectID"]),
+                source_dataset_id=str(prepared["datasetID"]),
+                external_high_resolution_summary=source_evidence,
+                nsc_summary=nsc,
+                output_dir=artifact_root,
+                investigation_id=investigation.id,
+            )
+        except NOIRLabArchiveUnavailable as exc:
+            raise RetryableExecutionError(str(exc)) from exc
 
         pair = spec.get("sourcePair") or {}
         print(f"   target Gaia DR3: {pair.get('targetGaiaDR3SourceID')}")
@@ -5217,7 +5228,7 @@ def build_engine(
             result=spec,
             next_stage=next_stage,
             input_hashes={
-                "externalHighResolutionValidation": sha256_json(external),
+                "sourcePairEvidence": sha256_json(source_evidence),
                 "nscResolvedPhotometry": sha256_json(nsc),
             },
             artifacts=tuple(artifacts),
@@ -5283,14 +5294,21 @@ def build_engine(
         input_hashes = {"preparation": sha256_json(preparation)}
         if run is not None:
             input_hashes["projectResult"] = sha256_json(run)
+        awaiting_des = (
+            summary.get("recommendedNextTest")
+            == "DES_DR2_SINGLE_EPOCH_LOCAL_FORCED_PHOTOMETRY"
+            and summary.get("physicalMechanismResolved") is False
+        )
         return StageOutcome(
             result=summary,
-            next_stage=StageRequest(
+            next_stage=None if awaiting_des else StageRequest(
                 id=_next_stage_id(request.id, "finalize"),
                 handler_id="openstar.tess.finalize",
                 parameters={"outputSuffix": "v20.22"},
                 triggered_by_stage_id=request.id,
             ),
+            stop=awaiting_des,
+            final_status="BLOCKED" if awaiting_des else "COMPLETE",
             input_hashes=input_hashes,
             artifacts=(_artifact(artifact_path, "application/json"),),
         )
