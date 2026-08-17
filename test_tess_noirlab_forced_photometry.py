@@ -441,13 +441,14 @@ class CurrentNOIRLabForcedPhotometryTests(unittest.TestCase):
         complete = InvestigationStage("050-interpret-noirlab",
             "openstar.tess.noirlab-image-forced-photometry.interpret", "COMPLETE", None, {},
             result={"recommendedNextTest": noir.NEXT_ARCHIVE_TEST,
-                    "physicalMechanismResolved": False}, stop=True)
+                    "physicalMechanismResolved": False,
+                    "sourcePair": self.pair}, stop=True)
         completed = Investigation("complete", target.workflow_id, target.workflow_version,
             "BLOCKED", "now", "now", {}, (complete,))
         branch = plan_tess_branches(completed, target)[0]
         self.assertEqual("openstar.tess.des-dr2-se-local-forced-photometry.prepare",
                          branch.experiment.handler_id)
-        self.assertTrue(branch.required_stage_ids)
+        self.assertEqual((), branch.required_stage_ids)
 
     def test_transient_failed_noirlab_run_uses_fresh_generic_retry_id(self):
         store = InvestigationStore(self.root / "run-retry")

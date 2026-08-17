@@ -20,6 +20,7 @@ from .tess_residual_localization import (
     _write_json,
 )
 from .tess_noirlab_forced_photometry import (
+    NOIRLabImageQualityRejected,
     _angular_separation_arcsec,
     _dataset_result,
     _header_float,
@@ -34,6 +35,35 @@ from .tess_noirlab_forced_photometry import (
     _text,
     _world_to_pixel,
 )
+
+CURRENT_TRIGGER = "DES_DR2_SINGLE_EPOCH_LOCAL_FORCED_PHOTOMETRY"
+HISTORICAL_TRIGGER = "TARGETED_HIGH_RESOLUTION_TIME_SERIES_PHOTOMETRY"
+NEXT_ARCHIVE_TEST = "ATLAS_FORCED_PHOTOMETRY"
+
+
+class DESArchiveUnavailable(RuntimeError):
+    """A transient DES archive failure, rather than a scientific result."""
+
+
+class DESImageQualityRejected(RuntimeError):
+    """An expected source-local image or scientific-quality rejection."""
+
+
+def _retryable_service_error(error: BaseException) -> bool:
+    current: BaseException | None = error
+    while current is not None:
+        if isinstance(current, (TimeoutError, ConnectionError, urllib.error.URLError)):
+            if isinstance(current, urllib.error.HTTPError):
+                return current.code in {408, 425, 429} or current.code >= 500
+            return True
+        module = type(current).__module__.lower()
+        name = type(current).__name__.lower()
+        if module.startswith(("requests.", "httpx", "urllib3.")) and any(
+            token in name for token in ("timeout", "connection", "network")
+        ):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
 
 DES_SIA_URL = "https://datalab.noirlab.edu/sia/des_dr2_se"
 HTTP_TIMEOUT_SECONDS = 120
@@ -77,8 +107,26 @@ def _parse_float(value: Any) -> float | None:
 def _source_pair(
     external_high_resolution_summary: dict[str, Any],
 ) -> tuple[list[dict[str, Any]], float]:
-    records = _source_records_by_role(external_high_resolution_summary)
     pair = external_high_resolution_summary.get("sourcePair") or {}
+    if pair.get("version") == "openstar.current-source-pair.v1":
+        sources: list[dict[str, Any]] = []
+        for key, role in (("target", "target-control"),
+                          ("counterpart", "catalog-counterpart")):
+            frozen = pair.get(key) or {}
+            source_id = _int(frozen.get("gaiaDR3SourceID"))
+            ra = _float(frozen.get("raDeg"))
+            dec = _float(frozen.get("decDeg"))
+            if source_id is None or ra is None or dec is None:
+                raise RuntimeError(f"Current frozen Gaia source pair is incomplete for {key}.")
+            sources.append({**dict(frozen), "sourceRole": role,
+                "gaiaDR3SourceID": int(source_id), "raDeg": float(ra),
+                "decDeg": float(dec)})
+        separation = _angular_separation_arcsec(
+            sources[0]["raDeg"], sources[0]["decDeg"],
+            sources[1]["raDeg"], sources[1]["decDeg"])
+        return sources, float(separation)
+
+    records = _source_records_by_role(external_high_resolution_summary)
     target_id = _int(pair.get("targetGaiaDR3SourceID"))
     counterpart_id = _int(pair.get("counterpartGaiaDR3SourceID"))
     if target_id is None or counterpart_id is None:
@@ -136,8 +184,8 @@ def _query_sia(
 ) -> list[dict[str, Any]]:
     try:
         from astropy.io.votable import parse_single_table
-    except Exception as exc:
-        raise RuntimeError(
+    except ImportError as exc:
+        raise ImportError(
             "v20.23 requires astropy.io.votable for the DES DR2 single-epoch SIA response."
         ) from exc
 
@@ -153,8 +201,15 @@ def _query_sia(
         f"{DES_SIA_URL}?{params}",
         headers={"User-Agent": USER_AGENT},
     )
-    with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
-        body = response.read()
+    try:
+        with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
+            body = response.read()
+    except Exception as exc:
+        if _retryable_service_error(exc):
+            raise DESArchiveUnavailable(
+                f"DES DR2 SIA unavailable: {type(exc).__name__}: {exc}"
+            ) from exc
+        raise
     if not body:
         raise RuntimeError("DES DR2 single-epoch SIA returned an empty response.")
 
@@ -296,7 +351,7 @@ def _download_fits_cutout(url: str) -> bytes:
     with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
         body = response.read()
     if not body:
-        raise RuntimeError("DES DR2 single-epoch source cutout was empty.")
+        raise DESImageQualityRejected("empty-local-image-product")
     return body
 
 
@@ -325,7 +380,7 @@ def _gaussian_template(
     )
     total = float(np.sum(values))
     if not math.isfinite(total) or total <= 0:
-        raise RuntimeError("Local forced-photometry Gaussian template is degenerate.")
+        raise DESImageQualityRejected("degenerate-local-template")
     return values / total
 
 
@@ -343,7 +398,7 @@ def _local_source_fit(
     )
     pixel_scale = _pixel_scale_arcsec(header)
     if pixel_scale > MAX_PIXEL_SCALE_ARCSEC:
-        raise RuntimeError(
+        raise DESImageQualityRejected(
             f"pixel-scale-too-coarse:{pixel_scale:.4f}-arcsec-per-pixel"
         )
 
@@ -355,19 +410,19 @@ def _local_source_fit(
     y0 = max(0, iy - radius)
     y1 = min(data.shape[0], iy + radius + 1)
     if x1 - x0 < 12 or y1 - y0 < 12:
-        raise RuntimeError("source-too-close-to-local-cutout-edge")
+        raise DESImageQualityRejected("source-too-close-to-local-cutout-edge")
 
     crop = np.asarray(data[y0:y1, x0:x1], dtype=np.float64)
     finite = np.isfinite(crop)
     if int(np.count_nonzero(finite)) < 120:
-        raise RuntimeError("too-few-finite-local-fit-pixels")
+        raise DESImageQualityRejected("too-few-finite-local-fit-pixels")
 
     headers = [header, primary_header]
     saturation = _saturation_level(headers)
     if saturation is not None:
         saturated_local = finite & (crop >= saturation * SATURATION_FRACTION)
         if bool(np.any(saturated_local)):
-            raise RuntimeError("local-cutout-saturation-contamination")
+            raise DESImageQualityRejected("local-cutout-saturation-contamination")
 
     yy, xx = np.indices(crop.shape, dtype=np.float64)
     xx += float(x0)
@@ -377,7 +432,7 @@ def _local_source_fit(
 
     min_fwhm_arcsec = max(0.55, pixel_scale * 2.0)
     if min_fwhm_arcsec >= MAX_ABSOLUTE_FWHM_ARCSEC:
-        raise RuntimeError("no-valid-local-psf-width-range")
+        raise DESImageQualityRejected("no-valid-local-psf-width-range")
     fwhm_grid = np.linspace(
         min_fwhm_arcsec,
         MAX_ABSOLUTE_FWHM_ARCSEC,
@@ -414,7 +469,7 @@ def _local_source_fit(
                         design,
                         values,
                     )
-                except Exception:
+                except NOIRLabImageQualityRejected:
                     continue
 
                 model = design @ coefficients
@@ -436,7 +491,7 @@ def _local_source_fit(
                             fit_values = values[robust]
                             model = fit_design @ coefficients
                             residual = fit_values - model
-                        except Exception:
+                        except NOIRLabImageQualityRejected:
                             continue
 
                 amplitude = float(coefficients[0])
@@ -470,11 +525,11 @@ def _local_source_fit(
                     best = candidate
 
     if best is None:
-        raise RuntimeError("no-positive-local-source-psf-fit")
+        raise DESImageQualityRejected("no-positive-local-source-psf-fit")
     if best["scaledDesignCondition"] > MAX_SCALED_DESIGN_CONDITION:
-        raise RuntimeError("local-source-fit-poorly-conditioned")
+        raise DESImageQualityRejected("local-source-fit-poorly-conditioned")
     if best["fitR2"] < MIN_FIT_R2:
-        raise RuntimeError("local-source-fit-low-explained-variance")
+        raise DESImageQualityRejected("local-source-fit-low-explained-variance")
 
     minimum_snr = (
         MIN_TARGET_AMPLITUDE_SNR
@@ -482,7 +537,7 @@ def _local_source_fit(
         else MIN_COUNTERPART_AMPLITUDE_SNR
     )
     if best["amplitudeSNR"] < minimum_snr:
-        raise RuntimeError("local-source-amplitude-snr-too-low")
+        raise DESImageQualityRejected("local-source-amplitude-snr-too-low")
 
     magnitude, calibration = _photometric_magnitude(
         best["amplitude"],
@@ -523,6 +578,7 @@ def _prepare_band_series(
     successful: list[dict[str, Any]],
     *,
     role: str,
+    failure_counts: Counter[str] | None = None,
 ) -> dict[str, dict[str, Any]]:
     result: dict[str, dict[str, Any]] = {}
     for band in SUPPORTED_BANDS:
@@ -557,7 +613,14 @@ def _prepare_band_series(
         if baseline < MIN_BAND_BASELINE_DAYS:
             continue
 
-        flux = _robust_standardize_magnitudes(kept_magnitudes)
+        try:
+            flux = _robust_standardize_magnitudes(kept_magnitudes)
+        except RuntimeError as exc:
+            if str(exc) != "Local forced-photometry magnitudes have no finite variability scale.":
+                raise
+            if failure_counts is not None:
+                failure_counts[f"{role}:{band}-flat-magnitude-series"] += 1
+            continue
         local_times = kept_times - float(kept_times[0])
         result[band] = {
             "times": local_times,
@@ -589,7 +652,7 @@ def build_des_dr2_se_local_forced_project(
     output_dir: str | Path,
     investigation_id: str,
 ) -> dict[str, Any]:
-    if noirlab_image_summary.get("recommendedNextTest") != "TARGETED_HIGH_RESOLUTION_TIME_SERIES_PHOTOMETRY":
+    if noirlab_image_summary.get("recommendedNextTest") not in {CURRENT_TRIGGER, HISTORICAL_TRIGGER}:
         raise RuntimeError(
             "v20.23 requires v20.22 to remain on the targeted time-series follow-up branch."
         )
@@ -606,11 +669,13 @@ def build_des_dr2_se_local_forced_project(
     center_ra, center_dec = _pair_center(sources)
 
     search = dict(
-        ((noirlab_image_summary.get("distributedValidation") or {}).get("frequencySearch") or {})
+        noirlab_image_summary.get("frequencySearch")
+        or ((noirlab_image_summary.get("distributedValidation") or {}).get("frequencySearch") or {})
     )
     if not search:
         search = dict(
-            ((external_high_resolution_summary.get("distributedValidation") or {}).get("frequencySearch") or {})
+            external_high_resolution_summary.get("frequencySearch")
+            or ((external_high_resolution_summary.get("distributedValidation") or {}).get("frequencySearch") or {})
         )
     total_frequencies = _int(search.get("totalFrequencies"))
     per_work = _int(search.get("frequenciesPerWorkUnit"))
@@ -688,11 +753,9 @@ def build_des_dr2_se_local_forced_project(
                     f"mag={fit['magnitude']:.3f}",
                     flush=True,
                 )
-            except Exception as exc:
+            except (DESImageQualityRejected, NOIRLabImageQualityRejected) as exc:
                 message = str(exc)
                 reason = message.split(":", 1)[0] if message else type(exc).__name__
-                if isinstance(exc, (urllib.error.URLError, TimeoutError)):
-                    reason = "download-error"
                 failure_counts[f"{role}:{reason}"] += 1
                 failures.append(
                     {
@@ -709,6 +772,23 @@ def build_des_dr2_se_local_forced_project(
                     f"         {role}: rejected: {type(exc).__name__}: {exc}",
                     flush=True,
                 )
+            except Exception as exc:
+                if not _retryable_service_error(exc):
+                    raise
+                reason = "download-error"
+                failure_counts[f"{role}:{reason}"] += 1
+                failures.append(
+                    {
+                        "identifier": exposure.get("identifier"),
+                        "band": band,
+                        "mjd": exposure.get("mjd"),
+                        "sourceRole": role,
+                        "gaiaDR3SourceID": int(source["gaiaDR3SourceID"]),
+                        "reason": reason,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+                print(f"         {role}: transient retrieval failure: {exc}", flush=True)
 
     total_attempts = int(sum(source_attempts.values()))
     transport_failures = sum(
@@ -724,12 +804,14 @@ def build_des_dr2_se_local_forced_project(
         )
     )
     if total_attempts >= 6 and transport_failures >= max(6, total_attempts // 2):
-        raise RuntimeError(
+        raise DESArchiveUnavailable(
             "v20.23 found DES DR2 single-epoch coverage but image retrieval failed broadly; retry rather than converting a service outage into a scientific non-detection."
         )
 
     series_by_role = {
-        role: _prepare_band_series(successful, role=role)
+        role: _prepare_band_series(
+            successful, role=role, failure_counts=failure_counts
+        )
         for role in ("target-control", "catalog-counterpart")
     }
 
@@ -943,27 +1025,27 @@ def interpret_des_dr2_se_local_forced_project(
     if candidate_exposures == 0:
         classification = "DES_DR2_SE_NO_FIELD_COVERAGE"
         origin = "UNRESOLVED_DES_DR2_SE_NO_SINGLE_EPOCH_COVERAGE"
-        next_test = "TARGETED_HIGH_RESOLUTION_TIME_SERIES_PHOTOMETRY"
+        next_test = NEXT_ARCHIVE_TEST
     elif counterpart_supported and target_supported:
         classification = "DES_DR2_SE_TARGET_AND_COUNTERPART_RESIDUAL_BAND_VARIABILITY_SUPPORTED"
         origin = "TARGET_AND_COUNTERPART_SUPPORTED_BY_DES_DR2_SE_LOCAL_PHOTOMETRY"
         next_test = "JOINT_TARGET_COUNTERPART_VARIABILITY_MODEL"
-    elif counterpart_supported:
+    elif counterpart_supported and bool(target.get("scientificallyUsableControl")):
         classification = "DES_DR2_SE_COUNTERPART_RESIDUAL_BAND_VARIABILITY_SUPPORTED"
         origin = "CATALOG_COUNTERPART_SUPPORTED_BY_DES_DR2_SE_LOCAL_PHOTOMETRY"
         next_test = "TARGET_RESIDUAL_REANALYSIS_AFTER_OFFSET_REMOVAL"
-    elif target_supported:
+    elif target_supported and bool(counterpart.get("scientificallyUsableControl")):
         classification = "DES_DR2_SE_TARGET_RESIDUAL_BAND_VARIABILITY_SUPPORTED"
         origin = "TARGET_SUPPORTED_BY_DES_DR2_SE_LOCAL_PHOTOMETRY"
         next_test = "TARGET_INTRINSIC_RESIDUAL_MODELING"
     elif counterpart_suggestive and not target_suggestive:
         classification = "DES_DR2_SE_COUNTERPART_RESIDUAL_BAND_VARIABILITY_SUGGESTIVE"
         origin = "CATALOG_COUNTERPART_SUGGESTIVE_BY_DES_DR2_SE_LOCAL_PHOTOMETRY"
-        next_test = "TARGETED_HIGH_RESOLUTION_TIME_SERIES_PHOTOMETRY"
+        next_test = NEXT_ARCHIVE_TEST
     elif target_suggestive and not counterpart_suggestive:
         classification = "DES_DR2_SE_TARGET_RESIDUAL_BAND_VARIABILITY_SUGGESTIVE"
         origin = "TARGET_SUGGESTIVE_BY_DES_DR2_SE_LOCAL_PHOTOMETRY"
-        next_test = "TARGETED_HIGH_RESOLUTION_TIME_SERIES_PHOTOMETRY"
+        next_test = NEXT_ARCHIVE_TEST
     elif not prepared_roles:
         if counterpart_successes > 0 or target_successes > 0:
             classification = "DES_DR2_SE_LOCAL_PHOTOMETRY_INSUFFICIENT_TIME_SERIES"
@@ -971,11 +1053,11 @@ def interpret_des_dr2_se_local_forced_project(
         else:
             classification = "DES_DR2_SE_NO_QUALIFYING_LOCAL_SOURCE_FITS"
             origin = "UNRESOLVED_DES_DR2_SE_IMAGE_FIT_QUALITY_LIMIT"
-        next_test = "TARGETED_HIGH_RESOLUTION_TIME_SERIES_PHOTOMETRY"
+        next_test = NEXT_ARCHIVE_TEST
     else:
         classification = "DES_DR2_SE_LOCAL_SOURCE_ATTRIBUTION_UNRESOLVED"
         origin = "ARCHIVAL_DES_DR2_SE_SOURCE_ATTRIBUTION_UNRESOLVED"
-        next_test = "TARGETED_HIGH_RESOLUTION_TIME_SERIES_PHOTOMETRY"
+        next_test = NEXT_ARCHIVE_TEST
 
     return {
         "version": "openstar.tess-des-dr2-se-local-forced-photometry.v1",

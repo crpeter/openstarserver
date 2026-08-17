@@ -117,6 +117,8 @@ from .tess_noirlab_forced_photometry import (
     interpret_noirlab_image_forced_photometry_project,
 )
 from .tess_des_dr2_se_local_forced import (
+    CURRENT_TRIGGER as CURRENT_DES_TRIGGER,
+    DESArchiveUnavailable,
     build_des_dr2_se_local_forced_project,
     interpret_des_dr2_se_local_forced_project,
 )
@@ -5327,7 +5329,10 @@ def build_engine(
             raise RuntimeError(
                 "v20.23 requires the frozen target plus completed v20.19 and v20.22 archival results."
             )
-        if noirlab.get("recommendedNextTest") != "TARGETED_HIGH_RESOLUTION_TIME_SERIES_PHOTOMETRY":
+        if noirlab.get("recommendedNextTest") not in {
+            CURRENT_DES_TRIGGER,
+            "TARGETED_HIGH_RESOLUTION_TIME_SERIES_PHOTOMETRY",
+        }:
             raise RuntimeError(
                 "v20.22 did not leave the investigation at TARGETED_HIGH_RESOLUTION_TIME_SERIES_PHOTOMETRY."
             )
@@ -5341,14 +5346,17 @@ def build_engine(
         print("   accepted source-band series become ordinary openstar.lomb-scargle.v1 datasets")
         print("   the TESS drift law is NOT extrapolated into the DES observing epochs")
 
-        spec = build_des_dr2_se_local_forced_project(
-            source_project_id=str(prepared["sourceProjectID"]),
-            source_dataset_id=str(prepared["datasetID"]),
-            external_high_resolution_summary=external,
-            noirlab_image_summary=noirlab,
-            output_dir=artifact_root,
-            investigation_id=investigation.id,
-        )
+        try:
+            spec = build_des_dr2_se_local_forced_project(
+                source_project_id=str(prepared["sourceProjectID"]),
+                source_dataset_id=str(prepared["datasetID"]),
+                external_high_resolution_summary=external,
+                noirlab_image_summary=noirlab,
+                output_dir=artifact_root,
+                investigation_id=investigation.id,
+            )
+        except DESArchiveUnavailable as exc:
+            raise RetryableExecutionError(str(exc)) from exc
 
         print(f"   actual Gaia pair separation: {spec.get('pairSeparationArcsec')} arcsec")
         print(f"   DES SIA rows: {spec.get('siaRows')}")
@@ -5460,14 +5468,20 @@ def build_engine(
         if run is not None:
             input_hashes["projectResult"] = sha256_json(run)
 
+        awaiting_atlas = (
+            summary.get("recommendedNextTest") == "ATLAS_FORCED_PHOTOMETRY"
+            and summary.get("physicalMechanismResolved") is False
+        )
         return StageOutcome(
             result=summary,
-            next_stage=StageRequest(
+            next_stage=None if awaiting_atlas else StageRequest(
                 id=_next_stage_id(request.id, "finalize"),
                 handler_id="openstar.tess.finalize",
                 parameters={"outputSuffix": "v20.23"},
                 triggered_by_stage_id=request.id,
             ),
+            stop=awaiting_atlas,
+            final_status="BLOCKED" if awaiting_atlas else None,
             input_hashes=input_hashes,
             artifacts=(_artifact(artifact_path, "application/json"),),
         )
