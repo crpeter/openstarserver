@@ -145,6 +145,10 @@ def plan_tess_branches(
     variability_interpretation = _latest_complete(
         investigation, "openstar.tess.offset-source-variability.interpret"
     )
+    gaia_interpretation = _latest_complete(
+        investigation,
+        "openstar.tess.gaia-source-resolved-counterpart-photometry.interpret",
+    )
     if (
         prf_interpretation is not None
         and catalog_identification is None
@@ -198,6 +202,43 @@ def plan_tess_branches(
                     handler_id="openstar.tess.offset-source-variability.prepare",
                     parameters={},
                     triggered_by_stage_id=catalog_identification.id,
+                ),
+            ),
+        )
+
+    variability_result = (
+        variability_interpretation.result or {}
+        if variability_interpretation is not None
+        else {}
+    )
+    gaia_started = any(
+        stage.handler_id.startswith(
+            "openstar.tess.gaia-source-resolved-counterpart-photometry."
+        )
+        and stage.status in {"RUNNING", "COMPLETE"}
+        for stage in investigation.stages
+    )
+    if (
+        variability_interpretation is not None
+        and gaia_interpretation is None
+        and not gaia_started
+        and variability_result.get("recommendedNextTest")
+        == "INDEPENDENT_SOURCE_RESOLVED_COUNTERPART_PHOTOMETRY"
+        and variability_result.get("physicalMechanismResolved") is False
+    ):
+        return (
+            ScientificBranch(
+                id=f"continue-gaia-counterpart-after-{variability_interpretation.id}",
+                experiment=StageRequest(
+                    id=_continuation_stage_id(
+                        variability_interpretation,
+                        "prepare-gaia-source-resolved-counterpart-photometry",
+                    ),
+                    handler_id=(
+                        "openstar.tess.gaia-source-resolved-counterpart-photometry.prepare"
+                    ),
+                    parameters={},
+                    triggered_by_stage_id=variability_interpretation.id,
                 ),
             ),
         )
