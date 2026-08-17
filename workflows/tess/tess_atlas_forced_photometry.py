@@ -52,6 +52,31 @@ MIN_PEAK_PROMINENCE_RATIO = 2.0
 MIN_CROSS_BAND_SUPPORT = 2
 MAX_CROSS_BAND_RELATIVE_FREQUENCY_SPREAD = 0.12
 
+CURRENT_TRIGGER = "ATLAS_FORCED_PHOTOMETRY"
+HISTORICAL_TRIGGER = "TARGETED_HIGH_RESOLUTION_TIME_SERIES_PHOTOMETRY"
+SIGNED_REANALYSIS = "ATLAS_SIGNED_FORCED_PHOTOMETRY_REANALYSIS"
+
+
+class ATLASArchiveUnavailable(RuntimeError):
+    """A transient ATLAS service failure, not a scientific no-data result."""
+
+
+def _retryable_service_error(error: BaseException) -> bool:
+    current: BaseException | None = error
+    while current is not None:
+        if isinstance(current, (TimeoutError, ConnectionError, urllib.error.URLError)):
+            if isinstance(current, urllib.error.HTTPError):
+                return current.code in {408, 425, 429} or current.code >= 500
+            return True
+        module = type(current).__module__.lower()
+        name = type(current).__name__.lower()
+        if module.startswith(("requests.", "httpx", "urllib3.")) and any(
+            token in name for token in ("timeout", "connection", "network")
+        ):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
 
 def atlas_credentials_available() -> bool:
     token = (os.environ.get("OPENSTAR_ATLAS_API_TOKEN") or "").strip()
@@ -101,6 +126,10 @@ def _json_request(
     except urllib.error.HTTPError as exc:
         payload = exc.read()
         status = int(exc.code)
+    except Exception as exc:
+        if _retryable_service_error(exc):
+            raise ATLASArchiveUnavailable(str(exc)) from exc
+        raise
 
     text = payload.decode("utf-8", errors="replace")
     try:
@@ -125,8 +154,13 @@ def _text_request(
         headers=request_headers,
         method="GET",
     )
-    with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
-        payload = response.read()
+    try:
+        with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
+            payload = response.read()
+    except Exception as exc:
+        if _retryable_service_error(exc):
+            raise ATLASArchiveUnavailable(str(exc)) from exc
+        raise
     if not payload:
         raise RuntimeError("ATLAS result download returned an empty response.")
     return payload.decode("utf-8", errors="replace")
@@ -144,6 +178,10 @@ def _atlas_headers() -> dict[str, str]:
             method="POST",
             form={"username": username, "password": password},
         )
+        if status in {408, 425, 429} or status >= 500:
+            raise ATLASArchiveUnavailable(
+                f"ATLAS authentication service temporarily failed with HTTP {status}: {payload}"
+            )
         if status != 200:
             raise RuntimeError(
                 f"ATLAS authentication failed with HTTP {status}: {payload}"
@@ -193,14 +231,13 @@ def _submit_atlas_job(
                 raise RuntimeError("ATLAS queued a task but returned no task URL.")
             return task_url
         if status == 429:
-            message = str(payload.get("detail") or "")
-            wait_seconds = _throttle_wait_seconds(message)
-            print(
-                f"      ATLAS queue throttled; retrying after {wait_seconds}s",
-                flush=True,
+            raise ATLASArchiveUnavailable(
+                f"ATLAS queue throttled (HTTP 429): {payload}"
             )
-            time.sleep(wait_seconds)
-            continue
+        if status in {408, 425} or status >= 500:
+            raise ATLASArchiveUnavailable(
+                f"ATLAS queue submission temporarily failed with HTTP {status}: {payload}"
+            )
         raise RuntimeError(
             f"ATLAS queue submission failed with HTTP {status}: {payload}"
         )
@@ -215,7 +252,7 @@ def _wait_for_atlas_job(
 
     while True:
         if time.monotonic() - started > JOB_TIMEOUT_SECONDS:
-            raise RuntimeError(
+            raise ATLASArchiveUnavailable(
                 "ATLAS forced-photometry task exceeded the OpenStar polling timeout. "
                 "Rerun the v20.24 continuation; the prior FAILED stage will remain provenance."
             )
@@ -225,6 +262,10 @@ def _wait_for_atlas_job(
             method="GET",
             headers=headers,
         )
+        if status in {408, 425, 429} or status >= 500:
+            raise ATLASArchiveUnavailable(
+                f"ATLAS task polling temporarily failed with HTTP {status}: {payload}"
+            )
         if status != 200:
             raise RuntimeError(
                 f"ATLAS task polling failed with HTTP {status}: {payload}"
@@ -488,6 +529,17 @@ def _dataset_result(
         and frequency is not None
         and frequency > 0
     )
+    interpretable = bool(
+        status
+        and coverage is not False
+        and status not in {
+            "SEARCHING",
+            "INCOMPLETE_COVERAGE",
+            "NO_DATASET",
+            "FAILED",
+            "ERROR",
+        }
+    )
 
     return {
         "datasetID": prepared.get("datasetID"),
@@ -505,6 +557,7 @@ def _dataset_result(
         "candidatePower": power,
         "candidatePeakProminenceRatio": prominence,
         "acceptedResidualBandVariability": accepted,
+        "searchInterpretable": interpretable,
     }
 
 
@@ -517,6 +570,9 @@ def _summarize_atlas_source(
         for item in results
         if item.get("sourceRole") == role
     ]
+    scientifically_usable = any(
+        bool(item.get("searchInterpretable")) for item in source_results
+    )
     accepted = [
         item
         for item in source_results
@@ -555,14 +611,37 @@ def _summarize_atlas_source(
         "crossBandRelativeFrequencySpread": relative_spread,
         "sourceSupported": supported,
         "sourceSuggestive": bool(accepted) and not supported,
+        "scientificallyUsableControl": scientifically_usable,
     }
 
 
 def _frozen_sources(
     external_high_resolution_summary: dict[str, Any],
 ) -> tuple[list[dict[str, Any]], float]:
-    records = _source_records_by_role(external_high_resolution_summary)
     pair = external_high_resolution_summary.get("sourcePair") or {}
+    if pair.get("version") == "openstar.current-source-pair.v1":
+        sources = []
+        for key, role in (("target", "target-control"),
+                          ("counterpart", "catalog-counterpart")):
+            frozen = pair.get(key) or {}
+            source_id = _int(frozen.get("gaiaDR3SourceID"))
+            ra = _float(frozen.get("raDeg"))
+            dec = _float(frozen.get("decDeg"))
+            if source_id is None or ra is None or dec is None:
+                raise RuntimeError(f"Current frozen Gaia source pair is incomplete for {key}.")
+            sources.append({**dict(frozen), "sourceRole": role,
+                "gaiaDR3SourceID": int(source_id), "raDeg": float(ra),
+                "decDeg": float(dec)})
+        separation = _angular_separation_arcsec(
+            sources[0]["raDeg"], sources[0]["decDeg"],
+            sources[1]["raDeg"], sources[1]["decDeg"])
+        if separation < MIN_GAIA_PAIR_SEPARATION_ARCSEC:
+            raise RuntimeError(
+                "v20.24 is preregistered only for the corrected widely separated Gaia source pair."
+            )
+        return sources, float(separation)
+
+    records = _source_records_by_role(external_high_resolution_summary)
     target_id = _int(pair.get("targetGaiaDR3SourceID"))
     counterpart_id = _int(pair.get("counterpartGaiaDR3SourceID"))
     if target_id is None or counterpart_id is None:
@@ -616,7 +695,9 @@ def build_atlas_forced_photometry_project(
     output_dir: str | Path,
     investigation_id: str,
 ) -> dict[str, Any]:
-    if des_dr2_se_summary.get("recommendedNextTest") != "TARGETED_HIGH_RESOLUTION_TIME_SERIES_PHOTOMETRY":
+    if des_dr2_se_summary.get("recommendedNextTest") not in {
+        CURRENT_TRIGGER, HISTORICAL_TRIGGER
+    }:
         raise RuntimeError(
             "v20.24 requires v20.23 to remain on the targeted high-resolution time-series branch."
         )
@@ -626,11 +707,15 @@ def build_atlas_forced_photometry_project(
     sources, pair_separation = _frozen_sources(external_high_resolution_summary)
 
     search = dict(
-        ((des_dr2_se_summary.get("distributedValidation") or {}).get("frequencySearch") or {})
+        (des_dr2_se_summary.get("frequencySearch")
+         or (des_dr2_se_summary.get("distributedValidation") or {}).get("frequencySearch")
+         or {})
     )
     if not search:
         search = dict(
-            ((external_high_resolution_summary.get("distributedValidation") or {}).get("frequencySearch") or {})
+            (external_high_resolution_summary.get("frequencySearch")
+             or (external_high_resolution_summary.get("distributedValidation") or {}).get("frequencySearch")
+             or {})
         )
     total_frequencies = _int(search.get("totalFrequencies"))
     per_work = _int(search.get("frequenciesPerWorkUnit"))
@@ -872,18 +957,18 @@ def interpret_atlas_forced_photometry_project(
         classification = "ATLAS_TARGET_AND_COUNTERPART_RESIDUAL_BAND_VARIABILITY_SUPPORTED"
         origin = "TARGET_AND_COUNTERPART_SUPPORTED_BY_ATLAS_FORCED_PHOTOMETRY"
         next_test = "JOINT_TARGET_COUNTERPART_VARIABILITY_MODEL"
-    elif counterpart_supported:
+    elif counterpart_supported and bool(target.get("scientificallyUsableControl")):
         classification = "ATLAS_COUNTERPART_RESIDUAL_BAND_VARIABILITY_SUPPORTED"
         origin = "CATALOG_COUNTERPART_SUPPORTED_BY_ATLAS_FORCED_PHOTOMETRY"
         next_test = "TARGET_RESIDUAL_REANALYSIS_AFTER_OFFSET_REMOVAL"
-    elif target_supported:
+    elif target_supported and bool(counterpart.get("scientificallyUsableControl")):
         classification = "ATLAS_TARGET_RESIDUAL_BAND_VARIABILITY_SUPPORTED"
         origin = "TARGET_SUPPORTED_BY_ATLAS_FORCED_PHOTOMETRY"
         next_test = "TARGET_INTRINSIC_RESIDUAL_MODELING"
     elif counterpart_suggestive and not target_suggestive:
         classification = "ATLAS_COUNTERPART_RESIDUAL_BAND_VARIABILITY_SUGGESTIVE"
         origin = "CATALOG_COUNTERPART_SUGGESTIVE_BY_ATLAS_FORCED_PHOTOMETRY"
-        next_test = "TARGETED_HIGH_RESOLUTION_TIME_SERIES_PHOTOMETRY"
+        next_test = HISTORICAL_TRIGGER
     elif target_suggestive and not counterpart_suggestive:
         classification = "ATLAS_TARGET_RESIDUAL_BAND_VARIABILITY_SUGGESTIVE"
         origin = "TARGET_SUGGESTIVE_BY_ATLAS_FORCED_PHOTOMETRY"
@@ -891,7 +976,7 @@ def interpret_atlas_forced_photometry_project(
     elif not prepared_roles:
         classification = "ATLAS_NO_QUALIFYING_FORCED_PHOTOMETRY_TIME_SERIES"
         origin = "UNRESOLVED_ATLAS_FORCED_PHOTOMETRY_QUALITY_OR_SENSITIVITY_LIMIT"
-        next_test = "TARGETED_HIGH_RESOLUTION_TIME_SERIES_PHOTOMETRY"
+        next_test = SIGNED_REANALYSIS
     else:
         classification = "ATLAS_SOURCE_ATTRIBUTION_UNRESOLVED"
         origin = "ARCHIVAL_ATLAS_SOURCE_ATTRIBUTION_UNRESOLVED"

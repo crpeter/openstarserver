@@ -294,7 +294,7 @@ class CurrentDESLocalForcedPhotometryTests(unittest.TestCase):
         target = InvestigationTarget("atlas", "atlas", inv.workflow_id, inv.workflow_version)
         branch = plan_tess_branches(inv, target)[0]
         self.assertEqual("openstar.tess.atlas-forced-photometry.prepare", branch.experiment.handler_id)
-        self.assertEqual(("openstar.capability.current-atlas-forced-photometry-adapter",),
+        self.assertEqual(("openstar.capability.atlas-forced-photometry-credentials",),
                          branch.required_stage_ids)
 
 
