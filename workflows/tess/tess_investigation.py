@@ -102,6 +102,7 @@ from .tess_gaia_counterpart import (
     interpret_current_gaia_counterpart_project,
 )
 from .tess_skymapper_resolved import (
+    SkyMapperArchiveUnavailable,
     build_skymapper_resolved_project,
     interpret_skymapper_resolved_project,
 )
@@ -3870,11 +3871,106 @@ def build_engine(
         return StageOutcome(
             result=summary,
             next_stage=StageRequest(
-                id=_next_stage_id(request.id, "finalize"),
-                handler_id="openstar.tess.finalize",
-                parameters={"outputSuffix": "current-gaia-counterpart"},
+                id=_next_stage_id(
+                    request.id,
+                    "prepare-skymapper-resolved-counterpart-photometry"
+                    if summary.get("recommendedNextTest") == "SKYMAPPER_RESOLVED_COUNTERPART_PHOTOMETRY"
+                    and summary.get("physicalMechanismResolved") is False else "finalize",
+                ),
+                handler_id=(
+                    "openstar.tess.skymapper-resolved-counterpart-photometry.prepare"
+                    if summary.get("recommendedNextTest") == "SKYMAPPER_RESOLVED_COUNTERPART_PHOTOMETRY"
+                    and summary.get("physicalMechanismResolved") is False
+                    else "openstar.tess.finalize"
+                ),
+                parameters=({} if summary.get("recommendedNextTest") == "SKYMAPPER_RESOLVED_COUNTERPART_PHOTOMETRY"
+                            and summary.get("physicalMechanismResolved") is False
+                            else {"outputSuffix": "current-gaia-counterpart"}),
                 triggered_by_stage_id=request.id,
             ),
+            input_hashes={"preparation": sha256_json(preparation),
+                          **({"projectResult": sha256_json(run)} if run is not None else {})},
+            artifacts=(_artifact(artifact_path, "application/json"),),
+        )
+
+    def skymapper_counterpart_prepare_stage(investigation, request):
+        prepared = _latest_result_for_handler(investigation, "openstar.tess.prepare-target")
+        gaia = _latest_result_for_handler(
+            investigation, "openstar.tess.gaia-source-resolved-counterpart-photometry.interpret"
+        )
+        if prepared is None or gaia is None:
+            raise RuntimeError("SkyMapper counterpart photometry requires persisted target and Gaia interpretation.")
+        try:
+            spec = build_skymapper_resolved_project(
+                source_project_id=str(prepared["sourceProjectID"]),
+                source_dataset_id=str(prepared["datasetID"]),
+                external_high_resolution_summary=gaia,
+                output_dir=store.directory_for(investigation.id) / "artifacts",
+                investigation_id=investigation.id,
+            )
+        except SkyMapperArchiveUnavailable as exc:
+            raise RetryableExecutionError(str(exc)) from exc
+        artifacts = tuple(
+            _artifact(Path(path), "application/json")
+            for path in ([spec.get("projectPath")] +
+                         [item.get("datasetPath") for item in spec.get("preparedSeries") or []])
+            if path
+        )
+        run_work = bool(spec.get("available") and spec.get("projectPath"))
+        label = ("run-skymapper-resolved-counterpart-photometry" if run_work
+                 else "interpret-skymapper-resolved-counterpart-photometry")
+        return StageOutcome(
+            result=spec,
+            next_stage=StageRequest(
+                id=_next_stage_id(request.id, label),
+                handler_id=("openstar.tess.skymapper-resolved-counterpart-photometry.run" if run_work
+                            else "openstar.tess.skymapper-resolved-counterpart-photometry.interpret"),
+                parameters=({"projectPath": spec["projectPath"]} if run_work
+                            else {"distributedRunExpected": False}),
+                triggered_by_stage_id=request.id,
+            ),
+            input_hashes={"gaiaInterpretation": sha256_json(gaia)}, artifacts=artifacts,
+        )
+
+    def skymapper_counterpart_run_stage(investigation, request):
+        run = coordinator.run_project(
+            request.parameters["projectPath"], poll_interval=poll_interval, timeout=timeout
+        )
+        return StageOutcome(
+            result=run.status,
+            next_stage=StageRequest(
+                id=_next_stage_id(request.id, "interpret-skymapper-resolved-counterpart-photometry"),
+                handler_id="openstar.tess.skymapper-resolved-counterpart-photometry.interpret",
+                parameters={"distributedRunExpected": True}, triggered_by_stage_id=request.id,
+            ), node_contributions=run.node_contributions, project_ids=(run.project_id,),
+        )
+
+    def skymapper_counterpart_interpret_stage(investigation, request):
+        preparation = _latest_result_for_handler(
+            investigation, "openstar.tess.skymapper-resolved-counterpart-photometry.prepare"
+        )
+        run = _latest_result_for_handler(
+            investigation, "openstar.tess.skymapper-resolved-counterpart-photometry.run"
+        )
+        if preparation is None or (request.parameters.get("distributedRunExpected") and run is None):
+            raise RuntimeError("SkyMapper counterpart interpretation lacks persisted inputs.")
+        summary = interpret_skymapper_resolved_project(project_status=run, preparation=preparation)
+        artifact_path = (store.directory_for(investigation.id) / "artifacts" /
+                         "skymapper-resolved-photometry" / "interpretation.json")
+        _write_json(artifact_path, summary)
+        awaiting_nsc = (
+            summary.get("recommendedNextTest") == "NSC_RESOLVED_COUNTERPART_PHOTOMETRY"
+            and summary.get("physicalMechanismResolved") is False
+        )
+        return StageOutcome(
+            result=summary,
+            next_stage=None if awaiting_nsc else StageRequest(
+                id=_next_stage_id(request.id, "finalize"), handler_id="openstar.tess.finalize",
+                parameters={"outputSuffix": "skymapper-resolved-counterpart"},
+                triggered_by_stage_id=request.id,
+            ),
+            stop=awaiting_nsc,
+            final_status="BLOCKED" if awaiting_nsc else "COMPLETE",
             input_hashes={"preparation": sha256_json(preparation),
                           **({"projectResult": sha256_json(run)} if run is not None else {})},
             artifacts=(_artifact(artifact_path, "application/json"),),
@@ -7748,6 +7844,18 @@ def build_engine(
     engine.register_handler(
         "openstar.tess.gaia-source-resolved-counterpart-photometry.interpret",
         current_gaia_counterpart_interpret_stage,
+    )
+    engine.register_handler(
+        "openstar.tess.skymapper-resolved-counterpart-photometry.prepare",
+        skymapper_counterpart_prepare_stage,
+    )
+    engine.register_handler(
+        "openstar.tess.skymapper-resolved-counterpart-photometry.run",
+        skymapper_counterpart_run_stage,
+    )
+    engine.register_handler(
+        "openstar.tess.skymapper-resolved-counterpart-photometry.interpret",
+        skymapper_counterpart_interpret_stage,
     )
     engine.register_handler(
         "openstar.tess.calibrated-prf-deblending.prepare",
