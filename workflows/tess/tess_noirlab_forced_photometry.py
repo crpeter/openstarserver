@@ -834,6 +834,17 @@ def _dataset_result(project_dataset: dict[str, Any], prepared: dict[str, Any]) -
     prominence = _float(project_dataset.get("candidatePeakProminenceRatio"))
     status = str(project_dataset.get("periodStatus") or "")
     coverage = project_dataset.get("coverageComplete")
+    interpretable = bool(
+        status
+        and coverage is not False
+        and status not in {
+            "SEARCHING",
+            "INCOMPLETE_COVERAGE",
+            "NO_DATASET",
+            "FAILED",
+            "ERROR",
+        }
+    )
     accepted = bool(
         status == "RELIABLE"
         and (coverage is None or bool(coverage))
@@ -850,6 +861,8 @@ def _dataset_result(project_dataset: dict[str, Any], prepared: dict[str, Any]) -
         "sampleCount": prepared.get("sampleCount"),
         "baselineDays": prepared.get("baselineDays"),
         "periodStatus": status or None,
+        "coverageComplete": coverage,
+        "searchInterpretable": interpretable,
         "periodConfidence": project_dataset.get("periodConfidence"),
         "candidateFrequency": frequency,
         "candidatePeriodDays": period,
@@ -861,6 +874,9 @@ def _dataset_result(project_dataset: dict[str, Any], prepared: dict[str, Any]) -
 
 def _summarize_source(role: str, results: list[dict[str, Any]]) -> dict[str, Any]:
     source_results = [item for item in results if item.get("sourceRole") == role]
+    scientifically_usable = any(
+        bool(item.get("searchInterpretable")) for item in source_results
+    )
     accepted = [item for item in source_results if item.get("acceptedResidualBandVariability")]
     frequencies = [
         float(item["candidateFrequency"])
@@ -888,6 +904,7 @@ def _summarize_source(role: str, results: list[dict[str, Any]]) -> dict[str, Any
         "crossBandRelativeFrequencySpread": relative_spread,
         "sourceSupported": supported,
         "sourceSuggestive": bool(accepted) and not supported,
+        "scientificallyUsableControl": scientifically_usable,
     }
 
 
@@ -1231,11 +1248,8 @@ def interpret_noirlab_image_forced_photometry_project(
     counterpart_supported = bool(counterpart.get("sourceSupported"))
     target_suggestive = bool(target.get("sourceSuggestive"))
     counterpart_suggestive = bool(counterpart.get("sourceSuggestive"))
-    prepared = preparation.get("preparedSeries") or []
-    target_usable = any(item.get("sourceRole") == "target-control" for item in prepared)
-    counterpart_usable = any(item.get("sourceRole") == "catalog-counterpart" for item in prepared)
-    target["scientificallyUsableControl"] = target_usable
-    counterpart["scientificallyUsableControl"] = counterpart_usable
+    target_usable = bool(target.get("scientificallyUsableControl"))
+    counterpart_usable = bool(counterpart.get("scientificallyUsableControl"))
 
     failure_reasons = preparation.get("failureReasons") or {}
     successful_exposures = int(preparation.get("successfulForcedPhotometryExposures") or 0)

@@ -92,11 +92,13 @@ class CurrentNOIRLabForcedPhotometryTests(unittest.TestCase):
         self.assertEqual(noir.NEXT_ARCHIVE_TEST, summary["recommendedNextTest"])
 
     def test_incomplete_target_control_cannot_decisively_attribute_counterpart(self):
-        prepared = [{"datasetID": "cg", "sourceRole": "catalog-counterpart", "band": "g"},
+        prepared = [{"datasetID": "tg", "sourceRole": "target-control", "band": "g"},
+                    {"datasetID": "cg", "sourceRole": "catalog-counterpart", "band": "g"},
                     {"datasetID": "cr", "sourceRole": "catalog-counterpart", "band": "r"}]
         datasets = [{"datasetID": item["datasetID"], "periodStatus": "RELIABLE",
                      "coverageComplete": True, "candidateFrequency": 1.2,
-                     "candidatePeakProminenceRatio": 4.0} for item in prepared]
+                     "candidatePeakProminenceRatio": 4.0} for item in prepared
+                    if item["sourceRole"] == "catalog-counterpart"]
         minimal_numpy = SimpleNamespace(
             float64=float, asarray=lambda values, dtype=None: list(values),
             median=lambda values: sorted(values)[len(values) // 2])
@@ -109,6 +111,59 @@ class CurrentNOIRLabForcedPhotometryTests(unittest.TestCase):
         self.assertTrue(summary["catalogCounterpartEvidence"]["sourceSupported"])
         self.assertFalse(summary["targetControl"]["scientificallyUsableControl"])
         self.assertEqual(noir.NEXT_ARCHIVE_TEST, summary["recommendedNextTest"])
+
+    def test_missing_counterpart_result_is_not_decisive_for_supported_target(self):
+        prepared = [{"datasetID": "tg", "sourceRole": "target-control", "band": "g"},
+                    {"datasetID": "tr", "sourceRole": "target-control", "band": "r"},
+                    {"datasetID": "cg", "sourceRole": "catalog-counterpart", "band": "g"}]
+        datasets = [{"datasetID": item["datasetID"], "periodStatus": "RELIABLE",
+                     "coverageComplete": True, "candidateFrequency": 1.2,
+                     "candidatePeakProminenceRatio": 4.0} for item in prepared
+                    if item["sourceRole"] == "target-control"]
+        summary = self._interpret_with_minimal_numpy(prepared, datasets)
+        self.assertTrue(summary["targetControl"]["sourceSupported"])
+        self.assertFalse(summary["catalogCounterpartEvidence"]["scientificallyUsableControl"])
+        self.assertEqual(noir.NEXT_ARCHIVE_TEST, summary["recommendedNextTest"])
+
+    def _interpret_with_minimal_numpy(self, prepared, datasets):
+        minimal_numpy = SimpleNamespace(
+            float64=float, asarray=lambda values, dtype=None: list(values),
+            median=lambda values: sorted(values)[len(values) // 2])
+        with mock.patch.object(noir, "np", minimal_numpy):
+            return noir.interpret_noirlab_image_forced_photometry_project(
+                project_status={"datasets": datasets}, preparation={
+                    "preparedSeries": prepared, "candidateExposures": 20,
+                    "successfulForcedPhotometryExposures": 20,
+                    "workloadID": "openstar.lomb-scargle.v1"})
+
+    def test_usable_nonrecurrent_control_preserves_decisive_one_sided_routes(self):
+        prepared = []
+        for role, prefix in (("target-control", "t"),
+                             ("catalog-counterpart", "c")):
+            for band in ("g", "r"):
+                prepared.append({"datasetID": f"{prefix}{band}", "sourceRole": role,
+                                 "band": band})
+
+        def supported(role):
+            rows = []
+            for item in prepared:
+                is_supported = item["sourceRole"] == role
+                rows.append({"datasetID": item["datasetID"],
+                    "periodStatus": "RELIABLE" if is_supported else "LOW_CONFIDENCE",
+                    "coverageComplete": True,
+                    "candidateFrequency": 1.2 if is_supported else None,
+                    "candidatePeakProminenceRatio": 4.0 if is_supported else 1.0})
+            return rows
+
+        counterpart = self._interpret_with_minimal_numpy(
+            prepared, supported("catalog-counterpart"))
+        self.assertTrue(counterpart["targetControl"]["scientificallyUsableControl"])
+        self.assertEqual("TARGET_RESIDUAL_REANALYSIS_AFTER_OFFSET_REMOVAL",
+                         counterpart["recommendedNextTest"])
+        target = self._interpret_with_minimal_numpy(prepared, supported("target-control"))
+        self.assertTrue(target["catalogCounterpartEvidence"]["scientificallyUsableControl"])
+        self.assertEqual("TARGET_INTRINSIC_RESIDUAL_MODELING",
+                         target["recommendedNextTest"])
 
     def test_transient_error_classification_is_narrow(self):
         for code, expected in ((408, True), (425, True), (429, True),
