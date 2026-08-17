@@ -127,6 +127,52 @@ class CurrentATLASForcedPhotometryTests(unittest.TestCase):
         self.assertEqual("TARGET_RESIDUAL_REANALYSIS_AFTER_OFFSET_REMOVAL",
                          self._interpret("catalog-counterpart", True)["recommendedNextTest"])
 
+    def test_search_interpretable_uses_completed_search_status_allowlist_contract(self):
+        prepared = {"datasetID": "d", "sourceRole": "target-control", "band": "c"}
+        for status in ("NONRECURRENT", "RELIABLE"):
+            result = atlas._dataset_result(
+                {"periodStatus": status, "coverageComplete": True}, prepared
+            )
+            self.assertTrue(result["searchInterpretable"], status)
+        for status in (
+            "SEARCHING", "INCOMPLETE_COVERAGE", "NO_DATASET", "FAILED", "ERROR"
+        ):
+            result = atlas._dataset_result(
+                {"periodStatus": status, "coverageComplete": True}, prepared
+            )
+            self.assertFalse(result["searchInterpretable"], status)
+        self.assertFalse(atlas._dataset_result(
+            {"periodStatus": "RELIABLE", "coverageComplete": False}, prepared
+        )["searchInterpretable"])
+
+    def test_unusable_opposite_search_statuses_block_one_sided_attribution(self):
+        for supported_role, control_status in (
+            ("catalog-counterpart", "ERROR"),
+            ("target-control", "NO_DATASET"),
+        ):
+            prepared, datasets = [], []
+            for role, prefix in (("target-control", "t"),
+                                 ("catalog-counterpart", "c")):
+                for band in ("c", "o"):
+                    dataset_id = prefix + band
+                    prepared.append({"datasetID": dataset_id,
+                                     "sourceRole": role, "band": band})
+                    supported = role == supported_role
+                    datasets.append({
+                        "datasetID": dataset_id,
+                        "coverageComplete": True,
+                        "periodStatus": "RELIABLE" if supported else control_status,
+                        "candidateFrequency": 1.2 if supported else None,
+                        "candidatePeakProminenceRatio": 4 if supported else None,
+                    })
+            summary = atlas.interpret_atlas_forced_photometry_project(
+                project_status={"datasets": datasets},
+                preparation={"preparedSeries": prepared,
+                             "workloadID": "openstar.lomb-scargle.v1"},
+            )
+            self.assertEqual(atlas.HISTORICAL_TRIGGER,
+                             summary["recommendedNextTest"])
+
     def test_no_qualifying_series_routes_to_signed_reanalysis_boundary(self):
         summary = atlas.interpret_atlas_forced_photometry_project(
             project_status=None, preparation={"preparedSeries": [],

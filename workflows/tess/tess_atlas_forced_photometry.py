@@ -529,6 +529,17 @@ def _dataset_result(
         and frequency is not None
         and frequency > 0
     )
+    interpretable = bool(
+        status
+        and coverage is not False
+        and status not in {
+            "SEARCHING",
+            "INCOMPLETE_COVERAGE",
+            "NO_DATASET",
+            "FAILED",
+            "ERROR",
+        }
+    )
 
     return {
         "datasetID": prepared.get("datasetID"),
@@ -546,10 +557,7 @@ def _dataset_result(
         "candidatePower": power,
         "candidatePeakProminenceRatio": prominence,
         "acceptedResidualBandVariability": accepted,
-        "searchInterpretable": bool(
-            status and status not in {"FAILED", "INCOMPLETE"}
-            and (coverage is None or bool(coverage))
-        ),
+        "searchInterpretable": interpretable,
     }
 
 
