@@ -384,6 +384,16 @@ def _gaussian_template(
     return values / total
 
 
+def _candidate_scaled_linear_fit(
+    design: np.ndarray, values: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, float, float] | None:
+    """Reject only expected numerical failures for an individual PSF candidate."""
+    try:
+        return _scaled_linear_fit(design, values)
+    except (NOIRLabImageQualityRejected, np.linalg.LinAlgError):
+        return None
+
+
 def _local_source_fit(
     data: np.ndarray,
     header: Any,
@@ -464,13 +474,10 @@ def _local_source_fit(
                     ]
                 )
                 design = design_full[mask]
-                try:
-                    coefficients, covariance, condition, _ = _scaled_linear_fit(
-                        design,
-                        values,
-                    )
-                except NOIRLabImageQualityRejected:
+                fit_result = _candidate_scaled_linear_fit(design, values)
+                if fit_result is None:
                     continue
+                coefficients, covariance, condition, _ = fit_result
 
                 model = design @ coefficients
                 residual = values - model
@@ -482,17 +489,16 @@ def _local_source_fit(
                     robust_sigma = 1.4826 * mad
                     robust = np.abs(residual - center) <= 6.0 * robust_sigma
                     if int(np.count_nonzero(robust)) >= 100:
-                        try:
-                            coefficients, covariance, condition, _ = _scaled_linear_fit(
-                                design[robust],
-                                values[robust],
-                            )
-                            fit_design = design[robust]
-                            fit_values = values[robust]
-                            model = fit_design @ coefficients
-                            residual = fit_values - model
-                        except NOIRLabImageQualityRejected:
+                        fit_result = _candidate_scaled_linear_fit(
+                            design[robust], values[robust]
+                        )
+                        if fit_result is None:
                             continue
+                        coefficients, covariance, condition, _ = fit_result
+                        fit_design = design[robust]
+                        fit_values = values[robust]
+                        model = fit_design @ coefficients
+                        residual = fit_values - model
 
                 amplitude = float(coefficients[0])
                 if not math.isfinite(amplitude) or amplitude <= 0:
@@ -728,7 +734,12 @@ def build_des_dr2_se_local_forced_project(
             )
             try:
                 body = _download_fits_cutout(cutout_url)
-                data, header, primary_header = _image_hdu_from_bytes(body)
+                try:
+                    data, header, primary_header = _image_hdu_from_bytes(body)
+                except OSError as exc:
+                    raise DESImageQualityRejected(
+                        f"invalid-local-image-product:{exc}"
+                    ) from exc
                 fit = _local_source_fit(
                     data,
                     header,

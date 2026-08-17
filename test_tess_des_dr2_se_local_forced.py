@@ -20,6 +20,7 @@ except ModuleNotFoundError:
     stub.float64 = float
     stub.float32 = float
     stub.asarray = lambda values, dtype=None: list(values)
+    stub.linalg = SimpleNamespace(LinAlgError=type("LinAlgError", (Exception,), {}))
     sys.modules["numpy"] = stub
     _installed_numpy_stub = True
 else:
@@ -168,6 +169,38 @@ class CurrentDESLocalForcedPhotometryTests(unittest.TestCase):
         with mock.patch.object(des, "_download_fits_cutout", side_effect=ImportError("astropy")):
             with self.assertRaises(ImportError): self._build(rows)
 
+    def test_malformed_fits_is_scientific_rejection_and_processing_continues(self):
+        rows = [{"access_url": "https://example/one", "mjd_obs": "1",
+                 "obs_bandpass": "g", "prodtype": "image", "obs_id": "one"}]
+        with mock.patch.object(des, "_download_fits_cutout", return_value=b"not-fits"), \
+                mock.patch.object(des, "_image_hdu_from_bytes",
+                                  side_effect=OSError("corrupt FITS")):
+            result = self._build(rows)
+        self.assertEqual(2, sum(result["sourceAttempts"].values()))
+        self.assertEqual(2, result["failureReasons"][
+            "target-control:invalid-local-image-product"] + result["failureReasons"][
+            "catalog-counterpart:invalid-local-image-product"])
+
+    def test_candidate_linalg_error_is_scientific_fit_rejection(self):
+        original = getattr(des.np, "linalg", None)
+        if original is None:
+            des.np.linalg = SimpleNamespace(
+                LinAlgError=type("LinAlgError", (Exception,), {})
+            )
+        try:
+            with mock.patch.object(des, "_scaled_linear_fit",
+                                   side_effect=des.np.linalg.LinAlgError("singular")):
+                self.assertIsNone(des._candidate_scaled_linear_fit(object(), object()))
+            with mock.patch.object(des, "_scaled_linear_fit",
+                                   side_effect=TypeError("programming bug")):
+                with self.assertRaises(TypeError):
+                    des._candidate_scaled_linear_fit(object(), object())
+        finally:
+            if original is None:
+                del des.np.linalg
+            else:
+                des.np.linalg = original
+
     def test_broad_transport_outage_raises_archive_unavailable(self):
         rows = [{"access_url": f"https://example/{i}", "mjd_obs": str(i),
                  "obs_bandpass": "g", "prodtype": "image", "obs_id": str(i)} for i in range(3)]
@@ -178,10 +211,11 @@ class CurrentDESLocalForcedPhotometryTests(unittest.TestCase):
         store = InvestigationStore(self.root / "engine")
         stages = (InvestigationStage("001", "openstar.tess.prepare-target", "COMPLETE", None, {},
                     result={"sourceProjectID": "p", "datasetID": "d"}),
-            InvestigationStage("043", "openstar.tess.external-high-resolution-variability-validation.interpret",
+            InvestigationStage("043", "openstar.tess.gaia-source-resolved-counterpart-photometry.interpret",
                     "COMPLETE", None, {}, result={"sourcePair": self.pair}),
             InvestigationStage("049", "openstar.tess.noirlab-image-forced-photometry.interpret",
-                    "COMPLETE", None, {}, result={"recommendedNextTest": des.CURRENT_TRIGGER}))
+                    "COMPLETE", None, {}, result={"recommendedNextTest": des.CURRENT_TRIGGER,
+                                                  "sourcePair": self.pair}))
         inv = Investigation("engine", "openstar.workflow.tess-investigation.v1", "20.2",
                             "RUNNING", "now", "now", {}, stages); store.save(inv)
         with mock.patch("workflows.tess.tess_investigation.build_des_dr2_se_local_forced_project",
@@ -196,13 +230,18 @@ class CurrentDESLocalForcedPhotometryTests(unittest.TestCase):
     def test_registered_prepare_run_interpret_and_direct_interpret(self):
         for distributed in (True, False):
             store = InvestigationStore(self.root / f"chain-{distributed}")
+            gaia_pair = {
+                **self.pair,
+                "target": {**self.pair["target"], "gaiaDR3SourceID": 303},
+            }
             stages = (
                 InvestigationStage("001", "openstar.tess.prepare-target", "COMPLETE", None, {},
                     result={"sourceProjectID": "p", "datasetID": "d"}),
-                InvestigationStage("043", "openstar.tess.external-high-resolution-variability-validation.interpret",
-                    "COMPLETE", None, {}, result={"sourcePair": self.pair}),
+                InvestigationStage("043", "openstar.tess.gaia-source-resolved-counterpart-photometry.interpret",
+                    "COMPLETE", None, {}, result={"sourcePair": gaia_pair}),
                 InvestigationStage("049", "openstar.tess.noirlab-image-forced-photometry.interpret",
-                    "COMPLETE", None, {}, result={"recommendedNextTest": des.CURRENT_TRIGGER}),
+                    "COMPLETE", None, {}, result={"recommendedNextTest": des.CURRENT_TRIGGER,
+                                                  "sourcePair": self.pair}),
             )
             inv = Investigation(f"chain-{distributed}",
                 "openstar.workflow.tess-investigation.v1", "20.2", "RUNNING",
@@ -222,7 +261,7 @@ class CurrentDESLocalForcedPhotometryTests(unittest.TestCase):
                        "physicalMechanismResolved": False}
             with mock.patch(
                 "workflows.tess.tess_investigation.build_des_dr2_se_local_forced_project",
-                return_value=spec), mock.patch(
+                return_value=spec) as prepare_des, mock.patch(
                 "workflows.tess.tess_investigation.interpret_des_dr2_se_local_forced_project",
                 return_value=summary):
                 completed = build_engine(store, coordinator, poll_interval=0, timeout=1).run(
@@ -230,6 +269,12 @@ class CurrentDESLocalForcedPhotometryTests(unittest.TestCase):
                         "050-prepare-des-dr2-single-epoch-local-forced-photometry",
                         "openstar.tess.des-dr2-se-local-forced-photometry.prepare", {}, "049"),
                     software_id="test", software_version="1")
+            source_evidence = prepare_des.call_args.kwargs[
+                "external_high_resolution_summary"
+            ]
+            self.assertEqual(self.pair, source_evidence["sourcePair"])
+            self.assertFalse(any("external-high-resolution" in stage.handler_id
+                                 for stage in stages))
             handlers = [stage.handler_id for stage in completed.stages[3:]]
             expected = ["openstar.tess.des-dr2-se-local-forced-photometry.prepare"]
             if distributed:
