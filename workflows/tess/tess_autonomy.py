@@ -112,6 +112,23 @@ def _has_terminal_tess_evidence(investigation: Investigation) -> bool:
     )
 
 
+def _awaiting_nsc_adapter(investigation: Investigation) -> bool:
+    """Identify only the incremental SkyMapper-to-NSC implementation boundary."""
+    stage = _latest_complete(
+        investigation, "openstar.tess.skymapper-resolved-counterpart-photometry.interpret"
+    )
+    result = (stage.result or {}) if stage is not None else {}
+    return bool(
+        stage is not None
+        and result.get("recommendedNextTest") == "NSC_RESOLVED_COUNTERPART_PHOTOMETRY"
+        and result.get("physicalMechanismResolved") is False
+        and not any(
+            item.handler_id.startswith("openstar.tess.nsc-resolved-photometry.")
+            for item in investigation.stages
+        )
+    )
+
+
 def _persisted_archive_continuation(investigation: Investigation):
     """Return an unattempted continuation recorded by an archive prepare/run stage."""
     attempted_ids = {stage.id for stage in investigation.stages}
@@ -157,6 +174,7 @@ def repair_obsolete_terminal_wait(
         investigation.status == "BLOCKED"
         and control.get("schedulerAction") == "WAIT_FOR_PREREQUISITES"
         and _has_terminal_tess_evidence(investigation)
+        and not _awaiting_nsc_adapter(investigation)
     ):
         repaired, _ = AutonomousInvestigationEngine(store).decide(investigation, ())
         return repaired
@@ -203,10 +221,11 @@ def repair_obsolete_terminal_wait(
         and gaia_result.get("physicalMechanismResolved") is False
         and not skymapper_attempted
     )
+    obsolete_skymapper_terminal = _awaiting_nsc_adapter(investigation)
     if not (
         investigation.status == "COMPLETE"
         and control.get("schedulerAction") == "INVESTIGATION_COMPLETE"
-        and (obsolete_gaia_terminal or (
+        and (obsolete_gaia_terminal or obsolete_skymapper_terminal or (
             offset_variability is not None
             and offset_result.get("recommendedNextTest")
             == "INDEPENDENT_SOURCE_RESOLVED_COUNTERPART_PHOTOMETRY"
@@ -265,6 +284,26 @@ def plan_tess_branches(
         "openstar.tess.skymapper-resolved-counterpart-photometry."
     ) for stage in investigation.stages)
     gaia_result = (gaia_interpretation.result or {}) if gaia_interpretation else {}
+    if _awaiting_nsc_adapter(investigation):
+        # NSC's historical handler consumes the obsolete v20.19 source-pair
+        # contract.  Keep this recommendation durably blocked until a current
+        # adapter exists rather than either reviving that contract or claiming
+        # scientific completion.
+        return (
+            ScientificBranch(
+                id=f"continue-nsc-after-{skymapper_interpretation.id}",
+                experiment=StageRequest(
+                    id=_continuation_stage_id(
+                        skymapper_interpretation,
+                        "prepare-nsc-resolved-counterpart-photometry",
+                    ),
+                    handler_id="openstar.tess.nsc-resolved-photometry.prepare",
+                    parameters={},
+                    triggered_by_stage_id=skymapper_interpretation.id,
+                ),
+                required_stage_ids=("openstar.capability.current-nsc-source-pair-adapter",),
+            ),
+        )
     if (gaia_interpretation is not None and skymapper_interpretation is None
             and not skymapper_started
             and gaia_result.get("recommendedNextTest") == "SKYMAPPER_RESOLVED_COUNTERPART_PHOTOMETRY"

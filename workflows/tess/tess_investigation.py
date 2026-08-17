@@ -3958,13 +3958,19 @@ def build_engine(
         artifact_path = (store.directory_for(investigation.id) / "artifacts" /
                          "skymapper-resolved-photometry" / "interpretation.json")
         _write_json(artifact_path, summary)
+        awaiting_nsc = (
+            summary.get("recommendedNextTest") == "NSC_RESOLVED_COUNTERPART_PHOTOMETRY"
+            and summary.get("physicalMechanismResolved") is False
+        )
         return StageOutcome(
             result=summary,
-            next_stage=StageRequest(
+            next_stage=None if awaiting_nsc else StageRequest(
                 id=_next_stage_id(request.id, "finalize"), handler_id="openstar.tess.finalize",
                 parameters={"outputSuffix": "skymapper-resolved-counterpart"},
                 triggered_by_stage_id=request.id,
             ),
+            stop=awaiting_nsc,
+            final_status="BLOCKED" if awaiting_nsc else "COMPLETE",
             input_hashes={"preparation": sha256_json(preparation),
                           **({"projectResult": sha256_json(run)} if run is not None else {})},
             artifacts=(_artifact(artifact_path, "application/json"),),
