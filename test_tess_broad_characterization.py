@@ -27,6 +27,7 @@ try:
     import numpy as _real_numpy
 except ModuleNotFoundError:
     _real_numpy = None
+_installed_numpy_stub = _real_numpy is None
 if _real_numpy is None:
     sys.modules["numpy"] = types.ModuleType("numpy")
 
@@ -40,6 +41,13 @@ from workflows.tess.tess_time_frequency import _fit_family_python
 from workflows.tess.tess_multisource_residual import interpret_multisource_residual_project
 from workflows.tess.tess_prf_refinement import compare_prf_hypotheses, diagnose_prf_cube
 from workflows.tess.tess_spoc_prf import _render_prf_template
+
+# The dependency stub exists only to make the optional-handler import graph
+# loadable.  Leaving it in sys.modules makes later test modules mistake the
+# empty module for NumPy, so restore the interpreter's dependency state as
+# soon as those imports are complete.
+if _installed_numpy_stub:
+    sys.modules.pop("numpy", None)
 
 
 class BroadIndependentCharacterizationTests(unittest.TestCase):

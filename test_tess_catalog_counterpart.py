@@ -21,6 +21,9 @@ try:
 except ModuleNotFoundError:
     sys.modules["numpy"] = types.ModuleType("numpy")
     HAS_NUMPY = False
+    _installed_numpy_stub = True
+else:
+    _installed_numpy_stub = False
 
 from workflows.tess.tess_offset_variability import (
     MIN_COMPONENT_SAMPLES,
@@ -34,6 +37,9 @@ from workflows.tess.tess_investigation import (
     prf_catalog_counterpart_continuation,
 )
 from workflows.tess.tess_autonomy import plan_tess_branches
+
+if _installed_numpy_stub:
+    sys.modules.pop("numpy", None)
 
 
 class CatalogCounterpartTest(unittest.TestCase):

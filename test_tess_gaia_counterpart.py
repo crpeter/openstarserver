@@ -11,6 +11,9 @@ try:
     import numpy  # noqa: F401
 except ModuleNotFoundError:
     sys.modules["numpy"] = types.ModuleType("numpy")
+    _installed_numpy_stub = True
+else:
+    _installed_numpy_stub = False
 
 from openstar_investigation import InvestigationStage, InvestigationStore
 from openstar_autonomy import AutonomousInvestigationEngine
@@ -24,6 +27,9 @@ from openstar_workflow import RetryableExecutionError, StageOutcome, StageReques
 from workflows.tess.tess_investigation import build_engine
 from workflows.tess.tess_autonomy import plan_tess_branches, repair_obsolete_terminal_wait
 from workflows.tess import tess_gaia_counterpart as gaia
+
+if _installed_numpy_stub:
+    sys.modules.pop("numpy", None)
 
 
 class _Array(list):
