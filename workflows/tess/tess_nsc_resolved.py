@@ -337,6 +337,18 @@ def _robust_standardize_magnitudes(magnitudes: np.ndarray) -> np.ndarray:
     return -(values - median) / scale
 
 
+def _standardize_series_or_quality_outcome(
+    magnitudes: np.ndarray,
+) -> tuple[np.ndarray | None, str | None]:
+    """Return a scientific quality outcome only for the known zero-scale case."""
+    try:
+        return _robust_standardize_magnitudes(magnitudes), None
+    except RuntimeError as exc:
+        if str(exc) != "NSC magnitudes have no finite variability scale.":
+            raise
+        return None, "NO_FINITE_VARIABILITY_SCALE"
+
+
 def _closest_valid_measurement(
     rows: list[dict[str, str]],
     *,
@@ -410,6 +422,7 @@ def _prepare_codetected_series(
         }
         for band in SUPPORTED_BANDS
     }
+    unusable_series: list[dict[str, Any]] = []
 
     for (_, band), group_rows in by_exposure_band.items():
         diag = diagnostics[band]
@@ -485,7 +498,15 @@ def _prepare_codetected_series(
             kept_pairs = [pair for pair, accepted in zip(pairs, keep.tolist()) if accepted]
             if len(kept_times) < MIN_BAND_SAMPLES:
                 continue
-            flux = _robust_standardize_magnitudes(kept_mags)
+            flux, quality_outcome = _standardize_series_or_quality_outcome(kept_mags)
+            if flux is None:
+                unusable_series.append({
+                    "sourceRole": role,
+                    "band": band,
+                    "sampleCount": int(len(kept_times)),
+                    "reason": quality_outcome,
+                })
+                continue
             local_times = kept_times - float(kept_times[0])
             result[role][band] = {
                 "times": local_times,
@@ -503,6 +524,7 @@ def _prepare_codetected_series(
     return result, {
         "minimumMeasuredPairSeparationArcsec": minimum_measured_separation,
         "bandDiagnostics": diagnostics,
+        "unusableSeries": unusable_series,
     }
 
 

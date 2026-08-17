@@ -268,8 +268,16 @@ class CurrentSkyMapperResolvedTests(unittest.TestCase):
             "openstar.tess.skymapper-resolved-counterpart-photometry.interpret", interpret_stage)
         workflow.register_handler(
             "openstar.tess.nsc-resolved-photometry.prepare",
-            lambda current, request: StageOutcome(result={}, stop=True,
-                                                  final_status="BLOCKED"))
+            lambda current, request: StageOutcome(result={}, next_stage=StageRequest(
+                "047-interpret-nsc-resolved-counterpart-photometry",
+                "openstar.tess.nsc-resolved-photometry.interpret",
+                {"distributedRunExpected": False}, request.id)))
+        workflow.register_handler(
+            "openstar.tess.nsc-resolved-photometry.interpret",
+            lambda current, request: StageOutcome(
+                result={"recommendedNextTest": "NOIRLAB_IMAGE_LEVEL_FORCED_PHOTOMETRY",
+                        "physicalMechanismResolved": False}, stop=True,
+                final_status="BLOCKED"))
         dispatcher = InvestigationDispatcher(store, workflow)
         lifecycle = InvestigationLifecycleLoop(
             self.root / f"lifecycle-{suffix}.json", store, dispatcher,
@@ -284,7 +292,7 @@ class CurrentSkyMapperResolvedTests(unittest.TestCase):
         self.assertEqual(next_request, executions[0])
         self.assertEqual(persisted_prepare, store.load(investigation.id).stages[1])
         self.assertEqual(2 if distributed else 1, len(executions))
-        self.assertEqual("INVESTIGATION_COMPLETE",
+        self.assertEqual("WAIT_FOR_PREREQUISITES",
                          store.load(investigation.id).metadata["controlState"]["schedulerAction"])
 
     def test_prepare_run_interpret_restarts_without_repreparing_or_looping(self):
