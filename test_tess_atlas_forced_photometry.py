@@ -25,6 +25,7 @@ else:
     _installed_numpy_stub = False
 
 from openstar_investigation import Investigation, InvestigationStage, InvestigationStore
+from openstar_lifecycle import InvestigationLifecycleLoop
 from openstar_external_jobs import (ExternalJob, ExternalJobPollUnavailable,
                                     ExternalDependency, ExternalJobStore,
                                     apply_external_job_wakeups)
@@ -180,6 +181,82 @@ class CurrentATLASForcedPhotometryTests(unittest.TestCase):
         first = store.path_for("blind").read_bytes()
         apply_external_job_wakeups(store, restarted.ready_dependencies())
         self.assertEqual(first, store.path_for("blind").read_bytes())
+
+    def _registered_collect_evidence(self, name):
+        store = InvestigationStore(self.root / name / "investigations")
+        dependency = f"atlas-forced-photometry:{name}:052"
+        job_store = ExternalJobStore(store.root.parent / "external-jobs")
+        job_ids = []
+        for role in ("target-control", "catalog-counterpart"):
+            job = ExternalJob.create(provider="atlas-forced-photometry",
+                investigation_id=name, trigger_stage_id="052-prepare",
+                dependency_id=dependency, role=role)
+            job_store.save(replace(job, state="COMPLETE",
+                remoteTaskURL=f"task-{role}", remoteResultURL=f"result-{role}"))
+            job_ids.append(job.id)
+        job_store.save_dependency(ExternalDependency(dependency, name, "052-prepare",
+            "atlas-forced-photometry", tuple(job_ids)))
+        submission = InvestigationStage("052-prepare",
+            "openstar.tess.atlas-forced-photometry.prepare", "COMPLETE", "051", {},
+            result={"sourceProjectID": "p", "sourceDatasetID": "d",
+                "sourcePair": self.pair, "frequencySearch": {
+                    "totalFrequencies": 10, "frequenciesPerWorkUnit": 2},
+                "externalDependencyID": dependency, "externalJobIDs": job_ids}, stop=True)
+        investigation = Investigation(name, "openstar.workflow.tess-investigation.v1",
+            "20.2", "RUNNING", "now", "now", {}, (submission,))
+        store.save(investigation)
+        return store, investigation, job_store
+
+    def test_registered_collect_transient_retries_download_only_with_same_jobs(self):
+        store, investigation, jobs = self._registered_collect_evidence("collect-retry")
+        workflow = _workflow_module()
+        captured = []
+        def build(**kwargs):
+            captured.append(tuple((job.id, job.remoteTaskURL, job.remoteResultURL)
+                                  for job in kwargs["external_jobs"]))
+            return atlas.build_atlas_forced_photometry_project(**kwargs)
+        engine = _build_engine(store, mock.Mock(), poll_interval=0, timeout=1)
+        request = StageRequest("053-collect-atlas-forced-photometry",
+            "openstar.tess.atlas-forced-photometry.collect", {}, "052-prepare")
+        with mock.patch.object(workflow, "build_atlas_forced_photometry_project",
+                               side_effect=build), \
+                mock.patch.object(atlas, "require_atlas_credentials"), \
+                mock.patch.object(atlas, "_atlas_headers", return_value={}), \
+                mock.patch.object(atlas, "_text_request", side_effect=[
+                    atlas.ATLASArchiveUnavailable("temporary result download outage"),
+                    "# MJD uJy duJy F err chi/N\n",
+                    "# MJD uJy duJy F err chi/N\n",
+                ]) as download, \
+                mock.patch.object(atlas, "_submit_atlas_job") as submit:
+            with self.assertRaises(RetryableExecutionError):
+                engine.run_stage(investigation, request,
+                    software_id="test", software_version="1")
+            failed_investigation = store.load(investigation.id)
+            failed = failed_investigation.stages[-1]
+            self.assertEqual("TRANSIENT_INFRASTRUCTURE", failed.failure_classification)
+            retry = InvestigationLifecycleLoop._retry_request(failed_investigation, failed)
+            self.assertEqual("054-collect-atlas-forced-photometry", retry.id)
+            engine.run_stage(failed_investigation, retry,
+                software_id="test", software_version="1")
+            submit.assert_not_called()
+            self.assertEqual(3, download.call_count)
+        self.assertEqual(captured[0], captured[1])
+        self.assertEqual(tuple(jobs.load(job_id).remoteTaskURL
+                               for job_id in failed_investigation.stages[0].result["externalJobIDs"]),
+                         tuple(item[1] for item in captured[1]))
+
+    def test_registered_collect_programming_error_is_non_retryable(self):
+        store, investigation, _ = self._registered_collect_evidence("collect-bug")
+        workflow = _workflow_module()
+        engine = _build_engine(store, mock.Mock(), poll_interval=0, timeout=1)
+        with mock.patch.object(workflow, "build_atlas_forced_photometry_project",
+                               side_effect=RuntimeError("parser bug")):
+            with self.assertRaisesRegex(RuntimeError, "parser bug"):
+                engine.run_stage(investigation, StageRequest("053-collect",
+                    "openstar.tess.atlas-forced-photometry.collect", {}, "052-prepare"),
+                    software_id="test", software_version="1")
+        self.assertEqual("NON_RETRYABLE",
+                         store.load(investigation.id).stages[-1].failure_classification)
 
     def _interpret(self, supported_role, include_control):
         prepared, datasets = [], []

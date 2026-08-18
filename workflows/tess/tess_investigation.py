@@ -5580,15 +5580,18 @@ def build_engine(
         from openstar_external_jobs import ExternalJobStore
         jobs = ExternalJobStore(store.root.parent / "external-jobs")
         exact = [jobs.load(job_id) for job_id in submission["externalJobIDs"]]
-        spec = build_atlas_forced_photometry_project(
-            source_project_id=str(submission["sourceProjectID"]),
-            source_dataset_id=str(submission["sourceDatasetID"]),
-            external_high_resolution_summary={"sourcePair": submission["sourcePair"],
-                "frequencySearch": submission["frequencySearch"]},
-            des_dr2_se_summary={"recommendedNextTest": CURRENT_ATLAS_TRIGGER,
-                "frequencySearch": submission["frequencySearch"]},
-            output_dir=store.directory_for(investigation.id) / "artifacts",
-            investigation_id=investigation.id, external_jobs=exact)
+        try:
+            spec = build_atlas_forced_photometry_project(
+                source_project_id=str(submission["sourceProjectID"]),
+                source_dataset_id=str(submission["sourceDatasetID"]),
+                external_high_resolution_summary={"sourcePair": submission["sourcePair"],
+                    "frequencySearch": submission["frequencySearch"]},
+                des_dr2_se_summary={"recommendedNextTest": CURRENT_ATLAS_TRIGGER,
+                    "frequencySearch": submission["frequencySearch"]},
+                output_dir=store.directory_for(investigation.id) / "artifacts",
+                investigation_id=investigation.id, external_jobs=exact)
+        except ATLASArchiveUnavailable as exc:
+            raise RetryableExecutionError(str(exc)) from exc
         project_path = spec.get("projectPath")
         next_stage = StageRequest(
             id=_next_stage_id(request.id, "run-atlas-forced-photometry") if project_path
