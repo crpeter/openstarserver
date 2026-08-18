@@ -17,7 +17,9 @@ from workflows.tess.tess_autonomy import (
     register_tess_workflow_handlers,
     repair_obsolete_terminal_wait,
 )
-from workflows.tess.tess_ranked_followup import TessDeepAdmissionStore, TessRankedFollowupTargetSource
+from workflows.tess.tess_ranked_followup import (
+    TessDeepAdmissionStore, TessRankedFollowupTargetSource, verified_reusable_primary,
+)
 from workflows.tess.tess_sector_archive import TessSectorInventoryStore
 from workflows.tess.tess_sector_ranking import TessSectorRankingStore, aggregate_tess_sector_ranking
 
@@ -74,6 +76,15 @@ def run_tess_ranked_followup(sector: int, sector_state_dir: str | Path,
     admissions, new, excluded = ledger.admit(ranking, promote_top)
 
     store = InvestigationStore(deep_root / "investigations")
+    shallow_store = InvestigationStore(sector_root / "investigations")
+    # Only absent investigations receive new reuse metadata. Existing deep
+    # state is immutable even when an old admission ledger is loaded.
+    reusable = {}
+    for admission in admissions:
+        if not store.path_for(admission.deepInvestigationID).exists():
+            verified = verified_reusable_primary(shallow_store, admission)
+            if verified is not None:
+                reusable[admission.deepInvestigationID] = verified
     # Apply only TESS's narrow durable compatibility migrations before the
     # domain-neutral scheduler classifies already-admitted investigations.
     for admission in admissions:
@@ -88,7 +99,7 @@ def run_tess_ranked_followup(sector: int, sector_state_dir: str | Path,
     coordinator = coordinator or OpenStarCoordinatorClient(coordinator_url)
     workflow = register_tess_workflow_handlers(store, coordinator, poll_interval=poll_interval, timeout=timeout)
     scheduler = InvestigationScheduler(store, InvestigationDispatcher(store, workflow),
-        TessRankedFollowupTargetSource(admissions), {WORKFLOW_ID: plan_tess_branches},
+        TessRankedFollowupTargetSource(admissions, reusable), {WORKFLOW_ID: plan_tess_branches},
         software_id=SOFTWARE_ID, software_version=SOFTWARE_VERSION,
         max_concurrent_investigations=max_concurrent_investigations)
     result = scheduler.run_until_idle()

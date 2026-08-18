@@ -1,17 +1,24 @@
+import json
 import tempfile
 import threading
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
 from openstar_autonomy import ExternalDataDependency, ScientificBranch
-from openstar_investigation import InvestigationStore
+from openstar_coordinator_client import ProjectRunResult
+from openstar_investigation import InvestigationStore, sha256_file
 from openstar_workflow import StageOutcome, StageRequest, WorkflowEngine
 from run_openstar_tess_sector_sweep import run_tess_sector_sweep
 from run_openstar_tess_ranked_followup import run_tess_ranked_followup, validate_state_roots
 from test_tess_sector_sweep import FakeCoordinator, FakeProvider, Prepared, product
 from workflows.tess import tess_sector_scan
-from workflows.tess.tess_ranked_followup import TessDeepAdmissionStore, TessRankedFollowupTargetSource
+from workflows.tess.tess_followup import build_single_target_primary
+from workflows.tess.tess_primary_reuse import run_primary as run_primary_with_reuse
+from workflows.tess.tess_ranked_followup import (
+    TessDeepAdmissionStore, TessRankedFollowupTargetSource, verified_reusable_primary,
+)
 from workflows.tess.tess_sector_archive import TessSectorInventoryStore
 from workflows.tess.tess_sector_ranking import aggregate_tess_sector_ranking
 
@@ -33,6 +40,62 @@ class RankedFollowupTests(unittest.TestCase):
     def _sweep(self, root, tics=(1, 2)):
         run_tess_sector_sweep(7, "unused", root,
             provider=FakeProvider([product(tic) for tic in tics]), coordinator=FakeCoordinator())
+
+    def _direct_primary(self, root, *, mutate_shallow=None, mutate_after_prepare=None):
+        shallow, deep = Path(root) / "shallow", Path(root) / "deep"
+        self._sweep(shallow, (1,))
+        ranking = aggregate_tess_sector_ranking(
+            TessSectorInventoryStore(shallow / "tess-sector-7-inventory.json").load(),
+            InvestigationStore(shallow / "investigations"))
+        admission = TessDeepAdmissionStore(deep / "ledger.json", 7).admit(ranking, 1)[0][0]
+        shallow_store = InvestigationStore(shallow / "investigations")
+        before = {p.relative_to(shallow): p.read_bytes() for p in shallow.rglob("*") if p.is_file()}
+        if mutate_shallow is not None:
+            mutate_shallow(shallow_store, admission)
+        reusable = verified_reusable_primary(shallow_store, admission)
+        target = TessRankedFollowupTargetSource(
+            (admission,), {admission.deepInvestigationID: reusable} if reusable else {}).enumerate_targets()[0]
+        deep_store = InvestigationStore(deep / "investigations")
+        investigation = deep_store.create(target.investigation_id, target.workflow_id,
+                                          target.workflow_version, target.metadata)
+
+        class Coordinator:
+            calls = 0
+            def run_project(self, project_path, **kwargs):
+                self.calls += 1
+                manifest = json.loads(Path(project_path).read_text())
+                entry = manifest["datasets"][0]
+                status = {"projectID": "fresh-deep-project", "status": "COMPLETE",
+                          "datasets": [{"datasetID": entry["id"], "ticID": entry["ticID"],
+                                        "sector": entry["sector"], "bestFrequency": .5,
+                                        "bestPeriodDays": 2.0, "bestPower": .8}],
+                          "nodeContributions": {"fresh": 1}}
+                return ProjectRunResult("fresh-deep-project", status)
+
+        coordinator = Coordinator(); engine = WorkflowEngine(deep_store)
+        def prepare(investigation, request):
+            prepared = build_single_target_primary(
+                source_project_path=request.parameters["projectPath"],
+                output_dir=deep_store.directory_for(investigation.id) / "artifacts",
+                investigation_id=investigation.id, dataset_id=request.parameters["datasetID"],
+                tic_id=request.parameters["ticID"])
+            return StageOutcome(prepared, StageRequest("002-primary-distributed-search",
+                "openstar.tess.primary-project.run", {"projectPath": prepared["projectPath"]}, request.id),
+                input_hashes={"sourceProjectManifest": sha256_file(request.parameters["projectPath"]),
+                              "sourceDataset": sha256_file(prepared["datasetPath"])})
+        engine.register_handler("openstar.tess.prepare-target", prepare)
+        engine.register_handler("openstar.tess.primary-project.run", lambda investigation, request:
+            run_primary_with_reuse(investigation, request, coordinator, poll_interval=0, timeout=None))
+        investigation, primary_request = engine.run_stage(investigation, StageRequest(
+            "001-prepare-target", "openstar.tess.prepare-target",
+            {"projectPath": admission.sourceProjectPath, "datasetID": admission.datasetID,
+             "ticID": admission.ticID}), software_id="test", software_version="1")
+        if mutate_after_prepare is not None:
+            mutate_after_prepare(investigation, admission)
+        investigation, downstream = engine.run_stage(investigation, primary_request,
+            software_id="test", software_version="1")
+        unchanged = {p.relative_to(shallow): p.read_bytes() for p in shallow.rglob("*") if p.is_file()}
+        return investigation, downstream, coordinator.calls, before, unchanged
 
     def _run(self, shallow, deep, top, executions, *, planner=None, execute_hook=None):
         class Coordinator:
@@ -171,6 +234,113 @@ class RankedFollowupTests(unittest.TestCase):
             code, coordinator = self._run(shallow, deep, 2, executions)
             self.assertEqual((0, [1, 2], []), (code, executions, coordinator.calls))
             self.assertEqual(completed_bytes, investigation_path.read_bytes())
+
+    def test_new_deep_target_receives_verified_full_shallow_primary(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); shallow = root / "shallow"; deep = root / "deep"
+            self._sweep(shallow, (1,))
+            captured = {}
+            def inspect(investigation):
+                captured.update(investigation.metadata["reusablePrimary"])
+            code, coordinator = self._run(shallow, deep, 1, [], execute_hook=inspect)
+            self.assertEqual((0, []), (code, coordinator.calls))
+            self.assertEqual("EXACT_FROZEN_SHALLOW_PRIMARY", captured["verification"])
+            self.assertEqual("openstar.workflow.tess-sector-scan.v1", captured["sourceWorkflowID"])
+            self.assertEqual("COMPLETE", captured["coordinatorResult"]["status"])
+            self.assertEqual(1, len(captured["coordinatorResult"]["datasets"]))
+            self.assertEqual(["project-1"], captured["computeProjectIDs"])
+
+    def test_deep_primary_reuses_full_result_and_continues_without_compute(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            investigation, downstream, calls, before, after = self._direct_primary(temporary)
+            primary = investigation.stages[-1]
+            self.assertEqual(0, calls)
+            self.assertEqual("003-catalog-identity", downstream.id)
+            self.assertEqual("openstar.tess.catalog-identity", downstream.handler_id)
+            self.assertEqual("COMPLETE", primary.result["status"])
+            self.assertEqual("project-1", primary.result["projectID"])
+            self.assertEqual({"mac": 2, "iphone": 1}, primary.result["nodeContributions"])
+            self.assertEqual("tess-sector-7-tic-1", primary.result["datasets"][0]["datasetID"])
+            self.assertEqual("REUSED_SHALLOW_COMPUTE",
+                             primary.result["reuseProvenance"]["computeDisposition"])
+            self.assertEqual(("project-1",), primary.provenance.project_ids)
+            self.assertEqual(before, after, "deep reuse must not rewrite shallow state")
+
+    def test_deep_primary_falls_back_when_frozen_input_changes(self):
+        def mutate_dataset(investigation, admission):
+            Path(admission.datasetArtifact).write_text("{}\n", encoding="utf-8")
+        def mutate_project(investigation, admission):
+            Path(admission.sourceProjectPath).write_text("{}\n", encoding="utf-8")
+        def mutate_workload(investigation, admission):
+            primary = Path(investigation.stages[-1].result["projectPath"])
+            value = json.loads(primary.read_text()); value["workloadID"] = "wrong"
+            primary.write_text(json.dumps(value), encoding="utf-8")
+        def mutate_frequency(investigation, admission):
+            dataset = Path(admission.datasetArtifact)
+            value = json.loads(dataset.read_text()); value["frequencySearch"]["minimumFrequency"] = 999
+            dataset.write_text(json.dumps(value), encoding="utf-8")
+        for label, mutation in (("dataset-hash", mutate_dataset), ("project-hash", mutate_project),
+                                ("workload", mutate_workload), ("frequency-search", mutate_frequency)):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temporary:
+                investigation, _, calls, _, _ = self._direct_primary(
+                    temporary, mutate_after_prepare=mutation)
+                self.assertEqual(1, calls)
+                self.assertEqual("FRESH_DEEP_COMPUTE",
+                                 investigation.stages[-1].result["reuseProvenance"]["mode"])
+                self.assertEqual(("fresh-deep-project",), investigation.stages[-1].provenance.project_ids)
+
+    def test_shallow_verification_doubt_forces_fresh_compute(self):
+        def change_scan(store, admission, transform):
+            investigation = store.load(admission.sourceScanInvestigationID)
+            stages = list(investigation.stages)
+            index = next(i for i, stage in enumerate(stages) if stage.id == "002-broad-distributed-scan")
+            stages[index] = transform(stages[index])
+            store.save(replace(investigation, stages=tuple(stages)))
+
+        mutators = {
+            "scan-project-path": lambda store, admission: change_scan(
+                store, admission, lambda stage: replace(stage, parameters={"projectPath": "/wrong/project.json"})),
+            "result-dataset-id": lambda store, admission: change_scan(
+                store, admission, lambda stage: replace(stage, result={**stage.result,
+                    "datasets": [{**stage.result["datasets"][0], "datasetID": "wrong"}]})),
+            "result-tic": lambda store, admission: change_scan(
+                store, admission, lambda stage: replace(stage, result={**stage.result,
+                    "datasets": [{**stage.result["datasets"][0], "ticID": 999}]})),
+            "result-sector": lambda store, admission: change_scan(
+                store, admission, lambda stage: replace(stage, result={**stage.result,
+                    "datasets": [{**stage.result["datasets"][0], "sector": 99}]})),
+            "incomplete": lambda store, admission: store.set_status(
+                store.load(admission.sourceScanInvestigationID), "RUNNING"),
+            "failed": lambda store, admission: store.set_status(
+                store.load(admission.sourceScanInvestigationID), "FAILED"),
+            "malformed-result": lambda store, admission: change_scan(
+                store, admission, lambda stage: replace(stage, result={"datasets": "bad"})),
+            "unsuccessful-result": lambda store, admission: change_scan(
+                store, admission, lambda stage: replace(stage, result={**stage.result, "status": "FAILED"})),
+            "evidence-hash": lambda store, admission: Path(
+                store.load(admission.sourceScanInvestigationID).stages[-1].artifacts[0].path
+            ).write_text("{}\n", encoding="utf-8"),
+        }
+        for label, mutation in mutators.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temporary:
+                investigation, _, calls, _, _ = self._direct_primary(
+                    temporary, mutate_shallow=mutation)
+                self.assertEqual(1, calls)
+                self.assertEqual("FRESH_DEEP_COMPUTE",
+                                 investigation.stages[-1].result["reuseProvenance"]["mode"])
+
+    def test_unverified_shallow_result_is_not_offered_for_reuse(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); shallow = root / "shallow"; deep = root / "deep"
+            self._sweep(shallow, (1,))
+            store = InvestigationStore(shallow / "investigations")
+            investigation = store.load("tess-sector-scan-7-tic-1")
+            evidence_path = Path(investigation.stages[-1].artifacts[0].path)
+            evidence_path.write_text("{}\n", encoding="utf-8")
+            def inspect(investigation):
+                self.assertNotIn("reusablePrimary", investigation.metadata)
+            code, coordinator = self._run(shallow, deep, 1, [], execute_hook=inspect)
+            self.assertEqual((0, []), (code, coordinator.calls))
 
     def test_ranked_rerun_applies_tess_repair_before_scheduler_classification(self):
         with tempfile.TemporaryDirectory() as temporary:

@@ -12,6 +12,10 @@ from openstar_investigation import sha256_file, sha256_json
 from openstar_targets import InvestigationTarget
 from workflows.tess.tess_autonomy import WORKFLOW_ID, WORKFLOW_VERSION
 from workflows.tess.tess_sector_ranking import TessSectorRanking
+from workflows.tess.tess_sector_scan import (
+    EVIDENCE_HANDLER, MATERIALIZE_HANDLER, SCAN_HANDLER,
+    WORKFLOW_ID as SCAN_WORKFLOW_ID, WORKFLOW_VERSION as SCAN_WORKFLOW_VERSION,
+)
 
 
 def _atomic_json(path: Path, value: Any) -> None:
@@ -102,9 +106,107 @@ def _verified_admission(ranking: TessSectorRanking, entry: dict[str, Any], ranki
         str(ranking.content["rankingPolicyID"]), str(ranking.content["rankingPolicyVersion"]), ranking_hash)
 
 
+def verified_reusable_primary(store, admission: TessDeepAdmission) -> dict[str, Any] | None:
+    """Return self-contained shallow compute provenance, or no reuse on any doubt."""
+    try:
+        investigation = store.load(admission.sourceScanInvestigationID)
+        if (investigation.workflow_id != SCAN_WORKFLOW_ID
+                or investigation.workflow_version != SCAN_WORKFLOW_VERSION
+                or investigation.status != "COMPLETE"):
+            return None
+        materialized = [s for s in investigation.stages if s.id == "001-materialize-light-curve"
+                        and s.handler_id == MATERIALIZE_HANDLER and s.status == "COMPLETE"]
+        scans = [s for s in investigation.stages if s.id == "002-broad-distributed-scan"
+                 and s.handler_id == SCAN_HANDLER and s.status == "COMPLETE"]
+        evidences = [s for s in investigation.stages if s.id == "003-persist-scan-evidence"
+                     and s.handler_id == EVIDENCE_HANDLER and s.status == "COMPLETE" and s.stop]
+        if len(materialized) != 1 or len(scans) != 1 or len(evidences) != 1:
+            return None
+        prepared, scan_stage, evidence_stage = materialized[0].result, scans[0], evidences[0]
+        scan = scan_stage.result
+        evidence = evidence_stage.result
+        if not all(isinstance(value, dict) for value in (prepared, scan, evidence)):
+            return None
+        if scan.get("status") != "COMPLETE":
+            return None
+        if investigation.metadata.get("ticID") != admission.ticID or investigation.metadata.get("sector") != admission.sector:
+            return None
+        if (str(prepared.get("projectPath")) != admission.sourceProjectPath
+                or prepared.get("projectManifestSha256") != admission.sourceProjectManifestSha256
+                or prepared.get("datasetID") != admission.datasetID
+                or str(prepared.get("datasetPath")) != admission.datasetArtifact
+                or prepared.get("datasetSha256") != admission.datasetSha256):
+            return None
+        project_path, dataset_path = Path(admission.sourceProjectPath), Path(admission.datasetArtifact)
+        dispatched_path = scan_stage.parameters.get("projectPath")
+        if (not isinstance(dispatched_path, str)
+                or Path(dispatched_path).expanduser().resolve() != project_path.resolve()):
+            return None
+        if (not project_path.is_file() or sha256_file(project_path) != admission.sourceProjectManifestSha256
+                or not dataset_path.is_file() or sha256_file(dataset_path) != admission.datasetSha256):
+            return None
+        project, dataset = json.loads(project_path.read_text()), json.loads(dataset_path.read_text())
+        if project.get("id") != admission.sourceProjectID or project.get("workloadID") != "openstar.lomb-scargle.v1":
+            return None
+        entries = [x for x in project.get("datasets", []) if isinstance(x, dict)
+                   and str(x.get("id")) == admission.datasetID]
+        if len(entries) != 1 or Path(str(entries[0].get("path"))).resolve() != dataset_path.resolve():
+            return None
+        if entries[0].get("ticID") != admission.ticID or entries[0].get("sector") != admission.sector:
+            return None
+        results = scan.get("datasets")
+        if not isinstance(results, list) or len(results) != 1 or not isinstance(results[0], dict):
+            return None
+        target = results[0]
+        if str(target.get("datasetID")) != admission.datasetID:
+            return None
+        if target.get("ticID") is not None and target.get("ticID") != admission.ticID:
+            return None
+        if target.get("sector") is not None and target.get("sector") != admission.sector:
+            return None
+        expected = {
+            "bestFrequency": target.get("bestFrequency", target.get("candidateFrequency")),
+            "bestPeriodDays": target.get("bestPeriodDays", target.get("candidatePeriodDays")),
+            "bestPower": target.get("bestPower", target.get("candidatePower")),
+            "periodStatus": target.get("periodStatus"), "periodConfidence": target.get("periodConfidence"),
+            "foldCoherence": target.get("candidateFoldCoherence"), "coverageComplete": target.get("coverageComplete"),
+        }
+        if any(evidence.get(key) != value for key, value in expected.items()):
+            return None
+        if (evidence.get("ticID") != admission.ticID or evidence.get("sector") != admission.sector
+                or evidence.get("datasetArtifact") != admission.datasetArtifact
+                or evidence.get("datasetSha256") != admission.datasetSha256):
+            return None
+        if len(evidence_stage.artifacts) != 1 or evidence_stage.artifacts[0].sha256 != admission.sourceEvidenceSha256:
+            return None
+        evidence_path = Path(evidence_stage.artifacts[0].path)
+        if (not evidence_path.is_file() or sha256_file(evidence_path) != admission.sourceEvidenceSha256
+                or json.loads(evidence_path.read_text()) != evidence):
+            return None
+        provenance = scan_stage.provenance
+        if provenance is None or list(provenance.project_ids) != evidence.get("computeProjectIDs") \
+                or provenance.node_contributions != evidence.get("nodeContributions"):
+            return None
+        if scan.get("projectID") is not None and scan.get("projectID") not in provenance.project_ids:
+            return None
+        return {"schemaVersion": "1", "verification": "EXACT_FROZEN_SHALLOW_PRIMARY",
+                "sourceScanInvestigationID": investigation.id, "sourceWorkflowID": investigation.workflow_id,
+                "sourceWorkflowVersion": investigation.workflow_version, "sourceProjectID": admission.sourceProjectID,
+                "sourceProjectManifestSha256": admission.sourceProjectManifestSha256,
+                "datasetID": admission.datasetID, "datasetArtifact": admission.datasetArtifact,
+                "datasetSha256": admission.datasetSha256, "frequencySearchSha256": sha256_json(dataset.get("frequencySearch")),
+                "sourceEvidenceSha256": admission.sourceEvidenceSha256,
+                "coordinatorResult": scan, "coordinatorResultSha256": sha256_json(scan),
+                "computeProjectIDs": list(provenance.project_ids),
+                "nodeContributions": dict(provenance.node_contributions)}
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+        return None
+
+
 class TessRankedFollowupTargetSource:
     id, version = "openstar.tess-ranked-followup-targets", "1"
-    def __init__(self, admissions: Sequence[TessDeepAdmission]): self.admissions = tuple(admissions)
+    def __init__(self, admissions: Sequence[TessDeepAdmission], reusable_primary=None):
+        self.admissions = tuple(admissions); self.reusable_primary = reusable_primary or {}
     def enumerate_targets(self) -> tuple[InvestigationTarget, ...]:
         return tuple(InvestigationTarget(
             id=f"tess-sector-{a.sector}-ranked-followup-tic-{a.ticID}",
@@ -114,6 +216,10 @@ class TessRankedFollowupTargetSource:
                       "datasetID": a.datasetID, "ticID": a.ticID, "targetName": a.targetName,
                       "sourceScanInvestigationID": a.sourceScanInvestigationID,
                       "sourceEvidenceSha256": a.sourceEvidenceSha256,
+                      "sourceProjectManifestSha256": a.sourceProjectManifestSha256,
+                      "datasetSha256": a.datasetSha256,
+                      **({"reusablePrimary": self.reusable_primary[a.deepInvestigationID]}
+                         if a.deepInvestigationID in self.reusable_primary else {}),
                       "sourceRankingRank": a.admittedRankingRank,
                       "sourceRankingPolicyID": a.rankingPolicyID,
                       "sourceRankingPolicyVersion": a.rankingPolicyVersion,

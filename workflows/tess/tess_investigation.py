@@ -24,6 +24,7 @@ from .tess_followup import (
     build_low_frequency_followup,
     build_single_target_primary,
 )
+from .tess_primary_reuse import run_primary as run_primary_with_reuse
 from .tess_hypotheses import (
     analyze,
     broad_independent_next_handler,
@@ -1487,28 +1488,8 @@ def build_engine(
         )
 
     def run_primary(investigation, request):
-        print("⚙️ Activating primary distributed period search")
-        run = coordinator.run_project(
-            request.parameters["projectPath"],
-            poll_interval=poll_interval,
-            timeout=timeout,
-        )
-        target = _target_result(run.status)
-        print("✅ Primary distributed search complete")
-        print(f"   period status: {target.get('periodStatus')}")
-        print(f"   raw period: {target.get('candidatePeriodDays')} days")
-        print(f"   preferred period: {target.get('preferredPhysicalPeriodDays')} days")
-        return StageOutcome(
-            result=run.status,
-            next_stage=StageRequest(
-                id="003-catalog-identity",
-                handler_id="openstar.tess.catalog-identity",
-                parameters={},
-                triggered_by_stage_id=request.id,
-            ),
-            node_contributions=run.node_contributions,
-            project_ids=(run.project_id,),
-        )
+        return run_primary_with_reuse(investigation, request, coordinator,
+                                      poll_interval=poll_interval, timeout=timeout)
 
     def identity_stage(investigation, request):
         prepared = _result(investigation, "001-prepare-target")
