@@ -11,6 +11,7 @@ from typing import Any, Sequence
 from openstar_investigation import sha256_file, sha256_json
 from openstar_targets import InvestigationTarget
 from workflows.tess.tess_autonomy import WORKFLOW_ID, WORKFLOW_VERSION
+from workflows.tess.tess_primary_reuse import coordinator_dataset_identity_matches
 from workflows.tess.tess_sector_ranking import TessSectorRanking
 from workflows.tess.tess_sector_scan import (
     EVIDENCE_HANDLER, MATERIALIZE_HANDLER, SCAN_HANDLER,
@@ -158,7 +159,7 @@ def verified_reusable_primary(store, admission: TessDeepAdmission) -> dict[str, 
         if not isinstance(results, list) or len(results) != 1 or not isinstance(results[0], dict):
             return None
         target = results[0]
-        if str(target.get("datasetID")) != admission.datasetID:
+        if not coordinator_dataset_identity_matches(target, admission.datasetID):
             return None
         if target.get("ticID") is not None and target.get("ticID") != admission.ticID:
             return None
