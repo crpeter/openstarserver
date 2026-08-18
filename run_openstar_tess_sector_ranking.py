@@ -12,20 +12,37 @@ from workflows.tess.tess_sector_ranking import (TessSectorRankingStore,
     aggregate_tess_sector_ranking, write_promotion_manifest)
 
 
+def _sector_output_path(root: Path, requested: str | Path | None, default_name: str) -> Path:
+    """Resolve an output and confine it to the sector-sweep state tree."""
+    candidate = Path(requested).expanduser() if requested is not None else Path(default_name)
+    resolved = candidate.resolve() if candidate.is_absolute() else (root / candidate).resolve()
+    if not resolved.is_relative_to(root):
+        raise RuntimeError(
+            f"TESS sector ranking output escapes sector-sweep state directory: {resolved}"
+        )
+    return resolved
+
+
 def run_tess_sector_ranking(sector: int, state_dir: str | Path, output: str | Path | None = None,
                             promote_top: int | None = None, promotion_output: str | Path | None = None) -> int:
     root = Path(state_dir).expanduser().resolve()
     legacy = [name for name in ("lifecycle.json", "portfolio.json") if (root / name).exists()]
     if legacy:
         raise RuntimeError("TESS sector ranking refuses legacy single-lifecycle state: " + ", ".join(legacy))
+    # Resolve and validate every requested destination together, before loading
+    # state or constructing a store (which may create its root directory).
+    output_path = _sector_output_path(root, output, f"tess-sector-{sector}-ranking.json")
+    promotion_path = None
+    if promote_top is not None:
+        promotion_path = _sector_output_path(
+            root, promotion_output, f"tess-sector-{sector}-promoted-top-{promote_top}.json"
+        )
     inventory_path = root / f"tess-sector-{sector}-inventory.json"
     inventory = TessSectorInventoryStore(inventory_path).load()
     if inventory.sector != sector: raise RuntimeError("Inventory sector does not match requested sector")
     ranking = aggregate_tess_sector_ranking(inventory, InvestigationStore(root / "investigations"))
-    output_path = Path(output) if output else root / f"tess-sector-{sector}-ranking.json"
     TessSectorRankingStore(output_path).save(ranking)
-    if promote_top is not None:
-        promotion_path = Path(promotion_output) if promotion_output else root / f"tess-sector-{sector}-promoted-top-{promote_top}.json"
+    if promotion_path is not None:
         write_promotion_manifest(ranking, promote_top, promotion_path)
     c = ranking.content
     print("OpenStar TESS sector ranking:")
