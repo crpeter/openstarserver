@@ -5,10 +5,14 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from coordinator_state import CoordinatorState, first_value
+from coordinator_state import CoordinatorState, first_value, normalize_id
 
 
 class ProjectBusyError(RuntimeError):
+    pass
+
+
+class ProjectConflictError(RuntimeError):
     pass
 
 
@@ -17,18 +21,16 @@ class NoActiveProjectError(RuntimeError):
 
 
 class CoordinatorRuntime:
-    """
-    Generic control-plane wrapper around one active CoordinatorState.
-
-    Workers register with the runtime, not a particular project. Their
-    registration is replayed into each newly activated project so Mac/iPhone
-    can remain running while a workflow advances from one project to the next.
-    """
+    """Multi-project scheduler around isolated, project-local states."""
 
     def __init__(self):
         self.lock = threading.RLock()
-        self._state: CoordinatorState | None = None
+        self._states: dict[str, CoordinatorState] = {}
+        self._project_order: list[str] = []
+        self._work_project_index: dict[str, str] = {}
         self._node_registrations: dict[str, dict[str, Any]] = {}
+        self._next_project_index = 0
+        self._legacy_current_project_id: str | None = None
 
     @staticmethod
     def _node_key(node_id: Any) -> str:
@@ -40,133 +42,201 @@ class CoordinatorRuntime:
         completed = int(status.get("projectCompletedWorkUnits") or 0)
         failed = int(status.get("projectFailedWorkUnits") or 0)
         assigned = int(status.get("projectAssignedWorkUnits") or 0)
+        return total <= 0 or completed + failed >= total and assigned == 0
 
-        if total <= 0:
-            return True
-
-        return completed + failed >= total and assigned == 0
+    @staticmethod
+    def _idle_status() -> dict[str, Any]:
+        return {
+            "status": "IDLE",
+            "projectID": "",
+            "workloadID": "",
+            "datasetID": "",
+            "targetName": "",
+            "totalWorkUnits": 0,
+            "pendingWorkUnits": 0,
+            "assignedWorkUnits": 0,
+            "completedWorkUnits": 0,
+            "retryCount": 0,
+            "failedWorkUnits": 0,
+            "projectPendingWorkUnits": 0,
+            "projectAssignedWorkUnits": 0,
+            "projectCompletedWorkUnits": 0,
+            "projectFailedWorkUnits": 0,
+            "projectTotalWorkUnits": 0,
+            "projectProgress": 1.0,
+            "nodeContributions": {},
+            "datasets": [],
+        }
 
     def active_state(self) -> CoordinatorState | None:
         with self.lock:
-            return self._state
+            project_id = self._legacy_current_project_id
+            return self._states.get(project_id) if project_id is not None else None
 
     def active_project_path(self) -> str | None:
         state = self.active_state()
-        if state is None:
-            return None
-        return str(state.project_path)
+        return None if state is None else str(state.project_path)
 
     def register_node(self, payload: dict[str, Any]) -> None:
         node_id = first_value(payload, "nodeID", "nodeId", "id")
         if node_id is None:
             raise KeyError("Missing node ID.")
-
         normalized = dict(payload)
         normalized["nodeID"] = str(node_id)
-
         with self.lock:
             self._node_registrations[self._node_key(node_id)] = copy.deepcopy(
                 normalized
             )
-            state = self._state
-
-        if state is not None:
+            states = list(self._states.values())
+        for state in states:
             state.register_node(normalized)
 
     def claim_work(self, node_id: Any):
-        state = self.active_state()
-        if state is None:
+        with self.lock:
+            if not self._project_order:
+                return None
+            start = self._next_project_index % len(self._project_order)
+
+            for offset in range(len(self._project_order)):
+                position = (start + offset) % len(self._project_order)
+                project_id = self._project_order[position]
+                state = self._states[project_id]
+                work = state.claim_work(node_id)
+                if work is None:
+                    continue
+                self._next_project_index = (position + 1) % len(self._project_order)
+                return work
+
             return None
-        return state.claim_work(node_id)
 
     def submit_result(self, work_id: str, payload: dict[str, Any]):
-        state = self.active_state()
+        normalized = normalize_id(work_id)
+        with self.lock:
+            project_id = self._work_project_index.get(normalized)
+            state = self._states.get(project_id) if project_id is not None else None
         if state is None:
-            return False, "No active project.", 409
+            return False, "Unknown work unit.", 404
         return state.submit_result(work_id, payload)
 
-    def dataset(self, dataset_id: str) -> dict[str, Any] | None:
-        state = self.active_state()
-        if state is None:
-            return None
-        return state.datasets.get(dataset_id)
+    def dataset(
+        self, dataset_id: str, project_id: str | None = None
+    ) -> dict[str, Any] | None:
+        with self.lock:
+            selected_id = (
+                project_id
+                if project_id is not None
+                else self._legacy_current_project_id
+            )
+            state = self._states.get(selected_id) if selected_id is not None else None
+        return None if state is None else state.datasets.get(dataset_id)
 
-    def project_status(self) -> dict[str, Any]:
-        state = self.active_state()
+    def project_status(self, project_id: str | None = None) -> dict[str, Any] | None:
+        with self.lock:
+            selected_id = (
+                project_id
+                if project_id is not None
+                else self._legacy_current_project_id
+            )
+            state = self._states.get(selected_id) if selected_id is not None else None
         if state is None:
-            return {
-                "status": "IDLE",
-                "projectID": "",
-                "workloadID": "",
-                "datasetID": "",
-                "targetName": "",
-                "totalWorkUnits": 0,
-                "pendingWorkUnits": 0,
-                "assignedWorkUnits": 0,
-                "completedWorkUnits": 0,
-                "retryCount": 0,
-                "failedWorkUnits": 0,
-                "projectPendingWorkUnits": 0,
-                "projectAssignedWorkUnits": 0,
-                "projectCompletedWorkUnits": 0,
-                "projectFailedWorkUnits": 0,
-                "projectTotalWorkUnits": 0,
-                "projectProgress": 1.0,
-                "nodeContributions": {},
-                "datasets": [],
-            }
-
-        status = state.project_status()
-        status = dict(status)
-        status["status"] = (
-            "COMPLETE"
-            if self._is_terminal_status(status)
-            else "RUNNING"
-        )
+            return self._idle_status() if project_id is None else None
+        status = dict(state.project_status())
+        status["status"] = "COMPLETE" if self._is_terminal_status(status) else "RUNNING"
         status["projectPath"] = str(state.project_path)
         return status
 
+    def projects(self) -> list[dict[str, Any]]:
+        with self.lock:
+            entries = [
+                (project_id, self._states[project_id])
+                for project_id in self._project_order
+            ]
+        result = []
+        for project_id, state in entries:
+            status = self.project_status(project_id)
+            if status is not None:
+                result.append(
+                    {
+                        "projectID": project_id,
+                        "projectPath": str(state.project_path),
+                        "status": status,
+                    }
+                )
+        return result
+
     def activate_project(
-        self,
-        project_path: str | Path,
-        *,
-        require_terminal: bool = True,
+        self, project_path: str | Path, *, require_terminal: bool = True
     ) -> dict[str, Any]:
         resolved = Path(project_path).expanduser().resolve()
         if not resolved.exists():
             raise FileNotFoundError(f"Project manifest not found: {resolved}")
-
-        # Validate/build the new project state before replacing the active one.
         new_state = CoordinatorState(resolved)
+        project_id = str(new_state.project_id)
+        new_work_ids = list(new_state.work_units)
 
         with self.lock:
-            current = self._state
-            if current is not None and require_terminal:
-                current_status = current.project_status()
-                if not self._is_terminal_status(current_status):
-                    raise ProjectBusyError(
-                        "Cannot activate a new project while the current "
-                        f"project is still running: {current.project_id}"
+            existing = self._states.get(project_id)
+            if existing is not None:
+                if existing.project_path != resolved:
+                    raise ProjectConflictError(
+                        f"Project ID {project_id!r} is already loaded from {existing.project_path}."
                     )
+                self._legacy_current_project_id = project_id
+                status = self.project_status(project_id)
+                assert status is not None
+                return status
 
-            registrations = [
-                copy.deepcopy(payload)
-                for payload in self._node_registrations.values()
+            if require_terminal:
+                for state in self._states.values():
+                    if not self._is_terminal_status(state.project_status()):
+                        raise ProjectBusyError(
+                            "Cannot activate a new project while an existing project is still running: "
+                            + str(state.project_id)
+                        )
+            collisions = [
+                work_id
+                for work_id in new_work_ids
+                if normalize_id(work_id) in self._work_project_index
             ]
-
-            # Replay workers into the new state before publishing it. A worker
-            # that claims immediately after the swap can therefore be matched
-            # by workload capability without needing to re-register.
+            if collisions:
+                raise ProjectConflictError(
+                    f"Work unit ID is already owned by another project: {collisions[0]}"
+                )
+            registrations = [
+                copy.deepcopy(value) for value in self._node_registrations.values()
+            ]
             for payload in registrations:
                 new_state.register_node(payload)
+            self._states[project_id] = new_state
+            self._project_order.append(project_id)
+            for work_id in new_work_ids:
+                self._work_project_index[normalize_id(work_id)] = project_id
+            self._legacy_current_project_id = project_id
 
-            self._state = new_state
+        return self.project_status(project_id)  # type: ignore[return-value]
 
-        print()
-        print("🧭 Project activated by control plane")
-        print(f"   project: {new_state.project_id}")
-        print(f"   workload: {new_state.workload_id}")
-        print(f"   manifest: {resolved}")
-        print(f"   retained nodes: {len(registrations)}")
-
-        return self.project_status()
+    def remove_project(self, project_id: str) -> None:
+        with self.lock:
+            state = self._states.get(project_id)
+            if state is None:
+                raise KeyError(project_id)
+            if not self._is_terminal_status(state.project_status()):
+                raise ProjectBusyError(
+                    f"Cannot remove nonterminal project: {project_id}"
+                )
+            removed_index = self._project_order.index(project_id)
+            del self._states[project_id]
+            self._project_order.pop(removed_index)
+            for work_id, owner in list(self._work_project_index.items()):
+                if owner == project_id:
+                    del self._work_project_index[work_id]
+            if self._project_order:
+                if removed_index < self._next_project_index:
+                    self._next_project_index -= 1
+                self._next_project_index %= len(self._project_order)
+            else:
+                self._next_project_index = 0
+            if self._legacy_current_project_id == project_id:
+                self._legacy_current_project_id = (
+                    self._project_order[-1] if self._project_order else None
+                )

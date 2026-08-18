@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+from urllib.parse import quote
 
 from openstar_workflow import RetryableExecutionError
 
@@ -41,8 +42,12 @@ class OpenStarCoordinatorClient:
     def health(self) -> dict[str, Any]:
         return self._request_json("GET", "/v1/health")
 
-    def project_status(self) -> dict[str, Any]:
-        return self._request_json("GET", "/v1/projects/current/status")
+    def project_status(self, project_id: str | None = None) -> dict[str, Any]:
+        if project_id is None:
+            path = "/v1/projects/current/status"
+        else:
+            path = f"/v1/projects/{quote(str(project_id), safe='')}/status"
+        return self._request_json("GET", path)
 
     def activate_project(
         self,
@@ -67,7 +72,7 @@ class OpenStarCoordinatorClient:
         poll_interval: float = 1.0,
         timeout: float | None = None,
     ) -> ProjectRunResult:
-        status = self.activate_project(project_path)
+        status = self.activate_project(project_path, require_terminal=False)
         project_id = str(status["projectID"])
         final_status = self.wait_for_project(
             project_id,
@@ -86,13 +91,7 @@ class OpenStarCoordinatorClient:
         started = time.monotonic()
 
         while True:
-            status = self.project_status()
-            active_id = status.get("projectID")
-            if str(active_id) != str(project_id):
-                raise CoordinatorClientError(
-                    "Active project changed while workflow was waiting: "
-                    f"expected={project_id}, active={active_id}"
-                )
+            status = self.project_status(project_id)
 
             if self.is_terminal(status):
                 return status

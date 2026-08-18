@@ -8,9 +8,9 @@ from urllib.parse import unquote, urlparse
 from coordinator_runtime import (
     CoordinatorRuntime,
     ProjectBusyError,
+    ProjectConflictError,
 )
 from coordinator_state import first_value
-
 
 DEFAULT_PROJECT_PATH = "data/projects/openstar.tess-validation-v1.json"
 DEFAULT_HOST = "0.0.0.0"
@@ -115,20 +115,40 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._send_json(200, status)
             return
 
+        if path == "/v1/projects":
+            self._send_json(200, RUNTIME.projects())
+            return
+
+        project_prefix = "/v1/projects/"
+        if path.startswith(project_prefix):
+            remainder = path[len(project_prefix) :].strip("/")
+            parts = remainder.split("/")
+            if len(parts) == 2 and parts[1] == "status":
+                status = RUNTIME.project_status(unquote(parts[0]))
+                if status is None:
+                    self._send_error_json(404, "Unknown project.")
+                else:
+                    self._send_json(200, status)
+                return
+            if len(parts) == 3 and parts[1] == "datasets":
+                dataset = RUNTIME.dataset(unquote(parts[2]), unquote(parts[0]))
+                if dataset is None:
+                    self._send_error_json(404, "Unknown project or dataset.")
+                else:
+                    self._send_json(200, dataset)
+                return
+
         print(f"🌐 GET {path}")
         dataset_prefix = "/v1/datasets/"
         if path.startswith(dataset_prefix):
-            dataset_id = unquote(path[len(dataset_prefix):]).strip("/")
+            dataset_id = unquote(path[len(dataset_prefix) :]).strip("/")
             dataset = RUNTIME.dataset(dataset_id)
 
             if dataset is None:
                 self._send_error_json(404, "Unknown dataset or no active project.")
                 return
 
-            print(
-                "   dataset targetName: "
-                f"{dataset.get('targetName', dataset_id)}"
-            )
+            print("   dataset targetName: " f"{dataset.get('targetName', dataset_id)}")
             self._send_json(200, dataset)
             return
 
@@ -161,7 +181,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                     str(project_path),
                     require_terminal=require_terminal,
                 )
-            except ProjectBusyError as error:
+            except (ProjectBusyError, ProjectConflictError) as error:
                 self._send_error_json(409, str(error))
                 return
             except (OSError, KeyError, TypeError, ValueError, RuntimeError) as error:
@@ -216,7 +236,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         result_prefix = "/v1/work/"
         result_suffix = "/result"
         if path.startswith(result_prefix) and path.endswith(result_suffix):
-            work_id = path[len(result_prefix):-len(result_suffix)].strip("/")
+            work_id = path[len(result_prefix) : -len(result_suffix)].strip("/")
             if not work_id:
                 self._send_error_json(400, "Missing work unit ID.")
                 return
@@ -235,6 +255,26 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
 
         self._send_error_json(404, "Not found.")
+
+    def do_DELETE(self):
+        path = urlparse(self.path).path
+        prefix = "/v1/projects/"
+        if not path.startswith(prefix) or not path[len(prefix) :].strip("/"):
+            self._send_error_json(404, "Not found.")
+            return
+        project_id = unquote(path[len(prefix) :].strip("/"))
+        if "/" in project_id:
+            self._send_error_json(404, "Not found.")
+            return
+        try:
+            RUNTIME.remove_project(project_id)
+        except KeyError:
+            self._send_error_json(404, "Unknown project.")
+            return
+        except ProjectBusyError as error:
+            self._send_error_json(409, str(error))
+            return
+        self._send_json(200, {"accepted": True, "message": "Project removed."})
 
 
 def parse_args():
