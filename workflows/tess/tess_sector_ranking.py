@@ -156,17 +156,22 @@ def _entry(inventory: TessSectorInventory, item, store: InvestigationStore) -> T
         reasons.append("MISSING_MATERIALIZATION_PROVENANCE")
     dataset = _verify_file(evidence.get("datasetArtifact"), evidence.get("datasetSha256"), "DATASET", reasons)
     project = _verify_file(prepared.get("projectPath"), prepared.get("projectManifestSha256"), "SOURCE_PROJECT_MANIFEST", reasons)
+    source_dataset = None
+    source_project_id = None
     if project is not None:
         try:
             project_value = json.loads(project.read_text(encoding="utf-8"))
+            source_project_id = project_value.get("id")
             project_datasets = project_value.get("datasets")
             matching = [value for value in project_datasets if isinstance(value, dict)
                         and value.get("ticID") == tic and value.get("sector") == sector] \
                 if isinstance(project_datasets, list) else []
             if len(matching) != 1:
                 reasons.append("SOURCE_PROJECT_IDENTITY_MISMATCH")
-            elif dataset is not None and Path(str(matching[0].get("path"))).resolve() != dataset.resolve():
-                reasons.append("SOURCE_PROJECT_DATASET_MISMATCH")
+            else:
+                source_dataset = matching[0]
+                if dataset is not None and Path(str(source_dataset.get("path"))).resolve() != dataset.resolve():
+                    reasons.append("SOURCE_PROJECT_DATASET_MISMATCH")
         except (OSError, UnicodeError, json.JSONDecodeError, TypeError):
             reasons.append("MALFORMED_SOURCE_PROJECT_MANIFEST")
     project_ids = evidence.get("computeProjectIDs")
@@ -197,6 +202,8 @@ def _entry(inventory: TessSectorInventory, item, store: InvestigationStore) -> T
               "cadenceSeconds": evidence.get("cadenceSeconds"), "datasetArtifact": str(dataset) if dataset else evidence.get("datasetArtifact"),
               "datasetSha256": evidence.get("datasetSha256"), "sourceProjectPath": str(project) if project else prepared.get("projectPath"),
               "sourceProjectManifestSha256": prepared.get("projectManifestSha256"),
+              "sourceProjectID": source_project_id,
+              "datasetID": source_dataset.get("id") if source_dataset else evidence.get("datasetID"),
               "computeProjectIDs": project_ids, "nodeContributions": contributions,
               "sourceEvidenceSha256": evidence_sha}
     state = "COMPLETE_ELIGIBLE" if not reasons else "COMPLETE_NO_RELIABLE_PERIOD"
