@@ -8,7 +8,10 @@ from openstar_autonomy import ExternalDataDependency, ScientificBranch
 from openstar_dispatch import InvestigationDispatcher
 from openstar_external_jobs import ExternalDependency, ExternalJob, ExternalJobStore
 from openstar_investigation import InvestigationStage, InvestigationStore
-from openstar_lifecycle import InvestigationLifecycleLoop
+from openstar_lifecycle import (
+    InvestigationLifecycleLoop,
+    InvestigationSchedulingState,
+)
 from openstar_targets import InvestigationTarget, InvestigationTargetPortfolio
 from openstar_workflow import (
     RetryableExecutionError,
@@ -290,6 +293,155 @@ class InvestigationLifecycleLoopTests(unittest.TestCase):
         result = loop.run(max_transitions=1)
         self.assertEqual("NONRETRYABLE_FAILURE_REQUIRES_ATTENTION", result.disposition)
         self.assertEqual(1, len(self.store.load(investigation.id).stages))
+
+    def test_persisted_recovery_must_be_fresh_valid_and_link_latest_failure(self):
+        cases = {
+            "missing-selection": None,
+            "stale-trigger": {
+                "id": "002-recovery",
+                "handler_id": "test.execute",
+                "parameters": {},
+                "triggered_by_stage_id": "000-other",
+            },
+            "malformed-handler": {
+                "id": "002-recovery",
+                "handler_id": "",
+                "parameters": {},
+                "triggered_by_stage_id": "001-failed",
+            },
+            "existing-id": {
+                "id": "001-failed",
+                "handler_id": "test.execute",
+                "parameters": {},
+                "triggered_by_stage_id": "001-failed",
+            },
+        }
+        for suffix, selected in cases.items():
+            with self.subTest(case=suffix):
+                target = InvestigationTarget(
+                    suffix, f"investigation-{suffix}", "test", "1"
+                )
+                investigation = self.store.create(target.investigation_id, "test", "1")
+                failed = InvestigationStage(
+                    "001-failed", "test.execute", "FAILED", None, {},
+                    error="ValueError: bad data",
+                    failure_classification="NON_RETRYABLE",
+                )
+                control = {
+                    "schedulerAction": "RUN_EXPERIMENT",
+                    "selectedExperiment": selected,
+                }
+                self.store.save(
+                    replace(
+                        investigation,
+                        status="RUNNING",
+                        stages=(failed,),
+                        metadata={"controlState": control},
+                    )
+                )
+
+                prepared = self.loop().driver.prepare(target)
+
+                self.assertEqual(InvestigationSchedulingState.FAILED, prepared.state)
+                self.assertEqual((failed,), prepared.investigation.stages)
+
+    def test_valid_persisted_non_retryable_recovery_is_runnable(self):
+        target = InvestigationTarget(
+            "recovery", "investigation-recovery", "test", "1"
+        )
+        investigation = self.store.create(target.investigation_id, "test", "1")
+        failed = InvestigationStage(
+            "001-failed",
+            "test.execute",
+            "FAILED",
+            None,
+            {},
+            error="ValueError: bad data",
+            failure_classification="NON_RETRYABLE",
+        )
+        investigation = replace(investigation, status="RUNNING", stages=(failed,))
+        self.store.save(investigation)
+        self.store.set_control_state(
+            investigation,
+            status="RUNNING",
+            control_state={
+                "schedulerAction": "RUN_EXPERIMENT",
+                "selectedExperiment": {
+                    "id": "002-recovery",
+                    "handler_id": "test.execute",
+                    "parameters": {},
+                    "triggered_by_stage_id": failed.id,
+                },
+            },
+        )
+
+        prepared = self.loop().driver.prepare(target)
+
+        self.assertEqual(InvestigationSchedulingState.RUNNABLE, prepared.state)
+        self.assertEqual((failed,), prepared.investigation.stages)
+
+    def test_real_shaped_tess_006_compatibility_state_dispatches_only_007(self):
+        target = InvestigationTarget(
+            "tic", "tess-investigation", "test", "1"
+        )
+        investigation = self.store.create(target.investigation_id, "test", "1")
+        primary = InvestigationStage(
+            "002-primary-distributed-search",
+            "openstar.tess.primary-project.run",
+            "COMPLETE",
+            "001-prepare-target",
+            {},
+        )
+        failed = InvestigationStage(
+            "006-prepare-independent-sectors",
+            "openstar.tess.independent.prepare",
+            "FAILED",
+            "005-planner",
+            {},
+            error="ValueError: I/O operation on closed file.",
+            failure_classification="NON_RETRYABLE",
+        )
+        investigation = replace(
+            investigation, status="RUNNING", stages=(primary, failed)
+        )
+        self.store.save(investigation)
+        self.store.set_control_state(
+            investigation,
+            status="RUNNING",
+            control_state={
+                "schedulerAction": "RUN_EXPERIMENT",
+                "recovery": "TESS_LIGHTKURVE_CLOSED_FILE_COMPATIBILITY_RETRY",
+                "selectedExperiment": {
+                    "id": "007-prepare-independent-sectors",
+                    "handler_id": "openstar.tess.independent.prepare",
+                    "parameters": {},
+                    "triggered_by_stage_id": failed.id,
+                },
+            },
+        )
+        executions = []
+        self.workflow.register_handler(
+            "openstar.tess.independent.prepare",
+            lambda investigation, request: (
+                executions.append(request.id) or StageOutcome({}, stop=True)
+            ),
+        )
+
+        prepared = self.loop(
+            planners={"test": lambda investigation, target: ()}
+        ).driver.dispatch_runnable(target)
+
+        self.assertEqual(InvestigationSchedulingState.COMPLETE, prepared.state)
+        self.assertEqual(["007-prepare-independent-sectors"], executions)
+        stages = self.store.load(investigation.id).stages
+        self.assertEqual(("FAILED", "NON_RETRYABLE"), (
+            stages[1].status, stages[1].failure_classification
+        ))
+        self.assertEqual(
+            ["002-primary-distributed-search", "006-prepare-independent-sectors",
+             "007-prepare-independent-sectors"],
+            [stage.id for stage in stages],
+        )
 
     def test_target_advance_is_durable_and_continues_same_lifecycle(self):
         def advancing_planner(investigation, target):

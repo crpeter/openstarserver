@@ -235,6 +235,61 @@ class InvestigationSchedulerTests(unittest.TestCase):
         scheduler.run_until_idle()
         self.assertEqual(2, executions["a"])
 
+    def test_scheduler_dispatches_explicit_non_retryable_recovery(self):
+        target = self.target("recovery")
+        investigation = self.store.create(
+            target.investigation_id, target.workflow_id, target.workflow_version
+        )
+
+        def fail(investigation, request):
+            raise ValueError("historical scientific failure")
+
+        recovered = []
+        self.workflow.register_handler("fail", fail)
+        self.workflow.register_handler(
+            "recover",
+            lambda investigation, request: (
+                recovered.append(request.id) or StageOutcome({}, stop=True)
+            ),
+        )
+        with self.assertRaises(ValueError):
+            self.workflow.run(
+                investigation, StageRequest("001-failed", "fail", {}),
+                software_id="test", software_version="1",
+            )
+        investigation = self.store.load(target.investigation_id)
+        failed = investigation.stages[-1]
+        failed_bytes = self.store.stage_path_for(
+            investigation.id, failed.id
+        ).read_bytes()
+        self.store.set_control_state(
+            investigation,
+            status="RUNNING",
+            control_state={
+                "schedulerAction": "RUN_EXPERIMENT",
+                "selectedExperiment": {
+                    "id": "002-recovery", "handler_id": "recover",
+                    "parameters": {}, "triggered_by_stage_id": failed.id,
+                },
+                "recovery": "EXPLICIT_TEST_RECOVERY",
+            },
+        )
+
+        result = self.scheduler([target], lambda investigation, target: ()).run_round()
+
+        self.assertEqual((target.investigation_id,), result.dispatched_investigation_ids)
+        self.assertEqual(["002-recovery"], recovered)
+        stages = self.store.load(target.investigation_id).stages
+        self.assertEqual(
+            [("001-failed", "FAILED"), ("002-recovery", "COMPLETE")],
+            [(stage.id, stage.status) for stage in stages],
+        )
+        self.assertEqual("NON_RETRYABLE", stages[0].failure_classification)
+        self.assertEqual(
+            failed_bytes,
+            self.store.stage_path_for(investigation.id, failed.id).read_bytes(),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
