@@ -100,7 +100,10 @@ class InvestigationTargetPortfolio:
                 reason = "trigger-investigation"
             elif self.investigation_store.path_for(target.investigation_id).exists():
                 investigation = self.investigation_store.load(target.investigation_id)
-                if investigation.status in {"COMPLETE", "QUIESCENT_AWAITING_DATA"}:
+                awakened = bool(investigation.metadata.get("externalJobWakeDependencies"))
+                if investigation.status == "COMPLETE" or (
+                    investigation.status == "QUIESCENT_AWAITING_DATA" and not awakened
+                ):
                     reason = f"investigation-{investigation.status.lower()}"
             if reason is None:
                 eligible.append(target)
@@ -203,6 +206,12 @@ class InvestigationTargetPortfolio:
             autonomy = AutonomousInvestigationEngine(self.investigation_store)
             investigation, _ = autonomy.decide(
                 investigation, planner(investigation, target)
+            )
+
+        if investigation.metadata.get("externalJobWakeDependencies"):
+            investigation = update_investigation_metadata(
+                self.investigation_store, investigation,
+                {"externalJobWakeDependencies": []}
             )
 
         dispatched = self.dispatcher.dispatch(

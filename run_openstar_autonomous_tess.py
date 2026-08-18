@@ -10,6 +10,8 @@ from dataclasses import replace
 from pathlib import Path
 
 from openstar_coordinator_client import OpenStarCoordinatorClient
+from openstar_external_jobs import (ExternalJobMonitor, ExternalJobStore,
+                                    apply_external_job_wakeups)
 from openstar_dispatch import InvestigationDispatcher
 from openstar_investigation import InvestigationStore
 from openstar_lifecycle import InvestigationLifecycleLoop, LifecycleResult
@@ -62,6 +64,15 @@ def run_autonomous_tess(
     root = Path(state_dir).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
     store = InvestigationStore(root / "investigations")
+    external_jobs = ExternalJobStore(root / "external-jobs")
+    if external_jobs.pending():
+        from workflows.tess.tess_atlas_forced_photometry import ATLASExternalJobProvider
+        ExternalJobMonitor(external_jobs, {
+            "atlas-forced-photometry": ATLASExternalJobProvider(),
+        }).poll_due()
+    # Reconstruct from durable terminal records even if a process crashed
+    # after the last job completed but before its investigation was awakened.
+    apply_external_job_wakeups(store, external_jobs.ready_dependencies())
     coordinator = OpenStarCoordinatorClient(coordinator_url)
     workflow = register_tess_workflow_handlers(
         store, coordinator, poll_interval=poll_interval, timeout=timeout
