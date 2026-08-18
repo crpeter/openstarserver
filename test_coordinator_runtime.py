@@ -252,6 +252,51 @@ class CoordinatorHTTPContractTests(unittest.TestCase):
 
 
 class CoordinatorClientTests(unittest.TestCase):
+    def test_run_projects_activates_batch_then_polls_in_order(self):
+        client = OpenStarCoordinatorClient()
+        activations = [{"projectID": "a"}, {"projectID": "b"}]
+        statuses = [
+            {"status": "COMPLETE", "nodeContributions": {"node": 2}},
+            {"status": "RUNNING"},
+            {"status": "COMPLETE", "nodeContributions": {"node": 3}},
+        ]
+        events = []
+
+        def activate(path, *, require_terminal):
+            events.append(("activate", path, require_terminal))
+            return activations.pop(0)
+
+        def status(project_id):
+            events.append(("status", project_id))
+            return statuses.pop(0)
+
+        with patch.object(
+            client, "activate_project", side_effect=activate
+        ), patch.object(client, "project_status", side_effect=status), patch(
+            "openstar_coordinator_client.time.sleep"
+        ) as sleep:
+            result = client.run_projects(["one.json", "two.json"], poll_interval=0)
+
+        self.assertEqual(("a", "b"), result.project_ids)
+        self.assertEqual({"node": 5}, result.node_contributions)
+        self.assertEqual(
+            [("activate", "one.json", False), ("activate", "two.json", False)],
+            events[:2],
+        )
+        self.assertEqual(
+            [("status", "a"), ("status", "b"), ("status", "b")], events[2:]
+        )
+        sleep.assert_called_once()
+
+    def test_run_projects_rejects_empty_and_duplicate_project_ids(self):
+        client = OpenStarCoordinatorClient()
+        with self.assertRaises(ValueError):
+            client.run_projects([])
+        with patch.object(
+            client, "activate_project", return_value={"projectID": "same"}
+        ), self.assertRaisesRegex(ValueError, "duplicate project ID"):
+            client.run_projects(["one.json", "two.json"])
+
     def test_wait_for_project_uses_project_specific_status(self):
         client = OpenStarCoordinatorClient()
         running = {"status": "RUNNING", "projectTotalWorkUnits": 1}

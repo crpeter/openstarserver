@@ -169,6 +169,8 @@ class InvestigationStore:
     ) -> Investigation:
         if stage.status != "RUNNING":
             raise ValueError("New stage must start as RUNNING.")
+        if any(existing.status == "RUNNING" for existing in investigation.stages):
+            raise ValueError("Investigation already has a RUNNING stage.")
         if any(existing.id == stage.id for existing in investigation.stages):
             raise ValueError(f"Duplicate stage id: {stage.id}")
 

@@ -10,11 +10,15 @@ from dataclasses import replace
 from pathlib import Path
 
 from openstar_coordinator_client import OpenStarCoordinatorClient
-from openstar_external_jobs import (ExternalJobMonitor, ExternalJobStore,
-                                    apply_external_job_wakeups)
+from openstar_external_jobs import (
+    ExternalJobMonitor,
+    ExternalJobStore,
+    apply_external_job_wakeups,
+)
 from openstar_dispatch import InvestigationDispatcher
 from openstar_investigation import InvestigationStore
 from openstar_lifecycle import InvestigationLifecycleLoop, LifecycleResult
+from openstar_scheduler import InvestigationScheduler
 from openstar_targets import InvestigationTargetPortfolio, NoEligibleTargetError
 from workflows.tess.tess_autonomy import (
     WORKFLOW_ID,
@@ -42,7 +46,9 @@ def _status(result: LifecycleResult) -> str:
         fields.append(f"selection={selection['selectionID']}")
     if investigation.stages:
         stage = investigation.stages[-1]
-        fields.extend((f"latest={stage.id}:{stage.status}", f"handler={stage.handler_id}"))
+        fields.extend(
+            (f"latest={stage.id}:{stage.status}", f"handler={stage.handler_id}")
+        )
         if stage.provenance is not None:
             fields.append(
                 f"software={stage.provenance.software_id}@{stage.provenance.software_version}"
@@ -59,17 +65,34 @@ def run_autonomous_tess(
     *,
     poll_interval: float = 1.0,
     timeout: float | None = None,
+    multi_investigation: bool = False,
+    max_concurrent_investigations: int | None = None,
 ) -> int:
     """Construct and run the existing lifecycle, returning a process exit code."""
     root = Path(state_dir).expanduser().resolve()
+    if multi_investigation:
+        legacy = [
+            name
+            for name in ("lifecycle.json", "portfolio.json")
+            if (root / name).exists()
+        ]
+        if legacy:
+            raise RuntimeError(
+                "Multi-investigation mode refuses legacy lifecycle state: "
+                + ", ".join(legacy)
+            )
     root.mkdir(parents=True, exist_ok=True)
     store = InvestigationStore(root / "investigations")
     external_jobs = ExternalJobStore(root / "external-jobs")
     if external_jobs.pending():
         from workflows.tess.tess_atlas_forced_photometry import ATLASExternalJobProvider
-        ExternalJobMonitor(external_jobs, {
-            "atlas-forced-photometry": ATLASExternalJobProvider(),
-        }).poll_due()
+
+        ExternalJobMonitor(
+            external_jobs,
+            {
+                "atlas-forced-photometry": ATLASExternalJobProvider(),
+            },
+        ).poll_due()
     # Reconstruct from durable terminal records even if a process crashed
     # after the last job completed but before its investigation was awakened.
     apply_external_job_wakeups(store, external_jobs.ready_dependencies())
@@ -79,10 +102,31 @@ def run_autonomous_tess(
     )
     dispatcher = InvestigationDispatcher(store, workflow)
     source = TessInvestigationTargetSource(project_paths)
+    if multi_investigation:
+        scheduler = InvestigationScheduler(
+            store,
+            dispatcher,
+            source,
+            {WORKFLOW_ID: plan_tess_branches},
+            software_id=SOFTWARE_ID,
+            software_version=SOFTWARE_VERSION,
+            max_concurrent_investigations=max_concurrent_investigations,
+        )
+        result = scheduler.run_until_idle()
+        for outcome in result.outcomes:
+            fields = [
+                f"investigation={outcome.investigation.id}",
+                f"state={outcome.state.value}",
+                f"status={outcome.investigation.status}",
+                f"stages={len(outcome.investigation.stages)}",
+            ]
+            if outcome.error is not None:
+                fields.append(f"error={type(outcome.error).__name__}: {outcome.error}")
+            print("OpenStar scheduler: " + " ".join(fields))
+        return 1 if any(outcome.error is not None for outcome in result.outcomes) else 0
+
     lifecycle_path = root / "lifecycle.json"
-    portfolio = InvestigationTargetPortfolio(
-        root / "portfolio.json", store, dispatcher
-    )
+    portfolio = InvestigationTargetPortfolio(root / "portfolio.json", store, dispatcher)
     lifecycle = InvestigationLifecycleLoop(
         lifecycle_path,
         store,
@@ -146,11 +190,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--state-dir", required=True)
     parser.add_argument("--poll-interval", type=float, default=1.0)
     parser.add_argument("--timeout", type=float)
+    parser.add_argument("--multi-investigation", action="store_true")
+    parser.add_argument("--max-concurrent-investigations", type=int)
     args = parser.parse_args(argv)
     if args.poll_interval <= 0:
         parser.error("--poll-interval must be positive")
     if args.timeout is not None and args.timeout <= 0:
         parser.error("--timeout must be positive")
+    if (
+        args.max_concurrent_investigations is not None
+        and args.max_concurrent_investigations <= 0
+    ):
+        parser.error("--max-concurrent-investigations must be positive")
     return args
 
 
@@ -163,6 +214,8 @@ def main(argv: list[str] | None = None) -> int:
             args.state_dir,
             poll_interval=args.poll_interval,
             timeout=args.timeout,
+            multi_investigation=args.multi_investigation,
+            max_concurrent_investigations=args.max_concurrent_investigations,
         )
     except KeyboardInterrupt:
         print("OpenStar lifecycle: disposition=SHUTDOWN", file=sys.stderr)
