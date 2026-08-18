@@ -329,6 +329,13 @@ class InvestigationLifecycleLoopTests(unittest.TestCase):
         state = json.loads((self.root / "lifecycle.json").read_text(encoding="utf-8"))
         self.assertEqual("one", state["currentTarget"]["id"])
 
+        held = self.loop(planners=planners).run(max_transitions=1)
+        self.assertEqual("LIFECYCLE_CHECKPOINT", held.disposition)
+        self.assertFalse((self.root / "portfolio.json").exists())
+        state = json.loads((self.root / "lifecycle.json").read_text(encoding="utf-8"))
+        self.assertEqual("one", state["currentTarget"]["id"])
+        self.assertFalse(self.store.path_for(self.second.investigation_id).exists())
+
         advanced = self.loop(planners=planners).run(max_transitions=2)
         self.assertEqual("LIFECYCLE_CHECKPOINT", advanced.disposition)
         state = json.loads((self.root / "lifecycle.json").read_text(encoding="utf-8"))
@@ -351,6 +358,31 @@ class InvestigationLifecycleLoopTests(unittest.TestCase):
             (self.root / "portfolio.json").read_text(encoding="utf-8")
         )
         self.assertEqual(1, len(portfolio["selections"]))
+
+    def test_persisted_complete_checkpoints_before_portfolio_advance(self):
+        planners = {"test": lambda investigation, target: ()}
+        loop = self.loop(planners=planners)
+        loop.start(self.initial)
+
+        planned = loop.run(max_transitions=1)
+        self.assertEqual("LIFECYCLE_CHECKPOINT", planned.disposition)
+        self.assertEqual(
+            "INVESTIGATION_COMPLETE",
+            self.store.load(self.initial.investigation_id)
+            .metadata["controlState"]["schedulerAction"],
+        )
+
+        held = self.loop(planners=planners).run(max_transitions=1)
+        self.assertEqual("LIFECYCLE_CHECKPOINT", held.disposition)
+        self.assertFalse((self.root / "portfolio.json").exists())
+        state = json.loads((self.root / "lifecycle.json").read_text(encoding="utf-8"))
+        self.assertEqual("one", state["currentTarget"]["id"])
+        self.assertFalse(self.store.path_for(self.second.investigation_id).exists())
+
+        advanced = self.loop(planners=planners).run(max_transitions=2)
+        self.assertEqual("LIFECYCLE_CHECKPOINT", advanced.disposition)
+        state = json.loads((self.root / "lifecycle.json").read_text(encoding="utf-8"))
+        self.assertEqual("two", state["currentTarget"]["id"])
 
     def _all_external_wait_loop(self, state):
         def planner(investigation, target):

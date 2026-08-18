@@ -390,6 +390,12 @@ class InvestigationLifecycleLoop:
                 software_version=self.software_version,
             )
             transitions += 1
+            if transitions >= max_transitions:
+                return LifecycleResult(
+                    dispatched.investigation,
+                    "LIFECYCLE_CHECKPOINT",
+                    transitions,
+                )
             try:
                 advanced = self.portfolio.advance(
                     dispatched,
