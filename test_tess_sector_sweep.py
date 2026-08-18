@@ -73,6 +73,15 @@ class FakeCoordinator:
 
 
 class InventoryTests(unittest.TestCase):
+    class _Row(dict):
+        @property
+        def colnames(self):
+            return list(self)
+
+    class _Scalar:
+        def __init__(self, value): self.value = value
+        def item(self): return self.value
+
     def _mock_mast_download(self, result, *, create_file):
         observations = MagicMock()
 
@@ -130,6 +139,51 @@ class InventoryTests(unittest.TestCase):
                 )
             self.assertEqual(1, observations.download_file.call_count)
 
+    def test_mast_row_fields_replaces_nonfinite_values(self):
+        row = self._Row(nan=float("nan"), positive=float("inf"),
+                        negative=float("-inf"), finite=12.5,
+                        scalar=self._Scalar(float("nan")))
+
+        fields = MastTessSectorArchiveProvider._row_fields(row)
+
+        self.assertEqual({"nan": None, "positive": None, "negative": None,
+                          "finite": 12.5, "scalar": None}, fields)
+
+    def test_mast_row_fields_recursively_replaces_nested_nonfinite_values(self):
+        row = self._Row(metadata={"values": [1, float("nan"),
+                                              (self._Scalar(float("inf")), -2.5)]})
+
+        fields = MastTessSectorArchiveProvider._row_fields(row)
+
+        self.assertEqual({"values": [1, None, (None, -2.5)]}, fields["metadata"])
+
+    def test_mast_nonfinite_exptime_is_missing_and_inventory_is_strict_json(self):
+        observations = [self._Row(obsid=101, obs_id="TIC 42", target_name="TIC 42",
+                                  provenance_name="SPOC", t_exptime=float("nan"),
+                                  missing=float("-inf"))]
+        products = [self._Row(parent_obsid=101, productFilename="tic-42-lc.fits",
+                              dataURI="mast:TESS/product/42", dataRights="PUBLIC",
+                              nested=[float("inf"), {"missing": self._Scalar(float("nan"))}])]
+        mast_observations = MagicMock()
+        mast_observations.query_criteria.return_value = observations
+        mast_observations.get_product_list.return_value = products
+        mast = types.ModuleType("astroquery.mast"); mast.Observations = mast_observations
+        astroquery = types.ModuleType("astroquery"); astroquery.mast = mast
+
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            sys.modules, {"astroquery": astroquery, "astroquery.mast": mast}
+        ):
+            provider = MastTessSectorArchiveProvider()
+            discovered = provider.inventory_sector(7)
+            self.assertIsNone(discovered[0].cadence_seconds)
+            store = TessSectorInventoryStore(Path(tmp) / "inventory.json")
+            store.create_or_load(7, provider)
+            raw = json.loads(store.path.read_text(encoding="utf-8"))
+
+        source = raw["entries"][0]["product"]["source_fields"]
+        self.assertIsNone(source["t_exptime"])
+        self.assertEqual([None, {"missing": None}], source["nested"])
+
     def test_selection_inventory_resume_and_stable_ids(self):
         products = [product(3, cadence=600), product(2, author="TESS-SPOC", cadence=200),
                     product(3, cadence=120), product(2, author="SPOC", cadence=1800),
@@ -165,6 +219,18 @@ class InventoryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             inv = TessSectorInventoryStore(Path(tmp)/"i.json").create_or_load(7, provider)
             self.assertEqual(600, inv.entries[0].product.cadence_seconds)
+
+    def test_missing_cadence_sorts_after_finite_cadence_deterministically(self):
+        products = [product(1, cadence=None, filename="a-missing-lc.fits"),
+                    product(1, cadence=600, filename="finite-lc.fits"),
+                    product(2, cadence=None, filename="z-missing-lc.fits"),
+                    product(2, cadence=None, filename="a-missing-lc.fits")]
+        with tempfile.TemporaryDirectory() as tmp:
+            inv = TessSectorInventoryStore(Path(tmp)/"i.json").create_or_load(
+                7, FakeProvider(products))
+
+        self.assertEqual("finite-lc.fits", inv.entries[0].product.product_filename)
+        self.assertEqual("a-missing-lc.fits", inv.entries[1].product.product_filename)
 
 
 class PreprocessingTests(unittest.TestCase):

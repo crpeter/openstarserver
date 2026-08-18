@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import tempfile
@@ -157,6 +158,16 @@ class MastTessSectorArchiveProvider:
         match = re.search(r"(?:TIC\s*)?(\d+)", str(value or ""), re.I)
         return int(match.group(1)) if match else None
 
+    @staticmethod
+    def _finite_float(value: Any) -> float | None:
+        if value is None:
+            return None
+        try:
+            converted = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return converted if math.isfinite(converted) else None
+
     def inventory_sector(self, sector: int) -> Sequence[TessArchiveProduct]:
         try:
             from astroquery.mast import Observations
@@ -186,22 +197,34 @@ class MastTessSectorArchiveProvider:
                 mast_observation_id=str(fields.get("obsid") or fields.get("parent_obsid") or "") or None,
                 data_uri=fields.get("dataURI"), product_uri=fields.get("dataURI"), product_filename=filename,
                 author=str(observation.get("provenance_name") or fields.get("provenance_name") or ""),
-                cadence_seconds=float(fields["t_exptime"]) if fields.get("t_exptime") is not None else None,
+                cadence_seconds=self._finite_float(fields.get("t_exptime")),
                 data_rights=str(fields.get("dataRights") or "PUBLIC"), source_fields=fields))
         return result
 
     @staticmethod
     def _row_fields(row) -> dict[str, Any]:
+        def sanitize(value: Any) -> Any:
+            if str(value) == "--":
+                return None
+            if hasattr(value, "item"):
+                converted = value.item()
+                if converted is not value:
+                    return sanitize(converted)
+            if isinstance(value, float):
+                return value if math.isfinite(value) else None
+            if isinstance(value, list):
+                return [sanitize(item) for item in value]
+            if isinstance(value, tuple):
+                return tuple(sanitize(item) for item in value)
+            if isinstance(value, dict):
+                return {key: sanitize(item) for key, item in value.items()}
+            if value is not None and not isinstance(value, (str, int, bool)):
+                return str(value)
+            return value
+
         fields = {}
         for name in row.colnames:
-            value = row[name]
-            if str(value) == "--":
-                value = None
-            elif hasattr(value, "item"):
-                value = value.item()
-            if value is not None and not isinstance(value, (str, int, float, bool, list, dict)):
-                value = str(value)
-            fields[name] = value
+            fields[name] = sanitize(row[name])
         return fields
 
     def download_light_curve(self, product: TessArchiveProduct, destination: Path) -> Path:
