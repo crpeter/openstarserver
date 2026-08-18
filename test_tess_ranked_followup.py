@@ -172,6 +172,34 @@ class RankedFollowupTests(unittest.TestCase):
             self.assertEqual((0, [1, 2], []), (code, executions, coordinator.calls))
             self.assertEqual(completed_bytes, investigation_path.read_bytes())
 
+    def test_new_deep_target_receives_verified_full_shallow_primary(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); shallow = root / "shallow"; deep = root / "deep"
+            self._sweep(shallow, (1,))
+            captured = {}
+            def inspect(investigation):
+                captured.update(investigation.metadata["reusablePrimary"])
+            code, coordinator = self._run(shallow, deep, 1, [], execute_hook=inspect)
+            self.assertEqual((0, []), (code, coordinator.calls))
+            self.assertEqual("EXACT_FROZEN_SHALLOW_PRIMARY", captured["verification"])
+            self.assertEqual("openstar.workflow.tess-sector-scan.v1", captured["sourceWorkflowID"])
+            self.assertEqual("COMPLETE", captured["coordinatorResult"]["status"])
+            self.assertEqual(1, len(captured["coordinatorResult"]["datasets"]))
+            self.assertEqual(["project-1"], captured["computeProjectIDs"])
+
+    def test_unverified_shallow_result_is_not_offered_for_reuse(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); shallow = root / "shallow"; deep = root / "deep"
+            self._sweep(shallow, (1,))
+            store = InvestigationStore(shallow / "investigations")
+            investigation = store.load("tess-sector-scan-7-tic-1")
+            evidence_path = Path(investigation.stages[-1].artifacts[0].path)
+            evidence_path.write_text("{}\n", encoding="utf-8")
+            def inspect(investigation):
+                self.assertNotIn("reusablePrimary", investigation.metadata)
+            code, coordinator = self._run(shallow, deep, 1, [], execute_hook=inspect)
+            self.assertEqual((0, []), (code, coordinator.calls))
+
     def test_ranked_rerun_applies_tess_repair_before_scheduler_classification(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary); shallow = root / "shallow"; deep = root / "deep"

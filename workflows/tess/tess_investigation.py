@@ -1487,6 +1487,55 @@ def build_engine(
         )
 
     def run_primary(investigation, request):
+        reusable = investigation.metadata.get("reusablePrimary")
+        prepared = _result(investigation, "001-prepare-target")
+        if isinstance(reusable, dict):
+            try:
+                dataset_path = Path(prepared["datasetPath"]).resolve()
+                dataset = json.loads(dataset_path.read_text(encoding="utf-8"))
+                primary = json.loads(Path(request.parameters["projectPath"]).read_text(encoding="utf-8"))
+                exact = (
+                    reusable.get("verification") == "EXACT_FROZEN_SHALLOW_PRIMARY"
+                    and reusable.get("sourceProjectID") == prepared.get("sourceProjectID")
+                    and reusable.get("datasetID") == prepared.get("datasetID")
+                    and Path(str(reusable.get("datasetArtifact"))).resolve() == dataset_path
+                    and reusable.get("datasetSha256") == sha256_file(dataset_path)
+                    and reusable.get("sourceProjectManifestSha256") == investigation.metadata.get("sourceProjectManifestSha256")
+                    and reusable.get("sourceEvidenceSha256") == investigation.metadata.get("sourceEvidenceSha256")
+                    and reusable.get("frequencySearchSha256") == sha256_json(dataset.get("frequencySearch"))
+                    and primary.get("workloadID") == "openstar.lomb-scargle.v1"
+                    and len(primary.get("datasets", [])) == 1
+                    and primary["datasets"][0] == prepared.get("sourceDatasetEntry")
+                    and sha256_json(reusable.get("coordinatorResult")) == reusable.get("coordinatorResultSha256")
+                    and isinstance(reusable.get("coordinatorResult", {}).get("datasets"), list)
+                    and len(reusable["coordinatorResult"]["datasets"]) == 1
+                )
+            except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+                exact = False
+            if exact:
+                print("♻️ Reusing verified shallow distributed period search")
+                reused_result = copy.deepcopy(reusable["coordinatorResult"])
+                reused_result["reuseProvenance"] = {
+                    "mode": "VERIFIED_SHALLOW_PRIMARY_REUSE",
+                    "sourceScanInvestigationID": reusable["sourceScanInvestigationID"],
+                    "sourceWorkflowID": reusable["sourceWorkflowID"],
+                    "sourceWorkflowVersion": reusable["sourceWorkflowVersion"],
+                    "sourceCoordinatorResultSha256": reusable["coordinatorResultSha256"],
+                    "sourceEvidenceSha256": reusable["sourceEvidenceSha256"],
+                    "datasetSha256": reusable["datasetSha256"],
+                    "frequencySearchSha256": reusable["frequencySearchSha256"],
+                }
+                return StageOutcome(
+                    result=reused_result,
+                    next_stage=StageRequest("003-catalog-identity", "openstar.tess.catalog-identity", {}, request.id),
+                    input_hashes={"sourceProjectManifest": reusable["sourceProjectManifestSha256"],
+                                  "sourceDataset": reusable["datasetSha256"],
+                                  "sourceEvidence": reusable["sourceEvidenceSha256"],
+                                  "sourceCoordinatorResult": reusable["coordinatorResultSha256"],
+                                  "frequencySearch": reusable["frequencySearchSha256"]},
+                    node_contributions=dict(reusable.get("nodeContributions") or {}),
+                    project_ids=tuple(reusable.get("computeProjectIDs") or ()),
+                )
         print("⚙️ Activating primary distributed period search")
         run = coordinator.run_project(
             request.parameters["projectPath"],
