@@ -4,6 +4,7 @@ import copy
 import json
 import math
 import re
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +18,27 @@ MAX_INDEPENDENT_SECTORS = 4
 BROAD_MINIMUM_FREQUENCY = 0.04
 BROAD_MAXIMUM_FREQUENCY = 0.20
 OFFICIAL_AUTHORS = ("SPOC", "TESS-SPOC")
+
+# Lightkurve search results retain Astropy table/file-backed state and its MAST
+# downloader uses process-global machinery.  Keep those objects inside one
+# process-local lifecycle; frozen numpy arrays are safe after this lock exits.
+_MAST_LIGHTKURVE_LOCK = threading.RLock()
+
+
+class TessArchiveInfrastructureError(RuntimeError):
+    """A transient MAST/Lightkurve failure with durable preparation evidence."""
+
+    def __init__(self, message: str, diagnostics: dict[str, Any]):
+        super().__init__(message)
+        self.diagnostics = diagnostics
+
+
+def _archive_io_failure(error: Exception) -> bool:
+    """Classify I/O only while executing an archive lifecycle operation."""
+    return isinstance(error, (OSError, ConnectionError, TimeoutError)) or (
+        isinstance(error, ValueError)
+        and str(error) == "I/O operation on closed file."
+    )
 
 
 def _write_json(path: Path, value: dict[str, Any]) -> None:
@@ -83,22 +105,23 @@ def _exptime_seconds(value: Any) -> float | None:
 def discover_official_sectors(tic_id: int) -> list[int]:
     import lightkurve as lk
 
-    search = lk.search_lightcurve(f"TIC {int(tic_id)}", mission="TESS")
-    table = getattr(search, "table", None)
-    if table is None or len(table) == 0:
-        return []
+    with _MAST_LIGHTKURVE_LOCK:
+        search = lk.search_lightcurve(f"TIC {int(tic_id)}", mission="TESS")
+        table = getattr(search, "table", None)
+        if table is None or len(table) == 0:
+            return []
 
-    sectors: set[int] = set()
-    colnames = set(getattr(table, "colnames", []))
-    for index in range(len(table)):
-        author = None
-        if "author" in colnames:
-            author = str(table["author"][index]).strip().upper()
-        if author not in OFFICIAL_AUTHORS:
-            continue
-        sector = _sector_from_search_row(table, index)
-        if sector is not None:
-            sectors.add(sector)
+        sectors: set[int] = set()
+        colnames = set(getattr(table, "colnames", []))
+        for index in range(len(table)):
+            author = None
+            if "author" in colnames:
+                author = str(table["author"][index]).strip().upper()
+            if author not in OFFICIAL_AUTHORS:
+                continue
+            sector = _sector_from_search_row(table, index)
+            if sector is not None:
+                sectors.add(sector)
     return sorted(sectors)
 
 
@@ -303,7 +326,21 @@ def build_independent_sector_project(
         }
     )
     if not sectors:
-        sectors = discover_official_sectors(tic_id)
+        try:
+            sectors = discover_official_sectors(tic_id)
+        except Exception as error:
+            diagnostic = {
+                "sector": None,
+                "operation": "archive-sector-discovery",
+                "error": f"{type(error).__name__}: {error}",
+            }
+            if _archive_io_failure(error):
+                raise TessArchiveInfrastructureError(
+                    "MAST sector discovery is temporarily unavailable.",
+                    {"candidateSectors": [], "preparedSectors": [],
+                     "errors": [diagnostic]},
+                ) from error
+            raise
     if primary_sector is not None:
         sectors = [
             value
@@ -328,9 +365,42 @@ def build_independent_sector_project(
         "   querying MAST light-curve catalog once for independent sectors...",
         flush=True,
     )
+    infrastructure_errors: list[dict[str, Any]] = []
     try:
-        search = _search_lightcurves(tic_id)
+        with _MAST_LIGHTKURVE_LOCK:
+            search = _search_lightcurves(tic_id)
+            materialized: list[tuple[int, str, float | None, Any, Any, dict[str, Any]]] = []
+            for position, sector in enumerate(selected_sectors, start=1):
+                try:
+                    print(
+                        f"   sector {sector} ({position}/{len(selected_sectors)}): "
+                        "selecting official product",
+                        flush=True,
+                    )
+                    selected, author, cadence_seconds = _select_product_from_search(search, sector)
+                    print("      downloading light curve...", flush=True)
+                    light_curve, source = _download_selected_sector(
+                        selected, tic_id=tic_id, sector=sector, author=author,
+                        cadence_seconds=cadence_seconds,
+                    )
+                    # Materialize while the archive lifecycle remains isolated;
+                    # no Lightkurve/Astropy object escapes the critical section.
+                    times, flux, prep = _prepare_samples(light_curve)
+                    materialized.append((sector, author, cadence_seconds, times, flux, prep))
+                except Exception as error:
+                    diagnostic = {"sector": int(sector), "operation": "archive-materialization",
+                                  "error": f"{type(error).__name__}: {error}"}
+                    errors.append(diagnostic)
+                    if _archive_io_failure(error):
+                        infrastructure_errors.append(diagnostic)
     except Exception as error:
+        diagnostic = {"sector": None, "operation": "archive-search",
+                      "error": f"{type(error).__name__}: {error}"}
+        if _archive_io_failure(error):
+            raise TessArchiveInfrastructureError(
+                "MAST light-curve search is temporarily unavailable.",
+                {"candidateSectors": sectors, "preparedSectors": [], "errors": [diagnostic]},
+            ) from error
         return {
             "available": False,
             "projectID": None,
@@ -339,13 +409,7 @@ def build_independent_sector_project(
             "primarySector": primary_sector,
             "candidateSectors": sectors,
             "preparedSectors": [],
-            "errors": [{
-                "sector": None,
-                "error": (
-                    "MAST search failed: "
-                    f"{type(error).__name__}: {error}"
-                ),
-            }],
+            "errors": [diagnostic],
             "frequencySearch": frequency_search,
         }
 
@@ -354,44 +418,16 @@ def build_independent_sector_project(
         flush=True,
     )
 
-    for position, sector in enumerate(selected_sectors, start=1):
+    if infrastructure_errors:
+        raise TessArchiveInfrastructureError(
+            "MAST light-curve download or materialization is temporarily unavailable.",
+            {"candidateSectors": sectors, "preparedSectors": [],
+             "errors": errors, "frequencySearch": frequency_search},
+        )
+
+    for sector, author, cadence_seconds, times, flux, prep in materialized:
         try:
-            print(
-                f"   sector {sector} ({position}/{len(selected_sectors)}): "
-                "selecting official product",
-                flush=True,
-            )
-            selected, author, cadence_seconds = (
-                _select_product_from_search(
-                    search,
-                    sector,
-                )
-            )
-            cadence_text = (
-                f"{cadence_seconds:.0f}s"
-                if cadence_seconds is not None
-                else "unknown cadence"
-            )
-            print(
-                f"      selected: {author} | {cadence_text}",
-                flush=True,
-            )
-            print(
-                "      downloading light curve...",
-                flush=True,
-            )
-            light_curve, source = _download_selected_sector(
-                selected,
-                tic_id=tic_id,
-                sector=sector,
-                author=author,
-                cadence_seconds=cadence_seconds,
-            )
-            print(
-                "      download complete; preparing frozen samples...",
-                flush=True,
-            )
-            times, flux, prep = _prepare_samples(light_curve)
+            source = {"author": author, "cadenceSeconds": cadence_seconds}
 
             dataset_id = f"{source_dataset_entry['id']}-sector-{sector}-independent-v1"
             target_name = (

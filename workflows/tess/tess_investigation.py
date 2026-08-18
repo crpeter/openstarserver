@@ -146,6 +146,7 @@ from .tess_observation_planning import (
     build_targeted_observation_plan,
 )
 from .tess_multisector import (
+    TessArchiveInfrastructureError,
     build_broad_independent_sector_project,
     build_independent_sector_project,
 )
@@ -1771,16 +1772,23 @@ def build_engine(
         print(f"   target period: {target_period} days")
         print(f"   catalog official sectors: {official_sectors}")
 
-        spec = build_independent_sector_project(
-            source_project_path=prepared["sourceProjectPath"],
-            source_dataset_entry=prepared["sourceDatasetEntry"],
-            tic_id=int(prepared["ticID"]),
-            primary_sector=prepared.get("sector"),
-            target_period_days=float(target_period),
-            candidate_sectors=list(official_sectors),
-            output_dir=artifact_root,
-            investigation_id=investigation.id,
-        )
+        try:
+            spec = build_independent_sector_project(
+                source_project_path=prepared["sourceProjectPath"],
+                source_dataset_entry=prepared["sourceDatasetEntry"],
+                tic_id=int(prepared["ticID"]),
+                primary_sector=prepared.get("sector"),
+                target_period_days=float(target_period),
+                candidate_sectors=list(official_sectors),
+                output_dir=artifact_root,
+                investigation_id=investigation.id,
+            )
+        except TessArchiveInfrastructureError as error:
+            raise RetryableExecutionError(
+                str(error), result=error.diagnostics,
+                input_hashes={"identity": sha256_json(identity),
+                              "planner": sha256_json(planner)},
+            ) from error
 
         print(f"   prepared independent sectors: {[item.get('sector') for item in spec.get('preparedSectors') or []]}")
         if spec.get("errors"):
