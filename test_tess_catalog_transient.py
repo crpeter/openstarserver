@@ -3,7 +3,19 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from openstar_investigation import InvestigationStage, InvestigationStore
+from openstar_investigation import (
+    ArtifactReference,
+    InvestigationStage,
+    InvestigationStore,
+    sha256_file,
+    sha256_json,
+)
+from openstar_workflow import (
+    RetryableExecutionError,
+    StageOutcome,
+    StageRequest,
+    WorkflowEngine,
+)
 from workflows.tess.tess_autonomy import WORKFLOW_ID, repair_obsolete_terminal_wait
 from workflows.tess.tess_identity import (
     TRANSIENT_INFRASTRUCTURE,
@@ -45,6 +57,80 @@ class CatalogTransientTests(unittest.TestCase):
                    return_value={"found": False, "sources": []}):
             identity = collect_identity(1)
         self.assertEqual([], transient_required_catalog_failures(identity))
+
+    def test_retryable_attempt_evidence_and_artifacts_are_immutable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = InvestigationStore(directory)
+            investigation = store.create("attempts", WORKFLOW_ID, "20.2")
+            engine = WorkflowEngine(store)
+            primary = {"periodStatus": "RELIABLE"}
+            primary_runs = 1
+
+            def identity_handler(current, request):
+                artifact_path = (
+                    store.directory_for(current.id) / "artifacts" / "identity"
+                    / f"{request.id}.json"
+                )
+                artifact_path.parent.mkdir(parents=True, exist_ok=True)
+                if request.id == "003-catalog-identity":
+                    result = {
+                        "gaiaDR3": {
+                            "queryError": "ReadTimeout: late",
+                            "queryErrorType": "ReadTimeout",
+                            "queryErrorClassification": TRANSIENT_INFRASTRUCTURE,
+                        }
+                    }
+                    artifact_path.write_text(str(result), encoding="utf-8")
+                    raise RetryableExecutionError(
+                        "Gaia unavailable",
+                        result=result,
+                        input_hashes={"primaryTargetResult": sha256_json(primary)},
+                        artifacts=(ArtifactReference(
+                            str(artifact_path), sha256_file(artifact_path),
+                            "application/json"),),
+                    )
+                result = {"gaiaDR3": {"found": False, "sources": []}}
+                artifact_path.write_text(str(result), encoding="utf-8")
+                return StageOutcome(
+                    result=result,
+                    stop=True,
+                    input_hashes={"primaryTargetResult": sha256_json(primary)},
+                    artifacts=(ArtifactReference(
+                        str(artifact_path), sha256_file(artifact_path),
+                        "application/json"),),
+                )
+
+            engine.register_handler("openstar.tess.catalog-identity", identity_handler)
+            first_request = StageRequest(
+                "003-catalog-identity", "openstar.tess.catalog-identity", {})
+            with self.assertRaises(RetryableExecutionError):
+                engine.run_stage(investigation, first_request,
+                                 software_id="test", software_version="1")
+            failed = store.load("attempts").stages[-1]
+            failed_bytes = Path(failed.artifacts[0].path).read_bytes()
+            self.assertEqual("FAILED", failed.status)
+            self.assertEqual(TRANSIENT_INFRASTRUCTURE,
+                             failed.failure_classification)
+            self.assertEqual("ReadTimeout",
+                             failed.result["gaiaDR3"]["queryErrorType"])
+            self.assertEqual(sha256_file(failed.artifacts[0].path),
+                             failed.artifacts[0].sha256)
+
+            retry_request = StageRequest(
+                "004-catalog-identity", "openstar.tess.catalog-identity", {},
+                first_request.id)
+            engine.run_stage(store.load("attempts"), retry_request,
+                             software_id="test", software_version="1")
+            retried = store.load("attempts")
+            completed = retried.stages[-1]
+            self.assertEqual("COMPLETE", completed.status)
+            self.assertNotEqual(failed.artifacts[0].path,
+                                completed.artifacts[0].path)
+            self.assertEqual(failed_bytes,
+                             Path(failed.artifacts[0].path).read_bytes())
+            self.assertEqual({"found": False, "sources": []},
+                             completed.result["gaiaDR3"])
+            self.assertEqual(1, primary_runs)
 
     def test_simbad_only_transient_is_optional(self):
         identity = {

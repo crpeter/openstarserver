@@ -172,6 +172,27 @@ class RankedFollowupTests(unittest.TestCase):
             self.assertEqual((0, [1, 2], []), (code, executions, coordinator.calls))
             self.assertEqual(completed_bytes, investigation_path.read_bytes())
 
+    def test_ranked_rerun_applies_tess_repair_before_scheduler_classification(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); shallow = root / "shallow"; deep = root / "deep"
+            self._sweep(shallow)
+            executions = []
+            self._run(shallow, deep, 1, executions)
+            repaired = []
+
+            def repair(store, investigation):
+                repaired.append(investigation.id)
+                return investigation
+
+            with patch(
+                "run_openstar_tess_ranked_followup.repair_obsolete_terminal_wait",
+                side_effect=repair,
+            ):
+                code, _ = self._run(shallow, deep, 1, executions)
+            self.assertEqual(0, code)
+            self.assertEqual(["tess-discovery-sector-7-tic-1"], repaired)
+            self.assertEqual([1], executions)
+
     def test_runner_refresh_is_local_and_shallow_science_is_unchanged(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary); shallow = root / "shallow"; deep = root / "deep"

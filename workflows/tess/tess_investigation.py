@@ -1520,7 +1520,7 @@ def build_engine(
             store.directory_for(investigation.id)
             / "artifacts"
             / "identity"
-            / "identity.json"
+            / f"{request.id}.json"
         )
         _write_json(artifact_path, identity)
         print(f"   identity resolved: {identity.get('identityResolved')}")
@@ -1531,7 +1531,10 @@ def build_engine(
         if transient_failures:
             raise RetryableExecutionError(
                 "Required catalog infrastructure failed transiently: "
-                + ", ".join(transient_failures)
+                + ", ".join(transient_failures),
+                result=identity,
+                input_hashes={"primaryTargetResult": sha256_json(primary)},
+                artifacts=(_artifact(artifact_path, "application/json"),),
             )
 
         return StageOutcome(
