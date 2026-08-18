@@ -117,7 +117,18 @@ def _entry(inventory: TessSectorInventory, item, store: InvestigationStore) -> T
     except Exception as error:
         return TessSectorRankingEntry("FAILED", tic, product.target_name,
                                       (f"MALFORMED_INVESTIGATION:{type(error).__name__}",), base)
-    if investigation.status == "FAILED" or any(stage.status == "FAILED" for stage in investigation.stages):
+    historical_failures = tuple(stage for stage in investigation.stages if stage.status == "FAILED")
+    base.update({
+        "historicalFailedAttemptCount": len(historical_failures),
+        "historicalFailedStageIDs": [stage.id for stage in historical_failures],
+        "historicalFailureClassifications": [
+            stage.failure_classification for stage in historical_failures
+        ],
+    })
+    # Terminal stages are immutable attempt provenance.  A durable retry can
+    # therefore be COMPLETE while still containing earlier FAILED stages; only
+    # the investigation's current outcome determines whether ranking failed.
+    if investigation.status == "FAILED":
         return TessSectorRankingEntry("FAILED", tic, product.target_name, ("FAILED_INVESTIGATION",), base)
     if investigation.status != "COMPLETE":
         return TessSectorRankingEntry("INCOMPLETE", tic, product.target_name,
