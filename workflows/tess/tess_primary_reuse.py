@@ -9,6 +9,21 @@ from openstar_investigation import sha256_file, sha256_json
 from openstar_workflow import StageOutcome, StageRequest
 
 
+def coordinator_dataset_identity_matches(result, expected_dataset_id) -> bool:
+    """Match a coordinator dataset result using ``id`` as its canonical identity."""
+    if not isinstance(result, dict):
+        return False
+    if "id" in result:
+        identity = result["id"]
+        if "datasetID" in result and str(result["datasetID"]) != str(identity):
+            return False
+    elif "datasetID" in result:
+        identity = result["datasetID"]
+    else:
+        return False
+    return identity is not None and str(identity) == str(expected_dataset_id)
+
+
 def run_primary(investigation, request, coordinator, *, poll_interval, timeout):
     prepared_stages = [stage for stage in investigation.stages
                        if stage.id == "001-prepare-target" and stage.status == "COMPLETE"]
@@ -39,7 +54,8 @@ def run_primary(investigation, request, coordinator, *, poll_interval, timeout):
                 and sha256_json(reusable.get("coordinatorResult")) == reusable.get("coordinatorResultSha256")
                 and isinstance(source_results, list) and len(source_results) == 1
                 and isinstance(source_results[0], dict)
-                and str(source_results[0].get("datasetID")) == str(prepared.get("datasetID"))
+                and coordinator_dataset_identity_matches(
+                    source_results[0], prepared.get("datasetID"))
                 and (source_results[0].get("ticID") is None
                      or source_results[0].get("ticID") == prepared.get("ticID"))
                 and (source_results[0].get("sector") is None

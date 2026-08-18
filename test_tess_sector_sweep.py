@@ -63,7 +63,7 @@ class FakeCoordinator:
             time.sleep(.02)
             self.calls.append(tic)
             if tic == self.fail_tic: raise RuntimeError("bad coordinator target")
-            dataset = {"datasetID": manifest["datasets"][0]["id"], "ticID": tic,
+            dataset = {"id": manifest["datasets"][0]["id"], "ticID": tic,
                        "sector": manifest["datasets"][0]["sector"],
                        "bestFrequency": .5, "bestPeriodDays": 2.0, "bestPower": .8,
                        "periodStatus": "RELIABLE", "periodConfidence": "high",
