@@ -9,11 +9,17 @@ from dataclasses import replace
 from pathlib import Path
 
 from openstar_coordinator_client import ProjectRunResult
+from openstar_dispatch import InvestigationDispatcher
+from openstar_investigation import InvestigationStore
+from openstar_scheduler import InvestigationScheduler
 from workflows.tess.tess_preprocessing import prepare_tess_samples
 from workflows.tess.tess_sector_archive import (
     MastTessSectorArchiveProvider, TessArchiveProduct, TessSectorInventoryStore,
 )
-from workflows.tess.tess_sector_scan import TessSectorScanTargetSource
+from workflows.tess.tess_sector_scan import (
+    WORKFLOW_ID, TessSectorScanTargetSource, plan_tess_sector_scan,
+    register_tess_sector_scan_handlers,
+)
 from run_openstar_tess_sector_sweep import run_tess_sector_sweep
 
 
@@ -115,6 +121,88 @@ class PreprocessingTests(unittest.TestCase):
 
 
 class SweepTests(unittest.TestCase):
+    def _partial_scheduler(self, root, provider, coordinator, *, chained):
+        inventory = TessSectorInventoryStore(root / "inventory.json").create_or_load(7, provider)
+        store = InvestigationStore(root / "investigations")
+        workflow = register_tess_sector_scan_handlers(
+            store, coordinator, provider, preprocessing=lambda path: Prepared()
+        )
+        workflow.chain_stages = chained
+        scheduler = InvestigationScheduler(
+            store, InvestigationDispatcher(store, workflow),
+            TessSectorScanTargetSource(inventory),
+            {WORKFLOW_ID: plan_tess_sector_scan}, software_id="test-sector-sweep",
+            software_version="1", max_concurrent_investigations=1,
+        )
+        return store, scheduler
+
+    def _assert_resumed_terminal_scan(self, investigation, provider, coordinator):
+        self.assertEqual("COMPLETE", investigation.status)
+        self.assertEqual(
+            ["001-materialize-light-curve", "002-broad-distributed-scan",
+             "003-persist-scan-evidence"],
+            [stage.id for stage in investigation.stages],
+        )
+        self.assertTrue(all(stage.status == "COMPLETE" for stage in investigation.stages))
+        self.assertEqual(1, provider.downloads.count(1))
+        self.assertEqual(1, coordinator.calls.count(1))
+        scan = investigation.stages[1]
+        self.assertEqual(("project-1",), scan.provenance.project_ids)
+        self.assertEqual({"iphone": 1, "mac": 2}, scan.provenance.node_contributions)
+        evidence = investigation.stages[2]
+        self.assertTrue(evidence.stop)
+        self.assertEqual(["project-1"], evidence.result["computeProjectIDs"])
+        self.assertEqual({"iphone": 1, "mac": 2}, evidence.result["nodeContributions"])
+        self.assertTrue(Path(evidence.artifacts[0].path).exists())
+
+    def test_restart_after_materialization_resumes_persisted_002(self):
+        provider, coordinator = FakeProvider([product(1)]), FakeCoordinator()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store, before_crash = self._partial_scheduler(
+                root, provider, coordinator, chained=False
+            )
+            first = before_crash.run_round().outcomes[0].investigation
+            self.assertEqual("RUNNING", first.status)
+            self.assertEqual(["001-materialize-light-curve"], [s.id for s in first.stages])
+            self.assertEqual("002-broad-distributed-scan", first.stages[0].next_stage["id"])
+            self.assertEqual([1], provider.downloads)
+            self.assertEqual([], coordinator.calls)
+
+            store, restarted = self._partial_scheduler(
+                root, provider, coordinator, chained=True
+            )
+            restarted.run_until_idle()
+            self._assert_resumed_terminal_scan(
+                store.load("tess-sector-scan-7-tic-1"), provider, coordinator
+            )
+
+    def test_restart_after_compute_resumes_persisted_003(self):
+        provider, coordinator = FakeProvider([product(1)]), FakeCoordinator()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store, before_crash = self._partial_scheduler(
+                root, provider, coordinator, chained=False
+            )
+            before_crash.run_round()
+            second = before_crash.run_round().outcomes[0].investigation
+            self.assertEqual("RUNNING", second.status)
+            self.assertEqual(
+                ["001-materialize-light-curve", "002-broad-distributed-scan"],
+                [stage.id for stage in second.stages],
+            )
+            self.assertEqual("003-persist-scan-evidence", second.stages[1].next_stage["id"])
+            self.assertEqual([1], provider.downloads)
+            self.assertEqual([1], coordinator.calls)
+
+            store, restarted = self._partial_scheduler(
+                root, provider, coordinator, chained=True
+            )
+            restarted.run_until_idle()
+            self._assert_resumed_terminal_scan(
+                store.load("tess-sector-scan-7-tic-1"), provider, coordinator
+            )
+
     def test_concurrent_shallow_evidence_resume_and_runtime_limit(self):
         provider = FakeProvider([product(3), product(1), product(2)])
         coordinator = FakeCoordinator()

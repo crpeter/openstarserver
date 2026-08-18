@@ -62,12 +62,37 @@ class TessSectorScanTargetSource:
 
 
 def plan_tess_sector_scan(investigation: Investigation, target: InvestigationTarget):
-    if investigation.stages and investigation.stages[-1].status == "COMPLETE" and investigation.stages[-1].stop:
+    if not investigation.stages:
+        return (ScientificBranch("materialize-selected-archive-product", StageRequest(
+            "001-materialize-light-curve", MATERIALIZE_HANDLER, {}, None)),)
+
+    latest = investigation.stages[-1]
+    if latest.status != "COMPLETE":
+        # RUNNING and FAILED stages are deliberately classified and recovered
+        # by InvestigationLifecycleDriver, not by this scientific planner.
         return ()
-    if investigation.stages:
+    if latest.stop:
         return ()
-    return (ScientificBranch("materialize-selected-archive-product", StageRequest(
-        "001-materialize-light-curve", MATERIALIZE_HANDLER, {}, None)),)
+
+    continuation = latest.next_stage
+    if not isinstance(continuation, dict):
+        raise RuntimeError(
+            f"Completed nonterminal scan stage has no continuation: {latest.id}"
+        )
+    request = StageRequest(
+        id=str(continuation["id"]),
+        handler_id=str(continuation["handler_id"]),
+        parameters=dict(continuation.get("parameters") or {}),
+        triggered_by_stage_id=continuation.get("triggered_by_stage_id"),
+    )
+    if any(stage.id == request.id for stage in investigation.stages):
+        # This is reachable only for malformed/manual state; never manufacture
+        # a duplicate stage attempt. Generic lifecycle recovery owns real
+        # RUNNING/FAILED attempts and encounters those as the latest stage.
+        raise RuntimeError(f"Persisted scan continuation was already attempted: {request.id}")
+    return (ScientificBranch(
+        f"resume-persisted-continuation-{request.id}", request
+    ),)
 
 
 def _result(investigation: Investigation, handler: str) -> dict[str, Any]:
