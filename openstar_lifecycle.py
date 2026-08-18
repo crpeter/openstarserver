@@ -126,6 +126,40 @@ class InvestigationLifecycleDriver:
             triggered_by_stage_id=failed.id,
         )
 
+    @staticmethod
+    def _has_persisted_failed_stage_recovery(
+        investigation: Investigation, failed
+    ) -> bool:
+        """Recognize a deliberate, durable replacement for the latest failure.
+
+        This does not decide whether a failure is safe to retry.  It only honors
+        a decision already persisted by a workflow-specific repair or planner,
+        while requiring an unambiguous fresh stage identity.
+        """
+        if investigation.status != "RUNNING":
+            return False
+        control = investigation.metadata.get("controlState")
+        if (
+            not isinstance(control, dict)
+            or control.get("schedulerAction") != "RUN_EXPERIMENT"
+        ):
+            return False
+        selected = control.get("selectedExperiment")
+        if not isinstance(selected, dict):
+            return False
+        stage_id = selected.get("id")
+        handler_id = selected.get("handler_id")
+        parameters = selected.get("parameters", {})
+        return (
+            isinstance(stage_id, str)
+            and bool(stage_id)
+            and isinstance(handler_id, str)
+            and bool(handler_id)
+            and isinstance(parameters, dict)
+            and selected.get("triggered_by_stage_id") == failed.id
+            and not any(stage.id == stage_id for stage in investigation.stages)
+        )
+
     def prepare(self, target: InvestigationTarget) -> InvestigationPreparation:
         investigation = self.attach(target)
         transitions = 0
@@ -134,8 +168,19 @@ class InvestigationLifecycleDriver:
                 investigation, InvestigationSchedulingState.RECOVERY_REQUIRED
             )
 
+        latest_failed = (
+            investigation.stages[-1]
+            if investigation.stages and investigation.stages[-1].status == "FAILED"
+            else None
+        )
+        persisted_recovery = (
+            latest_failed is not None
+            and self._has_persisted_failed_stage_recovery(
+                investigation, latest_failed
+            )
+        )
         failed = self._retryable_failure(investigation)
-        if failed is not None:
+        if failed is not None and not persisted_recovery:
             control = investigation.metadata.get("controlState")
             selected = (
                 control.get("selectedExperiment") if isinstance(control, dict) else None
@@ -161,7 +206,7 @@ class InvestigationLifecycleDriver:
                     },
                 )
                 transitions += 1
-        elif investigation.stages and investigation.stages[-1].status == "FAILED":
+        elif latest_failed is not None and not persisted_recovery:
             return InvestigationPreparation(
                 investigation, InvestigationSchedulingState.FAILED
             )
