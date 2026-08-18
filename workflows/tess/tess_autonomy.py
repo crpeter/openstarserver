@@ -263,6 +263,73 @@ def _request_from_persisted(raw: dict) -> StageRequest:
     )
 
 
+_LEGACY_TRANSIENT_QUERY_TYPES = {
+    "Timeout", "ReadTimeout", "ConnectTimeout", "TimeoutError", "ConnectionError",
+    "ConnectError", "NewConnectionError", "MaxRetryError", "NameResolutionError",
+    "NetworkError",
+}
+
+
+def _transient_required_identity_failure(result: dict) -> bool:
+    for key in ("tic", "vsx", "gaiaDR3", "gaiaVariability"):
+        query = result.get(key) or {}
+        if query.get("queryErrorClassification") == "TRANSIENT_INFRASTRUCTURE":
+            return True
+        # Historical identity snapshots retained the exception type at the
+        # beginning of queryError, before structured classification existed.
+        error_type = query.get("queryErrorType")
+        if not error_type and isinstance(query.get("queryError"), str):
+            error_type = query["queryError"].partition(":")[0]
+        if error_type in _LEGACY_TRANSIENT_QUERY_TYPES:
+            return True
+    return False
+
+
+def _repair_catalog_timeout_terminal(
+    store: InvestigationStore, investigation: Investigation, control: dict
+) -> Investigation | None:
+    if investigation.status != "COMPLETE" or control.get("schedulerAction") != "INVESTIGATION_COMPLETE":
+        return None
+    conclusion = next((stage.result for stage in reversed(investigation.stages)
+                       if stage.status == "COMPLETE" and isinstance(stage.result, dict)
+                       and (stage.result.get("claim") is not None)), None)
+    claim = conclusion.get("claim") if conclusion else None
+    if isinstance(claim, dict):
+        claim = claim.get("claim")
+    planner = _latest_complete(investigation, "openstar.tess.planner")
+    if claim != "HUMAN_REVIEW_REQUIRED" or planner is None or (planner.result or {}).get("reason") != "catalog-coverage-incomplete":
+        return None
+
+    identities = [stage for stage in investigation.stages
+                  if stage.handler_id == "openstar.tess.catalog-identity"
+                  and stage.status == "COMPLETE" and isinstance(stage.result, dict)]
+    failed_index = next((index for index, stage in enumerate(identities)
+                         if _transient_required_identity_failure(stage.result or {})), None)
+    if failed_index is None or any(
+        not _transient_required_identity_failure(stage.result or {})
+        for stage in identities[failed_index + 1:]
+    ):
+        return None
+    prefixes = [int(stage.id.partition("-")[0]) for stage in investigation.stages
+                if stage.id.partition("-")[0].isdigit()]
+    retry = StageRequest(
+        id=f"{max(prefixes, default=0) + 1:03d}-catalog-identity",
+        handler_id="openstar.tess.catalog-identity",
+        parameters={},
+        triggered_by_stage_id=identities[failed_index].id,
+    )
+    return store.set_control_state(
+        investigation,
+        status="RUNNING",
+        control_state={
+            "branchAssessments": [],
+            "selectedExperiment": asdict(retry),
+            "schedulerAction": "RUN_EXPERIMENT",
+            "recovery": "TRANSIENT_CATALOG_IDENTITY_COMPATIBILITY_RETRY",
+        },
+    )
+
+
 def repair_obsolete_terminal_wait(
     store: InvestigationStore, investigation: Investigation
 ) -> Investigation:
@@ -271,6 +338,10 @@ def repair_obsolete_terminal_wait(
     control = investigation.metadata.get("controlState")
     if investigation.workflow_id != WORKFLOW_ID or not isinstance(control, dict):
         return investigation
+
+    catalog_repair = _repair_catalog_timeout_terminal(store, investigation, control)
+    if catalog_repair is not None:
+        return catalog_repair
 
     if (
         investigation.status == "BLOCKED"

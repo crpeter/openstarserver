@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import re
+import socket
 from typing import Any
 
 
@@ -19,6 +20,40 @@ GAIA_VARIABILITY_CATALOGS = (
 )
 VSX_RADIUS_ARCSEC = 10.0
 GAIA_RADIUS_ARCSEC = 5.0
+TRANSIENT_INFRASTRUCTURE = "TRANSIENT_INFRASTRUCTURE"
+
+
+def classify_query_exception(error: BaseException) -> str | None:
+    """Classify transport failures without interpreting exception messages."""
+    status = getattr(getattr(error, "response", None), "status_code", None)
+    if status is None:
+        status = getattr(error, "status", None) or getattr(error, "code", None)
+    if isinstance(status, int) and (status in {408, 425, 429} or 500 <= status <= 599):
+        return TRANSIENT_INFRASTRUCTURE
+
+    transient_names = {
+        "Timeout", "ReadTimeout", "ConnectTimeout", "TimeoutError",
+        "ConnectionError", "ConnectError", "NewConnectionError",
+        "MaxRetryError", "NameResolutionError", "NetworkError",
+    }
+    if isinstance(error, (TimeoutError, ConnectionError, socket.gaierror)) or any(
+        cls.__name__ in transient_names
+        and cls.__module__.split(".", 1)[0] in {"requests", "httpx", "urllib3", "socket", "builtins"}
+        for cls in type(error).__mro__
+    ):
+        return TRANSIENT_INFRASTRUCTURE
+    return None
+
+
+def _query_failure(error: BaseException) -> dict[str, Any]:
+    failure = {
+        "queryError": f"{type(error).__name__}: {error}",
+        "queryErrorType": type(error).__name__,
+    }
+    classification = classify_query_exception(error)
+    if classification:
+        failure["queryErrorClassification"] = classification
+    return failure
 
 
 def _python_value(value: Any) -> Any:
@@ -73,20 +108,25 @@ def _query_tic(tic_id: int) -> dict[str, Any]:
     from astroquery.mast import Catalogs
 
     table = None
-    errors = []
+    errors: list[BaseException] = []
     for catalog_name in ("TIC", "Tic"):
         try:
             table = Catalogs.query_criteria(catalog=catalog_name, ID=int(tic_id))
             if table is not None and len(table) > 0:
                 break
         except Exception as error:
-            errors.append(f"{catalog_name}: {type(error).__name__}: {error}")
+            errors.append(error)
 
     if table is None or len(table) == 0:
-        return {
+        failure = {
             "found": False,
-            "queryError": "; ".join(errors) if errors else "TIC ID not found.",
+            "queryError": "; ".join(f"{type(e).__name__}: {e}" for e in errors) if errors else "TIC ID not found.",
         }
+        if errors:
+            failure["queryErrorType"] = type(errors[-1]).__name__
+            if any(classify_query_exception(error) for error in errors):
+                failure["queryErrorClassification"] = TRANSIENT_INFRASTRUCTURE
+        return failure
 
     selected = None
     for row in table:
@@ -146,7 +186,7 @@ def _query_simbad(tic_id: int) -> dict[str, Any]:
     try:
         table = Simbad.query_object(f"TIC {int(tic_id)}")
     except Exception as error:
-        result["queryError"] = f"{type(error).__name__}: {error}"
+        result.update(_query_failure(error))
         return result
     if table is None or len(table) == 0:
         return result
@@ -203,7 +243,7 @@ def _query_vsx(coordinate: Any) -> dict[str, Any]:
             catalog=VSX_CATALOG,
         )
     except Exception as error:
-        return {"found": False, "queryError": f"{type(error).__name__}: {error}"}
+        return {"found": False, **_query_failure(error)}
     if len(result) == 0 or len(result[0]) == 0:
         return {"found": False, "matches": []}
 
@@ -236,7 +276,7 @@ def _query_gaia_main(coordinate: Any) -> dict[str, Any]:
             catalog=GAIA_MAIN_CATALOG,
         )
     except Exception as error:
-        return {"found": False, "queryError": f"{type(error).__name__}: {error}"}
+        return {"found": False, **_query_failure(error)}
     if len(result) == 0 or len(result[0]) == 0:
         return {"found": False, "sources": []}
 
@@ -324,7 +364,7 @@ def _query_gaia_variability(source_id: int) -> dict[str, Any]:
             Source=str(int(source_id)),
         )
     except Exception as error:
-        output["queryError"] = f"{type(error).__name__}: {error}"
+        output.update(_query_failure(error))
         return output
 
     for key in result.keys():
@@ -370,7 +410,7 @@ def _query_tess_products(tic_id: int) -> dict[str, Any]:
     try:
         search = lk.search_lightcurve(f"TIC {int(tic_id)}", mission="TESS")
     except Exception as error:
-        return {"found": False, "products": [], "officialProducts": [], "queryError": f"{type(error).__name__}: {error}"}
+        return {"found": False, "products": [], "officialProducts": [], **_query_failure(error)}
     table = getattr(search, "table", None)
     if table is None or len(table) == 0:
         return {"found": False, "products": [], "officialProducts": [], "officialSectors": []}
@@ -417,7 +457,7 @@ def collect_identity(tic_id: int) -> dict[str, Any]:
     try:
         tic = _query_tic(tic_id)
     except Exception as error:
-        tic = {"found": False, "queryError": f"{type(error).__name__}: {error}"}
+        tic = {"found": False, **_query_failure(error)}
     if tic.get("queryError"):
         query_errors.append(f"TIC: {tic['queryError']}")
 
@@ -430,21 +470,21 @@ def collect_identity(tic_id: int) -> dict[str, Any]:
     try:
         simbad = _query_simbad(tic_id)
     except Exception as error:
-        simbad = {"found": False, "queryError": f"{type(error).__name__}: {error}"}
+        simbad = {"found": False, **_query_failure(error)}
     if simbad.get("queryError"):
         query_errors.append(f"SIMBAD: {simbad['queryError']}")
 
     try:
         vsx = _query_vsx(coordinate)
     except Exception as error:
-        vsx = {"found": False, "queryError": f"{type(error).__name__}: {error}"}
+        vsx = {"found": False, **_query_failure(error)}
     if vsx.get("queryError"):
         query_errors.append(f"VSX: {vsx['queryError']}")
 
     try:
         gaia = _query_gaia_main(coordinate)
     except Exception as error:
-        gaia = {"found": False, "queryError": f"{type(error).__name__}: {error}"}
+        gaia = {"found": False, **_query_failure(error)}
     if gaia.get("queryError"):
         query_errors.append(f"Gaia: {gaia['queryError']}")
 
@@ -454,7 +494,7 @@ def collect_identity(tic_id: int) -> dict[str, Any]:
         try:
             gaia_variability = _query_gaia_variability(int(nearest["sourceID"]))
         except Exception as error:
-            gaia_variability = {"classification": None, "tablesFound": [], "periodCandidates": [], "queryError": f"{type(error).__name__}: {error}"}
+            gaia_variability = {"classification": None, "tablesFound": [], "periodCandidates": [], **_query_failure(error)}
     for error in gaia_variability.get("queryErrors") or []:
         query_errors.append(f"Gaia variability: {error}")
     if gaia_variability.get("queryError"):
@@ -463,7 +503,7 @@ def collect_identity(tic_id: int) -> dict[str, Any]:
     try:
         tess = _query_tess_products(tic_id)
     except Exception as error:
-        tess = {"found": False, "products": [], "officialProducts": [], "queryError": f"{type(error).__name__}: {error}"}
+        tess = {"found": False, "products": [], "officialProducts": [], **_query_failure(error)}
     if tess.get("queryError"):
         query_errors.append(f"TESS inventory: {tess['queryError']}")
 
@@ -478,3 +518,11 @@ def collect_identity(tic_id: int) -> dict[str, Any]:
         "queryErrors": query_errors,
         "identityResolved": bool(tic.get("found")),
     }
+
+
+def transient_required_catalog_failures(identity: dict[str, Any]) -> list[str]:
+    """Return failed required period-catalog paths; optional enrichment is excluded."""
+    required = (("TIC", "tic"), ("VSX", "vsx"), ("Gaia", "gaiaDR3"),
+                ("Gaia variability", "gaiaVariability"))
+    return [name for name, key in required if
+            (identity.get(key) or {}).get("queryErrorClassification") == TRANSIENT_INFRASTRUCTURE]
