@@ -33,7 +33,7 @@ from .tess_hypotheses import (
     plan,
     plan_independent_contradiction_resolution,
 )
-from .tess_identity import collect_identity
+from .tess_identity import collect_identity, transient_required_catalog_failures
 from .tess_morphology import analyze_morphology
 from .tess_physical import analyze_physical_interpretation
 from .tess_localization import localize_periodic_source
@@ -1520,18 +1520,27 @@ def build_engine(
             store.directory_for(investigation.id)
             / "artifacts"
             / "identity"
-            / "identity.json"
+            / f"{request.id}.json"
         )
         _write_json(artifact_path, identity)
         print(f"   identity resolved: {identity.get('identityResolved')}")
         print(f"   catalog query errors: {len(identity.get('queryErrors') or [])}")
         tess = identity.get("tess") or {}
         print(f"   official TESS sectors: {tess.get('officialSectors') or []}")
+        transient_failures = transient_required_catalog_failures(identity)
+        if transient_failures:
+            raise RetryableExecutionError(
+                "Required catalog infrastructure failed transiently: "
+                + ", ".join(transient_failures),
+                result=identity,
+                input_hashes={"primaryTargetResult": sha256_json(primary)},
+                artifacts=(_artifact(artifact_path, "application/json"),),
+            )
 
         return StageOutcome(
             result=identity,
             next_stage=StageRequest(
-                id="004-hypotheses",
+                id=_next_stage_id(request.id, "hypotheses"),
                 handler_id="openstar.tess.hypotheses",
                 parameters={},
                 triggered_by_stage_id=request.id,
@@ -1543,7 +1552,9 @@ def build_engine(
     def hypothesis_stage(investigation, request):
         prepared = _result(investigation, "001-prepare-target")
         primary = _target_result(_result(investigation, "002-primary-distributed-search"))
-        identity = _result(investigation, "003-catalog-identity")
+        identity = _latest_result_for_handler(investigation, "openstar.tess.catalog-identity")
+        if identity is None:
+            raise RuntimeError("Hypotheses require completed catalog identity.")
         analysis = analyze(
             primary,
             identity,
@@ -1563,7 +1574,7 @@ def build_engine(
         return StageOutcome(
             result=analysis,
             next_stage=StageRequest(
-                id="005-planner",
+                id=_next_stage_id(request.id, "planner"),
                 handler_id="openstar.tess.planner",
                 parameters={},
                 triggered_by_stage_id=request.id,
@@ -1575,8 +1586,10 @@ def build_engine(
         )
 
     def planner_stage(investigation, request):
-        identity = _result(investigation, "003-catalog-identity")
-        analysis = _result(investigation, "004-hypotheses")
+        identity = _latest_result_for_handler(investigation, "openstar.tess.catalog-identity")
+        analysis = _latest_result_for_handler(investigation, "openstar.tess.hypotheses")
+        if identity is None or analysis is None:
+            raise RuntimeError("Planner requires completed identity and hypotheses.")
         planned = plan(analysis, identity)
         print("🧭 Deterministic planner")
         print(f"   action: {planned['action']}")
@@ -1584,21 +1597,21 @@ def build_engine(
 
         if planned["action"] == "LOW_FREQUENCY_FOLLOWUP":
             next_stage = StageRequest(
-                id="006-prepare-followup",
+                id=_next_stage_id(request.id, "prepare-followup"),
                 handler_id="openstar.tess.followup.prepare-low-frequency",
                 parameters={},
                 triggered_by_stage_id=request.id,
             )
         elif planned["action"] == "INDEPENDENT_SECTOR_FOLLOWUP":
             next_stage = StageRequest(
-                id="006-prepare-independent-sectors",
+                id=_next_stage_id(request.id, "prepare-independent-sectors"),
                 handler_id="openstar.tess.independent.prepare",
                 parameters={},
                 triggered_by_stage_id=request.id,
             )
         else:
             next_stage = StageRequest(
-                id="006-finalize",
+                id=_next_stage_id(request.id, "finalize"),
                 handler_id="openstar.tess.finalize",
                 parameters={},
                 triggered_by_stage_id=request.id,
@@ -6368,8 +6381,10 @@ def build_engine(
 
     def finalize_stage(investigation, request):
         prepared = _result(investigation, "001-prepare-target")
-        primary_analysis = _result(investigation, "004-hypotheses")
-        planner = _result(investigation, "005-planner")
+        primary_analysis = _latest_result_for_handler(investigation, "openstar.tess.hypotheses")
+        planner = _latest_result_for_handler(investigation, "openstar.tess.planner")
+        if primary_analysis is None or planner is None:
+            raise RuntimeError("Finalization requires completed hypotheses and planner stages.")
         followup_interpretation = _latest_result_for_handler(
             investigation,
             "openstar.tess.followup.interpret",

@@ -13,7 +13,20 @@ from openstar_investigation import (
 
 
 class RetryableExecutionError(RuntimeError):
-    """An execution dependency failed transiently; science did not fail."""
+    """A transient dependency failure, optionally carrying attempt evidence."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        result: dict[str, Any] | None = None,
+        input_hashes: dict[str, str] | None = None,
+        artifacts: tuple[ArtifactReference, ...] = (),
+    ):
+        super().__init__(message)
+        self.result = result
+        self.input_hashes = dict(input_hashes or {})
+        self.artifacts = tuple(artifacts)
 
 
 @dataclass(frozen=True)
@@ -81,21 +94,24 @@ class WorkflowEngine:
                     f"Stage {request.id} returned neither stop=True nor next_stage."
                 )
         except Exception as error:
+            retryable = isinstance(error, RetryableExecutionError)
             failed = self.store.build_terminal_stage(
                 stage_id=request.id,
                 handler_id=request.handler_id,
                 status="FAILED",
                 triggered_by_stage_id=request.triggered_by_stage_id,
                 parameters=request.parameters,
-                result=None,
+                result=error.result if retryable else None,
                 error=f"{type(error).__name__}: {error}",
                 failure_classification=(
                     "TRANSIENT_INFRASTRUCTURE"
-                    if isinstance(error, RetryableExecutionError)
+                    if retryable
                     else "NON_RETRYABLE"
                 ),
                 software_id=software_id,
                 software_version=software_version,
+                input_hashes=error.input_hashes if retryable else {},
+                artifacts=error.artifacts if retryable else (),
                 started_at=running.started_at,
             )
             investigation = self.store.complete_current_stage(

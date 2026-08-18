@@ -11,7 +11,12 @@ from openstar_dispatch import InvestigationDispatcher
 from openstar_external_jobs import ExternalJobMonitor, ExternalJobStore, apply_external_job_wakeups
 from openstar_investigation import InvestigationStore
 from openstar_scheduler import InvestigationScheduler
-from workflows.tess.tess_autonomy import WORKFLOW_ID, plan_tess_branches, register_tess_workflow_handlers
+from workflows.tess.tess_autonomy import (
+    WORKFLOW_ID,
+    plan_tess_branches,
+    register_tess_workflow_handlers,
+    repair_obsolete_terminal_wait,
+)
 from workflows.tess.tess_ranked_followup import TessDeepAdmissionStore, TessRankedFollowupTargetSource
 from workflows.tess.tess_sector_archive import TessSectorInventoryStore
 from workflows.tess.tess_sector_ranking import TessSectorRankingStore, aggregate_tess_sector_ranking
@@ -69,6 +74,12 @@ def run_tess_ranked_followup(sector: int, sector_state_dir: str | Path,
     admissions, new, excluded = ledger.admit(ranking, promote_top)
 
     store = InvestigationStore(deep_root / "investigations")
+    # Apply only TESS's narrow durable compatibility migrations before the
+    # domain-neutral scheduler classifies already-admitted investigations.
+    for admission in admissions:
+        path = store.path_for(admission.deepInvestigationID)
+        if path.exists():
+            repair_obsolete_terminal_wait(store, store.load(admission.deepInvestigationID))
     jobs = ExternalJobStore(deep_root / "external-jobs")
     if jobs.pending():
         from workflows.tess.tess_atlas_forced_photometry import ATLASExternalJobProvider
