@@ -4,7 +4,7 @@ import json
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from urllib.parse import quote
@@ -31,6 +31,23 @@ class ProjectRunResult:
             str(key): int(value)
             for key, value in self.status.get("nodeContributions", {}).items()
         }
+
+
+@dataclass(frozen=True)
+class ProjectBatchRunResult:
+    runs: tuple[ProjectRunResult, ...]
+
+    @property
+    def project_ids(self) -> tuple[str, ...]:
+        return tuple(run.project_id for run in self.runs)
+
+    @property
+    def node_contributions(self) -> dict[str, int]:
+        contributions: dict[str, int] = {}
+        for run in self.runs:
+            for node_id, count in run.node_contributions.items():
+                contributions[node_id] = contributions.get(node_id, 0) + count
+        return contributions
 
 
 class OpenStarCoordinatorClient:
@@ -80,6 +97,62 @@ class OpenStarCoordinatorClient:
             timeout=timeout,
         )
         return ProjectRunResult(project_id=project_id, status=final_status)
+
+    def run_projects(
+        self,
+        project_paths: Sequence[str | Path],
+        *,
+        poll_interval: float = 1.0,
+        timeout: float | None = None,
+    ) -> ProjectBatchRunResult:
+        paths = tuple(project_paths)
+        if not paths:
+            raise ValueError("run_projects requires at least one project path.")
+
+        deadline = time.monotonic() + timeout if timeout is not None else None
+
+        def check_deadline() -> None:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError("Timed out waiting for OpenStar project batch.")
+
+        project_ids: list[str] = []
+        seen: set[str] = set()
+        for path in paths:
+            status = self.activate_project(path, require_terminal=False)
+            check_deadline()
+            project_id = str(status["projectID"])
+            if project_id in seen:
+                raise ValueError(
+                    f"Coordinator returned duplicate project ID: {project_id}"
+                )
+            seen.add(project_id)
+            project_ids.append(project_id)
+
+        completed: dict[str, dict[str, Any]] = {}
+        while len(completed) < len(project_ids):
+            check_deadline()
+            for project_id in project_ids:
+                if project_id in completed:
+                    continue
+                check_deadline()
+                status = self.project_status(project_id)
+                check_deadline()
+                if self.is_terminal(status):
+                    completed[project_id] = status
+
+            if len(completed) == len(project_ids):
+                check_deadline()
+                break
+            check_deadline()
+            time.sleep(max(0.05, poll_interval))
+
+        check_deadline()
+        return ProjectBatchRunResult(
+            tuple(
+                ProjectRunResult(project_id, completed[project_id])
+                for project_id in project_ids
+            )
+        )
 
     def wait_for_project(
         self,

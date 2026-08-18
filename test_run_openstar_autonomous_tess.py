@@ -51,7 +51,9 @@ class AutonomousTessEntryPointTests(unittest.TestCase):
         output = io.StringIO()
         with (
             patch.object(runner, "register_tess_workflow_handlers", self.workflow),
-            patch.object(runner, "plan_tess_branches", planner or self.complete_planner),
+            patch.object(
+                runner, "plan_tess_branches", planner or self.complete_planner
+            ),
             contextlib.redirect_stdout(output),
         ):
             code = runner.run_autonomous_tess(
@@ -64,7 +66,10 @@ class AutonomousTessEntryPointTests(unittest.TestCase):
         self.assertEqual(0, code)
         self.assertIn("disposition=STARTED target=validation:first", output)
         self.assertTrue(
-            (self.root / "state/investigations/tess-validation-first/investigation.json").exists()
+            (
+                self.root
+                / "state/investigations/tess-validation-first/investigation.json"
+            ).exists()
         )
 
     def test_restart_resumes_persisted_lifecycle(self):
@@ -212,6 +217,74 @@ class AutonomousTessEntryPointTests(unittest.TestCase):
         code, output = self.invoke(waiting)
         self.assertEqual(2, code)
         self.assertIn("disposition=EXPERIMENT_RECOVERY_REQUIRED", output)
+
+    def test_nonretryable_failure_surfaces_attention_without_busy_loop(self):
+        def waiting(investigation, target):
+            return (
+                ScientificBranch(
+                    "wait",
+                    StageRequest("wait", "test.execute", {}),
+                    required_stage_ids=("prerequisite",),
+                ),
+            )
+
+        self.invoke(waiting)
+        store = InvestigationStore(self.root / "state/investigations")
+        investigation = store.load("tess-validation-first")
+        running = InvestigationStage("failed", "test.execute", "RUNNING", None, {})
+        investigation = store.append_running_stage(investigation, running)
+        failed = store.build_terminal_stage(
+            stage_id="failed",
+            handler_id="test.execute",
+            status="FAILED",
+            triggered_by_stage_id=None,
+            parameters={},
+            result=None,
+            error="ValueError: bad data",
+            failure_classification="NON_RETRYABLE",
+            software_id="test",
+            software_version="1",
+        )
+        store.complete_current_stage(investigation, failed)
+
+        code, output = self.invoke(waiting)
+
+        self.assertEqual(0, code)
+        self.assertIn("NONRETRYABLE_FAILURE_REQUIRES_ATTENTION", output)
+
+    def test_multi_mode_uses_scheduler_without_legacy_state_files(self):
+        output = io.StringIO()
+        with (
+            patch.object(runner, "register_tess_workflow_handlers", self.workflow),
+            patch.object(runner, "plan_tess_branches", self.complete_planner),
+            contextlib.redirect_stdout(output),
+        ):
+            code = runner.run_autonomous_tess(
+                [self.project],
+                "http://coordinator.test",
+                self.root / "multi-state",
+                multi_investigation=True,
+            )
+        self.assertEqual(0, code)
+        self.assertIn("OpenStar scheduler:", output.getvalue())
+        self.assertFalse((self.root / "multi-state/lifecycle.json").exists())
+        self.assertFalse((self.root / "multi-state/portfolio.json").exists())
+
+    def test_multi_mode_refuses_and_preserves_legacy_state_files(self):
+        for filename in ("lifecycle.json", "portfolio.json"):
+            with self.subTest(filename=filename):
+                state = self.root / filename / "state"
+                state.mkdir(parents=True)
+                legacy = state / filename
+                legacy.write_text("legacy-state", encoding="utf-8")
+                with self.assertRaisesRegex(RuntimeError, "refuses legacy"):
+                    runner.run_autonomous_tess(
+                        [self.project],
+                        "http://coordinator.test",
+                        state,
+                        multi_investigation=True,
+                    )
+                self.assertEqual("legacy-state", legacy.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

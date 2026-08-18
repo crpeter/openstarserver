@@ -4,6 +4,7 @@ import json
 import os
 import tempfile
 from dataclasses import asdict, dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +26,203 @@ class LifecycleResult:
     investigation: Investigation
     disposition: str
     transitions: int
+
+
+class InvestigationSchedulingState(str, Enum):
+    RUNNABLE = "RUNNABLE"
+    WAITING_EXTERNAL_DATA = "WAITING_EXTERNAL_DATA"
+    BLOCKED_PREREQUISITES = "BLOCKED_PREREQUISITES"
+    RECOVERY_REQUIRED = "RECOVERY_REQUIRED"
+    COMPLETE = "COMPLETE"
+    FAILED = "FAILED"
+
+
+@dataclass(frozen=True)
+class InvestigationPreparation:
+    investigation: Investigation
+    state: InvestigationSchedulingState
+    transitions: int = 0
+
+
+class InvestigationLifecycleDriver:
+    """Prepare and execute one explicitly selected durable investigation."""
+
+    def __init__(
+        self,
+        store: InvestigationStore,
+        dispatcher: InvestigationDispatcher,
+        planners: dict[str, BranchPlanner],
+        *,
+        software_id: str,
+        software_version: str,
+    ):
+        self.store = store
+        self.dispatcher = dispatcher
+        self.planners = planners
+        self.software_id = software_id
+        self.software_version = software_version
+        self.autonomy = AutonomousInvestigationEngine(store)
+
+    def attach(self, target: InvestigationTarget) -> Investigation:
+        path = self.store.path_for(target.investigation_id)
+        if path.exists():
+            investigation = self.store.load(target.investigation_id)
+            if (
+                investigation.workflow_id != target.workflow_id
+                or investigation.workflow_version != target.workflow_version
+            ):
+                raise RuntimeError(
+                    "Target does not match its existing investigation workflow."
+                )
+            return investigation
+        return self.store.create(
+            target.investigation_id,
+            target.workflow_id,
+            target.workflow_version,
+            metadata=dict(target.metadata or {}),
+        )
+
+    def _plan(
+        self, investigation: Investigation, target: InvestigationTarget
+    ) -> Investigation:
+        planner = self.planners.get(investigation.workflow_id)
+        if planner is None:
+            raise KeyError(
+                f"No branch planner registered for {investigation.workflow_id}"
+            )
+        updated, _ = self.autonomy.decide(investigation, planner(investigation, target))
+        return updated
+
+    @staticmethod
+    def _retryable_failure(investigation: Investigation):
+        if not investigation.stages:
+            return None
+        stage = investigation.stages[-1]
+        if stage.status != "FAILED":
+            return None
+        if stage.failure_classification == "TRANSIENT_INFRASTRUCTURE":
+            return stage
+        if stage.failure_classification is None and stage.error:
+            exception_type, separator, _ = stage.error.partition(":")
+            if separator and exception_type == "CoordinatorClientError":
+                return stage
+        return None
+
+    @staticmethod
+    def _retry_request(investigation: Investigation, failed) -> StageRequest:
+        prefixes = []
+        for stage in investigation.stages:
+            prefix, separator, _ = stage.id.partition("-")
+            if separator and prefix.isdigit():
+                prefixes.append(int(prefix))
+        failed_prefix, separator, label = failed.id.partition("-")
+        if not separator or not failed_prefix.isdigit():
+            raise ValueError(f"Stage id must begin with an integer prefix: {failed.id}")
+        next_number = max(prefixes, default=int(failed_prefix)) + 1
+        return StageRequest(
+            id=f"{next_number:03d}-{label}",
+            handler_id=failed.handler_id,
+            parameters=dict(failed.parameters),
+            triggered_by_stage_id=failed.id,
+        )
+
+    def prepare(self, target: InvestigationTarget) -> InvestigationPreparation:
+        investigation = self.attach(target)
+        transitions = 0
+        if any(stage.status == "RUNNING" for stage in investigation.stages):
+            return InvestigationPreparation(
+                investigation, InvestigationSchedulingState.RECOVERY_REQUIRED
+            )
+
+        failed = self._retryable_failure(investigation)
+        if failed is not None:
+            control = investigation.metadata.get("controlState")
+            selected = (
+                control.get("selectedExperiment") if isinstance(control, dict) else None
+            )
+            planned = (
+                isinstance(selected, dict)
+                and control.get("schedulerAction") == "RUN_EXPERIMENT"
+                and selected.get("triggered_by_stage_id") == failed.id
+                and not any(
+                    stage.id == selected.get("id") for stage in investigation.stages
+                )
+            )
+            if not planned:
+                retry = self._retry_request(investigation, failed)
+                investigation = self.store.set_control_state(
+                    investigation,
+                    status="RUNNING",
+                    control_state={
+                        "branchAssessments": [],
+                        "selectedExperiment": asdict(retry),
+                        "schedulerAction": "RUN_EXPERIMENT",
+                        "recovery": "TRANSIENT_INFRASTRUCTURE_RETRY",
+                    },
+                )
+                transitions += 1
+        elif investigation.stages and investigation.stages[-1].status == "FAILED":
+            return InvestigationPreparation(
+                investigation, InvestigationSchedulingState.FAILED
+            )
+
+        control = investigation.metadata.get("controlState")
+        if not isinstance(control, dict):
+            investigation = self._plan(investigation, target)
+            transitions += 1
+            control = investigation.metadata["controlState"]
+
+        action = control.get("schedulerAction")
+        if action == "RUN_EXPERIMENT":
+            state = InvestigationSchedulingState.RUNNABLE
+        elif action == "WAIT_FOR_PREREQUISITES":
+            state = InvestigationSchedulingState.BLOCKED_PREREQUISITES
+        elif action in {"INVESTIGATION_COMPLETE"}:
+            state = InvestigationSchedulingState.COMPLETE
+        elif (
+            action == "ADVANCE_TO_NEXT_TARGET"
+            and investigation.status == "QUIESCENT_AWAITING_DATA"
+        ):
+            state = InvestigationSchedulingState.WAITING_EXTERNAL_DATA
+        else:
+            raise ValueError(f"Unknown persisted scheduler action: {action}")
+        return InvestigationPreparation(investigation, state, transitions)
+
+    def classify(self, target: InvestigationTarget) -> InvestigationPreparation:
+        """Return the durable scheduler-visible state for an explicit target."""
+        return self.prepare(target)
+
+    def dispatch_runnable(
+        self, target: InvestigationTarget
+    ) -> InvestigationPreparation:
+        prepared = self.prepare(target)
+        if prepared.state != InvestigationSchedulingState.RUNNABLE:
+            return prepared
+        dispatched = self.dispatch_prepared(prepared)
+        if dispatched.disposition == "EXPERIMENT_RECOVERY_REQUIRED":
+            return InvestigationPreparation(
+                dispatched.investigation,
+                InvestigationSchedulingState.RECOVERY_REQUIRED,
+                prepared.transitions + 1,
+            )
+        self.replan_after_dispatch(target)
+        result = self.prepare(target)
+        return InvestigationPreparation(
+            result.investigation, result.state, prepared.transitions + 2
+        )
+
+    def dispatch_prepared(self, prepared: InvestigationPreparation):
+        """Dispatch one already-prepared runnable decision without replanning."""
+        if prepared.state != InvestigationSchedulingState.RUNNABLE:
+            raise ValueError("Only a RUNNABLE investigation may be dispatched.")
+        return self.dispatcher.dispatch(
+            prepared.investigation.id,
+            software_id=self.software_id,
+            software_version=self.software_version,
+        )
+
+    def replan_after_dispatch(self, target: InvestigationTarget) -> Investigation:
+        return self._plan(self.store.load(target.investigation_id), target)
 
 
 class InvestigationLifecycleLoop:
@@ -56,6 +254,13 @@ class InvestigationLifecycleLoop:
         self.software_id = software_id
         self.software_version = software_version
         self.autonomy = AutonomousInvestigationEngine(store)
+        self.driver = InvestigationLifecycleDriver(
+            store,
+            dispatcher,
+            planners,
+            software_id=software_id,
+            software_version=software_version,
+        )
 
     def _save_target(self, target: InvestigationTarget) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -93,38 +298,14 @@ class InvestigationLifecycleLoop:
 
     def start(self, target: InvestigationTarget) -> Investigation:
         """Create or attach to the initial investigation and persist ownership."""
-        path = self.store.path_for(target.investigation_id)
-        if path.exists():
-            investigation = self.store.load(target.investigation_id)
-            if (
-                investigation.workflow_id != target.workflow_id
-                or investigation.workflow_version != target.workflow_version
-            ):
-                raise RuntimeError(
-                    "Initial target does not match its existing investigation workflow."
-                )
-        else:
-            investigation = self.store.create(
-                target.investigation_id,
-                target.workflow_id,
-                target.workflow_version,
-                metadata=dict(target.metadata or {}),
-            )
+        investigation = self.driver.attach(target)
         self._save_target(target)
         return investigation
 
     def _plan(
         self, investigation: Investigation, target: InvestigationTarget
     ) -> Investigation:
-        planner = self.planners.get(investigation.workflow_id)
-        if planner is None:
-            raise KeyError(
-                f"No branch planner registered for {investigation.workflow_id}"
-            )
-        updated, _ = self.autonomy.decide(
-            investigation, planner(investigation, target)
-        )
-        return updated
+        return self.driver._plan(investigation, target)
 
     @staticmethod
     def _retryable_failure(investigation: Investigation):
@@ -134,36 +315,11 @@ class InvestigationLifecycleLoop:
         exception *type* is the narrow compatibility contract; the error
         message itself is deliberately never inspected.
         """
-        if not investigation.stages:
-            return None
-        stage = investigation.stages[-1]
-        if stage.status != "FAILED":
-            return None
-        if stage.failure_classification == "TRANSIENT_INFRASTRUCTURE":
-            return stage
-        if stage.failure_classification is None and stage.error:
-            exception_type, separator, _ = stage.error.partition(":")
-            if separator and exception_type == "CoordinatorClientError":
-                return stage
-        return None
+        return InvestigationLifecycleDriver._retryable_failure(investigation)
 
     @staticmethod
     def _retry_request(investigation: Investigation, failed) -> StageRequest:
-        prefixes = []
-        for stage in investigation.stages:
-            prefix, separator, _ = stage.id.partition("-")
-            if separator and prefix.isdigit():
-                prefixes.append(int(prefix))
-        failed_prefix, separator, label = failed.id.partition("-")
-        if not separator or not failed_prefix.isdigit():
-            raise ValueError(f"Stage id must begin with an integer prefix: {failed.id}")
-        next_number = max(prefixes, default=int(failed_prefix)) + 1
-        return StageRequest(
-            id=f"{next_number:03d}-{label}",
-            handler_id=failed.handler_id,
-            parameters=dict(failed.parameters),
-            triggered_by_stage_id=failed.id,
-        )
+        return InvestigationLifecycleDriver._retry_request(investigation, failed)
 
     def run(self, *, max_transitions: int = 100) -> LifecycleResult:
         """Run until a durable wait, terminal state, recovery, or checkpoint."""
@@ -173,139 +329,109 @@ class InvestigationLifecycleLoop:
         target = self._load_target()
         transitions = 0
         while transitions < max_transitions:
-            investigation = self.store.load(target.investigation_id)
+            prepared = self.driver.prepare(target)
+            transitions += prepared.transitions
 
-            # An interrupted handler is an explicit recovery boundary.  Never
-            # ask the planner or dispatcher to execute it automatically.
-            if any(stage.status == "RUNNING" for stage in investigation.stages):
+            if transitions >= max_transitions:
                 return LifecycleResult(
-                    investigation, "EXPERIMENT_RECOVERY_REQUIRED", transitions
+                    prepared.investigation, "LIFECYCLE_CHECKPOINT", transitions
                 )
 
-            failed = self._retryable_failure(investigation)
-            if failed is not None:
-                control = investigation.metadata.get("controlState")
-                selected = (
-                    control.get("selectedExperiment")
-                    if isinstance(control, dict)
-                    else None
+            if prepared.state == InvestigationSchedulingState.RECOVERY_REQUIRED:
+                return LifecycleResult(
+                    prepared.investigation, "EXPERIMENT_RECOVERY_REQUIRED", transitions
                 )
-                retry_already_planned = (
-                    isinstance(selected, dict)
-                    and control.get("schedulerAction") == "RUN_EXPERIMENT"
-                    and selected.get("triggered_by_stage_id") == failed.id
-                    and not any(stage.id == selected.get("id") for stage in investigation.stages)
+            if prepared.state == InvestigationSchedulingState.FAILED:
+                return LifecycleResult(
+                    prepared.investigation,
+                    "NONRETRYABLE_FAILURE_REQUIRES_ATTENTION",
+                    transitions,
                 )
-                if retry_already_planned:
-                    failed = None
-            if failed is not None:
-                retry = self._retry_request(investigation, failed)
-                investigation = self.store.set_control_state(
-                    investigation,
-                    status="RUNNING",
-                    control_state={
-                        "branchAssessments": [],
-                        "selectedExperiment": asdict(retry),
-                        "schedulerAction": "RUN_EXPERIMENT",
-                        "recovery": "TRANSIENT_INFRASTRUCTURE_RETRY",
-                    },
-                )
+            if prepared.state == InvestigationSchedulingState.RUNNABLE:
+                dispatched = self.driver.dispatch_prepared(prepared)
+                transitions += 1
+                if dispatched.disposition == "EXPERIMENT_RECOVERY_REQUIRED":
+                    return LifecycleResult(
+                        dispatched.investigation,
+                        "EXPERIMENT_RECOVERY_REQUIRED",
+                        transitions,
+                    )
+                if transitions >= max_transitions:
+                    return LifecycleResult(
+                        self.store.load(prepared.investigation.id),
+                        "LIFECYCLE_CHECKPOINT",
+                        transitions,
+                    )
+                investigation = self.driver.replan_after_dispatch(target)
                 transitions += 1
                 if transitions >= max_transitions:
                     return LifecycleResult(
-                        investigation, "LIFECYCLE_CHECKPOINT", transitions
+                        investigation,
+                        "LIFECYCLE_CHECKPOINT",
+                        transitions,
                     )
                 continue
-
-            control = investigation.metadata.get("controlState")
-            if not isinstance(control, dict):
-                investigation = self._plan(investigation, target)
+            if prepared.state == InvestigationSchedulingState.BLOCKED_PREREQUISITES:
+                dispatched = self.dispatcher.dispatch(
+                    prepared.investigation.id,
+                    software_id=self.software_id,
+                    software_version=self.software_version,
+                )
                 transitions += 1
-                continue
+                return LifecycleResult(
+                    dispatched.investigation, "WAITING_FOR_PREREQUISITES", transitions
+                )
 
-            action = control.get("schedulerAction")
+            # The legacy lifecycle treats both scientific completion and an
+            # external-data wait as a request to select another portfolio target.
             dispatched = self.dispatcher.dispatch(
-                investigation.id,
+                prepared.investigation.id,
                 software_id=self.software_id,
                 software_version=self.software_version,
             )
             transitions += 1
-
-            if dispatched.disposition == "EXPERIMENT_RECOVERY_REQUIRED":
+            if transitions >= max_transitions:
                 return LifecycleResult(
-                    dispatched.investigation, dispatched.disposition, transitions
+                    dispatched.investigation,
+                    "LIFECYCLE_CHECKPOINT",
+                    transitions,
                 )
-            if action == "RUN_EXPERIMENT":
-                # Dispatch is synchronous today.  Its terminal result is new
-                # scientific state, so deliberately return through the planner.
-                if transitions >= max_transitions:
-                    return LifecycleResult(
-                        self.store.load(investigation.id),
-                        "LIFECYCLE_CHECKPOINT",
-                        transitions,
-                    )
-                investigation = self.store.load(investigation.id)
-                investigation = self._plan(investigation, target)
-                transitions += 1
-                continue
-            if action == "WAIT_FOR_PREREQUISITES":
-                return LifecycleResult(
-                    dispatched.investigation, "WAITING_FOR_PREREQUISITES", transitions
+            try:
+                advanced = self.portfolio.advance(
+                    dispatched,
+                    self.target_source,
+                    self.planners,
+                    software_id=self.software_id,
+                    software_version=self.software_version,
                 )
-            if action in {"INVESTIGATION_COMPLETE", "ADVANCE_TO_NEXT_TARGET"}:
-                try:
-                    advanced = self.portfolio.advance(
-                        dispatched,
-                        self.target_source,
-                        self.planners,
-                        software_id=self.software_id,
-                        software_version=self.software_version,
-                    )
-                except NoEligibleTargetError:
-                    from openstar_external_jobs import ExternalJobStore
-                    external_root = self.store.root.parent / "external-jobs"
-                    external_jobs = (
-                        ExternalJobStore(external_root) if external_root.exists() else None
-                    )
-                    if external_jobs and external_jobs.failed_dependencies():
-                        return LifecycleResult(
-                            dispatched.investigation,
-                            "EXTERNAL_JOB_FAILURE_REQUIRES_ATTENTION",
-                            transitions,
-                        )
-                    if external_jobs and (
-                        external_jobs.pending_dependencies() or external_jobs.pending()
-                    ):
-                        return LifecycleResult(
-                            dispatched.investigation,
-                            "NO_RUNNABLE_TARGETS_WAITING_EXTERNAL_DATA",
-                            transitions,
-                        )
-                    return LifecycleResult(
-                        dispatched.investigation,
-                        "INVESTIGATION_COMPLETE_NO_NEXT_TARGET",
-                        transitions,
-                    )
-                target = advanced.target
-                self._save_target(target)
-                transitions += 1
-                if advanced.dispatch.disposition == "EXPERIMENT_RECOVERY_REQUIRED":
-                    return LifecycleResult(
-                        advanced.dispatch.investigation,
-                        advanced.dispatch.disposition,
-                        transitions,
-                    )
-                if transitions >= max_transitions:
-                    return LifecycleResult(
-                        self.store.load(target.investigation_id),
-                        "LIFECYCLE_CHECKPOINT",
-                        transitions,
-                    )
-                # Whether the selected action ran or was a durable wait/stop,
-                # reload it on the next iteration and use the same lifecycle.
-                continue
+            except NoEligibleTargetError:
+                from openstar_external_jobs import ExternalJobStore
 
-            raise ValueError(f"Unknown persisted scheduler action: {action}")
+                external_root = self.store.root.parent / "external-jobs"
+                external_jobs = (
+                    ExternalJobStore(external_root) if external_root.exists() else None
+                )
+                if external_jobs and external_jobs.failed_dependencies():
+                    disposition = "EXTERNAL_JOB_FAILURE_REQUIRES_ATTENTION"
+                elif external_jobs and (
+                    external_jobs.pending_dependencies() or external_jobs.pending()
+                ):
+                    disposition = "NO_RUNNABLE_TARGETS_WAITING_EXTERNAL_DATA"
+                else:
+                    disposition = "INVESTIGATION_COMPLETE_NO_NEXT_TARGET"
+                return LifecycleResult(
+                    dispatched.investigation, disposition, transitions
+                )
+
+            target = advanced.target
+            self._save_target(target)
+            transitions += 1
+            if advanced.dispatch.disposition == "EXPERIMENT_RECOVERY_REQUIRED":
+                return LifecycleResult(
+                    advanced.dispatch.investigation,
+                    advanced.dispatch.disposition,
+                    transitions,
+                )
 
         return LifecycleResult(
             self.store.load(target.investigation_id),

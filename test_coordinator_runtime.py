@@ -252,6 +252,99 @@ class CoordinatorHTTPContractTests(unittest.TestCase):
 
 
 class CoordinatorClientTests(unittest.TestCase):
+    def test_run_projects_activates_batch_then_polls_in_order(self):
+        client = OpenStarCoordinatorClient()
+        activations = [{"projectID": "a"}, {"projectID": "b"}]
+        statuses = [
+            {"status": "COMPLETE", "nodeContributions": {"node": 2}},
+            {"status": "RUNNING"},
+            {"status": "COMPLETE", "nodeContributions": {"node": 3}},
+        ]
+        events = []
+
+        def activate(path, *, require_terminal):
+            events.append(("activate", path, require_terminal))
+            return activations.pop(0)
+
+        def status(project_id):
+            events.append(("status", project_id))
+            return statuses.pop(0)
+
+        with patch.object(
+            client, "activate_project", side_effect=activate
+        ), patch.object(client, "project_status", side_effect=status), patch(
+            "openstar_coordinator_client.time.sleep"
+        ) as sleep:
+            result = client.run_projects(["one.json", "two.json"], poll_interval=0)
+
+        self.assertEqual(("a", "b"), result.project_ids)
+        self.assertEqual({"node": 5}, result.node_contributions)
+        self.assertEqual(
+            [("activate", "one.json", False), ("activate", "two.json", False)],
+            events[:2],
+        )
+        self.assertEqual(
+            [("status", "a"), ("status", "b"), ("status", "b")], events[2:]
+        )
+        sleep.assert_called_once()
+
+    def test_run_projects_rejects_empty_and_duplicate_project_ids(self):
+        client = OpenStarCoordinatorClient()
+        with self.assertRaises(ValueError):
+            client.run_projects([])
+        with patch.object(
+            client, "activate_project", return_value={"projectID": "same"}
+        ), self.assertRaisesRegex(ValueError, "duplicate project ID"):
+            client.run_projects(["one.json", "two.json"])
+
+    def test_run_projects_activation_time_counts_toward_overall_timeout(self):
+        client = OpenStarCoordinatorClient()
+        clock = [0.0]
+
+        def activate(path, *, require_terminal):
+            clock[0] = 2.0
+            return {"projectID": "a"}
+
+        with patch.object(client, "activate_project", side_effect=activate), patch(
+            "openstar_coordinator_client.time.monotonic",
+            side_effect=lambda: clock[0],
+        ), self.assertRaises(TimeoutError):
+            client.run_projects(["one.json"], timeout=1.0)
+
+    def test_run_projects_terminal_status_after_deadline_times_out(self):
+        client = OpenStarCoordinatorClient()
+        clock = [0.0]
+
+        def status(project_id):
+            clock[0] = 2.0
+            return {"projectID": project_id, "status": "COMPLETE"}
+
+        with patch.object(
+            client, "activate_project", return_value={"projectID": "a"}
+        ), patch.object(client, "project_status", side_effect=status), patch(
+            "openstar_coordinator_client.time.monotonic",
+            side_effect=lambda: clock[0],
+        ), self.assertRaises(
+            TimeoutError
+        ):
+            client.run_projects(["one.json"], timeout=1.0)
+
+    def test_run_projects_completion_before_deadline_succeeds(self):
+        client = OpenStarCoordinatorClient()
+        complete = {
+            "projectID": "a",
+            "status": "COMPLETE",
+            "nodeContributions": {"node": 4},
+        }
+        with patch.object(
+            client, "activate_project", return_value={"projectID": "a"}
+        ), patch.object(client, "project_status", return_value=complete), patch(
+            "openstar_coordinator_client.time.monotonic", return_value=0.0
+        ):
+            result = client.run_projects(["one.json"], timeout=1.0)
+        self.assertEqual(("a",), result.project_ids)
+        self.assertEqual({"node": 4}, result.node_contributions)
+
     def test_wait_for_project_uses_project_specific_status(self):
         client = OpenStarCoordinatorClient()
         running = {"status": "RUNNING", "projectTotalWorkUnits": 1}
