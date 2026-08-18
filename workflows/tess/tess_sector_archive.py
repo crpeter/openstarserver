@@ -211,6 +211,7 @@ class MastTessSectorArchiveProvider:
         destination.mkdir(parents=True, exist_ok=True)
         path = destination / (product.product_filename or "tess-light-curve.fits")
         result = Observations.download_file(uri, local_path=str(path), cache=True)
-        if str(result).upper() != "COMPLETE" or not path.exists():
+        status = result[0] if isinstance(result, (tuple, list)) and result else result
+        if str(status).upper() != "COMPLETE" or not path.exists():
             raise RuntimeError(f"MAST download failed for {uri}")
         return path

@@ -5,8 +5,11 @@ import time
 import unittest
 import math
 import struct
+import sys
+import types
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 from openstar_coordinator_client import ProjectRunResult
 from openstar_dispatch import InvestigationDispatcher
@@ -48,11 +51,15 @@ class Prepared:
 
 
 class FakeCoordinator:
-    def __init__(self, fail_tic=None): self.calls = []; self.active = self.maximum_active = 0; self.lock = threading.Lock(); self.fail_tic = fail_tic
+    def __init__(self, fail_tic=None, expected_concurrent=None):
+        self.calls = []; self.active = self.maximum_active = 0; self.lock = threading.Lock(); self.fail_tic = fail_tic
+        self.barrier = threading.Barrier(expected_concurrent) if expected_concurrent else None
     def run_project(self, path, **kwargs):
         manifest = json.loads(Path(path).read_text()); tic = manifest["datasets"][0]["ticID"]
         with self.lock: self.active += 1; self.maximum_active = max(self.maximum_active, self.active)
         try:
+            if self.barrier is not None:
+                self.barrier.wait(timeout=2)
             time.sleep(.02)
             self.calls.append(tic)
             if tic == self.fail_tic: raise RuntimeError("bad coordinator target")
@@ -66,6 +73,63 @@ class FakeCoordinator:
 
 
 class InventoryTests(unittest.TestCase):
+    def _mock_mast_download(self, result, *, create_file):
+        observations = MagicMock()
+
+        def download_file(uri, *, local_path, cache):
+            if create_file:
+                Path(local_path).write_bytes(b"downloaded TESS FITS")
+            return result
+
+        observations.download_file.side_effect = download_file
+        mast = types.ModuleType("astroquery.mast")
+        mast.Observations = observations
+        astroquery = types.ModuleType("astroquery")
+        astroquery.mast = mast
+        return observations, patch.dict(
+            sys.modules,
+            {"astroquery": astroquery, "astroquery.mast": mast},
+        )
+
+    def test_mast_tuple_complete_download_uses_exact_uri_and_path(self):
+        selected = product(42, filename="selected-light-curve.fits")
+        observations, mocked_modules = self._mock_mast_download(
+            ("COMPLETE", None, None), create_file=True
+        )
+        with tempfile.TemporaryDirectory() as tmp, mocked_modules:
+            destination = Path(tmp) / "source"
+            expected = destination / "selected-light-curve.fits"
+            actual = MastTessSectorArchiveProvider().download_light_curve(
+                selected, destination
+            )
+            self.assertEqual(expected, actual)
+            self.assertTrue(actual.exists())
+            observations.download_file.assert_called_once_with(
+                selected.product_uri, local_path=str(expected), cache=True
+            )
+
+    def test_mast_noncomplete_download_raises_even_if_file_exists(self):
+        observations, mocked_modules = self._mock_mast_download(
+            ("ERROR", "failed", None), create_file=True
+        )
+        with tempfile.TemporaryDirectory() as tmp, mocked_modules:
+            with self.assertRaisesRegex(RuntimeError, "MAST download failed"):
+                MastTessSectorArchiveProvider().download_light_curve(
+                    product(42), Path(tmp)
+                )
+            self.assertEqual(1, observations.download_file.call_count)
+
+    def test_mast_complete_download_without_file_raises(self):
+        observations, mocked_modules = self._mock_mast_download(
+            ("COMPLETE", None, None), create_file=False
+        )
+        with tempfile.TemporaryDirectory() as tmp, mocked_modules:
+            with self.assertRaisesRegex(RuntimeError, "MAST download failed"):
+                MastTessSectorArchiveProvider().download_light_curve(
+                    product(42), Path(tmp)
+                )
+            self.assertEqual(1, observations.download_file.call_count)
+
     def test_selection_inventory_resume_and_stable_ids(self):
         products = [product(3, cadence=600), product(2, author="TESS-SPOC", cadence=200),
                     product(3, cadence=120), product(2, author="SPOC", cadence=1800),
@@ -254,7 +318,7 @@ class SweepTests(unittest.TestCase):
 
     def test_concurrent_shallow_evidence_resume_and_runtime_limit(self):
         provider = FakeProvider([product(3), product(1), product(2)])
-        coordinator = FakeCoordinator()
+        coordinator = FakeCoordinator(expected_concurrent=2)
         with tempfile.TemporaryDirectory() as tmp:
             # Patch the default preprocessing boundary only at the injected handler factory call.
             from workflows.tess import tess_sector_scan
