@@ -1,0 +1,91 @@
+#!/usr/bin/env python3
+"""Create/resume a durable, shallow broad scan of one TESS sector."""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+from openstar_coordinator_client import OpenStarCoordinatorClient
+from openstar_dispatch import InvestigationDispatcher
+from openstar_investigation import InvestigationStore
+from openstar_scheduler import InvestigationScheduler
+from workflows.tess.tess_sector_archive import MastTessSectorArchiveProvider, TessSectorInventoryStore
+from workflows.tess.tess_sector_scan import (
+    WORKFLOW_ID, TessSectorScanTargetSource, plan_tess_sector_scan,
+    register_tess_sector_scan_handlers,
+)
+
+SOFTWARE_ID = "openstar.tess-sector-sweep-runner"
+SOFTWARE_VERSION = "1"
+
+
+def run_tess_sector_sweep(sector: int, coordinator_url: str, state_dir: str | Path, *,
+                          max_concurrent_investigations: int | None = None,
+                          max_targets: int | None = None, provider=None,
+                          coordinator=None, poll_interval: float = 1.0,
+                          timeout: float | None = None) -> int:
+    root = Path(state_dir).expanduser().resolve()
+    legacy = [
+        name for name in ("lifecycle.json", "portfolio.json")
+        if (root / name).exists()
+    ]
+    if legacy:
+        raise RuntimeError(
+            "TESS sector sweep refuses legacy single-lifecycle state: "
+            + ", ".join(legacy)
+        )
+    root.mkdir(parents=True, exist_ok=True)
+    provider = provider or MastTessSectorArchiveProvider()
+    inventory = TessSectorInventoryStore(root / f"tess-sector-{sector}-inventory.json").create_or_load(sector, provider)
+    store = InvestigationStore(root / "investigations")
+    coordinator = coordinator or OpenStarCoordinatorClient(coordinator_url)
+    workflow = register_tess_sector_scan_handlers(store, coordinator, provider,
+                                                   poll_interval=poll_interval, timeout=timeout)
+    scheduler = InvestigationScheduler(store, InvestigationDispatcher(store, workflow),
+        TessSectorScanTargetSource(inventory, max_targets=max_targets),
+        {WORKFLOW_ID: plan_tess_sector_scan}, software_id=SOFTWARE_ID,
+        software_version=SOFTWARE_VERSION,
+        max_concurrent_investigations=max_concurrent_investigations)
+    result = scheduler.run_until_idle()
+    counts: dict[str, int] = {}
+    for outcome in result.outcomes: counts[outcome.state.value] = counts.get(outcome.state.value, 0) + 1
+    summary = " ".join(f"{key.lower()}={counts[key]}" for key in sorted(counts))
+    print(f"OpenStar TESS sector sweep: sector={sector} inventory={len(inventory.entries)} admitted={len(result.outcomes)} {summary}")
+    for outcome in result.outcomes:
+        if outcome.error is not None:
+            print(f"OpenStar TESS sector sweep target failure: investigation={outcome.investigation.id} error={type(outcome.error).__name__}: {outcome.error}", file=sys.stderr)
+    return 1 if any(item.error is not None for item in result.outcomes) else 0
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="Run a shallow distributed scan of a TESS sector.")
+    parser.add_argument("--sector", type=int, required=True)
+    parser.add_argument("--coordinator-url", required=True)
+    parser.add_argument("--state-dir", required=True)
+    parser.add_argument("--max-concurrent-investigations", type=int)
+    parser.add_argument("--max-targets", type=int)
+    parser.add_argument("--poll-interval", type=float, default=1.0)
+    parser.add_argument("--timeout", type=float)
+    args = parser.parse_args(argv)
+    for name in ("sector", "max_concurrent_investigations", "max_targets"):
+        value = getattr(args, name)
+        if value is not None and value < 1: parser.error(f"--{name.replace('_', '-')} must be positive")
+    if args.poll_interval <= 0: parser.error("--poll-interval must be positive")
+    if args.timeout is not None and args.timeout <= 0: parser.error("--timeout must be positive")
+    return args
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    try:
+        return run_tess_sector_sweep(args.sector, args.coordinator_url, args.state_dir,
+            max_concurrent_investigations=args.max_concurrent_investigations,
+            max_targets=args.max_targets, poll_interval=args.poll_interval, timeout=args.timeout)
+    except KeyboardInterrupt: return 130
+    except Exception as error:
+        print(f"OpenStar TESS sector sweep: error={type(error).__name__}: {error}", file=sys.stderr); return 1
+
+
+if __name__ == "__main__": raise SystemExit(main())
