@@ -297,16 +297,14 @@ class CurrentATLASForcedPhotometryTests(unittest.TestCase):
                         "physicalMechanismResolved": False}),
             ))
 
-    def test_registered_current_handlers_run_and_direct_interpret(self):
+    def test_registered_current_handler_submits_and_quiesces(self):
         for distributed in (True, False):
             store = InvestigationStore(self.root / f"handler-{distributed}")
             inv = self._handler_evidence(f"handler-{distributed}"); store.save(inv)
             project = self.root / f"atlas-project-{distributed}.json"
             if distributed: project.write_text("{}", encoding="utf-8")
-            spec = {"available": distributed,
-                "projectPath": str(project) if distributed else None,
-                "preparedSeries": [], "sourceRecords": [],
-                "workloadID": "openstar.lomb-scargle.v1"}
+            spec = {"externalDependencyID": "atlas:inv:052",
+                    "externalJobIDs": ["target", "counterpart"]}
             coordinator = mock.Mock()
             coordinator.run_project.return_value = SimpleNamespace(
                 status={"datasets": []}, node_contributions={}, project_id="generic")
@@ -314,7 +312,7 @@ class CurrentATLASForcedPhotometryTests(unittest.TestCase):
                        "physicalMechanismResolved": False}
             workflow = _workflow_module()
             with mock.patch.dict(os.environ, {"OPENSTAR_ATLAS_API_TOKEN": "token"}, clear=True), \
-                    mock.patch.object(workflow, "build_atlas_forced_photometry_project",
+                    mock.patch.object(workflow, "submit_atlas_forced_photometry_jobs",
                                       return_value=spec) as builder, \
                     mock.patch.object(workflow, "interpret_atlas_forced_photometry_project",
                                       return_value=summary):
@@ -328,12 +326,9 @@ class CurrentATLASForcedPhotometryTests(unittest.TestCase):
             self.assertFalse(any("external-high-resolution" in item.handler_id
                                  for item in inv.stages))
             handlers = [item.handler_id for item in completed.stages[len(inv.stages):]]
-            expected = ["openstar.tess.atlas-forced-photometry.prepare"]
-            if distributed: expected.append("openstar.tess.atlas-forced-photometry.run")
-            expected.append("openstar.tess.atlas-forced-photometry.interpret")
-            self.assertEqual(expected, handlers)
-            self.assertEqual(distributed, bool(coordinator.run_project.call_count))
-            self.assertEqual("BLOCKED", completed.status)
+            self.assertEqual(["openstar.tess.atlas-forced-photometry.prepare"], handlers)
+            coordinator.run_project.assert_not_called()
+            self.assertEqual("QUIESCENT_AWAITING_DATA", completed.status)
 
     def test_registered_prepare_failure_classification_is_narrow(self):
         for error, expected, raised in (
@@ -344,7 +339,7 @@ class CurrentATLASForcedPhotometryTests(unittest.TestCase):
             store = InvestigationStore(self.root / expected)
             inv = self._handler_evidence(expected); store.save(inv)
             workflow = _workflow_module()
-            with mock.patch.object(workflow, "build_atlas_forced_photometry_project",
+            with mock.patch.object(workflow, "submit_atlas_forced_photometry_jobs",
                                    side_effect=error):
                 with self.assertRaises(raised):
                     _build_engine(store, mock.Mock(), poll_interval=0, timeout=1).run(

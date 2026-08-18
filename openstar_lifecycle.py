@@ -262,6 +262,14 @@ class InvestigationLifecycleLoop:
                         software_version=self.software_version,
                     )
                 except NoEligibleTargetError:
+                    from openstar_external_jobs import ExternalJobStore
+                    external_root = self.store.root.parent / "external-jobs"
+                    if external_root.exists() and ExternalJobStore(external_root).pending():
+                        return LifecycleResult(
+                            dispatched.investigation,
+                            "NO_RUNNABLE_TARGETS_WAITING_EXTERNAL_DATA",
+                            transitions,
+                        )
                     return LifecycleResult(
                         dispatched.investigation,
                         "INVESTIGATION_COMPLETE_NO_NEXT_TARGET",

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import hashlib
 import json
 import math
 import os
@@ -14,6 +15,10 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+
+from openstar_external_jobs import (
+    ExternalJob, ExternalJobStore, PollResult, stable_job_id, utc_now,
+)
 
 from .tess_residual_localization import (
     GENERIC_LOMB_SCARGLE_WORKLOAD_ID,
@@ -288,7 +293,26 @@ def _wait_for_atlas_job(
             else:
                 print(f"      ATLAS task queued: {task_url}", flush=True)
             last_state = state
+        # Retained only for compatibility with older specialized follow-ups.
+        # The current forced-photometry preparation never calls this helper.
         time.sleep(JOB_POLL_SECONDS)
+
+
+class ATLASExternalJobProvider:
+    """Translate ATLAS queue fields into provider-neutral operational states."""
+    def poll(self, job: ExternalJob) -> PollResult:
+        if not job.remoteTaskURL:
+            raise RuntimeError("ATLAS external job has no persisted task URL")
+        status, payload = _json_request(job.remoteTaskURL, headers=_atlas_headers())
+        if status in {408, 425, 429} or status >= 500:
+            raise ATLASArchiveUnavailable(f"ATLAS polling HTTP {status}: {payload}")
+        if status != 200:
+            raise RuntimeError(f"ATLAS polling HTTP {status}: {payload}")
+        finish = payload.get("finishtimestamp")
+        result_url = str(payload.get("result_url") or "").strip() or None
+        if finish:
+            return PollResult("COMPLETE" if result_url else "REMOTE_FAILED", result_url)
+        return PollResult("RUNNING" if payload.get("starttimestamp") else "QUEUED")
 
 
 def _parse_float(value: Any) -> float | None:
@@ -686,6 +710,56 @@ def _frozen_sources(
     return sources, float(separation)
 
 
+def submit_atlas_forced_photometry_jobs(
+    *, source_project_id: str, source_dataset_id: str,
+    external_high_resolution_summary: dict[str, Any],
+    des_dr2_se_summary: dict[str, Any], investigation_id: str,
+    trigger_stage_id: str, job_store: ExternalJobStore,
+) -> dict[str, Any]:
+    """Submit each missing source once, persisting acceptance before continuing."""
+    if des_dr2_se_summary.get("recommendedNextTest") not in {CURRENT_TRIGGER, HISTORICAL_TRIGGER}:
+        raise RuntimeError("v20.24 requires the persisted DES recommendation.")
+    require_atlas_credentials()
+    sources, separation = _frozen_sources(external_high_resolution_summary)
+    search = dict(des_dr2_se_summary.get("frequencySearch") or
+                  (des_dr2_se_summary.get("distributedValidation") or {}).get("frequencySearch") or
+                  external_high_resolution_summary.get("frequencySearch") or
+                  (external_high_resolution_summary.get("distributedValidation") or {}).get("frequencySearch") or {})
+    if not search or not _int(search.get("totalFrequencies")) or not _int(search.get("frequenciesPerWorkUnit")):
+        raise RuntimeError("v20.24 requires the frozen residual-frequency search definition.")
+    dependency_id = f"atlas-forced-photometry:{investigation_id}:{trigger_stage_id.split('-', 1)[0]}"
+    headers = None
+    ids = []
+    for source in sources:
+        role = str(source["sourceRole"])
+        job_id = stable_job_id("atlas-forced-photometry", investigation_id,
+                               trigger_stage_id, dependency_id, role)
+        existing = job_store.get(job_id)
+        if existing and existing.remoteTaskURL:
+            ids.append(job_id)
+            continue
+        if headers is None:
+            headers = _atlas_headers()
+        task_url = _submit_atlas_job(headers, ra_deg=float(source["raDeg"]),
+                                     dec_deg=float(source["decDeg"]))
+        now = utc_now()
+        job_store.save(ExternalJob(
+                id=job_id, provider="atlas-forced-photometry",
+                investigationID=investigation_id, triggerStageID=trigger_stage_id,
+                dependencyID=dependency_id, role=role, state="SUBMITTED",
+                remoteTaskURL=task_url, submittedAt=now, nextCheckAt=now))
+        ids.append(job_id)
+    return {
+        "version": "openstar.tess-atlas-forced-photometry-submission.v1",
+        "archive": "ATLAS Forced Photometry", "sourceProjectID": source_project_id,
+        "sourceDatasetID": source_dataset_id, "sourcePair": external_high_resolution_summary.get("sourcePair"),
+        "sourceDefinitions": sources, "gaiaPairSeparationArcsec": separation,
+        "frequencySearch": search, "mjdMinimum": ATLAS_MJD_MIN,
+        "useReducedTargetImages": True, "requestMode": "target-image-forced-photometry",
+        "externalDependencyID": dependency_id, "externalJobIDs": ids,
+    }
+
+
 def build_atlas_forced_photometry_project(
     *,
     source_project_id: str,
@@ -694,6 +768,7 @@ def build_atlas_forced_photometry_project(
     des_dr2_se_summary: dict[str, Any],
     output_dir: str | Path,
     investigation_id: str,
+    external_jobs: list[ExternalJob] | None = None,
 ) -> dict[str, Any]:
     if des_dr2_se_summary.get("recommendedNextTest") not in {
         CURRENT_TRIGGER, HISTORICAL_TRIGGER
@@ -739,6 +814,7 @@ def build_atlas_forced_photometry_project(
     print("   ATLAS mode: calibrated target-image forced photometry (use_reduced=True)", flush=True)
     print(f"   ATLAS minimum MJD: {ATLAS_MJD_MIN:.1f}", flush=True)
 
+    jobs_by_role = {job.role: job for job in (external_jobs or [])}
     for source in sources:
         role = str(source["sourceRole"])
         source_id = int(source["gaiaDR3SourceID"])
@@ -747,15 +823,36 @@ def build_atlas_forced_photometry_project(
             f"   requesting ATLAS forced photometry for {role} | Gaia DR3 {source_id}",
             flush=True,
         )
-        task_url = _submit_atlas_job(
-            headers,
-            ra_deg=float(source["raDeg"]),
-            dec_deg=float(source["decDeg"]),
-        )
-        result_url, text = _wait_for_atlas_job(headers, task_url)
-
         raw_path = root / f"atlas-{role}-gaia-{source_id}-target-image.txt"
-        raw_path.write_text(text, encoding="utf-8")
+        job = jobs_by_role.get(role)
+        if external_jobs is not None:
+            if job is None or job.state != "COMPLETE" or not job.remoteResultURL:
+                raise RuntimeError(f"External ATLAS job is not complete for {role}")
+            task_url, result_url = job.remoteTaskURL, job.remoteResultURL
+            provenance_path = raw_path.with_suffix(raw_path.suffix + ".provenance.json")
+            reusable = False
+            if raw_path.exists() and provenance_path.exists():
+                provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+                raw_bytes = raw_path.read_bytes()
+                reusable = bool(
+                    provenance.get("remoteResultURL") == result_url
+                    and provenance.get("sha256") == hashlib.sha256(raw_bytes).hexdigest()
+                )
+            if reusable:
+                text = raw_path.read_text(encoding="utf-8")
+            else:
+                text = _text_request(result_url, headers=headers)
+                raw_path.write_text(text, encoding="utf-8")
+                _write_json(provenance_path, {
+                    "version": "openstar.external-raw-artifact.v1",
+                    "remoteTaskURL": task_url, "remoteResultURL": result_url,
+                    "sha256": hashlib.sha256(raw_path.read_bytes()).hexdigest(),
+                })
+        else:
+            task_url = _submit_atlas_job(headers, ra_deg=float(source["raDeg"]),
+                                         dec_deg=float(source["decDeg"]))
+            result_url, text = _wait_for_atlas_job(headers, task_url)
+            raw_path.write_text(text, encoding="utf-8")
 
         parsed_rows = _parse_atlas_output(text)
         clean_rows, quality = _clean_atlas_rows(parsed_rows)
@@ -770,6 +867,7 @@ def build_atlas_forced_photometry_project(
             "taskURL": task_url,
             "resultURL": result_url,
             "rawPath": str(raw_path.resolve()),
+            "rawSha256": hashlib.sha256(raw_path.read_bytes()).hexdigest(),
             "rawRowCount": quality["rawRows"],
             "acceptedRawRowCount": quality["acceptedRawRows"],
             "rejectionCounts": quality["rejectionCounts"],

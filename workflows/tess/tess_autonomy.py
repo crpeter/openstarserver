@@ -477,6 +477,25 @@ def plan_tess_branches(
     nsc_interpretation = _latest_complete(
         investigation, "openstar.tess.nsc-resolved-photometry.interpret"
     )
+    atlas_submission = _latest_complete(
+        investigation, "openstar.tess.atlas-forced-photometry.prepare"
+    )
+    atlas_collection = _latest_complete(
+        investigation, "openstar.tess.atlas-forced-photometry.collect"
+    )
+    if (atlas_submission is not None and atlas_collection is None
+            and atlas_submission.next_stage is None):
+        dependency_id = str((atlas_submission.result or {}).get("externalDependencyID") or "")
+        available = (investigation.metadata.get("externalDataAvailability") or {}).get(dependency_id) is True
+        return (ScientificBranch(
+            id=f"collect-atlas-after-{atlas_submission.id}",
+            experiment=StageRequest(
+                id=_continuation_stage_id(atlas_submission, "collect-atlas-forced-photometry"),
+                handler_id="openstar.tess.atlas-forced-photometry.collect", parameters={},
+                triggered_by_stage_id=atlas_submission.id),
+            external_data=(ExternalDataDependency(dependency_id, available,
+                None if available else "The two persisted ATLAS jobs are still pending."),),
+        ),)
     if _awaiting_current_atlas_adapter(investigation):
         from .tess_atlas_forced_photometry import atlas_credentials_available
         des = _latest_complete(

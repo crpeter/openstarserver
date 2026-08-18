@@ -127,6 +127,7 @@ from .tess_atlas_forced_photometry import (
     CURRENT_TRIGGER as CURRENT_ATLAS_TRIGGER,
     SIGNED_REANALYSIS as ATLAS_SIGNED_REANALYSIS,
     build_atlas_forced_photometry_project,
+    submit_atlas_forced_photometry_jobs,
     interpret_atlas_forced_photometry_project,
 )
 from .tess_atlas_forced_reanalysis import (
@@ -5543,60 +5544,61 @@ def build_engine(
         print("   the TESS drift law is NOT extrapolated into the ATLAS observing epochs")
 
         try:
-            spec = build_atlas_forced_photometry_project(
+            from openstar_external_jobs import ExternalJobStore
+            trigger_stage_id = next(
+                (stage.id for stage in investigation.stages
+                 if stage.handler_id == request.handler_id), request.id
+            )
+            spec = submit_atlas_forced_photometry_jobs(
                 source_project_id=str(prepared["sourceProjectID"]),
                 source_dataset_id=str(prepared["datasetID"]),
                 external_high_resolution_summary=source_evidence,
                 des_dr2_se_summary=des,
-                output_dir=artifact_root,
                 investigation_id=investigation.id,
+                trigger_stage_id=trigger_stage_id,
+                job_store=ExternalJobStore(store.root.parent / "external-jobs"),
             )
         except ATLASArchiveUnavailable as exc:
             raise RetryableExecutionError(str(exc)) from exc
 
         print(f"   corrected Gaia source separation: {spec.get('gaiaPairSeparationArcsec')} arcsec")
-        print(f"   prepared ATLAS source-band datasets: {len(spec.get('preparedSeries') or [])}")
-        print(f"   distributed work units: {spec.get('totalWorkUnits')}")
-
-        artifacts: list[ArtifactReference] = []
-        for record in spec.get("sourceRecords") or []:
-            raw_path = record.get("rawPath")
-            if raw_path and Path(raw_path).exists():
-                artifacts.append(_artifact(Path(raw_path), "text/plain"))
-
-        for item in spec.get("preparedSeries") or []:
-            dataset_path = item.get("datasetPath")
-            if dataset_path and Path(dataset_path).exists():
-                artifacts.append(_artifact(Path(dataset_path), "application/json"))
-
-        project_path = spec.get("projectPath")
-        if project_path and Path(project_path).exists():
-            artifacts.append(_artifact(Path(project_path), "application/json"))
-
-        if spec.get("available") and project_path:
-            next_stage = StageRequest(
-                id=_next_stage_id(request.id, "run-atlas-forced-photometry"),
-                handler_id="openstar.tess.atlas-forced-photometry.run",
-                parameters={"projectPath": project_path},
-                triggered_by_stage_id=request.id,
-            )
-        else:
-            next_stage = StageRequest(
-                id=_next_stage_id(request.id, "interpret-atlas-forced-photometry"),
-                handler_id="openstar.tess.atlas-forced-photometry.interpret",
-                parameters={"distributedRunExpected": False},
-                triggered_by_stage_id=request.id,
-            )
-
         return StageOutcome(
             result=spec,
-            next_stage=next_stage,
+            stop=True,
+            final_status="QUIESCENT_AWAITING_DATA",
             input_hashes={
                 "sourcePairEvidence": sha256_json(source_evidence),
                 "desDr2SeLocalForcedPhotometry": sha256_json(des),
             },
-            artifacts=tuple(artifacts),
         )
+
+    def atlas_forced_collect_stage(investigation, request):
+        submission = _latest_result_for_handler(
+            investigation, "openstar.tess.atlas-forced-photometry.prepare")
+        if submission is None:
+            raise RuntimeError("ATLAS collection requires its immutable submission stage")
+        from openstar_external_jobs import ExternalJobStore
+        jobs = ExternalJobStore(store.root.parent / "external-jobs")
+        exact = [jobs.load(job_id) for job_id in submission["externalJobIDs"]]
+        spec = build_atlas_forced_photometry_project(
+            source_project_id=str(submission["sourceProjectID"]),
+            source_dataset_id=str(submission["sourceDatasetID"]),
+            external_high_resolution_summary={"sourcePair": submission["sourcePair"],
+                "frequencySearch": submission["frequencySearch"]},
+            des_dr2_se_summary={"recommendedNextTest": CURRENT_ATLAS_TRIGGER,
+                "frequencySearch": submission["frequencySearch"]},
+            output_dir=store.directory_for(investigation.id) / "artifacts",
+            investigation_id=investigation.id, external_jobs=exact)
+        project_path = spec.get("projectPath")
+        next_stage = StageRequest(
+            id=_next_stage_id(request.id, "run-atlas-forced-photometry") if project_path
+               else _next_stage_id(request.id, "interpret-atlas-forced-photometry"),
+            handler_id="openstar.tess.atlas-forced-photometry.run" if project_path
+               else "openstar.tess.atlas-forced-photometry.interpret",
+            parameters={"projectPath": project_path} if project_path
+               else {"distributedRunExpected": False}, triggered_by_stage_id=request.id)
+        return StageOutcome(result=spec, next_stage=next_stage,
+                            input_hashes={"submission": sha256_json(submission)})
 
     def atlas_forced_run_stage(investigation, request):
         print("⚙️ Activating generic ATLAS nightly source-resolved Lomb-Scargle work")
@@ -5622,8 +5624,12 @@ def build_engine(
     def atlas_forced_interpret_stage(investigation, request):
         preparation = _latest_result_for_handler(
             investigation,
-            "openstar.tess.atlas-forced-photometry.prepare",
+            "openstar.tess.atlas-forced-photometry.collect",
         )
+        if preparation is None:  # compatibility with completed synchronous v20.24 stages
+            preparation = _latest_result_for_handler(
+                investigation, "openstar.tess.atlas-forced-photometry.prepare"
+            )
         run = _latest_result_for_handler(
             investigation,
             "openstar.tess.atlas-forced-photometry.run",
@@ -8103,6 +8109,10 @@ def build_engine(
     engine.register_handler(
         "openstar.tess.atlas-forced-photometry.prepare",
         atlas_forced_prepare_stage,
+    )
+    engine.register_handler(
+        "openstar.tess.atlas-forced-photometry.collect",
+        atlas_forced_collect_stage,
     )
     engine.register_handler(
         "openstar.tess.atlas-forced-photometry.run",
