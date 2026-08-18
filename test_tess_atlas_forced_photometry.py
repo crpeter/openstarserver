@@ -26,7 +26,8 @@ else:
 
 from openstar_investigation import Investigation, InvestigationStage, InvestigationStore
 from openstar_external_jobs import (ExternalJob, ExternalJobPollUnavailable,
-                                    ExternalJobStore, apply_external_job_wakeups)
+                                    ExternalDependency, ExternalJobStore,
+                                    apply_external_job_wakeups)
 from openstar_targets import InvestigationTarget
 from openstar_workflow import RetryableExecutionError, StageRequest
 from workflows.tess import tess_atlas_forced_photometry as atlas
@@ -119,6 +120,30 @@ class CurrentATLASForcedPhotometryTests(unittest.TestCase):
         with mock.patch.object(atlas, "_atlas_headers", side_effect=ValueError("bug")):
             with self.assertRaisesRegex(ValueError, "bug"): provider.poll(job)
 
+    def test_partial_submission_retry_reuses_target_and_manifest(self):
+        jobs = ExternalJobStore(self.root / "partial" / "external-jobs")
+        search = {"totalFrequencies": 10, "frequenciesPerWorkUnit": 2}
+        submit = mock.Mock(side_effect=["target-task",
+            atlas.ATLASArchiveUnavailable("counterpart unavailable"),
+            "counterpart-task"])
+        kwargs = dict(source_project_id="p", source_dataset_id="d",
+            external_high_resolution_summary={"sourcePair": self.pair},
+            des_dr2_se_summary={"recommendedNextTest": atlas.CURRENT_TRIGGER,
+                                "frequencySearch": search},
+            investigation_id="inv", trigger_stage_id="052-prepare", job_store=jobs)
+        with mock.patch.object(atlas, "require_atlas_credentials"), \
+                mock.patch.object(atlas, "_atlas_headers", return_value={}), \
+                mock.patch.object(atlas, "_submit_atlas_job", submit):
+            with self.assertRaises(atlas.ATLASArchiveUnavailable):
+                atlas.submit_atlas_forced_photometry_jobs(**kwargs)
+            result = atlas.submit_atlas_forced_photometry_jobs(**kwargs)
+        self.assertEqual(3, submit.call_count)
+        self.assertEqual([10.0, 10.01, 10.01],
+                         [call.kwargs["ra_deg"] for call in submit.call_args_list])
+        self.assertEqual(2, len(jobs.dependencies()[0].expectedJobIDs))
+        self.assertEqual(2, len(jobs.list()))
+        self.assertEqual(2, len(result["externalJobIDs"]))
+
     def test_restart_complete_records_wake_exact_053_collect_without_loop(self):
         dependency = "atlas-forced-photometry:blind:052"
         submission = InvestigationStage("052-prepare-atlas-forced-photometry",
@@ -130,6 +155,12 @@ class CurrentATLASForcedPhotometryTests(unittest.TestCase):
                 "schedulerAction": "ADVANCE_TO_NEXT_TARGET"}}, (submission,))
         store = InvestigationStore(self.root / "state" / "investigations"); store.save(inv)
         jobs = ExternalJobStore(self.root / "state" / "external-jobs")
+        expected_ids = tuple(ExternalJob.create(provider="atlas-forced-photometry",
+            investigation_id="blind", trigger_stage_id=submission.id,
+            dependency_id=dependency, role=role).id
+            for role in ("target-control", "catalog-counterpart"))
+        jobs.save_dependency(ExternalDependency(dependency, "blind", submission.id,
+            "atlas-forced-photometry", expected_ids))
         for role in ("target-control", "catalog-counterpart"):
             job = ExternalJob.create(provider="atlas-forced-photometry",
                 investigation_id="blind", trigger_stage_id=submission.id,

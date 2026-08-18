@@ -17,7 +17,7 @@ from typing import Any
 import numpy as np
 
 from openstar_external_jobs import (
-    ExternalJob, ExternalJobPollUnavailable, ExternalJobStore, PollResult,
+    ExternalDependency, ExternalJob, ExternalJobPollUnavailable, ExternalJobStore, PollResult,
     stable_job_id, utc_now,
 )
 
@@ -732,12 +732,20 @@ def submit_atlas_forced_photometry_jobs(
     if not search or not _int(search.get("totalFrequencies")) or not _int(search.get("frequenciesPerWorkUnit")):
         raise RuntimeError("v20.24 requires the frozen residual-frequency search definition.")
     dependency_id = f"atlas-forced-photometry:{investigation_id}:{trigger_stage_id.split('-', 1)[0]}"
+    expected_ids = tuple(
+        stable_job_id("atlas-forced-photometry", investigation_id, trigger_stage_id,
+                      dependency_id, str(source["sourceRole"]))
+        for source in sources
+    )
+    job_store.save_dependency(ExternalDependency(
+        id=dependency_id, investigationID=investigation_id,
+        triggerStageID=trigger_stage_id, provider="atlas-forced-photometry",
+        expectedJobIDs=expected_ids,
+    ))
     headers = None
     ids = []
-    for source in sources:
+    for source, job_id in zip(sources, expected_ids):
         role = str(source["sourceRole"])
-        job_id = stable_job_id("atlas-forced-photometry", investigation_id,
-                               trigger_stage_id, dependency_id, role)
         existing = job_store.get(job_id)
         if existing and existing.remoteTaskURL:
             ids.append(job_id)

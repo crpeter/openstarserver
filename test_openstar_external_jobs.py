@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from openstar_external_jobs import (
-    ExternalJob, ExternalJobMonitor, ExternalJobPollUnavailable, ExternalJobStore,
+    ExternalDependency, ExternalJob, ExternalJobMonitor, ExternalJobPollUnavailable, ExternalJobStore,
     PollResult, apply_external_job_wakeups,
 )
 from openstar_investigation import InvestigationStore
@@ -21,6 +21,9 @@ class ExternalJobTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(); self.root = Path(self.temp.name)
         self.store = ExternalJobStore(self.root / "external-jobs")
+        expected = (self.job().id, self.job("catalog-counterpart").id)
+        self.store.save_dependency(ExternalDependency("atlas:inv:052", "inv",
+            "052-prepare", "atlas", expected))
 
     def tearDown(self): self.temp.cleanup()
 
@@ -116,6 +119,30 @@ class ExternalJobTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "parser bug"):
             ExternalJobMonitor(self.store, {"atlas": Bug()}).poll_due()
         self.assertIsNone(self.store.load(job.id).lastOperationalError)
+
+    def test_partial_expected_group_never_becomes_ready_across_restart(self):
+        target = replace(self.job(), state="COMPLETE", remoteTaskURL="target",
+                         remoteResultURL="target-result")
+        self.store.save(target)
+        self.assertEqual((), self.store.ready_dependencies())
+        restarted = ExternalJobStore(self.store.root)
+        self.assertEqual((), restarted.ready_dependencies())
+        counterpart = replace(self.job("catalog-counterpart"), state="QUEUED",
+                              remoteTaskURL="counterpart")
+        restarted.save(counterpart)
+        self.assertEqual((), restarted.ready_dependencies())
+        restarted.save(replace(counterpart, state="COMPLETE",
+                               remoteResultURL="counterpart-result"))
+        self.assertEqual((("inv", "atlas:inv:052"),),
+                         restarted.ready_dependencies())
+
+    def test_manifest_with_zero_existing_jobs_is_incomplete(self):
+        empty_store = ExternalJobStore(self.root / "empty-external-jobs")
+        empty_store.save_dependency(ExternalDependency("dependency", "empty-inv",
+            "prepare", "provider", ("missing-a", "missing-b")))
+        self.assertEqual((), empty_store.ready_dependencies())
+        self.assertEqual((("empty-inv", "dependency"),),
+                         empty_store.pending_dependencies())
 
 
 if __name__ == "__main__": unittest.main()

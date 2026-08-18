@@ -13,6 +13,7 @@ from typing import Any, Protocol
 from openstar_investigation import InvestigationStore
 
 VERSION = "openstar.external-job.v1"
+DEPENDENCY_VERSION = "openstar.external-dependency.v1"
 PENDING_STATES = frozenset({"SUBMITTED", "QUEUED", "RUNNING"})
 TERMINAL_STATES = frozenset({"COMPLETE", "REMOTE_FAILED"})
 
@@ -55,6 +56,16 @@ class ExternalJob:
 
 
 @dataclass(frozen=True)
+class ExternalDependency:
+    id: str
+    investigationID: str
+    triggerStageID: str
+    provider: str
+    expectedJobIDs: tuple[str, ...]
+    version: str = DEPENDENCY_VERSION
+
+
+@dataclass(frozen=True)
 class PollResult:
     state: str
     remote_result_url: str | None = None
@@ -72,6 +83,8 @@ class ExternalJobStore:
     def __init__(self, root: str | Path):
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
+        self.dependencies_root = self.root / "dependencies"
+        self.dependencies_root.mkdir(parents=True, exist_ok=True)
 
     def path_for(self, job_id: str) -> Path:
         if not job_id or "/" in job_id or "\\" in job_id:
@@ -91,9 +104,25 @@ class ExternalJobStore:
         self._atomic_write(path, asdict(job))
         return job
 
+    def dependency_path_for(self, dependency_id: str) -> Path:
+        digest = hashlib.sha256(dependency_id.encode()).hexdigest()
+        return self.dependencies_root / f"external-dependency-{digest}.json"
+
+    def save_dependency(self, dependency: ExternalDependency) -> ExternalDependency:
+        if not dependency.expectedJobIDs or len(set(dependency.expectedJobIDs)) != len(
+            dependency.expectedJobIDs
+        ):
+            raise ValueError("External dependency expectedJobIDs must be non-empty and unique")
+        path = self.dependency_path_for(dependency.id)
+        if path.exists() and self.load_dependency(dependency.id) != dependency:
+            raise ValueError("A persisted external dependency manifest is immutable")
+        self._atomic_write(path, asdict(dependency))
+        return dependency
+
     def _atomic_write(self, path: Path, payload: dict[str, Any]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
         fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp",
-                                         dir=self.root)
+                                         dir=path.parent)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
                 json.dump(payload, handle, indent=2, sort_keys=True)
@@ -118,24 +147,50 @@ class ExternalJobStore:
     def pending(self) -> tuple[ExternalJob, ...]:
         return tuple(job for job in self.list() if job.state in PENDING_STATES)
 
-    def _dependency_groups(self) -> dict[tuple[str, str], list[ExternalJob]]:
-        groups: dict[tuple[str, str], list[ExternalJob]] = {}
-        for job in self.list():
-            groups.setdefault((job.investigationID, job.dependencyID), []).append(job)
-        return groups
+    def load_dependency(self, dependency_id: str) -> ExternalDependency:
+        with self.dependency_path_for(dependency_id).open(encoding="utf-8") as handle:
+            raw = json.load(handle)
+        if raw.get("version") != DEPENDENCY_VERSION:
+            raise ValueError(f"Unsupported external dependency version: {raw.get('version')}")
+        raw["expectedJobIDs"] = tuple(raw["expectedJobIDs"])
+        return ExternalDependency(**raw)
+
+    def dependencies(self) -> tuple[ExternalDependency, ...]:
+        result = []
+        for path in sorted(self.dependencies_root.glob("external-dependency-*.json")):
+            with path.open(encoding="utf-8") as handle:
+                raw = json.load(handle)
+            result.append(self.load_dependency(str(raw["id"])))
+        return tuple(result)
+
+    def _expected_jobs(self, dependency: ExternalDependency) -> list[ExternalJob | None]:
+        return [self.get(job_id) for job_id in dependency.expectedJobIDs]
 
     def ready_dependencies(self) -> tuple[tuple[str, str], ...]:
         """Reconstruct readiness solely from durable COMPLETE records."""
         return tuple(sorted(
-            identity for identity, jobs in self._dependency_groups().items()
-            if jobs and all(job.state == "COMPLETE" for job in jobs)
+            (dependency.investigationID, dependency.id)
+            for dependency in self.dependencies()
+            if all(job is not None and job.state == "COMPLETE"
+                   for job in self._expected_jobs(dependency))
         ))
 
     def failed_dependencies(self) -> tuple[tuple[str, str], ...]:
         """Return durable dependency groups containing a terminal remote failure."""
         return tuple(sorted(
-            identity for identity, jobs in self._dependency_groups().items()
-            if jobs and any(job.state == "REMOTE_FAILED" for job in jobs)
+            (dependency.investigationID, dependency.id)
+            for dependency in self.dependencies()
+            if any(job is not None and job.state == "REMOTE_FAILED"
+                   for job in self._expected_jobs(dependency))
+        ))
+
+    def pending_dependencies(self) -> tuple[tuple[str, str], ...]:
+        ready = set(self.ready_dependencies())
+        failed = set(self.failed_dependencies())
+        return tuple(sorted(
+            (dependency.investigationID, dependency.id)
+            for dependency in self.dependencies()
+            if (dependency.investigationID, dependency.id) not in ready | failed
         ))
 
 

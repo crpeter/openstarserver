@@ -6,7 +6,7 @@ from pathlib import Path
 
 from openstar_autonomy import ExternalDataDependency, ScientificBranch
 from openstar_dispatch import InvestigationDispatcher
-from openstar_external_jobs import ExternalJob, ExternalJobStore
+from openstar_external_jobs import ExternalDependency, ExternalJob, ExternalJobStore
 from openstar_investigation import InvestigationStage, InvestigationStore
 from openstar_lifecycle import InvestigationLifecycleLoop
 from openstar_targets import InvestigationTarget, InvestigationTargetPortfolio
@@ -353,6 +353,8 @@ class InvestigationLifecycleLoopTests(unittest.TestCase):
             job = ExternalJob.create(provider="test", investigation_id=target.investigation_id,
                 trigger_stage_id="prepare", dependency_id=f"external:{target.investigation_id}",
                 role="required")
+            jobs.save_dependency(ExternalDependency(f"external:{target.investigation_id}",
+                target.investigation_id, "prepare", "test", (job.id,)))
             jobs.save(replace(job, state=state, remoteTaskURL=f"task:{target.id}"))
         loop = self.loop(planners={"test": planner})
         loop.start(self.initial)

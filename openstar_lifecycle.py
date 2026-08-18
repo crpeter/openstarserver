@@ -273,7 +273,9 @@ class InvestigationLifecycleLoop:
                             "EXTERNAL_JOB_FAILURE_REQUIRES_ATTENTION",
                             transitions,
                         )
-                    if external_jobs and external_jobs.pending():
+                    if external_jobs and (
+                        external_jobs.pending_dependencies() or external_jobs.pending()
+                    ):
                         return LifecycleResult(
                             dispatched.investigation,
                             "NO_RUNNABLE_TARGETS_WAITING_EXTERNAL_DATA",
