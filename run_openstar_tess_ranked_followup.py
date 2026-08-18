@@ -26,8 +26,20 @@ def validate_state_roots(sector_state_dir: str | Path, deep_state_dir: str | Pat
     if sector_root == deep_root or sector_root.is_relative_to(deep_root) or deep_root.is_relative_to(sector_root):
         raise RuntimeError("Sector and deep state directories must be separate non-overlapping trees")
     for root in (sector_root, deep_root):
-        legacy = [name for name in ("lifecycle.json", "portfolio.json") if (root / name).exists()]
-        if legacy: raise RuntimeError(f"Ranked follow-up refuses legacy state in {root}: {', '.join(legacy)}")
+        # A child directory is not an isolation boundary from legacy Blind C
+        # state.  Resolve first, then inspect the root and every containing
+        # directory so symlinks cannot bypass the guard.
+        for container in (root, *root.parents):
+            legacy = [
+                name
+                for name in ("lifecycle.json", "portfolio.json")
+                if (container / name).exists()
+            ]
+            if legacy:
+                raise RuntimeError(
+                    "Ranked follow-up refuses state nested in legacy state at "
+                    f"{container}: {', '.join(legacy)}"
+                )
     return sector_root, deep_root
 
 
