@@ -330,6 +330,50 @@ def _repair_catalog_timeout_terminal(
     )
 
 
+def _repair_closed_file_independent_prepare(
+    store: InvestigationStore, investigation: Investigation
+) -> Investigation | None:
+    """Retry only the known pre-lock Lightkurve closed-file durable failure."""
+    if investigation.status != "FAILED" or not investigation.stages:
+        return None
+    failed = investigation.stages[-1]
+    if not (
+        failed.status == "FAILED"
+        and failed.handler_id == "openstar.tess.independent.prepare"
+        and failed.error == "ValueError: I/O operation on closed file."
+        and failed.failure_classification == "NON_RETRYABLE"
+    ):
+        return None
+    required = {
+        "openstar.tess.prepare-target",
+        "openstar.tess.primary-project.run",
+        "openstar.tess.catalog-identity",
+        "openstar.tess.planner",
+    }
+    completed = {stage.handler_id for stage in investigation.stages
+                 if stage.status == "COMPLETE"}
+    if not required.issubset(completed):
+        return None
+    prefixes = [int(stage.id.partition("-")[0]) for stage in investigation.stages
+                if stage.id.partition("-")[0].isdigit()]
+    retry = StageRequest(
+        id=f"{max(prefixes, default=0) + 1:03d}-prepare-independent-sectors",
+        handler_id="openstar.tess.independent.prepare",
+        parameters=dict(failed.parameters),
+        triggered_by_stage_id=failed.id,
+    )
+    return store.set_control_state(
+        investigation,
+        status="RUNNING",
+        control_state={
+            "branchAssessments": [],
+            "selectedExperiment": asdict(retry),
+            "schedulerAction": "RUN_EXPERIMENT",
+            "recovery": "TESS_LIGHTKURVE_CLOSED_FILE_COMPATIBILITY_RETRY",
+        },
+    )
+
+
 def repair_obsolete_terminal_wait(
     store: InvestigationStore, investigation: Investigation
 ) -> Investigation:
@@ -338,6 +382,10 @@ def repair_obsolete_terminal_wait(
     control = investigation.metadata.get("controlState")
     if investigation.workflow_id != WORKFLOW_ID or not isinstance(control, dict):
         return investigation
+
+    independent_repair = _repair_closed_file_independent_prepare(store, investigation)
+    if independent_repair is not None:
+        return independent_repair
 
     catalog_repair = _repair_catalog_timeout_terminal(store, investigation, control)
     if catalog_repair is not None:
