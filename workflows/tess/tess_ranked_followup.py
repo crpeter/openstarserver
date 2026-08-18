@@ -127,6 +127,8 @@ def verified_reusable_primary(store, admission: TessDeepAdmission) -> dict[str, 
         evidence = evidence_stage.result
         if not all(isinstance(value, dict) for value in (prepared, scan, evidence)):
             return None
+        if scan.get("status") != "COMPLETE":
+            return None
         if investigation.metadata.get("ticID") != admission.ticID or investigation.metadata.get("sector") != admission.sector:
             return None
         if (str(prepared.get("projectPath")) != admission.sourceProjectPath
@@ -136,6 +138,10 @@ def verified_reusable_primary(store, admission: TessDeepAdmission) -> dict[str, 
                 or prepared.get("datasetSha256") != admission.datasetSha256):
             return None
         project_path, dataset_path = Path(admission.sourceProjectPath), Path(admission.datasetArtifact)
+        dispatched_path = scan_stage.parameters.get("projectPath")
+        if (not isinstance(dispatched_path, str)
+                or Path(dispatched_path).expanduser().resolve() != project_path.resolve()):
+            return None
         if (not project_path.is_file() or sha256_file(project_path) != admission.sourceProjectManifestSha256
                 or not dataset_path.is_file() or sha256_file(dataset_path) != admission.datasetSha256):
             return None
@@ -152,6 +158,12 @@ def verified_reusable_primary(store, admission: TessDeepAdmission) -> dict[str, 
         if not isinstance(results, list) or len(results) != 1 or not isinstance(results[0], dict):
             return None
         target = results[0]
+        if str(target.get("datasetID")) != admission.datasetID:
+            return None
+        if target.get("ticID") is not None and target.get("ticID") != admission.ticID:
+            return None
+        if target.get("sector") is not None and target.get("sector") != admission.sector:
+            return None
         expected = {
             "bestFrequency": target.get("bestFrequency", target.get("candidateFrequency")),
             "bestPeriodDays": target.get("bestPeriodDays", target.get("candidatePeriodDays")),
@@ -174,6 +186,8 @@ def verified_reusable_primary(store, admission: TessDeepAdmission) -> dict[str, 
         provenance = scan_stage.provenance
         if provenance is None or list(provenance.project_ids) != evidence.get("computeProjectIDs") \
                 or provenance.node_contributions != evidence.get("nodeContributions"):
+            return None
+        if scan.get("projectID") is not None and scan.get("projectID") not in provenance.project_ids:
             return None
         return {"schemaVersion": "1", "verification": "EXACT_FROZEN_SHALLOW_PRIMARY",
                 "sourceScanInvestigationID": investigation.id, "sourceWorkflowID": investigation.workflow_id,
