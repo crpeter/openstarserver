@@ -75,6 +75,57 @@ class CoordinatorRuntimeTests(unittest.TestCase):
             [runtime.claim_work("node")["projectID"] for _ in range(6)],
         )
 
+    def test_concurrent_claims_advance_project_cursor_atomically(self):
+        runtime = self.activate_two()
+        for node_id in ("node-1", "node-2"):
+            runtime.register_node({"nodeID": node_id, "capabilities": {}})
+
+        first_entered = threading.Event()
+        second_entered = threading.Event()
+        release_first = threading.Event()
+        original_claim = runtime._states["a"].claim_work
+        call_lock = threading.Lock()
+        call_count = 0
+
+        def overlapping_claim(node_id):
+            nonlocal call_count
+            with call_lock:
+                call_count += 1
+                current_call = call_count
+            if current_call == 1:
+                first_entered.set()
+                self.assertTrue(release_first.wait(2))
+            else:
+                second_entered.set()
+            return original_claim(node_id)
+
+        claimed_projects = {}
+        errors = []
+
+        def claim(node_id):
+            try:
+                claimed_projects[node_id] = runtime.claim_work(node_id)["projectID"]
+            except Exception as error:
+                errors.append(error)
+
+        with patch.object(
+            runtime._states["a"], "claim_work", side_effect=overlapping_claim
+        ):
+            first = threading.Thread(target=claim, args=("node-1",))
+            second = threading.Thread(target=claim, args=("node-2",))
+            first.start()
+            self.assertTrue(first_entered.wait(2))
+            second.start()
+            second_entered.wait(0.1)
+            release_first.set()
+            first.join(2)
+            second.join(2)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual([], errors)
+        self.assertEqual({"node-1": "a", "node-2": "b"}, claimed_projects)
+
     def test_empty_and_incompatible_projects_are_skipped(self):
         runtime = CoordinatorRuntime()
         runtime.activate_project(

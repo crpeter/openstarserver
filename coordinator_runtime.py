@@ -93,24 +93,21 @@ class CoordinatorRuntime:
 
     def claim_work(self, node_id: Any):
         with self.lock:
-            order = list(self._project_order)
-            if not order:
+            if not self._project_order:
                 return None
-            start = self._next_project_index % len(order)
-            states = [(project_id, self._states[project_id]) for project_id in order]
+            start = self._next_project_index % len(self._project_order)
 
-        for offset in range(len(states)):
-            position = (start + offset) % len(states)
-            project_id, state = states[position]
-            work = state.claim_work(node_id)
-            if work is None:
-                continue
-            with self.lock:
-                if project_id in self._project_order:
-                    current = self._project_order.index(project_id)
-                    self._next_project_index = (current + 1) % len(self._project_order)
-            return work
-        return None
+            for offset in range(len(self._project_order)):
+                position = (start + offset) % len(self._project_order)
+                project_id = self._project_order[position]
+                state = self._states[project_id]
+                work = state.claim_work(node_id)
+                if work is None:
+                    continue
+                self._next_project_index = (position + 1) % len(self._project_order)
+                return work
+
+            return None
 
     def submit_result(self, work_id: str, payload: dict[str, Any]):
         normalized = normalize_id(work_id)
