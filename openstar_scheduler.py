@@ -29,6 +29,7 @@ class InvestigationScheduleOutcome:
 class SchedulingRoundResult:
     outcomes: tuple[InvestigationScheduleOutcome, ...]
     dispatched_investigation_ids: tuple[str, ...]
+    raised_investigation_ids: tuple[str, ...] = ()
 
     @property
     def immediately_runnable(self) -> bool:
@@ -110,13 +111,17 @@ class InvestigationScheduler:
             target, preparation.investigation, preparation.state, error
         )
 
-    def run_round(self) -> SchedulingRoundResult:
+    def run_round(
+        self, deferred_investigation_ids: set[str] | None = None
+    ) -> SchedulingRoundResult:
+        deferred = deferred_investigation_ids or set()
         targets = self.admit_targets()
         prepared = [(target, self.driver.prepare(target)) for target in targets]
         runnable = [
             (target, item)
             for target, item in prepared
             if item.state == InvestigationSchedulingState.RUNNABLE
+            and target.investigation_id not in deferred
         ]
         if not runnable:
             return SchedulingRoundResult(
@@ -125,6 +130,7 @@ class InvestigationScheduler:
 
         workers = self.max_concurrent_investigations or len(runnable)
         results: dict[str, InvestigationScheduleOutcome] = {}
+        raised: list[str] = []
         with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = {
                 executor.submit(self.driver.dispatch_runnable, target): target
@@ -135,10 +141,10 @@ class InvestigationScheduler:
                 try:
                     results[target.id] = self._outcome(target, future.result())
                 except BaseException as error:
-                    investigation = self.store.load(target.investigation_id)
-                    state = self.driver.prepare(target).state
-                    results[target.id] = InvestigationScheduleOutcome(
-                        target, investigation, state, error
+                    prepared_after_error = self.driver.prepare(target)
+                    raised.append(target.investigation_id)
+                    results[target.id] = self._outcome(
+                        target, prepared_after_error, error
                     )
 
         outcomes = []
@@ -147,13 +153,28 @@ class InvestigationScheduler:
         return SchedulingRoundResult(
             tuple(outcomes),
             tuple(target.investigation_id for target, _ in runnable),
+            tuple(raised),
         )
 
     def run_until_idle(self) -> SchedulingRoundResult:
+        deferred: set[str] = set()
+        deferred_outcomes: dict[str, InvestigationScheduleOutcome] = {}
         while True:
-            result = self.run_round()
+            result = self.run_round(deferred)
+            deferred.update(result.raised_investigation_ids)
+            for outcome in result.outcomes:
+                if outcome.error is not None:
+                    deferred_outcomes[outcome.investigation.id] = outcome
             if not result.dispatched_investigation_ids:
-                return result
+                outcomes = tuple(
+                    deferred_outcomes.get(outcome.investigation.id, outcome)
+                    for outcome in result.outcomes
+                )
+                return SchedulingRoundResult(
+                    outcomes,
+                    result.dispatched_investigation_ids,
+                    tuple(deferred),
+                )
 
     def run(self) -> SchedulingRoundResult:
         """Run scheduling rounds until no investigation is immediately runnable."""

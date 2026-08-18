@@ -9,7 +9,12 @@ from openstar_investigation import InvestigationStore
 from openstar_lifecycle import InvestigationSchedulingState
 from openstar_scheduler import InvestigationScheduler
 from openstar_targets import InvestigationTarget
-from openstar_workflow import StageOutcome, StageRequest, WorkflowEngine
+from openstar_workflow import (
+    RetryableExecutionError,
+    StageOutcome,
+    StageRequest,
+    WorkflowEngine,
+)
 
 
 class Source:
@@ -164,6 +169,71 @@ class InvestigationSchedulerTests(unittest.TestCase):
         self.scheduler(targets, planner).run_until_idle()
         investigation = self.store.load("investigation-target")
         self.assertEqual(["run"], [stage.id for stage in investigation.stages])
+
+    def test_retryable_failure_is_deferred_while_other_work_continues(self):
+        executions = {"a": 0, "b": 0}
+
+        def execute(investigation, request):
+            target_id = investigation.metadata["targetID"]
+            executions[target_id] += 1
+            if target_id == "a":
+                raise RetryableExecutionError("coordinator unavailable")
+            return StageOutcome({}, stop=True)
+
+        self.workflow.register_handler("execute", execute)
+
+        def planner(investigation, target):
+            if target.id == "a":
+                return (ScientificBranch("a", StageRequest("001-run", "execute", {})),)
+            completed = sum(
+                stage.status == "COMPLETE" for stage in investigation.stages
+            )
+            if completed >= 2:
+                return ()
+            return (
+                ScientificBranch(
+                    f"b-{completed + 1}",
+                    StageRequest(f"00{completed + 1}-run", "execute", {}),
+                ),
+            )
+
+        targets = [
+            InvestigationTarget(
+                "a",
+                "investigation-a",
+                "test.workflow",
+                "1",
+                metadata={"targetID": "a"},
+            ),
+            InvestigationTarget(
+                "b",
+                "investigation-b",
+                "test.workflow",
+                "1",
+                metadata={"targetID": "b"},
+            ),
+        ]
+        scheduler = self.scheduler(targets, planner)
+        result = scheduler.run_until_idle()
+
+        self.assertEqual({"a": 1, "b": 2}, executions)
+        a = self.store.load("investigation-a")
+        self.assertEqual("FAILED", a.stages[-1].status)
+        self.assertEqual(
+            "TRANSIENT_INFRASTRUCTURE", a.stages[-1].failure_classification
+        )
+        self.assertEqual(
+            "RUN_EXPERIMENT", a.metadata["controlState"]["schedulerAction"]
+        )
+        self.assertEqual(
+            a.stages[-1].id,
+            a.metadata["controlState"]["selectedExperiment"]["triggered_by_stage_id"],
+        )
+        self.assertEqual("COMPLETE", self.store.load("investigation-b").status)
+        self.assertTrue(any(outcome.error is not None for outcome in result.outcomes))
+
+        scheduler.run_until_idle()
+        self.assertEqual(2, executions["a"])
 
 
 if __name__ == "__main__":

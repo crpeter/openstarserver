@@ -297,6 +297,54 @@ class CoordinatorClientTests(unittest.TestCase):
         ), self.assertRaisesRegex(ValueError, "duplicate project ID"):
             client.run_projects(["one.json", "two.json"])
 
+    def test_run_projects_activation_time_counts_toward_overall_timeout(self):
+        client = OpenStarCoordinatorClient()
+        clock = [0.0]
+
+        def activate(path, *, require_terminal):
+            clock[0] = 2.0
+            return {"projectID": "a"}
+
+        with patch.object(client, "activate_project", side_effect=activate), patch(
+            "openstar_coordinator_client.time.monotonic",
+            side_effect=lambda: clock[0],
+        ), self.assertRaises(TimeoutError):
+            client.run_projects(["one.json"], timeout=1.0)
+
+    def test_run_projects_terminal_status_after_deadline_times_out(self):
+        client = OpenStarCoordinatorClient()
+        clock = [0.0]
+
+        def status(project_id):
+            clock[0] = 2.0
+            return {"projectID": project_id, "status": "COMPLETE"}
+
+        with patch.object(
+            client, "activate_project", return_value={"projectID": "a"}
+        ), patch.object(client, "project_status", side_effect=status), patch(
+            "openstar_coordinator_client.time.monotonic",
+            side_effect=lambda: clock[0],
+        ), self.assertRaises(
+            TimeoutError
+        ):
+            client.run_projects(["one.json"], timeout=1.0)
+
+    def test_run_projects_completion_before_deadline_succeeds(self):
+        client = OpenStarCoordinatorClient()
+        complete = {
+            "projectID": "a",
+            "status": "COMPLETE",
+            "nodeContributions": {"node": 4},
+        }
+        with patch.object(
+            client, "activate_project", return_value={"projectID": "a"}
+        ), patch.object(client, "project_status", return_value=complete), patch(
+            "openstar_coordinator_client.time.monotonic", return_value=0.0
+        ):
+            result = client.run_projects(["one.json"], timeout=1.0)
+        self.assertEqual(("a",), result.project_ids)
+        self.assertEqual({"node": 4}, result.node_contributions)
+
     def test_wait_for_project_uses_project_specific_status(self):
         client = OpenStarCoordinatorClient()
         running = {"status": "RUNNING", "projectTotalWorkUnits": 1}

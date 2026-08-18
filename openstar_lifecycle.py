@@ -198,22 +198,31 @@ class InvestigationLifecycleDriver:
         prepared = self.prepare(target)
         if prepared.state != InvestigationSchedulingState.RUNNABLE:
             return prepared
-        dispatched = self.dispatcher.dispatch(
-            prepared.investigation.id,
-            software_id=self.software_id,
-            software_version=self.software_version,
-        )
+        dispatched = self.dispatch_prepared(prepared)
         if dispatched.disposition == "EXPERIMENT_RECOVERY_REQUIRED":
             return InvestigationPreparation(
                 dispatched.investigation,
                 InvestigationSchedulingState.RECOVERY_REQUIRED,
                 prepared.transitions + 1,
             )
-        self._plan(self.store.load(prepared.investigation.id), target)
+        self.replan_after_dispatch(target)
         result = self.prepare(target)
         return InvestigationPreparation(
             result.investigation, result.state, prepared.transitions + 2
         )
+
+    def dispatch_prepared(self, prepared: InvestigationPreparation):
+        """Dispatch one already-prepared runnable decision without replanning."""
+        if prepared.state != InvestigationSchedulingState.RUNNABLE:
+            raise ValueError("Only a RUNNABLE investigation may be dispatched.")
+        return self.dispatcher.dispatch(
+            prepared.investigation.id,
+            software_id=self.software_id,
+            software_version=self.software_version,
+        )
+
+    def replan_after_dispatch(self, target: InvestigationTarget) -> Investigation:
+        return self._plan(self.store.load(target.investigation_id), target)
 
 
 class InvestigationLifecycleLoop:
@@ -323,6 +332,11 @@ class InvestigationLifecycleLoop:
             prepared = self.driver.prepare(target)
             transitions += prepared.transitions
 
+            if transitions >= max_transitions:
+                return LifecycleResult(
+                    prepared.investigation, "LIFECYCLE_CHECKPOINT", transitions
+                )
+
             if prepared.state == InvestigationSchedulingState.RECOVERY_REQUIRED:
                 return LifecycleResult(
                     prepared.investigation, "EXPERIMENT_RECOVERY_REQUIRED", transitions
@@ -330,20 +344,30 @@ class InvestigationLifecycleLoop:
             if prepared.state == InvestigationSchedulingState.FAILED:
                 return LifecycleResult(
                     prepared.investigation,
-                    "LIFECYCLE_CHECKPOINT",
+                    "NONRETRYABLE_FAILURE_REQUIRES_ATTENTION",
                     transitions,
                 )
             if prepared.state == InvestigationSchedulingState.RUNNABLE:
+                dispatched = self.driver.dispatch_prepared(prepared)
+                transitions += 1
+                if dispatched.disposition == "EXPERIMENT_RECOVERY_REQUIRED":
+                    return LifecycleResult(
+                        dispatched.investigation,
+                        "EXPERIMENT_RECOVERY_REQUIRED",
+                        transitions,
+                    )
                 if transitions >= max_transitions:
                     return LifecycleResult(
-                        prepared.investigation, "LIFECYCLE_CHECKPOINT", transitions
+                        self.store.load(prepared.investigation.id),
+                        "LIFECYCLE_CHECKPOINT",
+                        transitions,
                     )
-                result = self.driver.dispatch_runnable(target)
-                transitions += max(1, result.transitions - prepared.transitions)
-                if result.state == InvestigationSchedulingState.RECOVERY_REQUIRED:
+                investigation = self.driver.replan_after_dispatch(target)
+                transitions += 1
+                if transitions >= max_transitions:
                     return LifecycleResult(
-                        result.investigation,
-                        "EXPERIMENT_RECOVERY_REQUIRED",
+                        investigation,
+                        "LIFECYCLE_CHECKPOINT",
                         transitions,
                     )
                 continue

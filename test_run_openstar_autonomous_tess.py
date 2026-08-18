@@ -218,6 +218,40 @@ class AutonomousTessEntryPointTests(unittest.TestCase):
         self.assertEqual(2, code)
         self.assertIn("disposition=EXPERIMENT_RECOVERY_REQUIRED", output)
 
+    def test_nonretryable_failure_surfaces_attention_without_busy_loop(self):
+        def waiting(investigation, target):
+            return (
+                ScientificBranch(
+                    "wait",
+                    StageRequest("wait", "test.execute", {}),
+                    required_stage_ids=("prerequisite",),
+                ),
+            )
+
+        self.invoke(waiting)
+        store = InvestigationStore(self.root / "state/investigations")
+        investigation = store.load("tess-validation-first")
+        running = InvestigationStage("failed", "test.execute", "RUNNING", None, {})
+        investigation = store.append_running_stage(investigation, running)
+        failed = store.build_terminal_stage(
+            stage_id="failed",
+            handler_id="test.execute",
+            status="FAILED",
+            triggered_by_stage_id=None,
+            parameters={},
+            result=None,
+            error="ValueError: bad data",
+            failure_classification="NON_RETRYABLE",
+            software_id="test",
+            software_version="1",
+        )
+        store.complete_current_stage(investigation, failed)
+
+        code, output = self.invoke(waiting)
+
+        self.assertEqual(0, code)
+        self.assertIn("NONRETRYABLE_FAILURE_REQUIRES_ATTENTION", output)
+
     def test_multi_mode_uses_scheduler_without_legacy_state_files(self):
         output = io.StringIO()
         with (

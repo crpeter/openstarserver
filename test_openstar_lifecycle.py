@@ -288,7 +288,7 @@ class InvestigationLifecycleLoopTests(unittest.TestCase):
         failed = self.store.load(investigation.id).stages[-1]
         self.assertEqual("NON_RETRYABLE", failed.failure_classification)
         result = loop.run(max_transitions=1)
-        self.assertEqual("LIFECYCLE_CHECKPOINT", result.disposition)
+        self.assertEqual("NONRETRYABLE_FAILURE_REQUIRES_ATTENTION", result.disposition)
         self.assertEqual(1, len(self.store.load(investigation.id).stages))
 
     def test_target_advance_is_durable_and_continues_same_lifecycle(self):
@@ -318,7 +318,16 @@ class InvestigationLifecycleLoopTests(unittest.TestCase):
         planners = {"test": advancing_planner}
         loop = self.loop(planners=planners)
         loop.start(self.initial)
-        loop.run(max_transitions=1)  # persist ADVANCE_TO_NEXT_TARGET
+        planned = loop.run(max_transitions=1)  # persist ADVANCE_TO_NEXT_TARGET
+        self.assertEqual("LIFECYCLE_CHECKPOINT", planned.disposition)
+        self.assertEqual(
+            "ADVANCE_TO_NEXT_TARGET",
+            self.store.load(self.initial.investigation_id)
+            .metadata["controlState"]["schedulerAction"],
+        )
+        self.assertFalse((self.root / "portfolio.json").exists())
+        state = json.loads((self.root / "lifecycle.json").read_text(encoding="utf-8"))
+        self.assertEqual("one", state["currentTarget"]["id"])
 
         advanced = self.loop(planners=planners).run(max_transitions=2)
         self.assertEqual("LIFECYCLE_CHECKPOINT", advanced.disposition)
