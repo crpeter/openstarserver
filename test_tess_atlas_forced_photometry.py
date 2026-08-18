@@ -4,7 +4,7 @@ import tempfile
 import types
 import unittest
 import urllib.error
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -25,6 +25,8 @@ else:
     _installed_numpy_stub = False
 
 from openstar_investigation import Investigation, InvestigationStage, InvestigationStore
+from openstar_external_jobs import (ExternalJob, ExternalJobPollUnavailable,
+                                    ExternalJobStore, apply_external_job_wakeups)
 from openstar_targets import InvestigationTarget
 from openstar_workflow import RetryableExecutionError, StageRequest
 from workflows.tess import tess_atlas_forced_photometry as atlas
@@ -101,6 +103,52 @@ class CurrentATLASForcedPhotometryTests(unittest.TestCase):
             with self.assertRaises(atlas.ATLASArchiveUnavailable):
                 atlas._submit_atlas_job({}, ra_deg=1, dec_deg=2)
             sleep.assert_not_called()
+
+    def test_poll_adapter_classifies_only_retryable_service_failures(self):
+        job = ExternalJob.create(provider="atlas-forced-photometry",
+            investigation_id="inv", trigger_stage_id="052", dependency_id="dep",
+            role="target-control")
+        job = replace(job, remoteTaskURL="task")
+        provider = atlas.ATLASExternalJobProvider()
+        with mock.patch.object(atlas, "_atlas_headers", return_value={}), \
+                mock.patch.object(atlas, "_json_request", return_value=(503, {})):
+            with self.assertRaises(ExternalJobPollUnavailable): provider.poll(job)
+        with mock.patch.object(atlas, "_atlas_headers", return_value={}), \
+                mock.patch.object(atlas, "_json_request", return_value=(401, {})):
+            with self.assertRaises(RuntimeError): provider.poll(job)
+        with mock.patch.object(atlas, "_atlas_headers", side_effect=ValueError("bug")):
+            with self.assertRaisesRegex(ValueError, "bug"): provider.poll(job)
+
+    def test_restart_complete_records_wake_exact_053_collect_without_loop(self):
+        dependency = "atlas-forced-photometry:blind:052"
+        submission = InvestigationStage("052-prepare-atlas-forced-photometry",
+            "openstar.tess.atlas-forced-photometry.prepare", "COMPLETE", "051", {},
+            result={"externalDependencyID": dependency,
+                    "externalJobIDs": ["target", "counterpart"]}, stop=True)
+        inv = Investigation("blind", "openstar.workflow.tess-investigation.v1", "20.2",
+            "QUIESCENT_AWAITING_DATA", "now", "now", {"controlState": {
+                "schedulerAction": "ADVANCE_TO_NEXT_TARGET"}}, (submission,))
+        store = InvestigationStore(self.root / "state" / "investigations"); store.save(inv)
+        jobs = ExternalJobStore(self.root / "state" / "external-jobs")
+        for role in ("target-control", "catalog-counterpart"):
+            job = ExternalJob.create(provider="atlas-forced-photometry",
+                investigation_id="blind", trigger_stage_id=submission.id,
+                dependency_id=dependency, role=role)
+            jobs.save(replace(job, state="COMPLETE", remoteTaskURL=f"task-{role}",
+                              remoteResultURL=f"result-{role}"))
+        restarted = ExternalJobStore(jobs.root)
+        self.assertEqual((), restarted.pending())
+        apply_external_job_wakeups(store, restarted.ready_dependencies())
+        awakened = store.load("blind")
+        branch = plan_tess_branches(awakened, InvestigationTarget(
+            "blind", "blind", awakened.workflow_id, awakened.workflow_version))[0]
+        self.assertEqual("053-collect-atlas-forced-photometry", branch.experiment.id)
+        self.assertEqual("openstar.tess.atlas-forced-photometry.collect",
+                         branch.experiment.handler_id)
+        self.assertTrue(branch.external_data[0].available)
+        first = store.path_for("blind").read_bytes()
+        apply_external_job_wakeups(store, restarted.ready_dependencies())
+        self.assertEqual(first, store.path_for("blind").read_bytes())
 
     def _interpret(self, supported_role, include_control):
         prepared, datasets = [], []

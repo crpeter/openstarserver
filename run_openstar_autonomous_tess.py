@@ -65,13 +65,14 @@ def run_autonomous_tess(
     root.mkdir(parents=True, exist_ok=True)
     store = InvestigationStore(root / "investigations")
     external_jobs = ExternalJobStore(root / "external-jobs")
-    ready = ()
     if external_jobs.pending():
         from workflows.tess.tess_atlas_forced_photometry import ATLASExternalJobProvider
-        ready = ExternalJobMonitor(external_jobs, {
+        ExternalJobMonitor(external_jobs, {
             "atlas-forced-photometry": ATLASExternalJobProvider(),
         }).poll_due()
-    apply_external_job_wakeups(store, ready)
+    # Reconstruct from durable terminal records even if a process crashed
+    # after the last job completed but before its investigation was awakened.
+    apply_external_job_wakeups(store, external_jobs.ready_dependencies())
     coordinator = OpenStarCoordinatorClient(coordinator_url)
     workflow = register_tess_workflow_handlers(
         store, coordinator, poll_interval=poll_interval, timeout=timeout

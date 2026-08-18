@@ -6,8 +6,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from openstar_external_jobs import (
-    ExternalJob, ExternalJobMonitor, ExternalJobStore, PollResult, stable_job_id,
+    ExternalJob, ExternalJobMonitor, ExternalJobPollUnavailable, ExternalJobStore,
+    PollResult, apply_external_job_wakeups,
 )
+from openstar_investigation import InvestigationStore
 
 
 class Provider:
@@ -69,12 +71,51 @@ class ExternalJobTests(unittest.TestCase):
         job = replace(self.job(), remoteTaskURL="authoritative")
         self.store.save(job)
         class Failure:
-            def poll(self, unused): raise RuntimeError("HTTP 429")
+            def poll(self, unused): raise ExternalJobPollUnavailable("HTTP 429")
         self.assertEqual((), ExternalJobMonitor(self.store, {"atlas": Failure()}).poll_due())
         saved = self.store.load(job.id)
         self.assertEqual("authoritative", saved.remoteTaskURL)
         self.assertEqual("SUBMITTED", saved.state)
         self.assertIn("429", saved.lastOperationalError)
+
+    def test_restart_reconstructs_complete_dependency_and_wakeup_is_idempotent(self):
+        for job in (self.job(), self.job("catalog-counterpart")):
+            self.store.save(replace(job, state="COMPLETE", remoteTaskURL=job.role,
+                                    remoteResultURL=f"result-{job.role}"))
+        restarted = ExternalJobStore(self.store.root)
+        self.assertEqual((), restarted.pending())
+        ready = restarted.ready_dependencies()
+        self.assertEqual((("inv", "atlas:inv:052"),), ready)
+        investigations = InvestigationStore(self.root / "investigations")
+        investigations.create("inv", "test", "1")
+        apply_external_job_wakeups(investigations, ready)
+        first = investigations.load("inv")
+        apply_external_job_wakeups(investigations, ready)
+        second = investigations.load("inv")
+        self.assertEqual(first, second)
+        self.assertTrue(first.metadata["externalDataAvailability"]["atlas:inv:052"])
+        self.assertEqual(["atlas:inv:052"], first.metadata["externalJobWakeDependencies"])
+
+    def test_remote_failure_is_durable_not_ready_and_not_pending(self):
+        complete = replace(self.job(), state="COMPLETE", remoteTaskURL="a",
+                           remoteResultURL="ra")
+        failed = replace(self.job("catalog-counterpart"), state="REMOTE_FAILED",
+                         remoteTaskURL="authoritative")
+        self.store.save(complete); self.store.save(failed)
+        restarted = ExternalJobStore(self.store.root)
+        self.assertEqual((), restarted.pending())
+        self.assertEqual((), restarted.ready_dependencies())
+        self.assertEqual((("inv", "atlas:inv:052"),), restarted.failed_dependencies())
+        self.assertEqual("authoritative", restarted.load(failed.id).remoteTaskURL)
+
+    def test_unexpected_polling_error_surfaces(self):
+        job = replace(self.job(), remoteTaskURL="task")
+        self.store.save(job)
+        class Bug:
+            def poll(self, unused): raise ValueError("provider parser bug")
+        with self.assertRaisesRegex(ValueError, "parser bug"):
+            ExternalJobMonitor(self.store, {"atlas": Bug()}).poll_due()
+        self.assertIsNone(self.store.load(job.id).lastOperationalError)
 
 
 if __name__ == "__main__": unittest.main()

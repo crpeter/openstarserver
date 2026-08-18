@@ -64,6 +64,10 @@ class ExternalJobProvider(Protocol):
     def poll(self, job: ExternalJob) -> PollResult: ...
 
 
+class ExternalJobPollUnavailable(RuntimeError):
+    """A narrow retryable transport or remote-service polling failure."""
+
+
 class ExternalJobStore:
     def __init__(self, root: str | Path):
         self.root = Path(root)
@@ -114,6 +118,26 @@ class ExternalJobStore:
     def pending(self) -> tuple[ExternalJob, ...]:
         return tuple(job for job in self.list() if job.state in PENDING_STATES)
 
+    def _dependency_groups(self) -> dict[tuple[str, str], list[ExternalJob]]:
+        groups: dict[tuple[str, str], list[ExternalJob]] = {}
+        for job in self.list():
+            groups.setdefault((job.investigationID, job.dependencyID), []).append(job)
+        return groups
+
+    def ready_dependencies(self) -> tuple[tuple[str, str], ...]:
+        """Reconstruct readiness solely from durable COMPLETE records."""
+        return tuple(sorted(
+            identity for identity, jobs in self._dependency_groups().items()
+            if jobs and all(job.state == "COMPLETE" for job in jobs)
+        ))
+
+    def failed_dependencies(self) -> tuple[tuple[str, str], ...]:
+        """Return durable dependency groups containing a terminal remote failure."""
+        return tuple(sorted(
+            identity for identity, jobs in self._dependency_groups().items()
+            if jobs and any(job.state == "REMOTE_FAILED" for job in jobs)
+        ))
+
 
 class ExternalJobMonitor:
     """Perform at most one poll for each due job; never sleeps or submits."""
@@ -137,17 +161,13 @@ class ExternalJobMonitor:
                     remoteResultURL=result.remote_result_url or job.remoteResultURL,
                     lastCheckedAt=checked, nextCheckAt=next_check,
                     completedAt=completed, lastOperationalError=None)
-            except Exception as error:
+            except ExternalJobPollUnavailable as error:
                 updated = replace(job, lastCheckedAt=checked, nextCheckAt=next_check,
                                   lastOperationalError=f"{type(error).__name__}: {error}")
             self.store.save(updated)
             touched.add((job.investigationID, job.dependencyID))
-        ready = []
-        for identity in sorted(touched):
-            group = [j for j in self.store.list()
-                     if (j.investigationID, j.dependencyID) == identity]
-            if group and all(j.state == "COMPLETE" for j in group): ready.append(identity)
-        return tuple(ready)
+        ready = set(self.store.ready_dependencies())
+        return tuple(sorted(identity for identity in touched if identity in ready))
 
 
 def apply_external_job_wakeups(investigations: InvestigationStore,
@@ -157,6 +177,8 @@ def apply_external_job_wakeups(investigations: InvestigationStore,
         investigation = investigations.load(investigation_id)
         metadata = dict(investigation.metadata)
         availability = dict(metadata.get("externalDataAvailability") or {})
+        if availability.get(dependency_id) is True:
+            continue
         availability[dependency_id] = True
         wake = set(metadata.get("externalJobWakeDependencies") or [])
         wake.add(dependency_id)

@@ -6,6 +6,7 @@ from pathlib import Path
 
 from openstar_autonomy import ExternalDataDependency, ScientificBranch
 from openstar_dispatch import InvestigationDispatcher
+from openstar_external_jobs import ExternalJob, ExternalJobStore
 from openstar_investigation import InvestigationStage, InvestigationStore
 from openstar_lifecycle import InvestigationLifecycleLoop
 from openstar_targets import InvestigationTarget, InvestigationTargetPortfolio
@@ -341,6 +342,31 @@ class InvestigationLifecycleLoopTests(unittest.TestCase):
             (self.root / "portfolio.json").read_text(encoding="utf-8")
         )
         self.assertEqual(1, len(portfolio["selections"]))
+
+    def _all_external_wait_loop(self, state):
+        def planner(investigation, target):
+            dependency = f"external:{investigation.id}"
+            return (ScientificBranch("collect", StageRequest("collect", "test.execute", {}),
+                external_data=(ExternalDataDependency(dependency, False, "pending"),)),)
+        jobs = ExternalJobStore(self.root / "external-jobs")
+        for target in self.source.targets:
+            job = ExternalJob.create(provider="test", investigation_id=target.investigation_id,
+                trigger_stage_id="prepare", dependency_id=f"external:{target.investigation_id}",
+                role="required")
+            jobs.save(replace(job, state=state, remoteTaskURL=f"task:{target.id}"))
+        loop = self.loop(planners={"test": planner})
+        loop.start(self.initial)
+        return loop
+
+    def test_all_targets_pending_externally_is_waiting_not_science_complete(self):
+        result = self._all_external_wait_loop("QUEUED").run()
+        self.assertEqual("NO_RUNNABLE_TARGETS_WAITING_EXTERNAL_DATA", result.disposition)
+        self.assertEqual([], self.executions)
+
+    def test_terminal_external_failure_requires_attention_not_science_complete(self):
+        result = self._all_external_wait_loop("REMOTE_FAILED").run()
+        self.assertEqual("EXTERNAL_JOB_FAILURE_REQUIRES_ATTENTION", result.disposition)
+        self.assertEqual([], self.executions)
 
 
 if __name__ == "__main__":

@@ -17,7 +17,8 @@ from typing import Any
 import numpy as np
 
 from openstar_external_jobs import (
-    ExternalJob, ExternalJobStore, PollResult, stable_job_id, utc_now,
+    ExternalJob, ExternalJobPollUnavailable, ExternalJobStore, PollResult,
+    stable_job_id, utc_now,
 )
 
 from .tess_residual_localization import (
@@ -303,9 +304,12 @@ class ATLASExternalJobProvider:
     def poll(self, job: ExternalJob) -> PollResult:
         if not job.remoteTaskURL:
             raise RuntimeError("ATLAS external job has no persisted task URL")
-        status, payload = _json_request(job.remoteTaskURL, headers=_atlas_headers())
+        try:
+            status, payload = _json_request(job.remoteTaskURL, headers=_atlas_headers())
+        except ATLASArchiveUnavailable as error:
+            raise ExternalJobPollUnavailable(str(error)) from error
         if status in {408, 425, 429} or status >= 500:
-            raise ATLASArchiveUnavailable(f"ATLAS polling HTTP {status}: {payload}")
+            raise ExternalJobPollUnavailable(f"ATLAS polling HTTP {status}: {payload}")
         if status != 200:
             raise RuntimeError(f"ATLAS polling HTTP {status}: {payload}")
         finish = payload.get("finishtimestamp")

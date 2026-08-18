@@ -178,6 +178,25 @@ class InvestigationTargetPortfolioTests(unittest.TestCase):
         self.assertEqual("target-b", second.target.id)
         self.assertEqual(["investigation-a", "investigation-b"], self.executions)
 
+    def test_only_explicitly_awakened_quiescent_target_is_eligible_and_replanned(self):
+        dormant = self.store.create("investigation-a", "test", "1")
+        update_investigation_metadata(self.store, dormant, {"controlState": {
+            "schedulerAction": "ADVANCE_TO_NEXT_TARGET", "selectedExperiment": None,
+            "branchAssessments": []}}, status="QUIESCENT_AWAITING_DATA")
+        awakened = self.store.create("investigation-b", "test", "1")
+        update_investigation_metadata(self.store, awakened, {
+            "externalJobWakeDependencies": ["atlas:b:052"]},
+            status="QUIESCENT_AWAITING_DATA")
+
+        result = self.portfolio().advance(self.trigger, self.source(),
+            {"test": self.planner}, software_id="test", software_version="1")
+
+        self.assertEqual("target-b", result.target.id)
+        self.assertEqual(["target-b"], self.plans)
+        self.assertEqual(["investigation-b"], self.executions)
+        self.assertEqual([], self.store.load("investigation-b").metadata[
+            "externalJobWakeDependencies"])
+
 
 if __name__ == "__main__":
     unittest.main()
