@@ -121,6 +121,55 @@ class PreprocessingTests(unittest.TestCase):
 
 
 class SweepTests(unittest.TestCase):
+    def _assert_legacy_state_rejected(self, legacy_name):
+        provider, coordinator = FakeProvider([product(1)]), FakeCoordinator()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            legacy_path = root / legacy_name
+            original = b"legacy-state\x00must-remain-unchanged\n"
+            legacy_path.write_bytes(original)
+
+            with self.assertRaisesRegex(
+                RuntimeError, "refuses legacy single-lifecycle state"
+            ):
+                run_tess_sector_sweep(
+                    7, "unused", root, provider=provider, coordinator=coordinator
+                )
+
+            self.assertEqual(original, legacy_path.read_bytes())
+            self.assertEqual([], provider.calls)
+            self.assertEqual([], provider.downloads)
+            self.assertEqual([], coordinator.calls)
+            self.assertFalse(any(root.glob("tess-sector-*-inventory.json")))
+            self.assertFalse((root / "investigations").exists())
+            self.assertEqual([legacy_name], [path.name for path in root.iterdir()])
+
+    def test_lifecycle_state_directory_is_rejected_before_writes(self):
+        self._assert_legacy_state_rejected("lifecycle.json")
+
+    def test_portfolio_state_directory_is_rejected_before_writes(self):
+        self._assert_legacy_state_rejected("portfolio.json")
+
+    def test_fresh_sector_sweep_state_directory_still_runs(self):
+        provider, coordinator = FakeProvider([product(1)]), FakeCoordinator()
+        with tempfile.TemporaryDirectory() as tmp:
+            from workflows.tess import tess_sector_scan
+            original = tess_sector_scan.read_and_prepare_tess_light_curve
+            tess_sector_scan.read_and_prepare_tess_light_curve = lambda path: Prepared()
+            try:
+                self.assertEqual(
+                    0,
+                    run_tess_sector_sweep(
+                        7, "unused", tmp, provider=provider, coordinator=coordinator
+                    ),
+                )
+            finally:
+                tess_sector_scan.read_and_prepare_tess_light_curve = original
+            self.assertEqual([7], provider.calls)
+            self.assertTrue((Path(tmp) / "tess-sector-7-inventory.json").exists())
+            self.assertEqual([1], provider.downloads)
+            self.assertEqual([1], coordinator.calls)
+
     def _partial_scheduler(self, root, provider, coordinator, *, chained):
         inventory = TessSectorInventoryStore(root / "inventory.json").create_or_load(7, provider)
         store = InvestigationStore(root / "investigations")

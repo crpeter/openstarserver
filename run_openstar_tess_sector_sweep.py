@@ -26,7 +26,17 @@ def run_tess_sector_sweep(sector: int, coordinator_url: str, state_dir: str | Pa
                           max_targets: int | None = None, provider=None,
                           coordinator=None, poll_interval: float = 1.0,
                           timeout: float | None = None) -> int:
-    root = Path(state_dir).expanduser().resolve(); root.mkdir(parents=True, exist_ok=True)
+    root = Path(state_dir).expanduser().resolve()
+    legacy = [
+        name for name in ("lifecycle.json", "portfolio.json")
+        if (root / name).exists()
+    ]
+    if legacy:
+        raise RuntimeError(
+            "TESS sector sweep refuses legacy single-lifecycle state: "
+            + ", ".join(legacy)
+        )
+    root.mkdir(parents=True, exist_ok=True)
     provider = provider or MastTessSectorArchiveProvider()
     inventory = TessSectorInventoryStore(root / f"tess-sector-{sector}-inventory.json").create_or_load(sector, provider)
     store = InvestigationStore(root / "investigations")
