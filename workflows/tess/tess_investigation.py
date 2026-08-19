@@ -7395,8 +7395,12 @@ def build_engine(
             period_evidence["phenomenology"] = morphology_interpretation.get("phenomenology")
             if morphology_interpretation.get("physicalCycleResolved"):
                 period_evidence["physicalCycleResolved"] = True
-                period_evidence["physicalPeriodDays"] = morphology_interpretation.get(
+                resolved_physical_period = morphology_interpretation.get(
                     "resolvedPhysicalPeriodDays"
+                )
+                period_evidence["physicalPeriodDays"] = resolved_physical_period
+                period_evidence["resolvedPhysicalPeriodDays"] = (
+                    resolved_physical_period
                 )
                 period_evidence["interpretation"] = "morphology-resolved-physical-cycle"
                 period_evidence["candidateSource"] = "multi-sector-morphology-discrimination"
