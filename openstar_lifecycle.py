@@ -173,6 +173,20 @@ class InvestigationLifecycleDriver:
             if investigation.stages and investigation.stages[-1].status == "FAILED"
             else None
         )
+        if self._is_tess_archive_compatibility_failure(investigation):
+            retry = self._retry_request(investigation, latest_failed)
+            investigation = self.store.set_control_state(
+                investigation,
+                status="RUNNING",
+                control_state={
+                    "branchAssessments": [],
+                    "selectedExperiment": asdict(retry),
+                    "schedulerAction": "RUN_EXPERIMENT",
+                    "recovery": "TESS_ARCHIVE_TRANSPORT_COMPATIBILITY_RETRY",
+                },
+            )
+            transitions += 1
+            latest_failed = investigation.stages[-1]
         persisted_recovery = (
             latest_failed is not None
             and self._has_persisted_failed_stage_recovery(
@@ -232,6 +246,28 @@ class InvestigationLifecycleDriver:
         else:
             raise ValueError(f"Unknown persisted scheduler action: {action}")
         return InvestigationPreparation(investigation, state, transitions)
+
+    @staticmethod
+    def _is_tess_archive_compatibility_failure(investigation: Investigation) -> bool:
+        if (
+            investigation.workflow_id != "openstar.workflow.tess-sector-scan.v1"
+            or investigation.status != "FAILED"
+            or not investigation.stages
+        ):
+            return False
+        latest = investigation.stages[-1]
+        if (
+            latest.handler_id != "openstar.tess-sector-scan.materialize-light-curve"
+            or latest.status != "FAILED"
+            or latest.failure_classification != "NON_RETRYABLE"
+            or not latest.error
+            or latest.error.partition(":")[0] != "ConnectionError"
+        ):
+            return False
+        return not any(
+            stage.handler_id == latest.handler_id and stage.status == "COMPLETE"
+            for stage in investigation.stages
+        )
 
     def classify(self, target: InvestigationTarget) -> InvestigationPreparation:
         """Return the durable scheduler-visible state for an explicit target."""
