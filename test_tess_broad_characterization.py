@@ -139,13 +139,28 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
             same_sector_candidate_days=13.8,
         )
 
-    def test_stable_promoted_recurrence_finalizes_normally(self):
+    def test_promoted_recurrence_routes_to_physical_cycle_characterization(self):
         evidence = self._interpret([6.98, 7.0, 7.02], [2.0, 2.1, 1.9])
 
         self.assertTrue(evidence["promotionEligible"])
-        self.assertFalse(evidence["variabilityCharacterization"]["warranted"])
         self.assertEqual(
-            "openstar.tess.finalize", broad_independent_next_handler(evidence)
+            "INDEPENDENT_PERIOD_ESTIMATE",
+            evidence["claimDecision"]["claim"],
+        )
+        characterization = evidence["variabilityCharacterization"]
+        self.assertEqual(
+            "INDEPENDENT_PERIOD_PHYSICAL_CYCLE_UNRESOLVED",
+            characterization["state"],
+        )
+        self.assertTrue(characterization["warranted"])
+        self.assertEqual(
+            ["independent-period-estimate-needs-physical-cycle-characterization"],
+            characterization["reasons"],
+        )
+        self.assertEqual([], evidence["promotionBlockers"])
+        self.assertEqual(
+            "openstar.tess.morphology.analyze",
+            broad_independent_next_handler(evidence),
         )
 
     def test_no_meaningful_recurrent_family_finalizes_conservatively(self):
