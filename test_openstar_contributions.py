@@ -1,0 +1,185 @@
+import json
+import sqlite3
+from contextlib import closing
+import tempfile
+import threading
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+from urllib.request import urlopen
+
+import coordinator
+from coordinator_runtime import CoordinatorRuntime
+from openstar_contributions import ContributionStore
+from openstar_coordinator_client import OpenStarCoordinatorClient
+
+
+class ContributionStoreTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name) / "ledger.sqlite3"
+        self.store = ContributionStore(self.path)
+        self.node = {"nodeID": "device-a", "capabilities": {
+            "platform": "macOS", "hardwareIdentifier": "MacBookPro18,2",
+            "gpuName": "M1 Max", "processorCount": 10, "memoryGB": 32,
+            "workloads": ["openstar.lomb-scargle.v1"]}}
+        self.store.upsert_node(self.node, 10.0)
+
+    @staticmethod
+    def work(identifier="work-1", workload="openstar.lomb-scargle.v1"):
+        return {"id": identifier, "projectID": "project", "workloadID": workload,
+                "datasetID": "dataset", "payload": {"frequencyCount": 7}}
+
+    def record(self, **changes):
+        arguments = {"session_id": "session-1", "accepted_at": 20.0,
+            "work_unit": self.work(), "dataset": {"times": [1, 2, 3, 4]},
+            "node_id": "device-a", "result": {"duration": 5.0, "payload": {
+                "metalDurationSeconds": 2.0,
+                "validation": {"durationSeconds": 0.25}}}}
+        arguments.update(changes)
+        return self.store.record(**arguments)
+
+    def test_node_upsert_preserves_first_seen_and_updates_capabilities(self):
+        changed = {"nodeID": "device-a", "ownerUserID": "untrusted", "capabilities": {
+            "platform": "iOS", "hardwareIdentifier": "iPhone17,1",
+            "gpuName": "Apple GPU", "processorCount": 6, "memoryGB": 8}}
+        self.store.upsert_node(changed, 30.0)
+        node = self.store.nodes()[0]
+        self.assertEqual(10.0, node["firstSeenAt"])
+        self.assertEqual(30.0, node["lastSeenAt"])
+        self.assertEqual("iOS", node["platform"])
+        self.assertEqual(changed["capabilities"], node["capabilities"])
+        self.assertIsNone(node["ownerUserID"])
+
+    def test_record_is_idempotent_and_derives_work_not_worker_claims(self):
+        result = {"duration": 5, "sampleCount": 999999, "payload": {
+            "frequencyCount": 999999, "metalDurationSeconds": 2}}
+        self.assertTrue(self.record(result=result))
+        self.assertFalse(self.record(result=result, accepted_at=99))
+        with closing(sqlite3.connect(self.path)) as connection:
+            row = connection.execute(
+                "SELECT work_metrics_json,timing_metrics_json FROM contributions"
+            ).fetchone()
+        metrics, timing = map(json.loads, row)
+        self.assertEqual({"workloadID": "openstar.lomb-scargle.v1", "sampleCount": 4,
+            "frequencyCount": 7, "sampleFrequencyEvaluations": 28}, metrics)
+        self.assertEqual({"workerTotalSeconds": 5.0, "metalSeconds": 2.0}, timing)
+
+    def test_missing_timing_and_unknown_workload_are_supported(self):
+        self.assertTrue(self.record(work_unit=self.work(workload="future.work.v9"), result={}))
+        with closing(sqlite3.connect(self.path)) as connection:
+            metrics, timing = connection.execute(
+                "SELECT work_metrics_json,timing_metrics_json FROM contributions"
+            ).fetchone()
+        self.assertEqual({"workloadID": "future.work.v9"}, json.loads(metrics))
+        self.assertEqual({}, json.loads(timing))
+
+    def test_sessions_devices_and_restart_aggregate_independently(self):
+        self.record()
+        other = dict(self.node)
+        other["nodeID"] = "device-b"
+        self.store.upsert_node(other, 11)
+        self.record(session_id="old-session", work_unit=self.work("work-2"),
+                    node_id="device-b")
+        restarted = ContributionStore(self.path)
+        summary = restarted.summary("session-1")
+        self.assertEqual(1, summary["currentSession"]["totalAcceptedWorkUnits"])
+        self.assertEqual(2, summary["allTime"]["totalAcceptedWorkUnits"])
+        self.assertEqual({"device-a", "device-b"},
+                         {node["nodeID"] for node in summary["allTime"]["nodes"]})
+        self.assertEqual(14, summary["allTime"]["sampleFrequencyEvaluationsPerMetalSecond"])
+
+    def test_concurrent_writes_are_safe(self):
+        errors = []
+        def write(index):
+            try:
+                self.record(work_unit=self.work(f"work-{index}"))
+            except Exception as error:
+                errors.append(error)
+        threads = [threading.Thread(target=write, args=(index,)) for index in range(24)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual([], errors)
+        self.assertEqual(24, self.store.summary("session-1")["currentSession"]["totalAcceptedWorkUnits"])
+
+
+class ContributionRuntimeTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        root = Path(self.temp.name)
+        dataset = root / "dataset.json"
+        dataset.write_text(json.dumps({"id": "dataset", "times": [0, 1, 2],
+            "values": [1, 0, 1], "frequencySearch": {"minimumFrequency": 1,
+            "frequencyStep": .1, "totalFrequencies": 1,
+            "frequenciesPerWorkUnit": 1}}))
+        self.manifest = root / "project.json"
+        self.manifest.write_text(json.dumps({"id": "project",
+            "workloadID": "openstar.lomb-scargle.v1",
+            "datasets": [{"id": "dataset", "path": str(dataset)}]}))
+        self.runtime = CoordinatorRuntime(root / "ledger.sqlite3")
+        self.runtime.activate_project(self.manifest, require_terminal=False)
+        self.runtime.register_node({"nodeID": "node", "capabilities": {"platform": "macOS"}})
+
+    def test_only_accepted_result_is_recorded_and_duplicate_is_idempotent(self):
+        work = self.runtime.claim_work("node")
+        failed = {"status": "failed", "duration": 999}
+        self.assertFalse(self.runtime.submit_result(work["id"], failed)[0])
+        self.assertEqual(0, self.runtime.contribution_summary()["allTime"]["totalAcceptedWorkUnits"])
+        self.runtime.register_node({"nodeID": "node-2", "capabilities": {}})
+        self.runtime.active_state().retry_after.clear()
+        work = self.runtime.claim_work("node-2")
+        result = {"status": "completed", "bestFrequency": 1.0,
+                  "bestPower": .5, "bestFrequencyIndex": 0, "duration": 3}
+        self.assertTrue(self.runtime.submit_result(work["id"], result)[0])
+        self.assertTrue(self.runtime.submit_result(work["id"], result)[0])
+        self.assertEqual(1, self.runtime.contribution_summary()["allTime"]["totalAcceptedWorkUnits"])
+
+    def test_client_methods_and_defensive_node_results(self):
+        client = OpenStarCoordinatorClient()
+        with patch.object(client, "_request_json", side_effect=[[{"nodeID": "n"}], {"allTime": {}}]) as request:
+            nodes = client.registered_nodes()
+            summary = client.contribution_summary()
+        self.assertEqual([{"nodeID": "n"}], nodes)
+        self.assertEqual({"allTime": {}}, summary)
+        self.assertEqual([unittest.mock.call("GET", "/v1/nodes"),
+                          unittest.mock.call("GET", "/v1/contributions/summary")], request.call_args_list)
+        first = self.runtime.registered_nodes()
+        first[0]["capabilities"]["platform"] = "changed"
+        self.assertEqual("macOS", self.runtime.registered_nodes()[0]["capabilities"]["platform"])
+
+    def test_nodes_summary_and_health_http_endpoints(self):
+        original = coordinator.RUNTIME
+        coordinator.RUNTIME = self.runtime
+        server = coordinator.ThreadingHTTPServer(("127.0.0.1", 0), coordinator.RequestHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(setattr, coordinator, "RUNTIME", original)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        client = OpenStarCoordinatorClient(base)
+        self.assertEqual("node", client.registered_nodes()[0]["nodeID"])
+        self.assertIn("currentSession", client.contribution_summary())
+        with urlopen(base + "/v1/health") as response:
+            health = json.loads(response.read())
+        self.assertTrue(health["contributionLedger"]["ok"])
+
+    def test_ledger_failure_does_not_rewrite_scientific_acceptance(self):
+        work = self.runtime.claim_work("node")
+        result = {"status": "completed", "bestFrequency": 1.0,
+                  "bestPower": .5, "bestFrequencyIndex": 0}
+        with patch.object(self.runtime.contribution_store, "record",
+                          side_effect=sqlite3.OperationalError("disk full")):
+            accepted, _, status = self.runtime.submit_result(work["id"], result)
+        self.assertTrue(accepted)
+        self.assertEqual(200, status)
+        self.assertFalse(self.runtime.ledger_health()["ok"])
+        self.assertIn("disk full", self.runtime.ledger_health()["error"])
+
+
+if __name__ == "__main__":
+    unittest.main()

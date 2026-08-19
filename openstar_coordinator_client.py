@@ -59,6 +59,12 @@ class OpenStarCoordinatorClient:
     def health(self) -> dict[str, Any]:
         return self._request_json("GET", "/v1/health")
 
+    def registered_nodes(self) -> list[dict[str, Any]]:
+        return list(self._request_json("GET", "/v1/nodes"))
+
+    def contribution_summary(self) -> dict[str, Any]:
+        return dict(self._request_json("GET", "/v1/contributions/summary"))
+
     def project_status(self, project_id: str | None = None) -> dict[str, Any]:
         if project_id is None:
             path = "/v1/projects/current/status"
@@ -192,7 +198,7 @@ class OpenStarCoordinatorClient:
         method: str,
         path: str,
         payload: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
+    ) -> Any:
         body = None
         headers = {"Accept": "application/json"}
         if payload is not None:

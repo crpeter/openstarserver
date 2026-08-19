@@ -11,6 +11,7 @@ from coordinator_runtime import (
     ProjectConflictError,
 )
 from coordinator_state import first_value
+from openstar_contributions import DEFAULT_CONTRIBUTION_DB
 
 DEFAULT_PROJECT_PATH = "data/projects/openstar.tess-validation-v1.json"
 DEFAULT_HOST = "0.0.0.0"
@@ -100,8 +101,22 @@ class RequestHandler(BaseHTTPRequestHandler):
                     "ok": True,
                     "build": COORDINATOR_BUILD,
                     "project": RUNTIME.project_status(),
+                    "contributionLedger": RUNTIME.ledger_health(),
                 },
             )
+            return
+
+        if path == "/v1/nodes":
+            self._send_json(200, RUNTIME.registered_nodes())
+            return
+
+        if path == "/v1/contributions/summary":
+            try:
+                summary = RUNTIME.contribution_summary()
+            except Exception as error:
+                self._send_error_json(503, f"Contribution ledger unavailable: {error}")
+                return
+            self._send_json(200, summary)
             return
 
         if path == "/v1/projects/current/status":
@@ -291,11 +306,22 @@ def parse_args():
     )
     parser.add_argument("--host", default=DEFAULT_HOST)
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    parser.add_argument(
+        "--contribution-db",
+        default=str(DEFAULT_CONTRIBUTION_DB),
+        help="Path to the durable SQLite contribution ledger.",
+    )
     return parser.parse_args()
 
 
 def main():
+    global RUNTIME
     args = parse_args()
+    try:
+        RUNTIME = CoordinatorRuntime(args.contribution_db)
+    except (OSError, RuntimeError) as error:
+        print(f"❌ Contribution ledger failed to initialize: {error}")
+        raise SystemExit(1)
 
     if args.idle:
         print()
