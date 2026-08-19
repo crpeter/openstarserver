@@ -5,14 +5,12 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
-from contextlib import closing
+import threading
 from pathlib import Path
 from typing import Any, Callable
 
 SCHEMA_VERSION = 1
-DEFAULT_CONTRIBUTION_DB = Path(
-    "data/contributions/openstar-contributions.sqlite3"
-)
+DEFAULT_CONTRIBUTION_DB = Path("data/contributions/openstar-contributions.sqlite3")
 
 
 def _json(value: Any) -> str:
@@ -25,6 +23,22 @@ def _number(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return result if result >= 0 else None
+
+
+def timing_metrics(result: dict[str, Any]) -> dict[str, float]:
+    """Extract the small diagnostic timing snapshot from an accepted result."""
+    payload = result.get("payload")
+    if not isinstance(payload, dict):
+        payload = {}
+    validation = payload.get("validation")
+    if not isinstance(validation, dict):
+        validation = {}
+    values = {
+        "workerTotalSeconds": _number(result.get("duration")),
+        "metalSeconds": _number(payload.get("metalDurationSeconds")),
+        "validationSeconds": _number(validation.get("durationSeconds")),
+    }
+    return {key: value for key, value in values.items() if value is not None}
 
 
 AccountingAdapter = Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]]
@@ -80,21 +94,24 @@ class ContributionStore:
     def __init__(self, path: str | Path):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.RLock()
+        self._connection = sqlite3.connect(
+            self.path, timeout=30.0, check_same_thread=False
+        )
+        self._connection.row_factory = sqlite3.Row
         self._initialize()
 
-    def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path, timeout=30.0)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys=ON")
-        connection.execute("PRAGMA busy_timeout=30000")
-        return connection
+    def close(self) -> None:
+        with self._lock:
+            self._connection.close()
 
     def _initialize(self) -> None:
-        with closing(self._connect()) as connection, connection:
+        with self._lock, self._connection as connection:
+            connection.execute("PRAGMA foreign_keys=ON")
+            connection.execute("PRAGMA busy_timeout=30000")
             connection.execute("PRAGMA journal_mode=WAL")
             connection.execute("PRAGMA synchronous=FULL")
-            connection.executescript(
-                """
+            connection.executescript("""
                 CREATE TABLE IF NOT EXISTS ledger_metadata (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
@@ -143,8 +160,7 @@ class ContributionStore:
                     PRIMARY KEY(coordinator_session_id, node_id),
                     FOREIGN KEY(node_id) REFERENCES nodes(node_id)
                 );
-                """
-            )
+                """)
             row = connection.execute(
                 "SELECT value FROM ledger_metadata WHERE key='schema_version'"
             ).fetchone()
@@ -161,6 +177,7 @@ class ContributionStore:
         capabilities = payload.get("capabilities")
         if not isinstance(capabilities, dict):
             capabilities = {}
+
         def value(*names: str) -> Any:
             for name in names:
                 if payload.get(name) is not None:
@@ -168,15 +185,20 @@ class ContributionStore:
                 if capabilities.get(name) is not None:
                     return capabilities[name]
             return None
+
         return (
             node_id,
-            value("platform"), value("hardwareIdentifier"), value("gpuName"),
-            value("processorCount"), value("memoryGB", "memoryGb"), _json(capabilities),
+            value("platform"),
+            value("hardwareIdentifier"),
+            value("gpuName"),
+            value("processorCount"),
+            value("memoryGB", "memoryGb"),
+            _json(capabilities),
         )
 
     def upsert_node(self, payload: dict[str, Any], seen_at: float) -> None:
         values = self._node_values(payload)
-        with closing(self._connect()) as connection, connection:
+        with self._lock, self._connection as connection:
             connection.execute(
                 """INSERT INTO nodes(
                     node_id,first_seen_at,last_seen_at,platform,hardware_identifier,
@@ -194,48 +216,73 @@ class ContributionStore:
             )
 
     def nodes(self) -> list[dict[str, Any]]:
-        with closing(self._connect()) as connection, connection:
-            rows = connection.execute("SELECT * FROM nodes ORDER BY node_id COLLATE NOCASE").fetchall()
+        with self._lock:
+            connection = self._connection
+            rows = connection.execute(
+                "SELECT * FROM nodes ORDER BY node_id COLLATE NOCASE"
+            ).fetchall()
         return [self._public_node(row) for row in rows]
 
     @staticmethod
     def _public_node(row: sqlite3.Row) -> dict[str, Any]:
         return {
-            "nodeID": row["node_id"], "firstSeenAt": row["first_seen_at"],
-            "lastSeenAt": row["last_seen_at"], "platform": row["platform"],
-            "hardwareIdentifier": row["hardware_identifier"], "gpuName": row["gpu_name"],
-            "processorCount": row["processor_count"], "memoryGB": row["memory_gb"],
+            "nodeID": row["node_id"],
+            "firstSeenAt": row["first_seen_at"],
+            "lastSeenAt": row["last_seen_at"],
+            "platform": row["platform"],
+            "hardwareIdentifier": row["hardware_identifier"],
+            "gpuName": row["gpu_name"],
+            "processorCount": row["processor_count"],
+            "memoryGB": row["memory_gb"],
             "capabilities": json.loads(row["capabilities_json"]),
             "ownerUserID": row["owner_user_id"],
         }
 
     def record(
-        self, *, session_id: str, accepted_at: float, work_unit: dict[str, Any],
-        dataset: dict[str, Any], node_id: str, result: dict[str, Any],
-        accounting: WorkloadAccountingRegistry = DEFAULT_ACCOUNTING,
+        self,
+        *,
+        session_id: str,
+        accepted_at: float,
+        project_id: str,
+        workload_id: str,
+        dataset_id: str,
+        work_unit_id: str,
+        node_id: str,
+        work_metrics: dict[str, Any],
+        timing_metrics: dict[str, float],
     ) -> bool:
-        identity = "\0".join((session_id, str(work_unit.get("projectID", "")),
-            str(work_unit.get("datasetID", "")), str(work_unit["id"]), str(node_id).lower()))
+        identity = "\0".join(
+            (
+                session_id,
+                str(project_id),
+                str(dataset_id),
+                str(work_unit_id),
+                str(node_id).lower(),
+            )
+        )
         contribution_id = hashlib.sha256(identity.encode()).hexdigest()
-        metrics = accounting.metrics(work_unit, dataset)
-        result_payload = result.get("payload") if isinstance(result.get("payload"), dict) else {}
-        validation = result_payload.get("validation") if isinstance(result_payload.get("validation"), dict) else {}
-        worker = _number(result.get("duration"))
-        metal = _number(result_payload.get("metalDurationSeconds"))
-        validation_seconds = _number(validation.get("durationSeconds"))
-        timings = {key: value for key, value in {
-            "workerTotalSeconds": worker, "metalSeconds": metal,
-            "validationSeconds": validation_seconds,
-        }.items() if value is not None}
-        evaluations = int(metrics.get("sampleFrequencyEvaluations") or 0)
-        with closing(self._connect()) as connection, connection:
+        worker = timing_metrics.get("workerTotalSeconds")
+        metal = timing_metrics.get("metalSeconds")
+        evaluations = int(work_metrics.get("sampleFrequencyEvaluations") or 0)
+        with self._lock, self._connection as connection:
             cursor = connection.execute(
                 """INSERT OR IGNORE INTO contributions VALUES(
                     ?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (SCHEMA_VERSION, contribution_id, session_id, accepted_at,
-                 str(work_unit.get("projectID") or ""), str(work_unit.get("workloadID") or ""),
-                 str(work_unit.get("datasetID") or ""), str(work_unit["id"]), str(node_id),
-                 None, worker, _json(metrics), _json(timings)),
+                (
+                    SCHEMA_VERSION,
+                    contribution_id,
+                    session_id,
+                    accepted_at,
+                    str(project_id),
+                    str(workload_id),
+                    str(dataset_id),
+                    str(work_unit_id),
+                    str(node_id),
+                    None,
+                    worker,
+                    _json(work_metrics),
+                    _json(timing_metrics),
+                ),
             )
             if cursor.rowcount == 0:
                 return False
@@ -251,9 +298,11 @@ class ContributionStore:
         return True
 
     def summary(self, current_session_id: str) -> dict[str, Any]:
-        return {"coordinatorSessionID": current_session_id,
-                "currentSession": self._summary_scope(current_session_id),
-                "allTime": self._summary_scope(None)}
+        return {
+            "coordinatorSessionID": current_session_id,
+            "currentSession": self._summary_scope(current_session_id),
+            "allTime": self._summary_scope(None),
+        }
 
     def _summary_scope(self, session_id: str | None) -> dict[str, Any]:
         where = "WHERE a.coordinator_session_id=?" if session_id is not None else ""
@@ -263,23 +312,39 @@ class ContributionStore:
             SUM(a.sample_frequency_evaluations) evaluations
             FROM contribution_aggregates a JOIN nodes n ON n.node_id=a.node_id
             {where} GROUP BY a.node_id ORDER BY n.node_id COLLATE NOCASE"""
-        with closing(self._connect()) as connection, connection:
+        with self._lock:
+            connection = self._connection
             rows = connection.execute(query, parameters).fetchall()
         devices = []
         for row in rows:
             metal = float(row["metal_seconds"] or 0)
             evaluations = int(row["evaluations"] or 0)
             device = self._public_node(row)
-            device.update({"acceptedWorkUnits": int(row["accepted_work_units"] or 0),
-                "workerComputeSeconds": float(row["worker_seconds"] or 0),
-                "metalSeconds": metal, "sampleFrequencyEvaluations": evaluations,
-                "sampleFrequencyEvaluationsPerMetalSecond": evaluations / metal if metal > 0 else None})
+            device.update(
+                {
+                    "acceptedWorkUnits": int(row["accepted_work_units"] or 0),
+                    "workerComputeSeconds": float(row["worker_seconds"] or 0),
+                    "metalSeconds": metal,
+                    "sampleFrequencyEvaluations": evaluations,
+                    "sampleFrequencyEvaluationsPerMetalSecond": (
+                        evaluations / metal if metal > 0 else None
+                    ),
+                }
+            )
             devices.append(device)
         total_metal = sum(item["metalSeconds"] for item in devices)
         total_evaluations = sum(item["sampleFrequencyEvaluations"] for item in devices)
-        return {"totalAcceptedWorkUnits": sum(item["acceptedWorkUnits"] for item in devices),
-            "totalWorkerComputeSeconds": sum(item["workerComputeSeconds"] for item in devices),
+        return {
+            "totalAcceptedWorkUnits": sum(
+                item["acceptedWorkUnits"] for item in devices
+            ),
+            "totalWorkerComputeSeconds": sum(
+                item["workerComputeSeconds"] for item in devices
+            ),
             "totalMetalSeconds": total_metal,
             "totalSampleFrequencyEvaluations": total_evaluations,
-            "sampleFrequencyEvaluationsPerMetalSecond": total_evaluations / total_metal if total_metal > 0 else None,
-            "nodes": devices}
+            "aggregateSampleFrequencyEvaluationsPerMetalSecond": (
+                total_evaluations / total_metal if total_metal > 0 else None
+            ),
+            "nodes": devices,
+        }

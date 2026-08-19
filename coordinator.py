@@ -354,6 +354,7 @@ def main():
         print("Stopping OpenStar Coordinator.")
     finally:
         server.server_close()
+        RUNTIME.close()
 
 
 if __name__ == "__main__":

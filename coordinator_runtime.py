@@ -9,7 +9,11 @@ from pathlib import Path
 from typing import Any
 
 from coordinator_state import CoordinatorState, first_value, normalize_id
-from openstar_contributions import ContributionStore
+from openstar_contributions import (
+    DEFAULT_ACCOUNTING,
+    ContributionStore,
+    timing_metrics,
+)
 
 
 class ProjectBusyError(RuntimeError):
@@ -36,6 +40,7 @@ class CoordinatorRuntime:
         self._next_project_index = 0
         self._legacy_current_project_id: str | None = None
         self.coordinator_session_id = str(uuid.uuid4())
+        self.coordinator_session_started_at = time.time()
         self.contribution_store = (
             ContributionStore(contribution_db) if contribution_db is not None else None
         )
@@ -64,18 +69,47 @@ class CoordinatorRuntime:
 
     def contribution_summary(self) -> dict[str, Any]:
         if self.contribution_store is None:
-            empty = {"totalAcceptedWorkUnits": 0, "totalWorkerComputeSeconds": 0.0,
-                "totalMetalSeconds": 0.0, "totalSampleFrequencyEvaluations": 0,
-                "sampleFrequencyEvaluationsPerMetalSecond": None, "nodes": []}
-            return {"coordinatorSessionID": self.coordinator_session_id,
-                    "currentSession": copy.deepcopy(empty), "allTime": empty}
+            empty = {
+                "totalAcceptedWorkUnits": 0,
+                "totalWorkerComputeSeconds": 0.0,
+                "totalMetalSeconds": 0.0,
+                "totalSampleFrequencyEvaluations": 0,
+                "aggregateSampleFrequencyEvaluationsPerMetalSecond": None,
+                "nodes": [],
+            }
+            summary = {
+                "coordinatorSessionID": self.coordinator_session_id,
+                "coordinatorSessionStartedAt": self.coordinator_session_started_at,
+                "currentSession": copy.deepcopy(empty),
+                "allTime": empty,
+            }
+            return self._with_session_wall_metrics(summary)
         try:
-            return copy.deepcopy(
+            summary = copy.deepcopy(
                 self.contribution_store.summary(self.coordinator_session_id)
             )
+            summary["coordinatorSessionStartedAt"] = self.coordinator_session_started_at
+            return self._with_session_wall_metrics(summary)
         except Exception as error:
             self._ledger_failed("summary query", error)
             raise
+
+    def _with_session_wall_metrics(self, summary: dict[str, Any]) -> dict[str, Any]:
+        elapsed = max(0.0, time.time() - self.coordinator_session_started_at)
+        current = summary["currentSession"]
+        current["wallElapsedSeconds"] = elapsed
+        current["sampleFrequencyEvaluationsPerWallSecond"] = (
+            current["totalSampleFrequencyEvaluations"] / elapsed
+            if elapsed > 0
+            else None
+        )
+        summary["allTime"]["wallElapsedSeconds"] = None
+        summary["allTime"]["sampleFrequencyEvaluationsPerWallSecond"] = None
+        return summary
+
+    def close(self) -> None:
+        if self.contribution_store is not None:
+            self.contribution_store.close()
 
     @staticmethod
     def _node_key(node_id: Any) -> str:
@@ -170,17 +204,26 @@ class CoordinatorRuntime:
         if response[0] and self.contribution_store is not None:
             normalized_work_id = normalize_id(work_id)
             with state.lock:
-                work_unit = copy.deepcopy(state.work_units[normalized_work_id])
-                accepted_result = copy.deepcopy(state.completed[normalized_work_id])
-                dataset = copy.deepcopy(state.datasets[work_unit["datasetID"]])
+                work_unit = state.work_units[normalized_work_id]
+                dataset_id = str(work_unit["datasetID"])
+                metrics = DEFAULT_ACCOUNTING.metrics(
+                    work_unit, state.datasets[dataset_id]
+                )
+                accepted_result = state.completed[normalized_work_id]
+                record = {
+                    "project_id": str(work_unit.get("projectID") or ""),
+                    "workload_id": str(work_unit.get("workloadID") or ""),
+                    "dataset_id": dataset_id,
+                    "work_unit_id": str(work_unit["id"]),
+                    "node_id": str(accepted_result["nodeID"]),
+                    "work_metrics": dict(metrics),
+                    "timing_metrics": timing_metrics(accepted_result),
+                }
             try:
                 self.contribution_store.record(
                     session_id=self.coordinator_session_id,
                     accepted_at=time.time(),
-                    work_unit=work_unit,
-                    dataset=dataset,
-                    node_id=str(accepted_result["nodeID"]),
-                    result=accepted_result,
+                    **record,
                 )
             except Exception as error:
                 # Scientific acceptance is never rewritten by telemetry failure.
