@@ -13,10 +13,15 @@ from openstar_autonomy import ScientificBranch
 from openstar_coordinator_client import OpenStarCoordinatorClient
 from openstar_investigation import ArtifactReference, Investigation, InvestigationStore, sha256_file, sha256_json
 from openstar_targets import InvestigationTarget
-from openstar_workflow import StageOutcome, StageRequest, WorkflowEngine
+from openstar_workflow import RetryableExecutionError, StageOutcome, StageRequest, WorkflowEngine
 
 from .tess_preprocessing import broad_tess_frequency_search, read_and_prepare_tess_light_curve
-from .tess_sector_archive import TessArchiveProduct, TessSectorArchiveProvider, TessSectorInventory
+from .tess_sector_archive import (
+    TessArchiveProduct,
+    TessArchiveTransientError,
+    TessSectorArchiveProvider,
+    TessSectorInventory,
+)
 
 WORKFLOW_ID = "openstar.workflow.tess-sector-scan.v1"
 WORKFLOW_VERSION = "1"
@@ -108,6 +113,69 @@ def _dataset_status(status: dict[str, Any]) -> dict[str, Any]:
     return status
 
 
+def _next_stage(request: StageRequest, label: str, handler: str, parameters: dict[str, Any]):
+    prefix, separator, _ = request.id.partition("-")
+    if not separator or not prefix.isdigit():
+        raise ValueError(f"Stage id must begin with an integer prefix: {request.id}")
+    return StageRequest(
+        f"{int(prefix) + 1:03d}-{label}", handler, parameters, request.id
+    )
+
+
+def repair_legacy_archive_transport_failure(
+    store: InvestigationStore, investigation_id: str
+) -> bool:
+    """Persist the one narrowly supported legacy shallow-download recovery."""
+    if not store.path_for(investigation_id).exists():
+        return False
+    investigation = store.load(investigation_id)
+    if (
+        investigation.workflow_id != WORKFLOW_ID
+        or investigation.status != "FAILED"
+        or not investigation.stages
+    ):
+        return False
+    failed = investigation.stages[-1]
+    if (
+        failed.handler_id != MATERIALIZE_HANDLER
+        or failed.status != "FAILED"
+        or failed.failure_classification != "NON_RETRYABLE"
+        or not failed.error
+        or failed.error.partition(":")[0] != "ConnectionError"
+        or any(
+            stage.handler_id == MATERIALIZE_HANDLER and stage.status == "COMPLETE"
+            for stage in investigation.stages
+        )
+    ):
+        return False
+
+    prefixes = []
+    for stage in investigation.stages:
+        prefix, separator, _ = stage.id.partition("-")
+        if separator and prefix.isdigit():
+            prefixes.append(int(prefix))
+    _, separator, label = failed.id.partition("-")
+    if not separator:
+        raise ValueError(f"Stage id has no label: {failed.id}")
+    retry = StageRequest(
+        f"{max(prefixes, default=0) + 1:03d}-{label}",
+        MATERIALIZE_HANDLER,
+        dict(failed.parameters),
+        failed.id,
+    )
+    store.set_control_state(
+        investigation,
+        status="RUNNING",
+        control_state={
+            "branchAssessments": [],
+            "selectedExperiment": asdict(retry),
+            "schedulerAction": "RUN_EXPERIMENT",
+            "recovery": "TESS_ARCHIVE_TRANSPORT_COMPATIBILITY_RETRY",
+        },
+    )
+    return True
+
+
 def register_tess_sector_scan_handlers(
     store: InvestigationStore, coordinator: OpenStarCoordinatorClient,
     provider: TessSectorArchiveProvider, *, poll_interval: float = 1.0,
@@ -127,7 +195,22 @@ def register_tess_sector_scan_handlers(
         if product.sector != sector or product.tic_id != investigation.metadata.get("ticID"):
             raise RuntimeError("Archive product identity does not match the investigation.")
         artifact_dir = store.directory_for(investigation.id) / "artifacts" / "scan-input"
-        downloaded = provider.download_light_curve(product, artifact_dir / "source")
+        try:
+            downloaded = provider.download_light_curve(product, artifact_dir / "source")
+        except TessArchiveTransientError as error:
+            archive_provider = investigation.metadata.get("archiveProvider")
+            raise RetryableExecutionError(
+                str(error),
+                result={
+                    "sector": sector,
+                    "ticID": product.tic_id,
+                    "productURI": product.product_uri or product.data_uri,
+                    "productFilename": product.product_filename,
+                    "archiveProvider": dict(archive_provider)
+                    if isinstance(archive_provider, dict) else archive_provider,
+                },
+                input_hashes={"archiveProduct": sha256_json(asdict(product))},
+            ) from error
         prepared = preprocessing(downloaded)
         dataset_path, project_path = artifact_dir / "dataset.json", artifact_dir / "project.json"
         dataset_id = f"tess-sector-{sector}-tic-{product.tic_id}"
@@ -157,15 +240,15 @@ def register_tess_sector_scan_handlers(
                   "downloadedProductSha256": sha256_file(downloaded), "archiveProduct": asdict(product),
                   "sampleCount": prepared.sample_count, "sourceSampleCount": prepared.source_sample_count,
                   "baselineDays": prepared.baseline_days, "cadenceSeconds": product.cadence_seconds}
-        return StageOutcome(result, StageRequest("002-broad-distributed-scan", SCAN_HANDLER,
-                            {"projectPath": str(project_path.resolve())}, request.id),
+        return StageOutcome(result, _next_stage(request, "broad-distributed-scan", SCAN_HANDLER,
+                            {"projectPath": str(project_path.resolve())}),
                             input_hashes={"archiveProduct": sha256_json(asdict(product)),
                                           "downloadedProduct": result["downloadedProductSha256"]},
                             artifacts=(_artifact(dataset_path), _artifact(project_path)))
 
     def scan(investigation, request):
         run = coordinator.run_project(request.parameters["projectPath"], poll_interval=poll_interval, timeout=timeout)
-        return StageOutcome(run.status, StageRequest("003-persist-scan-evidence", EVIDENCE_HANDLER, {}, request.id),
+        return StageOutcome(run.status, _next_stage(request, "persist-scan-evidence", EVIDENCE_HANDLER, {}),
                             node_contributions=run.node_contributions, project_ids=(run.project_id,))
 
     def persist(investigation, request):

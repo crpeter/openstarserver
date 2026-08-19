@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 import math
 import os
 import re
+import socket
 import tempfile
+import urllib.error
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Protocol, Sequence
@@ -14,6 +17,47 @@ from typing import Any, Protocol, Sequence
 SCHEMA_VERSION = "1"
 SELECTION_ALGORITHM_VERSION = "spoc-cadence-preference-v1"
 PREFERRED_SPOC_CADENCE_SECONDS = 120.0
+
+
+class TessArchiveTransientError(RuntimeError):
+    """Provider-neutral signal that an archive operation may succeed later."""
+
+
+def _exception_chain(error: BaseException):
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        yield current
+        seen.add(id(current))
+        current = current.__cause__ or current.__context__
+
+
+def _is_transient_transport_error(error: BaseException) -> bool:
+    transient_types = (
+        urllib.error.URLError,
+        socket.timeout,
+        ConnectionResetError,
+        ConnectionAbortedError,
+        BrokenPipeError,
+        http.client.RemoteDisconnected,
+        http.client.IncompleteRead,
+    )
+    for item in _exception_chain(error):
+        if isinstance(item, urllib.error.HTTPError):
+            if item.code in {408, 425, 429, 500, 502, 503, 504}:
+                return True
+            continue
+        if isinstance(item, transient_types):
+            return True
+        # requests is an optional transitive dependency of astroquery.  Inspect
+        # the typed MRO rather than importing it (or parsing an error message).
+        if any(
+            cls.__module__ == "requests.exceptions"
+            and cls.__name__ in {"ConnectionError", "Timeout"}
+            for cls in type(item).__mro__
+        ):
+            return True
+    return False
 
 
 @dataclass(frozen=True)
@@ -233,7 +277,14 @@ class MastTessSectorArchiveProvider:
         if not uri: raise RuntimeError("Selected MAST product has no data URI.")
         destination.mkdir(parents=True, exist_ok=True)
         path = destination / (product.product_filename or "tess-light-curve.fits")
-        result = Observations.download_file(uri, local_path=str(path), cache=True)
+        try:
+            result = Observations.download_file(uri, local_path=str(path), cache=True)
+        except Exception as error:
+            if _is_transient_transport_error(error):
+                raise TessArchiveTransientError(
+                    f"Transient MAST transport failure downloading {uri}"
+                ) from error
+            raise
         status = result[0] if isinstance(result, (tuple, list)) and result else result
         if str(status).upper() != "COMPLETE" or not path.exists():
             raise RuntimeError(f"MAST download failed for {uri}")

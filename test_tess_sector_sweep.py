@@ -7,6 +7,8 @@ import math
 import struct
 import sys
 import types
+import urllib.error
+from http.client import RemoteDisconnected
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -14,16 +16,25 @@ from unittest.mock import MagicMock, patch
 from openstar_coordinator_client import ProjectRunResult
 from openstar_dispatch import InvestigationDispatcher
 from openstar_investigation import InvestigationStore
+from openstar_lifecycle import InvestigationLifecycleDriver, InvestigationSchedulingState
 from openstar_scheduler import InvestigationScheduler
 from workflows.tess.tess_preprocessing import prepare_tess_samples
 from workflows.tess.tess_sector_archive import (
-    MastTessSectorArchiveProvider, TessArchiveProduct, TessSectorInventoryStore,
+    MastTessSectorArchiveProvider, TessArchiveProduct, TessArchiveTransientError,
+    TessSectorInventoryStore,
 )
+from openstar_workflow import RetryableExecutionError, StageRequest
 from workflows.tess.tess_sector_scan import (
     WORKFLOW_ID, TessSectorScanTargetSource, plan_tess_sector_scan,
     register_tess_sector_scan_handlers,
 )
 from run_openstar_tess_sector_sweep import run_tess_sector_sweep
+
+
+RequestsConnectionError = type(
+    "ConnectionError", (OSError,), {"__module__": "requests.exceptions"}
+)
+RequestsTimeout = type("Timeout", (OSError,), {"__module__": "requests.exceptions"})
 
 
 def product(tic, *, sector=7, author="SPOC", cadence=120, filename=None, rights="PUBLIC"):
@@ -141,6 +152,49 @@ class InventoryTests(unittest.TestCase):
                 )
             self.assertEqual(1, observations.download_file.call_count)
 
+    def test_mast_connection_error_and_cause_chain_are_transient(self):
+        observations, mocked_modules = self._mock_mast_download(None, create_file=False)
+        observations.download_file.side_effect = RequestsConnectionError("disconnected")
+        with tempfile.TemporaryDirectory() as tmp, mocked_modules:
+            with self.assertRaises(TessArchiveTransientError) as raised:
+                MastTessSectorArchiveProvider().download_light_curve(product(42), Path(tmp))
+        self.assertIsInstance(raised.exception.__cause__, RequestsConnectionError)
+
+        observations, mocked_modules = self._mock_mast_download(None, create_file=False)
+        try:
+            try:
+                raise RemoteDisconnected("closed")
+            except RemoteDisconnected as cause:
+                raise RuntimeError("astroquery wrapper") from cause
+        except RuntimeError as wrapped:
+            observations.download_file.side_effect = wrapped
+        with tempfile.TemporaryDirectory() as tmp, mocked_modules:
+            with self.assertRaises(TessArchiveTransientError):
+                MastTessSectorArchiveProvider().download_light_curve(product(42), Path(tmp))
+
+    def test_mast_timeout_is_transient(self):
+        observations, mocked_modules = self._mock_mast_download(None, create_file=False)
+        observations.download_file.side_effect = RequestsTimeout("slow")
+        with tempfile.TemporaryDirectory() as tmp, mocked_modules:
+            with self.assertRaises(TessArchiveTransientError):
+                MastTessSectorArchiveProvider().download_light_curve(product(42), Path(tmp))
+
+    def test_mast_deterministic_error_is_not_reclassified(self):
+        observations, mocked_modules = self._mock_mast_download(None, create_file=False)
+        observations.download_file.side_effect = ValueError("bad product")
+        with tempfile.TemporaryDirectory() as tmp, mocked_modules:
+            with self.assertRaises(ValueError):
+                MastTessSectorArchiveProvider().download_light_curve(product(42), Path(tmp))
+
+        observations, mocked_modules = self._mock_mast_download(None, create_file=False)
+        permanent = urllib.error.HTTPError(
+            "https://mast.example/product", 400, "bad request", {}, None
+        )
+        observations.download_file.side_effect = permanent
+        with tempfile.TemporaryDirectory() as tmp, mocked_modules:
+            with self.assertRaises(urllib.error.HTTPError):
+                MastTessSectorArchiveProvider().download_light_curve(product(42), Path(tmp))
+
     def test_mast_row_fields_replaces_nonfinite_values(self):
         row = self._Row(nan=float("nan"), positive=float("inf"),
                         negative=float("-inf"), finite=12.5,
@@ -253,6 +307,130 @@ class PreprocessingTests(unittest.TestCase):
 
 
 class SweepTests(unittest.TestCase):
+    def test_transient_materialization_retries_then_runs_broad_scan(self):
+        class FlakyProvider(FakeProvider):
+            def download_light_curve(self, selected, destination):
+                self.downloads.append(selected.tic_id)
+                if len(self.downloads) == 1:
+                    raise TessArchiveTransientError("MAST disconnected")
+                destination.mkdir(parents=True, exist_ok=True)
+                path = destination / selected.product_filename
+                path.write_bytes(b"FITS")
+                return path
+
+        provider, coordinator = FlakyProvider([product(1)]), FakeCoordinator()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store, scheduler = self._partial_scheduler(root, provider, coordinator, chained=True)
+            first = scheduler.run_round().outcomes[0]
+            failed = first.investigation.stages[-1]
+            self.assertIsInstance(first.error, RetryableExecutionError)
+            self.assertEqual("TRANSIENT_INFRASTRUCTURE", failed.failure_classification)
+            self.assertEqual(7, failed.result["sector"])
+            self.assertFalse((store.directory_for(first.investigation.id) / "artifacts" / "scan-input" / "dataset.json").exists())
+
+            scheduler.run_until_idle()
+            completed = store.load("tess-sector-scan-7-tic-1")
+            self.assertEqual("COMPLETE", completed.status)
+            self.assertEqual(
+                ["001-materialize-light-curve", "002-materialize-light-curve",
+                 "003-broad-distributed-scan", "004-persist-scan-evidence"],
+                [stage.id for stage in completed.stages],
+            )
+            self.assertEqual(2, provider.downloads.count(1))
+            self.assertEqual([1], coordinator.calls)
+
+    def test_sweep_repairs_legacy_connection_failure_and_resumes_only_materialize(self):
+        class OnceBrokenProvider(FakeProvider):
+            def download_light_curve(self, selected, destination):
+                self.downloads.append(selected.tic_id)
+                if len(self.downloads) == 1:
+                    raise ConnectionError("old transport disconnect")
+                destination.mkdir(parents=True, exist_ok=True)
+                path = destination / selected.product_filename
+                path.write_bytes(b"FITS")
+                return path
+
+        provider, coordinator = OnceBrokenProvider([product(1)]), FakeCoordinator()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            from workflows.tess import tess_sector_scan
+            original = tess_sector_scan.read_and_prepare_tess_light_curve
+            tess_sector_scan.read_and_prepare_tess_light_curve = lambda path: Prepared()
+            try:
+                self.assertEqual(1, run_tess_sector_sweep(
+                    7, "unused", root, provider=provider, coordinator=coordinator))
+                store = InvestigationStore(root / "investigations")
+                investigation_id = "tess-sector-scan-7-tic-1"
+                failed_path = store.stage_path_for(
+                    investigation_id, "001-materialize-light-curve")
+                historical = failed_path.read_bytes()
+
+                import run_openstar_tess_sector_sweep as sweep_runner
+                actual_repair = sweep_runner.repair_legacy_archive_transport_failure
+                recovered_controls = []
+                repeated_repair_results = []
+                def recording_repair(repair_store, repair_id):
+                    changed = actual_repair(repair_store, repair_id)
+                    if changed:
+                        recovered_controls.append(
+                            repair_store.load(repair_id).metadata["controlState"])
+                        repeated_repair_results.append(
+                            actual_repair(repair_store, repair_id))
+                    return changed
+                with patch.object(
+                    sweep_runner, "repair_legacy_archive_transport_failure",
+                    recording_repair,
+                ):
+                    self.assertEqual(0, run_tess_sector_sweep(
+                        7, "unused", root, provider=provider, coordinator=coordinator))
+                self.assertEqual(1, len(recovered_controls))
+                self.assertEqual([False], repeated_repair_results)
+                self.assertEqual(
+                    "TESS_ARCHIVE_TRANSPORT_COMPATIBILITY_RETRY",
+                    recovered_controls[0]["recovery"],
+                )
+                self.assertEqual("RUN_EXPERIMENT", recovered_controls[0]["schedulerAction"])
+                completed = store.load(investigation_id)
+                self.assertEqual("COMPLETE", completed.status)
+                self.assertEqual(
+                    ["001-materialize-light-curve", "002-materialize-light-curve",
+                     "003-broad-distributed-scan", "004-persist-scan-evidence"],
+                    [stage.id for stage in completed.stages])
+                self.assertEqual("001-materialize-light-curve",
+                                 completed.stages[1].triggered_by_stage_id)
+                self.assertEqual(historical, failed_path.read_bytes())
+                self.assertEqual([1], coordinator.calls)
+
+                snapshot = store.path_for(investigation_id).read_bytes()
+                self.assertEqual(0, run_tess_sector_sweep(
+                    7, "unused", root, provider=provider, coordinator=coordinator))
+                self.assertEqual(snapshot, store.path_for(investigation_id).read_bytes())
+                self.assertEqual(2, provider.downloads.count(1))
+                self.assertEqual([1], coordinator.calls)
+            finally:
+                tess_sector_scan.read_and_prepare_tess_light_curve = original
+
+    def test_generic_lifecycle_contains_no_tess_compatibility_policy(self):
+        lifecycle_source = Path("openstar_lifecycle.py").read_text(encoding="utf-8")
+        self.assertNotIn("tess-sector", lifecycle_source.lower())
+        self.assertNotIn("TESS_ARCHIVE_TRANSPORT_COMPATIBILITY_RETRY", lifecycle_source)
+
+    def test_unrelated_nonretryable_materialization_remains_terminal(self):
+        provider, coordinator = FakeProvider([product(1)]), FakeCoordinator()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            inventory = TessSectorInventoryStore(root / "inventory.json").create_or_load(7, provider)
+            target = TessSectorScanTargetSource(inventory).enumerate_targets()[0]
+            store = InvestigationStore(root / "investigations")
+            workflow = register_tess_sector_scan_handlers(
+                store, coordinator, provider,
+                preprocessing=lambda path: (_ for _ in ()).throw(ValueError("invalid FITS")))
+            driver = InvestigationLifecycleDriver(store, InvestigationDispatcher(store, workflow),
+                {WORKFLOW_ID: plan_tess_sector_scan}, software_id="test", software_version="1")
+            with self.assertRaises(ValueError):
+                driver.dispatch_prepared(driver.prepare(target))
+            self.assertEqual(InvestigationSchedulingState.FAILED, driver.prepare(target).state)
     def _assert_legacy_state_rejected(self, legacy_name):
         provider, coordinator = FakeProvider([product(1)]), FakeCoordinator()
         with tempfile.TemporaryDirectory() as tmp:
