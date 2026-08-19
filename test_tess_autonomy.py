@@ -560,5 +560,97 @@ class TessShiftedStageLookupCompatibilityTests(unittest.TestCase):
             )
 
 
+class TessIndependentPeriodCharacterizationCompatibilityTests(unittest.TestCase):
+    def _completed(self, root, *, family=True, characterized=False):
+        store = InvestigationStore(root)
+        investigation = store.create(
+            "tic-25132999", WORKFLOW_ID, "20.3.1",
+            metadata={"controlState": {
+                "schedulerAction": "INVESTIGATION_COMPLETE",
+            }},
+        )
+        harmonic_family = ({
+            "representativeRawPeriodDays": 5.160480186046465,
+            "possibleDoubleCycleDays": 10.32096037209293,
+            "physicalCycleResolved": False,
+        } if family else None)
+        stages = [
+            InvestigationStage("001-prepare-target", "openstar.tess.prepare-target", "COMPLETE", None, {}, result={"ticID": 25132999}),
+            InvestigationStage("002-primary", "openstar.tess.primary-project.run", "COMPLETE", "001-prepare-target", {}, result={"primary": True}),
+            InvestigationStage("003-identity", "openstar.tess.catalog-identity", "COMPLETE", "002-primary", {}, result={"catalogued": False}),
+            InvestigationStage("004-hypotheses", "openstar.tess.hypotheses", "COMPLETE", "003-identity", {}, result={"rawCandidatePeriodDays": 5.16}),
+            InvestigationStage("005-independent-prepare", "openstar.tess.independent.prepare", "COMPLETE", "004-hypotheses", {}, result={"preparedSectors": [94, 96, 97, 98]}),
+            InvestigationStage("006-independent-run", "openstar.tess.independent.run", "COMPLETE", "005-independent-prepare", {}, result={"status": "COMPLETE"}),
+            InvestigationStage("007-broad-prepare", "openstar.tess.independent.broad.prepare", "COMPLETE", "006-independent-run", {}, result={"prepared": True}),
+            InvestigationStage("008-broad-run", "openstar.tess.independent.broad.run", "COMPLETE", "007-broad-prepare", {}, result={"status": "COMPLETE"}),
+            InvestigationStage("009-broad-interpret", "openstar.tess.independent.broad.interpret", "COMPLETE", "008-broad-run", {}, result={
+                "claimDecision": {"claim": "INDEPENDENT_PERIOD_ESTIMATE"},
+                "promotionEligible": True,
+                "harmonicFamily": harmonic_family,
+            }),
+        ]
+        if characterized:
+            stages.append(InvestigationStage(
+                "010-morphology", "openstar.tess.morphology.analyze", "COMPLETE",
+                "009-broad-interpret", {}, result={"physicalCycleResolved": False},
+            ))
+        stages.append(InvestigationStage(
+            "011-finalize" if characterized else "010-finalize",
+            "openstar.tess.finalize", "COMPLETE",
+            "010-morphology" if characterized else "009-broad-interpret", {},
+            result={"claim": {"claim": "INDEPENDENT_PERIOD_ESTIMATE"}}, stop=True,
+        ))
+        investigation = replace(investigation, status="COMPLETE", stages=tuple(stages))
+        store.save(investigation)
+        return store, investigation
+
+    def test_reopens_real_shaped_terminal_directly_to_morphology(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store, investigation = self._completed(temporary)
+            historical_stages = investigation.stages
+
+            repaired = repair_obsolete_terminal_wait(store, investigation)
+
+            self.assertEqual("RUNNING", repaired.status)
+            self.assertEqual(historical_stages, repaired.stages)
+            control = repaired.metadata["controlState"]
+            self.assertEqual("RUN_EXPERIMENT", control["schedulerAction"])
+            self.assertEqual(
+                "TESS_INDEPENDENT_PERIOD_CHARACTERIZATION_COMPATIBILITY_CONTINUATION",
+                control["recovery"],
+            )
+            self.assertEqual({
+                "id": "011-morphology",
+                "handler_id": "openstar.tess.morphology.analyze",
+                "parameters": {},
+                "triggered_by_stage_id": "009-broad-interpret",
+            }, control["selectedExperiment"])
+            for handler in (
+                "openstar.tess.prepare-target",
+                "openstar.tess.primary-project.run",
+                "openstar.tess.independent.prepare",
+                "openstar.tess.independent.run",
+                "openstar.tess.independent.broad.run",
+            ):
+                self.assertEqual(1, sum(
+                    stage.handler_id == handler for stage in repaired.stages
+                ))
+            self.assertEqual(repaired, repair_obsolete_terminal_wait(store, repaired))
+
+    def test_does_not_reopen_already_characterized_family(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store, investigation = self._completed(temporary, characterized=True)
+            self.assertEqual(
+                investigation, repair_obsolete_terminal_wait(store, investigation)
+            )
+
+    def test_does_not_reopen_without_valid_harmonic_family(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store, investigation = self._completed(temporary, family=False)
+            self.assertEqual(
+                investigation, repair_obsolete_terminal_wait(store, investigation)
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

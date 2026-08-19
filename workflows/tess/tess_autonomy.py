@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from dataclasses import asdict
 from pathlib import Path
@@ -330,6 +331,85 @@ def _repair_catalog_timeout_terminal(
     )
 
 
+def _positive_number(value: object) -> bool:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(number) and number > 0.0
+
+
+def _repair_promoted_period_characterization_terminal(
+    store: InvestigationStore, investigation: Investigation, control: dict
+) -> Investigation | None:
+    """Continue pre-v20.4 promoted period families directly to morphology."""
+    if (
+        investigation.status != "COMPLETE"
+        or control.get("schedulerAction") != "INVESTIGATION_COMPLETE"
+    ):
+        return None
+
+    broad_index = next((
+        index for index in range(len(investigation.stages) - 1, -1, -1)
+        if investigation.stages[index].status == "COMPLETE"
+        and investigation.stages[index].handler_id
+        == "openstar.tess.independent.broad.interpret"
+    ), None)
+    if broad_index is None:
+        return None
+    broad = investigation.stages[broad_index]
+    result = broad.result or {}
+    family = result.get("harmonicFamily") or {}
+    if not (
+        (result.get("claimDecision") or {}).get("claim")
+        == "INDEPENDENT_PERIOD_ESTIMATE"
+        and result.get("promotionEligible") is True
+        and _positive_number(family.get("representativeRawPeriodDays"))
+        and _positive_number(family.get("possibleDoubleCycleDays"))
+        and family.get("physicalCycleResolved") is not True
+    ):
+        return None
+
+    later_stages = investigation.stages[broad_index + 1:]
+    if any(
+        stage.status == "COMPLETE"
+        and stage.handler_id != "openstar.tess.finalize"
+        for stage in later_stages
+    ):
+        return None
+    terminal = next((
+        stage for stage in reversed(later_stages)
+        if stage.status == "COMPLETE"
+        and stage.handler_id == "openstar.tess.finalize"
+    ), None)
+    terminal_claim = (((terminal.result or {}).get("claim") or {}).get("claim")
+                      if terminal is not None else None)
+    if terminal_claim != "INDEPENDENT_PERIOD_ESTIMATE":
+        return None
+
+    prefixes = [int(stage.id.partition("-")[0]) for stage in investigation.stages
+                if stage.id.partition("-")[0].isdigit()]
+    continuation = StageRequest(
+        id=f"{max(prefixes, default=0) + 1:03d}-morphology",
+        handler_id="openstar.tess.morphology.analyze",
+        parameters={},
+        triggered_by_stage_id=broad.id,
+    )
+    return store.set_control_state(
+        investigation,
+        status="RUNNING",
+        control_state={
+            "branchAssessments": [],
+            "selectedExperiment": asdict(continuation),
+            "schedulerAction": "RUN_EXPERIMENT",
+            "recovery": (
+                "TESS_INDEPENDENT_PERIOD_CHARACTERIZATION_"
+                "COMPATIBILITY_CONTINUATION"
+            ),
+        },
+    )
+
+
 def _repair_closed_file_independent_prepare(
     store: InvestigationStore, investigation: Investigation
 ) -> Investigation | None:
@@ -463,6 +543,12 @@ def repair_obsolete_terminal_wait(
     catalog_repair = _repair_catalog_timeout_terminal(store, investigation, control)
     if catalog_repair is not None:
         return catalog_repair
+
+    period_repair = _repair_promoted_period_characterization_terminal(
+        store, investigation, control
+    )
+    if period_repair is not None:
+        return period_repair
 
     if (
         investigation.status == "BLOCKED"

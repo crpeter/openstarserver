@@ -1158,7 +1158,7 @@ def interpret_broad_independent_sectors(
         )
         source = "independent-broad-no-stable-cluster"
 
-    characterization_reasons = [
+    candidate_characterization_reasons = [
         blocker
         for blocker in promotion_blockers
         if blocker in {
@@ -1167,12 +1167,37 @@ def interpret_broad_independent_sectors(
             "supporting-peak-prominence-too-weak",
         }
     ]
-    characterization_warranted = bool(
+    candidate_characterization_warranted = bool(
         claim.claim == "CANDIDATE_PERIOD"
         and harmonic_family is not None
         and cluster_count >= BROAD_CANDIDATE_MIN_SECTORS
-        and characterization_reasons
+        and candidate_characterization_reasons
     )
+    independent_physical_cycle_unresolved = bool(
+        claim.claim == "INDEPENDENT_PERIOD_ESTIMATE"
+        and promotion_eligible is True
+        and harmonic_family is not None
+        and (_float(harmonic_family.get("representativeRawPeriodDays")) or 0.0) > 0.0
+        and (_float(harmonic_family.get("possibleDoubleCycleDays")) or 0.0) > 0.0
+        and harmonic_family.get("physicalCycleResolved") is not True
+    )
+    characterization_warranted = (
+        candidate_characterization_warranted
+        or independent_physical_cycle_unresolved
+    )
+    if independent_physical_cycle_unresolved:
+        characterization_state = "INDEPENDENT_PERIOD_PHYSICAL_CYCLE_UNRESOLVED"
+        characterization_reasons = [
+            "independent-period-estimate-needs-physical-cycle-characterization"
+        ]
+    elif candidate_characterization_warranted:
+        characterization_state = (
+            "RECURRENT_BUT_UNRESOLVED_CROSS_SECTOR_VARIABILITY"
+        )
+        characterization_reasons = candidate_characterization_reasons
+    else:
+        characterization_state = "NOT_WARRANTED_BY_BROAD_CLUSTERING"
+        characterization_reasons = candidate_characterization_reasons
 
     return {
         "claimDecision": claim.as_dict(),
@@ -1192,11 +1217,7 @@ def interpret_broad_independent_sectors(
         "promotionEligible": promotion_eligible,
         "promotionBlockers": promotion_blockers,
         "variabilityCharacterization": {
-            "state": (
-                "RECURRENT_BUT_UNRESOLVED_CROSS_SECTOR_VARIABILITY"
-                if characterization_warranted
-                else "NOT_WARRANTED_BY_BROAD_CLUSTERING"
-            ),
+            "state": characterization_state,
             "warranted": characterization_warranted,
             "reasons": characterization_reasons,
             "nextHandler": (

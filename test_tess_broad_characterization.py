@@ -139,13 +139,28 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
             same_sector_candidate_days=13.8,
         )
 
-    def test_stable_promoted_recurrence_finalizes_normally(self):
+    def test_promoted_recurrence_routes_to_physical_cycle_characterization(self):
         evidence = self._interpret([6.98, 7.0, 7.02], [2.0, 2.1, 1.9])
 
         self.assertTrue(evidence["promotionEligible"])
-        self.assertFalse(evidence["variabilityCharacterization"]["warranted"])
         self.assertEqual(
-            "openstar.tess.finalize", broad_independent_next_handler(evidence)
+            "INDEPENDENT_PERIOD_ESTIMATE",
+            evidence["claimDecision"]["claim"],
+        )
+        characterization = evidence["variabilityCharacterization"]
+        self.assertEqual(
+            "INDEPENDENT_PERIOD_PHYSICAL_CYCLE_UNRESOLVED",
+            characterization["state"],
+        )
+        self.assertTrue(characterization["warranted"])
+        self.assertEqual(
+            ["independent-period-estimate-needs-physical-cycle-characterization"],
+            characterization["reasons"],
+        )
+        self.assertEqual([], evidence["promotionBlockers"])
+        self.assertEqual(
+            "openstar.tess.morphology.analyze",
+            broad_independent_next_handler(evidence),
         )
 
     def test_no_meaningful_recurrent_family_finalizes_conservatively(self):
@@ -180,6 +195,76 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
         first = broad_independent_next_handler(evidence)
         second = broad_independent_next_handler(evidence)
         self.assertEqual(first, second)
+
+    def test_finalization_preserves_promoted_claim_across_morphology_outcomes(self):
+        for resolved in (False, True):
+            with self.subTest(resolved=resolved), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                store = InvestigationStore(root / "investigations")
+                investigation = store.create(
+                    f"promoted-finalize-{resolved}", WORKFLOW_ID, WORKFLOW_VERSION
+                )
+                broad = self._interpret([6.98, 7.0, 7.02], [2.0, 2.1, 1.9])
+                morphology = {
+                    "physicalCycleResolved": resolved,
+                    "resolvedPhysicalPeriodDays": 14.0 if resolved else None,
+                    "morphologyClass": (
+                        "DOUBLE_WAVE_PHYSICAL_CYCLE_SUPPORTED"
+                        if resolved else "PHYSICAL_CYCLE_UNRESOLVED"
+                    ),
+                    "phenomenology": "STABLE_PERIODIC_VARIABILITY",
+                    "continuationEvidence": {
+                        "timeFrequencyEvolutionWarranted": False,
+                    },
+                }
+                for stage_id, handler, result in (
+                    ("001-prepare-target", "openstar.tess.prepare-target", {
+                        "datasetID": "tic-25132999", "ticID": 25132999,
+                        "targetName": "TIC 25132999", "sector": 62,
+                    }),
+                    ("002-hypotheses", "openstar.tess.hypotheses", {
+                        "rawCandidatePeriodDays": 7.0,
+                        "observedPeriodDays": 14.0,
+                    }),
+                    ("003-planner", "openstar.tess.planner", {
+                        "claimDecision": {"claim": "CANDIDATE_PERIOD", "rationale": []},
+                    }),
+                    ("009-broad", "openstar.tess.independent.broad.interpret", broad),
+                    ("010-morphology", "openstar.tess.morphology.analyze", morphology),
+                ):
+                    investigation = self._complete(
+                        store, investigation, stage_id, handler, result
+                    )
+
+                engine = build_engine(
+                    store, coordinator=types.SimpleNamespace(),
+                    poll_interval=0.0, timeout=None,
+                )
+                engine.chain_stages = False
+                completed, next_request = engine.run_stage(
+                    investigation,
+                    StageRequest("011-finalize", "openstar.tess.finalize", {}, "010-morphology"),
+                    software_id="integration", software_version="20.29",
+                )
+
+                self.assertIsNone(next_request)
+                conclusion = completed.stages[-1].result
+                self.assertEqual(
+                    "INDEPENDENT_PERIOD_ESTIMATE",
+                    conclusion["claim"]["claim"],
+                )
+                self.assertAlmostEqual(
+                    7.0,
+                    conclusion["periodEvidence"]["recurrentPhotometricPeriodDays"],
+                )
+                self.assertEqual(resolved, conclusion["periodEvidence"]["physicalCycleResolved"])
+                if resolved:
+                    self.assertAlmostEqual(
+                        14.0,
+                        conclusion["periodEvidence"]["resolvedPhysicalPeriodDays"],
+                    )
+                else:
+                    self.assertIsNone(conclusion["selectedPeriodDays"])
 
     def test_broad_continuation_executes_existing_morphology_handler(self):
         temporary = tempfile.TemporaryDirectory()
