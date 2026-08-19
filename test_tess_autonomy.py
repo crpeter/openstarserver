@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+from dataclasses import asdict, replace
 from pathlib import Path
 
 from openstar_autonomy import AutonomousInvestigationEngine
@@ -484,6 +485,79 @@ class TessAutonomyIntegrationTests(unittest.TestCase):
                 ).stages
             ],
         )
+
+
+class TessShiftedStageLookupCompatibilityTests(unittest.TestCase):
+    def _failed(self, root, *, error=None):
+        store = InvestigationStore(root)
+        investigation = store.create(
+            "tic-8196173", WORKFLOW_ID, "20.2",
+            metadata={"controlState": {"schedulerAction": "INVESTIGATION_FAILED"}},
+        )
+        stages = (
+            InvestigationStage("001-prepare-target", "openstar.tess.prepare-target", "COMPLETE", None, {}, result={"ticID": 8196173}),
+            InvestigationStage("002-primary-distributed-search", "openstar.tess.primary-project.run", "COMPLETE", "001-prepare-target", {}, result={"primary": True}),
+            InvestigationStage("003-catalog-identity", "openstar.tess.catalog-identity", "FAILED", "002-primary-distributed-search", {}, error="TimeoutError: VSX timeout", failure_classification="TRANSIENT_INFRASTRUCTURE"),
+            InvestigationStage("004-catalog-identity", "openstar.tess.catalog-identity", "COMPLETE", "003-catalog-identity", {}, result={"identityResolved": True}),
+            InvestigationStage("005-hypotheses", "openstar.tess.hypotheses", "COMPLETE", "004-catalog-identity", {}, result={"observedPeriodDays": 2.0}),
+            InvestigationStage("006-planner", "openstar.tess.planner", "COMPLETE", "005-hypotheses", {}, result={"action": "INDEPENDENT_SECTOR_FOLLOWUP"}),
+            InvestigationStage(
+                "007-prepare-independent-sectors", "openstar.tess.independent.prepare",
+                "FAILED", "006-planner", {"preserve": True},
+                error=error or "RuntimeError: Stage is not COMPLETE with a result: 003-catalog-identity",
+                failure_classification="NON_RETRYABLE",
+            ),
+        )
+        investigation = replace(investigation, status="FAILED", stages=stages)
+        store.save(investigation)
+        return store, investigation
+
+    def test_repairs_exact_shifted_lookup_failure_without_mutating_stages(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store, investigation = self._failed(temporary)
+            failed_bytes = json.dumps(
+                asdict(investigation.stages[-1]), sort_keys=True
+            ).encode()
+
+            repaired = repair_obsolete_terminal_wait(store, investigation)
+
+            self.assertEqual("RUNNING", repaired.status)
+            self.assertEqual(investigation.stages, repaired.stages)
+            self.assertEqual(
+                failed_bytes,
+                json.dumps(asdict(repaired.stages[-1]), sort_keys=True).encode(),
+            )
+            control = repaired.metadata["controlState"]
+            self.assertEqual("RUN_EXPERIMENT", control["schedulerAction"])
+            self.assertEqual(
+                "TESS_RETRY_SHIFTED_STAGE_LOOKUP_COMPATIBILITY_RETRY",
+                control["recovery"],
+            )
+            self.assertEqual(
+                {
+                    "id": "008-prepare-independent-sectors",
+                    "handler_id": "openstar.tess.independent.prepare",
+                    "parameters": {"preserve": True},
+                    "triggered_by_stage_id": "007-prepare-independent-sectors",
+                },
+                control["selectedExperiment"],
+            )
+            self.assertEqual(1, sum(
+                stage.handler_id == "openstar.tess.primary-project.run"
+                for stage in repaired.stages
+            ))
+            self.assertEqual(2, sum(
+                stage.handler_id == "openstar.tess.catalog-identity"
+                for stage in repaired.stages
+            ))
+            self.assertEqual(repaired, repair_obsolete_terminal_wait(store, repaired))
+
+    def test_does_not_repair_unrelated_non_retryable_failure(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store, investigation = self._failed(temporary, error="RuntimeError: unrelated")
+            self.assertEqual(
+                investigation, repair_obsolete_terminal_wait(store, investigation)
+            )
 
 
 if __name__ == "__main__":

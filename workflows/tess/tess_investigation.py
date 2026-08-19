@@ -183,6 +183,16 @@ def _latest_result_for_handler(
     return None
 
 
+def _required_latest_result_for_handler(
+    investigation: Investigation,
+    handler_id: str,
+) -> dict[str, Any]:
+    result = _latest_result_for_handler(investigation, handler_id)
+    if result is None:
+        raise RuntimeError(f"No COMPLETE stage result for handler: {handler_id}")
+    return result
+
+
 def _all_results_for_handler(
     investigation: Investigation,
     handler_id: str,
@@ -1607,8 +1617,12 @@ def build_engine(
 
     def prepare_followup(investigation, request):
         prepared = _result(investigation, "001-prepare-target")
-        analysis = _result(investigation, "004-hypotheses")
-        planner = _result(investigation, "005-planner")
+        analysis = _required_latest_result_for_handler(
+            investigation, "openstar.tess.hypotheses"
+        )
+        planner = _required_latest_result_for_handler(
+            investigation, "openstar.tess.planner"
+        )
         artifact_root = store.directory_for(investigation.id) / "artifacts"
         follow = build_low_frequency_followup(
             source_project_path=prepared["sourceProjectPath"],
@@ -1650,7 +1664,7 @@ def build_engine(
         return StageOutcome(
             result=follow,
             next_stage=StageRequest(
-                id="007-run-followup",
+                id=_next_stage_id(request.id, "run-followup"),
                 handler_id="openstar.tess.followup.run",
                 parameters={"projectPath": follow["projectPath"]},
                 triggered_by_stage_id=request.id,
@@ -1677,7 +1691,7 @@ def build_engine(
         return StageOutcome(
             result=run.status,
             next_stage=StageRequest(
-                id="008-interpret-followup",
+                id=_next_stage_id(request.id, "interpret-followup"),
                 handler_id="openstar.tess.followup.interpret",
                 parameters={},
                 triggered_by_stage_id=request.id,
@@ -1687,10 +1701,18 @@ def build_engine(
         )
 
     def interpret_stage(investigation, request):
-        analysis = _result(investigation, "004-hypotheses")
-        identity = _result(investigation, "003-catalog-identity")
-        followup_spec = _result(investigation, "006-prepare-followup")
-        followup = _result(investigation, "007-run-followup")
+        analysis = _required_latest_result_for_handler(
+            investigation, "openstar.tess.hypotheses"
+        )
+        identity = _required_latest_result_for_handler(
+            investigation, "openstar.tess.catalog-identity"
+        )
+        followup_spec = _required_latest_result_for_handler(
+            investigation, "openstar.tess.followup.prepare-low-frequency"
+        )
+        followup = _required_latest_result_for_handler(
+            investigation, "openstar.tess.followup.run"
+        )
         interpreted = interpret_followup(
             analysis,
             followup,
@@ -1708,14 +1730,14 @@ def build_engine(
             and interpreted.get("selectedPeriodDays") is not None
         ):
             next_stage = StageRequest(
-                id="009-prepare-independent-sectors",
+                id=_next_stage_id(request.id, "prepare-independent-sectors"),
                 handler_id="openstar.tess.independent.prepare",
                 parameters={},
                 triggered_by_stage_id=request.id,
             )
         else:
             next_stage = StageRequest(
-                id="009-finalize",
+                id=_next_stage_id(request.id, "finalize"),
                 handler_id="openstar.tess.finalize",
                 parameters={},
                 triggered_by_stage_id=request.id,
@@ -1729,13 +1751,19 @@ def build_engine(
 
     def prepare_independent(investigation, request):
         prepared = _result(investigation, "001-prepare-target")
-        identity = _result(investigation, "003-catalog-identity")
+        identity = _required_latest_result_for_handler(
+            investigation, "openstar.tess.catalog-identity"
+        )
         followup_interpretation = _latest_result_for_handler(
             investigation,
             "openstar.tess.followup.interpret",
         )
-        planner = _result(investigation, "005-planner")
-        analysis = _result(investigation, "004-hypotheses")
+        planner = _required_latest_result_for_handler(
+            investigation, "openstar.tess.planner"
+        )
+        analysis = _required_latest_result_for_handler(
+            investigation, "openstar.tess.hypotheses"
+        )
 
         if followup_interpretation is not None:
             target_period = followup_interpretation.get("selectedPeriodDays")
@@ -1967,7 +1995,9 @@ def build_engine(
                 "Broad independent interpretation is missing its prepare/run stages."
             )
 
-        primary_analysis = _result(investigation, "004-hypotheses")
+        primary_analysis = _required_latest_result_for_handler(
+            investigation, "openstar.tess.hypotheses"
+        )
         followup_interpretation = _latest_result_for_handler(
             investigation,
             "openstar.tess.followup.interpret",
@@ -2033,7 +2063,9 @@ def build_engine(
                 "Harmonic-family reinterpretation requires completed broad independent prepare/run stages."
             )
 
-        primary_analysis = _result(investigation, "004-hypotheses")
+        primary_analysis = _required_latest_result_for_handler(
+            investigation, "openstar.tess.hypotheses"
+        )
         followup_interpretation = _latest_result_for_handler(
             investigation,
             "openstar.tess.followup.interpret",

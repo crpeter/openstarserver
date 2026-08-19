@@ -374,6 +374,73 @@ def _repair_closed_file_independent_prepare(
     )
 
 
+def _repair_shifted_stage_lookup_independent_prepare(
+    store: InvestigationStore, investigation: Investigation
+) -> Investigation | None:
+    """Retry the one obsolete numeric catalog-stage lookup failure shape."""
+    if investigation.status != "FAILED" or not investigation.stages:
+        return None
+    failed = investigation.stages[-1]
+    if not (
+        failed.status == "FAILED"
+        and failed.handler_id == "openstar.tess.independent.prepare"
+        and failed.failure_classification == "NON_RETRYABLE"
+        and failed.error
+        == "RuntimeError: Stage is not COMPLETE with a result: 003-catalog-identity"
+    ):
+        return None
+
+    identity_failures = [
+        index for index, stage in enumerate(investigation.stages)
+        if stage.handler_id == "openstar.tess.catalog-identity"
+        and stage.status == "FAILED"
+        and stage.failure_classification == "TRANSIENT_INFRASTRUCTURE"
+    ]
+    successful_identity = next((
+        index for index, stage in enumerate(investigation.stages)
+        if stage.handler_id == "openstar.tess.catalog-identity"
+        and stage.status == "COMPLETE"
+        and any(failed_index < index for failed_index in identity_failures)
+    ), None)
+    hypotheses = next((
+        index for index, stage in enumerate(investigation.stages)
+        if successful_identity is not None and index > successful_identity
+        and stage.handler_id == "openstar.tess.hypotheses" and stage.status == "COMPLETE"
+    ), None)
+    planner = next((
+        index for index, stage in enumerate(investigation.stages)
+        if hypotheses is not None and index > hypotheses
+        and stage.handler_id == "openstar.tess.planner" and stage.status == "COMPLETE"
+    ), None)
+    failed_index = len(investigation.stages) - 1
+    if planner is None or any(
+        index > failed_index
+        and stage.handler_id == "openstar.tess.independent.prepare"
+        and stage.status == "COMPLETE"
+        for index, stage in enumerate(investigation.stages)
+    ):
+        return None
+
+    prefixes = [int(stage.id.partition("-")[0]) for stage in investigation.stages
+                if stage.id.partition("-")[0].isdigit()]
+    retry = StageRequest(
+        id=f"{max(prefixes, default=0) + 1:03d}-prepare-independent-sectors",
+        handler_id="openstar.tess.independent.prepare",
+        parameters=dict(failed.parameters),
+        triggered_by_stage_id=failed.id,
+    )
+    return store.set_control_state(
+        investigation,
+        status="RUNNING",
+        control_state={
+            "branchAssessments": [],
+            "selectedExperiment": asdict(retry),
+            "schedulerAction": "RUN_EXPERIMENT",
+            "recovery": "TESS_RETRY_SHIFTED_STAGE_LOOKUP_COMPATIBILITY_RETRY",
+        },
+    )
+
+
 def repair_obsolete_terminal_wait(
     store: InvestigationStore, investigation: Investigation
 ) -> Investigation:
@@ -382,6 +449,12 @@ def repair_obsolete_terminal_wait(
     control = investigation.metadata.get("controlState")
     if investigation.workflow_id != WORKFLOW_ID or not isinstance(control, dict):
         return investigation
+
+    independent_repair = _repair_shifted_stage_lookup_independent_prepare(
+        store, investigation
+    )
+    if independent_repair is not None:
+        return independent_repair
 
     independent_repair = _repair_closed_file_independent_prepare(store, investigation)
     if independent_repair is not None:
