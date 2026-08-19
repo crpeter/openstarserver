@@ -292,10 +292,27 @@ class CurrentDESLocalForcedPhotometryTests(unittest.TestCase):
         inv = Investigation("atlas", "openstar.workflow.tess-investigation.v1", "20.2",
                             "BLOCKED", "now", "now", {}, (stage,))
         target = InvestigationTarget("atlas", "atlas", inv.workflow_id, inv.workflow_version)
-        branch = plan_tess_branches(inv, target)[0]
+        with mock.patch(
+                "workflows.tess.tess_atlas_forced_photometry.atlas_credentials_available",
+                return_value=False):
+            branch = plan_tess_branches(inv, target)[0]
         self.assertEqual("openstar.tess.atlas-forced-photometry.prepare", branch.experiment.handler_id)
         self.assertEqual(("openstar.capability.atlas-forced-photometry-credentials",),
                          branch.required_stage_ids)
+
+    def test_nondecisive_interpretation_needs_no_boundary_when_atlas_credentials_exist(self):
+        stage = InvestigationStage("052-interpret-des",
+            "openstar.tess.des-dr2-se-local-forced-photometry.interpret", "COMPLETE", None, {},
+            result={"recommendedNextTest": des.NEXT_ARCHIVE_TEST,
+                    "physicalMechanismResolved": False}, stop=True)
+        inv = Investigation("atlas", "openstar.workflow.tess-investigation.v1", "20.2",
+                            "BLOCKED", "now", "now", {}, (stage,))
+        target = InvestigationTarget("atlas", "atlas", inv.workflow_id, inv.workflow_version)
+        with mock.patch(
+                "workflows.tess.tess_atlas_forced_photometry.atlas_credentials_available",
+                return_value=True):
+            branch = plan_tess_branches(inv, target)[0]
+        self.assertEqual((), branch.required_stage_ids)
 
 
 if __name__ == "__main__": unittest.main()
