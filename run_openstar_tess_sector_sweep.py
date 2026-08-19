@@ -14,7 +14,7 @@ from openstar_scheduler import InvestigationScheduler
 from workflows.tess.tess_sector_archive import MastTessSectorArchiveProvider, TessSectorInventoryStore
 from workflows.tess.tess_sector_scan import (
     WORKFLOW_ID, TessSectorScanTargetSource, plan_tess_sector_scan,
-    register_tess_sector_scan_handlers,
+    register_tess_sector_scan_handlers, repair_legacy_archive_transport_failure,
 )
 
 SOFTWARE_ID = "openstar.tess-sector-sweep-runner"
@@ -40,11 +40,14 @@ def run_tess_sector_sweep(sector: int, coordinator_url: str, state_dir: str | Pa
     provider = provider or MastTessSectorArchiveProvider()
     inventory = TessSectorInventoryStore(root / f"tess-sector-{sector}-inventory.json").create_or_load(sector, provider)
     store = InvestigationStore(root / "investigations")
+    target_source = TessSectorScanTargetSource(inventory, max_targets=max_targets)
+    for target in target_source.enumerate_targets():
+        repair_legacy_archive_transport_failure(store, target.investigation_id)
     coordinator = coordinator or OpenStarCoordinatorClient(coordinator_url)
     workflow = register_tess_sector_scan_handlers(store, coordinator, provider,
                                                    poll_interval=poll_interval, timeout=timeout)
     scheduler = InvestigationScheduler(store, InvestigationDispatcher(store, workflow),
-        TessSectorScanTargetSource(inventory, max_targets=max_targets),
+        target_source,
         {WORKFLOW_ID: plan_tess_sector_scan}, software_id=SOFTWARE_ID,
         software_version=SOFTWARE_VERSION,
         max_concurrent_investigations=max_concurrent_investigations)

@@ -122,6 +122,60 @@ def _next_stage(request: StageRequest, label: str, handler: str, parameters: dic
     )
 
 
+def repair_legacy_archive_transport_failure(
+    store: InvestigationStore, investigation_id: str
+) -> bool:
+    """Persist the one narrowly supported legacy shallow-download recovery."""
+    if not store.path_for(investigation_id).exists():
+        return False
+    investigation = store.load(investigation_id)
+    if (
+        investigation.workflow_id != WORKFLOW_ID
+        or investigation.status != "FAILED"
+        or not investigation.stages
+    ):
+        return False
+    failed = investigation.stages[-1]
+    if (
+        failed.handler_id != MATERIALIZE_HANDLER
+        or failed.status != "FAILED"
+        or failed.failure_classification != "NON_RETRYABLE"
+        or not failed.error
+        or failed.error.partition(":")[0] != "ConnectionError"
+        or any(
+            stage.handler_id == MATERIALIZE_HANDLER and stage.status == "COMPLETE"
+            for stage in investigation.stages
+        )
+    ):
+        return False
+
+    prefixes = []
+    for stage in investigation.stages:
+        prefix, separator, _ = stage.id.partition("-")
+        if separator and prefix.isdigit():
+            prefixes.append(int(prefix))
+    _, separator, label = failed.id.partition("-")
+    if not separator:
+        raise ValueError(f"Stage id has no label: {failed.id}")
+    retry = StageRequest(
+        f"{max(prefixes, default=0) + 1:03d}-{label}",
+        MATERIALIZE_HANDLER,
+        dict(failed.parameters),
+        failed.id,
+    )
+    store.set_control_state(
+        investigation,
+        status="RUNNING",
+        control_state={
+            "branchAssessments": [],
+            "selectedExperiment": asdict(retry),
+            "schedulerAction": "RUN_EXPERIMENT",
+            "recovery": "TESS_ARCHIVE_TRANSPORT_COMPATIBILITY_RETRY",
+        },
+    )
+    return True
+
+
 def register_tess_sector_scan_handlers(
     store: InvestigationStore, coordinator: OpenStarCoordinatorClient,
     provider: TessSectorArchiveProvider, *, poll_interval: float = 1.0,

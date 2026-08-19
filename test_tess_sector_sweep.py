@@ -340,37 +340,81 @@ class SweepTests(unittest.TestCase):
             self.assertEqual(2, provider.downloads.count(1))
             self.assertEqual([1], coordinator.calls)
 
-    def test_legacy_connection_failure_gets_idempotent_compatibility_recovery(self):
-        class BrokenProvider(FakeProvider):
+    def test_sweep_repairs_legacy_connection_failure_and_resumes_only_materialize(self):
+        class OnceBrokenProvider(FakeProvider):
             def download_light_curve(self, selected, destination):
-                raise ConnectionError("old transport disconnect")
+                self.downloads.append(selected.tic_id)
+                if len(self.downloads) == 1:
+                    raise ConnectionError("old transport disconnect")
+                destination.mkdir(parents=True, exist_ok=True)
+                path = destination / selected.product_filename
+                path.write_bytes(b"FITS")
+                return path
 
-        provider, coordinator = BrokenProvider([product(1)]), FakeCoordinator()
+        provider, coordinator = OnceBrokenProvider([product(1)]), FakeCoordinator()
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            inventory = TessSectorInventoryStore(root / "inventory.json").create_or_load(7, provider)
-            target = TessSectorScanTargetSource(inventory).enumerate_targets()[0]
-            store = InvestigationStore(root / "investigations")
-            workflow = register_tess_sector_scan_handlers(store, coordinator, provider,
-                                                           preprocessing=lambda path: Prepared())
-            driver = InvestigationLifecycleDriver(
-                store, InvestigationDispatcher(store, workflow),
-                {WORKFLOW_ID: plan_tess_sector_scan}, software_id="test", software_version="1")
-            planned = driver.prepare(target)
-            with self.assertRaises(ConnectionError):
-                driver.dispatch_prepared(planned)
-            failed_path = store.stage_path_for(target.investigation_id, "001-materialize-light-curve")
-            historical = failed_path.read_bytes()
+            from workflows.tess import tess_sector_scan
+            original = tess_sector_scan.read_and_prepare_tess_light_curve
+            tess_sector_scan.read_and_prepare_tess_light_curve = lambda path: Prepared()
+            try:
+                self.assertEqual(1, run_tess_sector_sweep(
+                    7, "unused", root, provider=provider, coordinator=coordinator))
+                store = InvestigationStore(root / "investigations")
+                investigation_id = "tess-sector-scan-7-tic-1"
+                failed_path = store.stage_path_for(
+                    investigation_id, "001-materialize-light-curve")
+                historical = failed_path.read_bytes()
 
-            repaired = driver.prepare(target)
-            self.assertEqual(InvestigationSchedulingState.RUNNABLE, repaired.state)
-            control = repaired.investigation.metadata["controlState"]
-            self.assertEqual("TESS_ARCHIVE_TRANSPORT_COMPATIBILITY_RETRY", control["recovery"])
-            self.assertEqual("002-materialize-light-curve", control["selectedExperiment"]["id"])
-            self.assertEqual("001-materialize-light-curve", control["selectedExperiment"]["triggered_by_stage_id"])
-            again = driver.prepare(target)
-            self.assertEqual(0, again.transitions)
-            self.assertEqual(historical, failed_path.read_bytes())
+                import run_openstar_tess_sector_sweep as sweep_runner
+                actual_repair = sweep_runner.repair_legacy_archive_transport_failure
+                recovered_controls = []
+                repeated_repair_results = []
+                def recording_repair(repair_store, repair_id):
+                    changed = actual_repair(repair_store, repair_id)
+                    if changed:
+                        recovered_controls.append(
+                            repair_store.load(repair_id).metadata["controlState"])
+                        repeated_repair_results.append(
+                            actual_repair(repair_store, repair_id))
+                    return changed
+                with patch.object(
+                    sweep_runner, "repair_legacy_archive_transport_failure",
+                    recording_repair,
+                ):
+                    self.assertEqual(0, run_tess_sector_sweep(
+                        7, "unused", root, provider=provider, coordinator=coordinator))
+                self.assertEqual(1, len(recovered_controls))
+                self.assertEqual([False], repeated_repair_results)
+                self.assertEqual(
+                    "TESS_ARCHIVE_TRANSPORT_COMPATIBILITY_RETRY",
+                    recovered_controls[0]["recovery"],
+                )
+                self.assertEqual("RUN_EXPERIMENT", recovered_controls[0]["schedulerAction"])
+                completed = store.load(investigation_id)
+                self.assertEqual("COMPLETE", completed.status)
+                self.assertEqual(
+                    ["001-materialize-light-curve", "002-materialize-light-curve",
+                     "003-broad-distributed-scan", "004-persist-scan-evidence"],
+                    [stage.id for stage in completed.stages])
+                self.assertEqual("001-materialize-light-curve",
+                                 completed.stages[1].triggered_by_stage_id)
+                self.assertEqual(historical, failed_path.read_bytes())
+                self.assertEqual([1], coordinator.calls)
+
+                snapshot = store.path_for(investigation_id).read_bytes()
+                self.assertEqual(0, run_tess_sector_sweep(
+                    7, "unused", root, provider=provider, coordinator=coordinator))
+                self.assertEqual(snapshot, store.path_for(investigation_id).read_bytes())
+                self.assertEqual(2, provider.downloads.count(1))
+                self.assertEqual([1], coordinator.calls)
+            finally:
+                tess_sector_scan.read_and_prepare_tess_light_curve = original
+
+    def test_generic_lifecycle_contains_no_tess_compatibility_policy(self):
+        lifecycle_source = Path("openstar_lifecycle.py").read_text(encoding="utf-8")
+        self.assertNotIn("tess-sector", lifecycle_source.lower())
+        self.assertNotIn("TESS_ARCHIVE_TRANSPORT_COMPATIBILITY_RETRY", lifecycle_source)
 
     def test_unrelated_nonretryable_materialization_remains_terminal(self):
         provider, coordinator = FakeProvider([product(1)]), FakeCoordinator()
