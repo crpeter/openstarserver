@@ -125,7 +125,7 @@ def _next_stage(request: StageRequest, label: str, handler: str, parameters: dic
 def repair_legacy_archive_transport_failure(
     store: InvestigationStore, investigation_id: str
 ) -> bool:
-    """Persist the one narrowly supported legacy shallow-download recovery."""
+    """Persist narrowly supported legacy shallow-scan transport recoveries."""
     if not store.path_for(investigation_id).exists():
         return False
     investigation = store.load(investigation_id)
@@ -136,16 +136,32 @@ def repair_legacy_archive_transport_failure(
     ):
         return False
     failed = investigation.stages[-1]
-    if (
-        failed.handler_id != MATERIALIZE_HANDLER
-        or failed.status != "FAILED"
-        or failed.failure_classification != "NON_RETRYABLE"
-        or not failed.error
-        or failed.error.partition(":")[0] != "ConnectionError"
-        or any(
+    materialize_complete = next((
+        stage for stage in reversed(investigation.stages[:-1])
+        if stage.handler_id == MATERIALIZE_HANDLER and stage.status == "COMPLETE"
+    ), None)
+    error_type = failed.error.partition(":")[0] if failed.error else ""
+    legacy_scan_transport_failure = (
+        failed.handler_id == SCAN_HANDLER
+        and materialize_complete is not None
+        and error_type in {
+            "ConnectionResetError", "ConnectionAbortedError",
+            "BrokenPipeError", "ConnectionRefusedError", "TimeoutError",
+        }
+    )
+    legacy_archive_transport_failure = (
+        failed.handler_id == MATERIALIZE_HANDLER
+        and error_type == "ConnectionError"
+        and not any(
             stage.handler_id == MATERIALIZE_HANDLER and stage.status == "COMPLETE"
             for stage in investigation.stages
         )
+    )
+    if (
+        failed.status != "FAILED"
+        or failed.failure_classification != "NON_RETRYABLE"
+        or not failed.error
+        or not (legacy_archive_transport_failure or legacy_scan_transport_failure)
     ):
         return False
 
@@ -159,7 +175,7 @@ def repair_legacy_archive_transport_failure(
         raise ValueError(f"Stage id has no label: {failed.id}")
     retry = StageRequest(
         f"{max(prefixes, default=0) + 1:03d}-{label}",
-        MATERIALIZE_HANDLER,
+        failed.handler_id,
         dict(failed.parameters),
         failed.id,
     )
@@ -170,7 +186,11 @@ def repair_legacy_archive_transport_failure(
             "branchAssessments": [],
             "selectedExperiment": asdict(retry),
             "schedulerAction": "RUN_EXPERIMENT",
-            "recovery": "TESS_ARCHIVE_TRANSPORT_COMPATIBILITY_RETRY",
+            "recovery": (
+                "TESS_COORDINATOR_TRANSPORT_COMPATIBILITY_RETRY"
+                if legacy_scan_transport_failure
+                else "TESS_ARCHIVE_TRANSPORT_COMPATIBILITY_RETRY"
+            ),
         },
     )
     return True

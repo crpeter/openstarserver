@@ -2,13 +2,18 @@ import json
 import tempfile
 import threading
 import unittest
+from io import BytesIO
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 import coordinator
-from openstar_coordinator_client import OpenStarCoordinatorClient
+from openstar_coordinator_client import (
+    CoordinatorClientError, CoordinatorUnavailableError,
+    OpenStarCoordinatorClient,
+)
+from openstar_workflow import RetryableExecutionError
 from coordinator_runtime import (
     CoordinatorRuntime,
     ProjectBusyError,
@@ -252,6 +257,38 @@ class CoordinatorHTTPContractTests(unittest.TestCase):
 
 
 class CoordinatorClientTests(unittest.TestCase):
+    def test_raw_transient_transport_failures_are_retryable(self):
+        client = OpenStarCoordinatorClient()
+        failures = (
+            ConnectionResetError("reset"), ConnectionAbortedError("aborted"),
+            BrokenPipeError("broken"), ConnectionRefusedError("refused"),
+            TimeoutError("timed out"),
+        )
+        for failure in failures:
+            with self.subTest(failure=type(failure).__name__), patch(
+                "openstar_coordinator_client.urlopen", side_effect=failure
+            ), self.assertRaises(CoordinatorUnavailableError) as raised:
+                client.health()
+            self.assertIsInstance(raised.exception, RetryableExecutionError)
+
+    def test_http_errors_remain_non_retryable_client_errors(self):
+        error = HTTPError("http://coordinator", 400, "bad", {}, BytesIO(
+            b'{"message":"invalid project"}'
+        ))
+        with patch("openstar_coordinator_client.urlopen", side_effect=error), \
+                self.assertRaises(CoordinatorClientError) as raised:
+            OpenStarCoordinatorClient().health()
+        self.assertNotIsInstance(raised.exception, CoordinatorUnavailableError)
+        self.assertNotIsInstance(raised.exception, RetryableExecutionError)
+
+    def test_malformed_response_remains_non_retryable(self):
+        response = MagicMock()
+        response.__enter__.return_value.read.return_value = b"not json"
+        with patch("openstar_coordinator_client.urlopen", return_value=response), \
+                self.assertRaises(CoordinatorClientError) as raised:
+            OpenStarCoordinatorClient().health()
+        self.assertNotIsInstance(raised.exception, RetryableExecutionError)
+
     def test_run_projects_activates_batch_then_polls_in_order(self):
         client = OpenStarCoordinatorClient()
         activations = [{"projectID": "a"}, {"projectID": "b"}]

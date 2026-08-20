@@ -15,7 +15,7 @@ from unittest.mock import MagicMock, patch
 
 from openstar_coordinator_client import ProjectRunResult
 from openstar_dispatch import InvestigationDispatcher
-from openstar_investigation import InvestigationStore
+from openstar_investigation import InvestigationStage, InvestigationStore
 from openstar_lifecycle import InvestigationLifecycleDriver, InvestigationSchedulingState
 from openstar_scheduler import InvestigationScheduler
 from workflows.tess.tess_preprocessing import prepare_tess_samples
@@ -25,8 +25,9 @@ from workflows.tess.tess_sector_archive import (
 )
 from openstar_workflow import RetryableExecutionError, StageRequest
 from workflows.tess.tess_sector_scan import (
-    WORKFLOW_ID, TessSectorScanTargetSource, plan_tess_sector_scan,
-    register_tess_sector_scan_handlers,
+    MATERIALIZE_HANDLER, SCAN_HANDLER, WORKFLOW_ID,
+    TessSectorScanTargetSource, plan_tess_sector_scan,
+    register_tess_sector_scan_handlers, repair_legacy_archive_transport_failure,
 )
 from run_openstar_tess_sector_sweep import run_tess_sector_sweep
 
@@ -307,6 +308,61 @@ class PreprocessingTests(unittest.TestCase):
 
 
 class SweepTests(unittest.TestCase):
+    def test_repairs_legacy_broad_scan_transport_failure_without_rematerializing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = InvestigationStore(Path(tmp) / "investigations")
+            investigation = store.create("tess-sector-scan-1-tic-38934284", WORKFLOW_ID, "1")
+            project_path = store.directory_for(investigation.id) / "artifacts" / "scan-input" / "project.json"
+            project_path.parent.mkdir(parents=True)
+            project_path.write_bytes(b'{"durable":true}')
+            stages = (
+                InvestigationStage(
+                    "001-materialize-light-curve", "openstar.tess-sector-scan.materialize-light-curve",
+                    "COMPLETE", None, {}, result={"projectPath": str(project_path)},
+                ),
+                InvestigationStage(
+                    "002-broad-distributed-scan", "openstar.tess-sector-scan.broad-distributed-scan",
+                    "FAILED", "001-materialize-light-curve", {"projectPath": str(project_path)},
+                    error="ConnectionResetError: [Errno 54] Connection reset by peer",
+                    failure_classification="NON_RETRYABLE",
+                ),
+            )
+            failed = replace(investigation, status="FAILED", stages=stages)
+            store.save(failed)
+            artifact_before = project_path.read_bytes()
+
+            self.assertTrue(repair_legacy_archive_transport_failure(store, failed.id))
+            repaired = store.load(failed.id)
+            self.assertEqual(stages, repaired.stages)
+            retry = repaired.metadata["controlState"]["selectedExperiment"]
+            self.assertEqual("003-broad-distributed-scan", retry["id"])
+            self.assertEqual(str(project_path), retry["parameters"]["projectPath"])
+            self.assertEqual("002-broad-distributed-scan", retry["triggered_by_stage_id"])
+            self.assertEqual(artifact_before, project_path.read_bytes())
+            self.assertFalse(repair_legacy_archive_transport_failure(store, failed.id))
+
+    def test_broad_scan_repair_skips_successes_and_deterministic_failures(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = InvestigationStore(tmp)
+            for suffix, status, error in (
+                ("success", "COMPLETE", "ConnectionResetError: old irrelevant error"),
+                ("deterministic", "FAILED", "ValueError: invalid project"),
+            ):
+                investigation = store.create(f"scan-{suffix}", WORKFLOW_ID, "1")
+                stages = (
+                    InvestigationStage("001-materialize-light-curve", MATERIALIZE_HANDLER,
+                                       "COMPLETE", None, {}, result={"projectPath": "/durable/project.json"}),
+                    InvestigationStage("002-broad-distributed-scan", SCAN_HANDLER,
+                                       "COMPLETE" if status == "COMPLETE" else "FAILED",
+                                       "001-materialize-light-curve", {"projectPath": "/durable/project.json"},
+                                       error=error, failure_classification="NON_RETRYABLE"),
+                )
+                persisted = replace(investigation, status=status, stages=stages)
+                store.save(persisted)
+                before = store.path_for(persisted.id).read_bytes()
+                self.assertFalse(repair_legacy_archive_transport_failure(store, persisted.id))
+                self.assertEqual(before, store.path_for(persisted.id).read_bytes())
+
     def test_transient_materialization_retries_then_runs_broad_scan(self):
         class FlakyProvider(FakeProvider):
             def download_light_curve(self, selected, destination):
