@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,7 +14,9 @@ from openstar_workflow import RetryableExecutionError
 
 
 class CoordinatorClientError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, status_code: int | None = None):
+        super().__init__(message)
+        self.status_code = status_code
 
 
 class CoordinatorUnavailableError(CoordinatorClientError, RetryableExecutionError):
@@ -89,9 +92,27 @@ class OpenStarCoordinatorClient:
         return dict(response["status"])
 
     def remove_project(self, project_id: str) -> None:
-        self._request_json(
-            "DELETE", f"/v1/projects/{quote(str(project_id), safe='')}"
-        )
+        path = f"/v1/projects/{quote(str(project_id), safe='')}"
+        for attempt in range(3):
+            try:
+                self._request_json("DELETE", path)
+                return
+            except CoordinatorUnavailableError:
+                # DELETE is ambiguous after a transport failure: the server may
+                # already have removed the terminal project. Retry so a 404 can
+                # confirm that cleanup completed.
+                if attempt < 2:
+                    continue
+                logging.warning(
+                    "Could not confirm cleanup of terminal project %s; "
+                    "preserving its captured result.",
+                    project_id,
+                )
+                return
+            except CoordinatorClientError as error:
+                if error.status_code == 404:
+                    return
+                raise
 
     def run_project(
         self,
@@ -230,7 +251,8 @@ class OpenStarCoordinatorClient:
             except Exception:
                 message = raw.decode("utf-8", errors="replace")
             raise CoordinatorClientError(
-                f"Coordinator HTTP {error.code}: {message}"
+                f"Coordinator HTTP {error.code}: {message}",
+                status_code=error.code,
             ) from error
         except URLError as error:
             raise CoordinatorUnavailableError(

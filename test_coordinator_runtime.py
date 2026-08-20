@@ -288,6 +288,31 @@ class CoordinatorHTTPContractTests(unittest.TestCase):
         self.assertIsNotNone(second.getheader("Content-Length"))
         second.read()
 
+    def test_lost_delete_response_retries_and_accepts_already_absent(self):
+        state = self.runtime._states["a"]
+        state.failed.update({work_id: {} for work_id in state.work_units})
+        state.pending.clear()
+        real_urlopen = urlopen
+        calls = 0
+
+        def lose_first_response(request, timeout):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                with real_urlopen(request, timeout=timeout) as response:
+                    response.read()
+                raise ConnectionResetError("response lost after DELETE")
+            return real_urlopen(request, timeout=timeout)
+
+        client = OpenStarCoordinatorClient(self.base)
+        with patch(
+            "openstar_coordinator_client.urlopen", side_effect=lose_first_response
+        ):
+            client.remove_project("a")
+
+        self.assertEqual(2, calls)
+        self.assertNotIn("a", self.runtime._states)
+
 
 class CoordinatorClientTests(unittest.TestCase):
     def test_raw_transient_transport_failures_are_retryable(self):
@@ -313,6 +338,31 @@ class CoordinatorClientTests(unittest.TestCase):
             OpenStarCoordinatorClient().health()
         self.assertNotIsInstance(raised.exception, CoordinatorUnavailableError)
         self.assertNotIsInstance(raised.exception, RetryableExecutionError)
+        self.assertEqual(400, raised.exception.status_code)
+
+    def test_remove_project_preserves_deterministic_cleanup_errors(self):
+        client = OpenStarCoordinatorClient()
+        conflict = CoordinatorClientError("still running", status_code=409)
+        with patch.object(
+            client, "_request_json", side_effect=conflict
+        ) as request, self.assertRaises(CoordinatorClientError) as raised:
+            client.remove_project("a")
+        self.assertIs(conflict, raised.exception)
+        request.assert_called_once_with("DELETE", "/v1/projects/a")
+
+    def test_404_remains_an_error_for_unrelated_api_calls(self):
+        error = HTTPError(
+            "http://coordinator/v1/projects/missing/status",
+            404,
+            "missing",
+            {},
+            BytesIO(b'{"message":"Unknown project."}'),
+        )
+        with patch(
+            "openstar_coordinator_client.urlopen", side_effect=error
+        ), self.assertRaises(CoordinatorClientError) as raised:
+            OpenStarCoordinatorClient().project_status("missing")
+        self.assertEqual(404, raised.exception.status_code)
 
     def test_malformed_response_remains_non_retryable(self):
         response = MagicMock()
@@ -459,6 +509,68 @@ class CoordinatorClientTests(unittest.TestCase):
         ):
             client.run_project("project.json")
         remove.assert_not_called()
+
+    def test_run_project_returns_captured_result_after_ambiguous_cleanup(self):
+        client = OpenStarCoordinatorClient()
+        complete = {
+            "status": "COMPLETE",
+            "projectID": "a",
+            "nodeContributions": {"node": 7},
+        }
+        absent = CoordinatorClientError("unknown project", status_code=404)
+        with patch.object(
+            client, "activate_project", return_value={"projectID": "a"}
+        ) as activate, patch.object(
+            client, "wait_for_project", return_value=complete
+        ), patch.object(
+            client,
+            "_request_json",
+            side_effect=[CoordinatorUnavailableError("lost response"), absent],
+        ) as request:
+            result = client.run_project("project.json")
+
+        activate.assert_called_once_with("project.json", require_terminal=False)
+        self.assertIs(complete, result.status)
+        self.assertEqual({"node": 7}, result.node_contributions)
+        self.assertEqual(2, request.call_count)
+
+    def test_run_projects_returns_captured_results_after_ambiguous_cleanup(self):
+        client = OpenStarCoordinatorClient()
+        statuses = [
+            {
+                "status": "COMPLETE",
+                "projectID": "a",
+                "nodeContributions": {"node": 2},
+            },
+            {
+                "status": "COMPLETE",
+                "projectID": "b",
+                "nodeContributions": {"node": 3},
+            },
+        ]
+        absent = CoordinatorClientError("unknown project", status_code=404)
+        with patch.object(
+            client,
+            "activate_project",
+            side_effect=[{"projectID": "a"}, {"projectID": "b"}],
+        ) as activate, patch.object(
+            client, "project_status", side_effect=statuses
+        ), patch.object(
+            client,
+            "_request_json",
+            side_effect=[
+                CoordinatorUnavailableError("lost a"),
+                absent,
+                CoordinatorUnavailableError("lost b"),
+                absent,
+            ],
+        ) as request:
+            result = client.run_projects(["one.json", "two.json"])
+
+        self.assertEqual(2, activate.call_count)
+        self.assertEqual(("a", "b"), result.project_ids)
+        self.assertEqual({"node": 5}, result.node_contributions)
+        self.assertEqual(4, request.call_count)
 
     def test_run_projects_only_removes_statuses_captured_as_terminal(self):
         client = OpenStarCoordinatorClient()
