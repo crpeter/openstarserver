@@ -228,6 +228,13 @@ class OpenStarCoordinatorClient:
             raise CoordinatorUnavailableError(
                 f"Coordinator unavailable: {error.reason}"
             ) from error
+        except (ConnectionError, TimeoutError) as error:
+            # urlopen normally wraps transport failures in URLError, but some
+            # socket and HTTP layers allow these built-in transient failures to
+            # escape directly (notably ConnectionResetError while reading).
+            raise CoordinatorUnavailableError(
+                f"Coordinator unavailable: {error}"
+            ) from error
 
         if not raw:
             return {}
