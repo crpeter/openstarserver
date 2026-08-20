@@ -850,14 +850,6 @@ class CoordinatorState:
             for work_id in deferred:
                 self.pending.append(work_id)
 
-        if work_unit is not None:
-            print()
-            print("📦 Work assigned")
-            print(f"   work: {work_unit['id']}")
-            print(f"   node: {node_id}")
-            print(f"   workload: {work_unit['workloadID']}")
-            print(f"   dataset: {work_unit.get('datasetID', '[none]')}")
-
         return work_unit
 
     def _chunk_reference(self, dataset_id, start_index):
@@ -1959,53 +1951,6 @@ class CoordinatorState:
             # HTTP request. Returning 200 prevents networking layers from
             # immediately POSTing the identical deterministic result again.
             return False, message, 200
-
-        print()
-        print("✅ Science result accepted")
-        print(f"   work: {work_unit['id']}")
-        print(f"   node: {stored_result.get('nodeID', 'unknown')}")
-        print(f"   dataset: {work_unit['datasetID']}")
-        print(f"   frequency: {float(stored_result['bestFrequency']):.8f}")
-
-        if stored_result.get("bestPeriodDays") is not None:
-            print(
-                f"   period: {float(stored_result['bestPeriodDays']):.8f} days"
-            )
-
-        print(f"   power: {float(stored_result['bestPower']):.8f}")
-        print(
-            "   verification: "
-            f"{stored_result['verification'].get('method')}"
-        )
-
-        reference_status = stored_result["verification"].get(
-            "referenceComparisonStatus"
-        )
-
-        if reference_status == "match":
-            reference_method = stored_result["verification"].get(
-                "referenceComparisonMethod"
-            )
-            print(
-                "   Astropy comparison: MATCH"
-                + (
-                    f" ({reference_method})"
-                    if reference_method
-                    else ""
-                )
-            )
-        elif reference_status == "mismatch":
-            print(
-                "   Astropy comparison: MISMATCH "
-                "(diagnostic only; Metal result retained)"
-            )
-        elif reference_status == "not-available":
-            print("   Astropy comparison: not available")
-
-        if stored_result.get("duration") is not None:
-            print(f"   duration: {float(stored_result['duration']):.4f}s")
-
-        print(f"   project: {completed_count}/{total_count}")
 
         self._report_completions()
 

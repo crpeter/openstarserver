@@ -88,6 +88,11 @@ class OpenStarCoordinatorClient:
         )
         return dict(response["status"])
 
+    def remove_project(self, project_id: str) -> None:
+        self._request_json(
+            "DELETE", f"/v1/projects/{quote(str(project_id), safe='')}"
+        )
+
     def run_project(
         self,
         project_path: str | Path,
@@ -102,7 +107,9 @@ class OpenStarCoordinatorClient:
             poll_interval=poll_interval,
             timeout=timeout,
         )
-        return ProjectRunResult(project_id=project_id, status=final_status)
+        result = ProjectRunResult(project_id=project_id, status=final_status)
+        self.remove_project(project_id)
+        return result
 
     def run_projects(
         self,
@@ -145,6 +152,7 @@ class OpenStarCoordinatorClient:
                 check_deadline()
                 if self.is_terminal(status):
                     completed[project_id] = status
+                    self.remove_project(project_id)
 
             if len(completed) == len(project_ids):
                 check_deadline()

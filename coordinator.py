@@ -43,6 +43,7 @@ def _should_log_project_status(status):
 
 class RequestHandler(BaseHTTPRequestHandler):
     server_version = "OpenStarCoordinator/1.0"
+    protocol_version = "HTTP/1.1"
 
     def log_message(self, format, *args):
         return
@@ -171,7 +172,6 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urlparse(self.path).path
-        print(f"🌐 POST {path}")
 
         try:
             payload = self._read_json()

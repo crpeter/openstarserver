@@ -1,3 +1,4 @@
+import http.client
 import json
 import tempfile
 import threading
@@ -58,6 +59,19 @@ class CoordinatorRuntimeTests(unittest.TestCase):
             )
         )
         return manifest
+
+    def test_hot_path_progress_is_aggregated_by_interval(self):
+        with patch("coordinator_runtime.time.monotonic", return_value=0.0):
+            runtime = CoordinatorRuntime()
+        with patch(
+            "coordinator_runtime.time.monotonic", side_effect=[1.0, 11.0]
+        ), patch("builtins.print") as output:
+            runtime._record_progress(assigned=2)
+            output.assert_not_called()
+            runtime._record_progress(accepted=1)
+        output.assert_called_once_with(
+            "📊 Coordinator progress: assigned=2, accepted=1, liveProjects=0"
+        )
 
     def activate_two(self):
         runtime = CoordinatorRuntime()
@@ -255,6 +269,25 @@ class CoordinatorHTTPContractTests(unittest.TestCase):
             self.get("/v1/projects/a/status")
         self.assertEqual(404, missing.exception.code)
 
+    def test_http_11_connection_is_reused_with_framed_responses(self):
+        connection = http.client.HTTPConnection(
+            "127.0.0.1", self.server.server_address[1]
+        )
+        self.addCleanup(connection.close)
+        connection.request("GET", "/v1/projects")
+        first = connection.getresponse()
+        first_socket = connection.sock
+        self.assertEqual(11, first.version)
+        self.assertIsNotNone(first.getheader("Content-Length"))
+        first.read()
+
+        connection.request("GET", "/v1/projects/a/status")
+        second = connection.getresponse()
+        self.assertIs(connection.sock, first_socket)
+        self.assertEqual(11, second.version)
+        self.assertIsNotNone(second.getheader("Content-Length"))
+        second.read()
+
 
 class CoordinatorClientTests(unittest.TestCase):
     def test_raw_transient_transport_failures_are_retryable(self):
@@ -311,7 +344,7 @@ class CoordinatorClientTests(unittest.TestCase):
             client, "activate_project", side_effect=activate
         ), patch.object(client, "project_status", side_effect=status), patch(
             "openstar_coordinator_client.time.sleep"
-        ) as sleep:
+        ) as sleep, patch.object(client, "remove_project") as remove:
             result = client.run_projects(["one.json", "two.json"], poll_interval=0)
 
         self.assertEqual(("a", "b"), result.project_ids)
@@ -324,6 +357,10 @@ class CoordinatorClientTests(unittest.TestCase):
             [("status", "a"), ("status", "b"), ("status", "b")], events[2:]
         )
         sleep.assert_called_once()
+        self.assertEqual(
+            [unittest.mock.call("a"), unittest.mock.call("b")],
+            remove.call_args_list,
+        )
 
     def test_run_projects_rejects_empty_and_duplicate_project_ids(self):
         client = OpenStarCoordinatorClient()
@@ -377,10 +414,11 @@ class CoordinatorClientTests(unittest.TestCase):
             client, "activate_project", return_value={"projectID": "a"}
         ), patch.object(client, "project_status", return_value=complete), patch(
             "openstar_coordinator_client.time.monotonic", return_value=0.0
-        ):
+        ), patch.object(client, "remove_project") as remove:
             result = client.run_projects(["one.json"], timeout=1.0)
         self.assertEqual(("a",), result.project_ids)
         self.assertEqual({"node": 4}, result.node_contributions)
+        remove.assert_called_once_with("a")
 
     def test_wait_for_project_uses_project_specific_status(self):
         client = OpenStarCoordinatorClient()
@@ -401,11 +439,47 @@ class CoordinatorClientTests(unittest.TestCase):
             client, "activate_project", return_value={"projectID": "a"}
         ) as activate, patch.object(
             client, "wait_for_project", return_value=complete
-        ) as wait:
+        ) as wait, patch.object(client, "remove_project") as remove:
             result = client.run_project("project.json")
         activate.assert_called_once_with("project.json", require_terminal=False)
         wait.assert_called_once_with("a", poll_interval=1.0, timeout=None)
         self.assertEqual(complete, result.status)
+        remove.assert_called_once_with("a")
+
+    def test_run_project_transport_failure_does_not_remove_active_project(self):
+        client = OpenStarCoordinatorClient()
+        with patch.object(
+            client, "activate_project", return_value={"projectID": "a"}
+        ), patch.object(
+            client,
+            "wait_for_project",
+            side_effect=CoordinatorUnavailableError("offline"),
+        ), patch.object(client, "remove_project") as remove, self.assertRaises(
+            CoordinatorUnavailableError
+        ):
+            client.run_project("project.json")
+        remove.assert_not_called()
+
+    def test_run_projects_only_removes_statuses_captured_as_terminal(self):
+        client = OpenStarCoordinatorClient()
+        statuses = iter(
+            [
+                {"status": "COMPLETE", "projectID": "a"},
+                {"status": "RUNNING", "projectID": "b"},
+            ]
+        )
+        with patch.object(
+            client,
+            "activate_project",
+            side_effect=[{"projectID": "a"}, {"projectID": "b"}],
+        ), patch.object(client, "project_status", side_effect=statuses), patch.object(
+            client, "remove_project"
+        ) as remove, patch(
+            "openstar_coordinator_client.time.sleep",
+            side_effect=CoordinatorUnavailableError("offline"),
+        ), self.assertRaises(CoordinatorUnavailableError):
+            client.run_projects(["one.json", "two.json"])
+        remove.assert_called_once_with("a")
 
 
 if __name__ == "__main__":
