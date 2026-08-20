@@ -16,6 +16,7 @@ from workflows.tess.tess_sector_scan import (
     WORKFLOW_ID, TessSectorScanTargetSource, plan_tess_sector_scan,
     register_tess_sector_scan_handlers, repair_legacy_archive_transport_failure,
 )
+from workflows.tess.tess_preprocessing import broad_tess_frequency_search
 
 SOFTWARE_ID = "openstar.tess-sector-sweep-runner"
 SOFTWARE_VERSION = "1"
@@ -25,7 +26,13 @@ def run_tess_sector_sweep(sector: int, coordinator_url: str, state_dir: str | Pa
                           max_concurrent_investigations: int | None = None,
                           max_targets: int | None = None, provider=None,
                           coordinator=None, poll_interval: float = 1.0,
-                          timeout: float | None = None) -> int:
+                          timeout: float | None = None,
+                          frequencies_per_work_unit: int | None = None) -> int:
+    if frequencies_per_work_unit is not None and frequencies_per_work_unit <= 0:
+        raise ValueError("frequencies_per_work_unit must be positive")
+    scan_profile = broad_tess_frequency_search()
+    if frequencies_per_work_unit is not None:
+        scan_profile["frequenciesPerWorkUnit"] = frequencies_per_work_unit
     root = Path(state_dir).expanduser().resolve()
     legacy = [
         name for name in ("lifecycle.json", "portfolio.json")
@@ -45,7 +52,8 @@ def run_tess_sector_sweep(sector: int, coordinator_url: str, state_dir: str | Pa
         repair_legacy_archive_transport_failure(store, target.investigation_id)
     coordinator = coordinator or OpenStarCoordinatorClient(coordinator_url)
     workflow = register_tess_sector_scan_handlers(store, coordinator, provider,
-                                                   poll_interval=poll_interval, timeout=timeout)
+                                                   poll_interval=poll_interval, timeout=timeout,
+                                                   scan_profile=scan_profile)
     scheduler = InvestigationScheduler(store, InvestigationDispatcher(store, workflow),
         target_source,
         {WORKFLOW_ID: plan_tess_sector_scan}, software_id=SOFTWARE_ID,
@@ -55,7 +63,7 @@ def run_tess_sector_sweep(sector: int, coordinator_url: str, state_dir: str | Pa
     counts: dict[str, int] = {}
     for outcome in result.outcomes: counts[outcome.state.value] = counts.get(outcome.state.value, 0) + 1
     summary = " ".join(f"{key.lower()}={counts[key]}" for key in sorted(counts))
-    print(f"OpenStar TESS sector sweep: sector={sector} inventory={len(inventory.entries)} admitted={len(result.outcomes)} {summary}")
+    print(f"OpenStar TESS sector sweep: sector={sector} frequencies-per-work-unit={scan_profile['frequenciesPerWorkUnit']} inventory={len(inventory.entries)} admitted={len(result.outcomes)} {summary}")
     for outcome in result.outcomes:
         if outcome.error is not None:
             print(f"OpenStar TESS sector sweep target failure: investigation={outcome.investigation.id} error={type(outcome.error).__name__}: {outcome.error}", file=sys.stderr)
@@ -71,8 +79,10 @@ def parse_args(argv=None):
     parser.add_argument("--max-targets", type=int)
     parser.add_argument("--poll-interval", type=float, default=1.0)
     parser.add_argument("--timeout", type=float)
+    parser.add_argument("--frequencies-per-work-unit", type=int)
     args = parser.parse_args(argv)
-    for name in ("sector", "max_concurrent_investigations", "max_targets"):
+    for name in ("sector", "max_concurrent_investigations", "max_targets",
+                 "frequencies_per_work_unit"):
         value = getattr(args, name)
         if value is not None and value < 1: parser.error(f"--{name.replace('_', '-')} must be positive")
     if args.poll_interval <= 0: parser.error("--poll-interval must be positive")
@@ -85,7 +95,8 @@ def main(argv=None):
     try:
         return run_tess_sector_sweep(args.sector, args.coordinator_url, args.state_dir,
             max_concurrent_investigations=args.max_concurrent_investigations,
-            max_targets=args.max_targets, poll_interval=args.poll_interval, timeout=args.timeout)
+            max_targets=args.max_targets, poll_interval=args.poll_interval, timeout=args.timeout,
+            frequencies_per_work_unit=args.frequencies_per_work_unit)
     except KeyboardInterrupt: return 130
     except Exception as error:
         print(f"OpenStar TESS sector sweep: error={type(error).__name__}: {error}", file=sys.stderr); return 1
