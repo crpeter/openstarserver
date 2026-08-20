@@ -1,5 +1,7 @@
 import http.client
 import json
+import socket
+import struct
 import tempfile
 import threading
 import unittest
@@ -287,6 +289,46 @@ class CoordinatorHTTPContractTests(unittest.TestCase):
         self.assertEqual(11, second.version)
         self.assertIsNotNone(second.getheader("Content-Length"))
         second.read()
+
+    def test_http_11_client_reset_does_not_escape_request_handler(self):
+        handler_finished = threading.Event()
+        handler_error = threading.Event()
+        handler_errors = []
+
+        class ResetTrackingHandler(coordinator.RequestHandler):
+            def handle(self):
+                try:
+                    super().handle()
+                finally:
+                    handler_finished.set()
+
+        class ErrorTrackingServer(coordinator.ThreadingHTTPServer):
+            def handle_error(self, request, client_address):
+                handler_errors.append((request, client_address))
+                handler_error.set()
+
+        server = ErrorTrackingServer(("127.0.0.1", 0), ResetTrackingHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+
+        connection = http.client.HTTPConnection("127.0.0.1", server.server_port)
+        connection.request("GET", "/v1/projects")
+        response = connection.getresponse()
+        self.assertEqual(200, response.status)
+        response.read()
+
+        connection.sock.setsockopt(
+            socket.SOL_SOCKET,
+            socket.SO_LINGER,
+            struct.pack("ii", 1, 0),
+        )
+        connection.close()
+
+        self.assertTrue(handler_finished.wait(2))
+        self.assertFalse(handler_error.wait(0.1))
+        self.assertEqual([], handler_errors)
 
     def test_lost_delete_response_retries_and_accepts_already_absent(self):
         state = self.runtime._states["a"]
