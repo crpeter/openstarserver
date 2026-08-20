@@ -760,6 +760,21 @@ class CoordinatorState:
         return dataset_ids[-1]
 
     def claim_work(self, node_id):
+        work_units = self.claim_work_batch(node_id, 1)
+        return work_units[0] if work_units else None
+
+    def claim_work_batch(self, node_id, max_work_units):
+        """Lease up to ``max_work_units`` mutually compatible atomic units.
+
+        Compatibility is deliberately limited to generic routing identifiers;
+        interpretation of the workload payload remains the worker plugin's job.
+        Every selected unit receives its own normal lease entry.
+        """
+        if isinstance(max_work_units, bool) or not isinstance(max_work_units, int):
+            raise ValueError("max_work_units must be a positive integer.")
+        if max_work_units < 1:
+            raise ValueError("max_work_units must be a positive integer.")
+
         node_key = normalize_id(node_id)
 
         with self.lock:
@@ -788,7 +803,8 @@ class CoordinatorState:
                 return None
 
             deferred = []
-            work_unit = None
+            work_units = []
+            compatibility_key = None
 
             pending_length = len(self.pending)
 
@@ -838,19 +854,31 @@ class CoordinatorState:
                         deferred.append(work_id)
                         continue
 
+                candidate_key = (
+                    candidate.get("projectID"),
+                    candidate.get("workloadID"),
+                    candidate.get("datasetID"),
+                )
+                if compatibility_key is not None and candidate_key != compatibility_key:
+                    deferred.append(work_id)
+                    continue
+
                 self.assigned[work_id] = {
                     "nodeID": str(node_id),
                     "assignedAt": now,
                     "leaseExpiresAt": now + LEASE_SECONDS,
                 }
 
-                work_unit = dict(candidate)
-                break
+                work_units.append(dict(candidate))
+                if compatibility_key is None:
+                    compatibility_key = candidate_key
+                if len(work_units) >= max_work_units:
+                    break
 
             for work_id in deferred:
                 self.pending.append(work_id)
 
-        return work_unit
+        return work_units
 
     def _chunk_reference(self, dataset_id, start_index):
         return self.chunk_references_by_dataset.get(dataset_id, {}).get(

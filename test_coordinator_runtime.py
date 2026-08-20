@@ -4,6 +4,7 @@ import socket
 import struct
 import tempfile
 import threading
+import time
 import unittest
 from io import BytesIO
 from pathlib import Path
@@ -19,6 +20,7 @@ from openstar_coordinator_client import (
 from openstar_workflow import RetryableExecutionError
 from coordinator_runtime import (
     CoordinatorRuntime,
+    MAX_WORK_UNITS_PER_CLAIM,
     ProjectBusyError,
     ProjectConflictError,
 )
@@ -95,6 +97,46 @@ class CoordinatorRuntimeTests(unittest.TestCase):
             ["a", "b", "c", "a", "b", "c"],
             [runtime.claim_work("node")["projectID"] for _ in range(6)],
         )
+
+    def test_batch_claim_is_compatible_atomic_and_project_bounded(self):
+        runtime = self.activate_two()
+        runtime.register_node({"nodeID": "node", "capabilities": {}})
+
+        batch = runtime.claim_work_batch("node", MAX_WORK_UNITS_PER_CLAIM)
+
+        self.assertEqual(2, len(batch))
+        self.assertEqual(1, len({unit["projectID"] for unit in batch}))
+        self.assertEqual(1, len({unit["workloadID"] for unit in batch}))
+        self.assertEqual(1, len({unit["datasetID"] for unit in batch}))
+        self.assertEqual(len(batch), len({unit["id"] for unit in batch}))
+        owner = runtime._states[batch[0]["projectID"]]
+        self.assertTrue(all(unit["id"] in owner.assigned for unit in batch))
+        self.assertEqual(2, len(runtime._states["b"].pending))
+
+    def test_partial_batch_and_invalid_batch_counts(self):
+        runtime = self.activate_two()
+        runtime.register_node({"nodeID": "node", "capabilities": {}})
+        self.assertEqual(2, len(runtime.claim_work_batch("node", 3)))
+        for count in (0, -1, MAX_WORK_UNITS_PER_CLAIM + 1, True, 1.5):
+            with self.subTest(count=count), self.assertRaises(ValueError):
+                runtime.claim_work_batch("node", count)
+
+    def test_batch_leases_expire_independently_without_losing_units(self):
+        runtime = self.activate_two()
+        runtime.register_node({"nodeID": "first", "capabilities": {}})
+        runtime.register_node({"nodeID": "second", "capabilities": {}})
+        batch = runtime.claim_work_batch("first", 2)
+        state = runtime._states[batch[0]["projectID"]]
+        expired_id, live_id = (unit["id"] for unit in batch)
+        state.assigned[expired_id]["leaseExpiresAt"] = 0.0
+        state.assigned[live_id]["leaseExpiresAt"] = time.time() + 60.0
+
+        reclaimed = state.claim_work("second")
+
+        self.assertEqual(expired_id, reclaimed["id"])
+        self.assertEqual("second", state.assigned[expired_id]["nodeID"])
+        self.assertEqual("first", state.assigned[live_id]["nodeID"])
+        self.assertEqual(set(state.work_units), set(state.pending) | set(state.assigned))
 
     def test_concurrent_claims_advance_project_cursor_atomically(self):
         runtime = self.activate_two()
@@ -245,6 +287,44 @@ class CoordinatorHTTPContractTests(unittest.TestCase):
     def get(self, path):
         with urlopen(self.base + path) as response:
             return response.status, json.loads(response.read())
+
+    def post(self, path, payload):
+        request = Request(
+            self.base + path,
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlopen(request) as response:
+            return response.status, json.loads(response.read())
+
+    def test_claim_omission_is_legacy_object_and_batch_is_array(self):
+        self.runtime.register_node({"nodeID": "legacy", "capabilities": {}})
+        status, single = self.post("/v1/work/claim", {"nodeID": "legacy"})
+        self.assertEqual(200, status)
+        self.assertIsInstance(single, dict)
+
+        self.runtime.register_node({"nodeID": "batch", "capabilities": {}})
+        status, batch = self.post(
+            "/v1/work/claim", {"nodeID": "batch", "maxWorkUnits": 2}
+        )
+        self.assertEqual(200, status)
+        self.assertIsInstance(batch, list)
+        self.assertGreaterEqual(len(batch), 1)
+        self.assertLessEqual(len(batch), 2)
+
+    def test_claim_rejects_invalid_batch_counts(self):
+        self.runtime.register_node({"nodeID": "node", "capabilities": {}})
+        for count in (0, -1, MAX_WORK_UNITS_PER_CLAIM + 1, True, 1.5):
+            request = Request(
+                self.base + "/v1/work/claim",
+                data=json.dumps({"nodeID": "node", "maxWorkUnits": count}).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with self.subTest(count=count), self.assertRaises(HTTPError) as raised:
+                urlopen(request)
+            self.assertEqual(400, raised.exception.code)
 
     def test_project_list_specific_status_and_dataset_endpoints(self):
         self.assertEqual(

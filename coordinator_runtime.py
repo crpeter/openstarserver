@@ -15,6 +15,7 @@ from openstar_contributions import (
     timing_metrics,
 )
 
+MAX_WORK_UNITS_PER_CLAIM = 32
 HOT_PATH_PROGRESS_INTERVAL_SECONDS = 10.0
 
 
@@ -200,6 +201,7 @@ class CoordinatorRuntime:
             state.register_node(normalized)
 
     def claim_work(self, node_id: Any):
+        # Keep the legacy call path intact as well as its single-object result.
         with self.lock:
             if not self._project_order:
                 return None
@@ -214,6 +216,32 @@ class CoordinatorRuntime:
                     continue
                 self._next_project_index = (position + 1) % len(self._project_order)
                 self._record_progress(assigned=1)
+                return work
+
+            return None
+
+    def claim_work_batch(self, node_id: Any, max_work_units: int):
+        if isinstance(max_work_units, bool) or not isinstance(max_work_units, int):
+            raise ValueError("maxWorkUnits must be a positive integer.")
+        if not 1 <= max_work_units <= MAX_WORK_UNITS_PER_CLAIM:
+            raise ValueError(
+                f"maxWorkUnits must be between 1 and {MAX_WORK_UNITS_PER_CLAIM}."
+            )
+
+        with self.lock:
+            if not self._project_order:
+                return None
+            start = self._next_project_index % len(self._project_order)
+
+            for offset in range(len(self._project_order)):
+                position = (start + offset) % len(self._project_order)
+                project_id = self._project_order[position]
+                state = self._states[project_id]
+                work = state.claim_work_batch(node_id, max_work_units)
+                if not work:
+                    continue
+                self._next_project_index = (position + 1) % len(self._project_order)
+                self._record_progress(assigned=len(work))
                 return work
 
             return None
