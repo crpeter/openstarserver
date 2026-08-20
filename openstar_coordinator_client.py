@@ -173,7 +173,6 @@ class OpenStarCoordinatorClient:
                 check_deadline()
                 if self.is_terminal(status):
                     completed[project_id] = status
-                    self.remove_project(project_id)
 
             if len(completed) == len(project_ids):
                 check_deadline()
@@ -182,12 +181,15 @@ class OpenStarCoordinatorClient:
             time.sleep(max(0.05, poll_interval))
 
         check_deadline()
-        return ProjectBatchRunResult(
+        result = ProjectBatchRunResult(
             tuple(
                 ProjectRunResult(project_id, completed[project_id])
                 for project_id in project_ids
             )
         )
+        for project_id in project_ids:
+            self.remove_project(project_id)
+        return result
 
     def wait_for_project(
         self,
