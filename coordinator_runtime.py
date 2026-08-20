@@ -15,7 +15,7 @@ from openstar_contributions import (
     timing_metrics,
 )
 
-MAX_WORK_UNITS_PER_CLAIM = 32
+MAX_WORK_UNITS_PER_CLAIM = 128
 HOT_PATH_PROGRESS_INTERVAL_SECONDS = 10.0
 
 
