@@ -249,8 +249,16 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self._send_error_json(400, "Missing node ID.")
                 return
 
-            work_unit = RUNTIME.claim_work(node_id)
-            if work_unit is None:
+            max_work_units = payload.get("maxWorkUnits")
+            try:
+                if max_work_units is None:
+                    work_unit = RUNTIME.claim_work(node_id)
+                else:
+                    work_unit = RUNTIME.claim_work_batch(node_id, max_work_units)
+            except ValueError as error:
+                self._send_error_json(400, str(error))
+                return
+            if not work_unit:
                 self._send_no_content()
                 return
 
