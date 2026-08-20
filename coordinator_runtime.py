@@ -15,6 +15,8 @@ from openstar_contributions import (
     timing_metrics,
 )
 
+HOT_PATH_PROGRESS_INTERVAL_SECONDS = 10.0
+
 
 class ProjectBusyError(RuntimeError):
     pass
@@ -45,6 +47,28 @@ class CoordinatorRuntime:
             ContributionStore(contribution_db) if contribution_db is not None else None
         )
         self._ledger_error: str | None = None
+        self._progress_last_logged_at = time.monotonic()
+        self._progress_assigned = 0
+        self._progress_accepted = 0
+
+    def _record_progress(self, *, assigned: int = 0, accepted: int = 0) -> None:
+        """Periodically summarize successful hot-path operations in one write."""
+        with self.lock:
+            self._progress_assigned += assigned
+            self._progress_accepted += accepted
+            now = time.monotonic()
+            if now - self._progress_last_logged_at < HOT_PATH_PROGRESS_INTERVAL_SECONDS:
+                return
+            message = (
+                "📊 Coordinator progress: "
+                f"assigned={self._progress_assigned}, "
+                f"accepted={self._progress_accepted}, "
+                f"liveProjects={len(self._states)}"
+            )
+            self._progress_assigned = 0
+            self._progress_accepted = 0
+            self._progress_last_logged_at = now
+        print(message)
 
     def _ledger_failed(self, operation: str, error: Exception) -> None:
         self._ledger_error = f"{operation}: {type(error).__name__}: {error}"
@@ -189,6 +213,7 @@ class CoordinatorRuntime:
                 if work is None:
                     continue
                 self._next_project_index = (position + 1) % len(self._project_order)
+                self._record_progress(assigned=1)
                 return work
 
             return None
@@ -228,6 +253,8 @@ class CoordinatorRuntime:
             except Exception as error:
                 # Scientific acceptance is never rewritten by telemetry failure.
                 self._ledger_failed("accepted contribution write", error)
+        if response[0] and response[1] != "Identical result already accepted.":
+            self._record_progress(accepted=1)
         return response
 
     def dataset(

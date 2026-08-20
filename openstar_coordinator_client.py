@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,7 +14,9 @@ from openstar_workflow import RetryableExecutionError
 
 
 class CoordinatorClientError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, status_code: int | None = None):
+        super().__init__(message)
+        self.status_code = status_code
 
 
 class CoordinatorUnavailableError(CoordinatorClientError, RetryableExecutionError):
@@ -88,6 +91,29 @@ class OpenStarCoordinatorClient:
         )
         return dict(response["status"])
 
+    def remove_project(self, project_id: str) -> None:
+        path = f"/v1/projects/{quote(str(project_id), safe='')}"
+        for attempt in range(3):
+            try:
+                self._request_json("DELETE", path)
+                return
+            except CoordinatorUnavailableError:
+                # DELETE is ambiguous after a transport failure: the server may
+                # already have removed the terminal project. Retry so a 404 can
+                # confirm that cleanup completed.
+                if attempt < 2:
+                    continue
+                logging.warning(
+                    "Could not confirm cleanup of terminal project %s; "
+                    "preserving its captured result.",
+                    project_id,
+                )
+                return
+            except CoordinatorClientError as error:
+                if error.status_code == 404:
+                    return
+                raise
+
     def run_project(
         self,
         project_path: str | Path,
@@ -102,7 +128,9 @@ class OpenStarCoordinatorClient:
             poll_interval=poll_interval,
             timeout=timeout,
         )
-        return ProjectRunResult(project_id=project_id, status=final_status)
+        result = ProjectRunResult(project_id=project_id, status=final_status)
+        self.remove_project(project_id)
+        return result
 
     def run_projects(
         self,
@@ -153,12 +181,15 @@ class OpenStarCoordinatorClient:
             time.sleep(max(0.05, poll_interval))
 
         check_deadline()
-        return ProjectBatchRunResult(
+        result = ProjectBatchRunResult(
             tuple(
                 ProjectRunResult(project_id, completed[project_id])
                 for project_id in project_ids
             )
         )
+        for project_id in project_ids:
+            self.remove_project(project_id)
+        return result
 
     def wait_for_project(
         self,
@@ -222,7 +253,8 @@ class OpenStarCoordinatorClient:
             except Exception:
                 message = raw.decode("utf-8", errors="replace")
             raise CoordinatorClientError(
-                f"Coordinator HTTP {error.code}: {message}"
+                f"Coordinator HTTP {error.code}: {message}",
+                status_code=error.code,
             ) from error
         except URLError as error:
             raise CoordinatorUnavailableError(
