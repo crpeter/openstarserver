@@ -48,6 +48,15 @@ class RequestHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         return
 
+    def handle(self):
+        try:
+            super().handle()
+        except (BrokenPipeError, ConnectionResetError):
+            # HTTP/1.1 clients can disappear while the persistent request loop
+            # is waiting for the next request line. That ends this connection;
+            # it is not a coordinator error.
+            pass
+
     def _read_json(self):
         content_length = int(self.headers.get("Content-Length", "0"))
 
