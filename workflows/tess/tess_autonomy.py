@@ -486,6 +486,66 @@ def _repair_dynamic_harmonic_terminal(
     )
 
 
+def _repair_unresolved_dynamic_localization_review_failure(
+    store: InvestigationStore, investigation: Investigation, control: dict
+) -> Investigation | None:
+    """Resume only the obsolete v20.11 unresolved-family preparation failure."""
+    if (investigation.status != "FAILED" or not investigation.stages
+            or control.get("schedulerAction") != "INVESTIGATION_FAILED"):
+        return None
+    failed = investigation.stages[-1]
+    if (failed.status != "FAILED"
+            or failed.handler_id != "openstar.tess.residual-mode-localization-review.prepare"
+            or not any(text in str(failed.error or "") for text in (
+                "requires the morphology-resolved physical period",
+                "requires the completed v20.9 nonstationary model",
+            ))):
+        return None
+    morphology = _latest_complete(investigation, "openstar.tess.morphology.analyze")
+    dynamic = _latest_complete(investigation, "openstar.tess.dynamic-harmonic.analyze")
+    tf_prepare = _latest_complete(investigation, "openstar.tess.time-frequency.prepare")
+    tf_summary = _latest_complete(investigation, "openstar.tess.time-frequency.summarize")
+    mode = _latest_complete(investigation, "openstar.tess.mode-identification.analyze")
+    localization = _latest_complete(
+        investigation, "openstar.tess.residual-mode-localization.interpret"
+    )
+    dynamic_result = (dynamic.result or {}) if dynamic else {}
+    mode_result = (mode.result or {}) if mode else {}
+    tf_result = (tf_summary.result or {}) if tf_summary else {}
+    localization_result = (localization.result or {}) if localization else {}
+    orders = list(dynamic_result.get("supportedHarmonicOrders") or [])
+    if not (morphology and (morphology.result or {}).get("physicalCycleResolved") is False
+            and dynamic and orders
+            and tf_prepare and tf_summary
+            and ((tf_result.get("residualEvolution") or {}).get("classification")
+                 == "STABLE_RESIDUAL_MODE")
+            and mode and mode_result.get("independentModeEvidenceSurvived") is True
+            and localization
+            and localization_result.get("recommendedNextTest")
+                 == "RESIDUAL_MODE_SOURCE_LOCALIZATION_REVIEW"):
+        return None
+    localization_prepare = _latest_complete(
+        investigation, "openstar.tess.residual-mode-localization.prepare"
+    )
+    subtracted = ((localization_prepare.result or {}).get("subtractedHarmonicOrders")
+                  if localization_prepare else None)
+    rerun_localization = list(subtracted or [1, 2]) != orders
+    prefixes = [int(stage.id.partition("-")[0]) for stage in investigation.stages
+                if stage.id.partition("-")[0].isdigit()]
+    continuation = StageRequest(
+        id=(f"{max(prefixes, default=0) + 1:03d}-" +
+            ("prepare-residual-mode-localization" if rerun_localization
+             else "prepare-residual-mode-localization-review")),
+        handler_id=("openstar.tess.residual-mode-localization.prepare" if rerun_localization
+                    else "openstar.tess.residual-mode-localization-review.prepare"),
+        parameters={}, triggered_by_stage_id=failed.id,
+    )
+    return store.set_control_state(
+        investigation, status="RUNNING",
+        control_state={"branchAssessments": [], "selectedExperiment": asdict(continuation),
+                       "schedulerAction": "RUN_EXPERIMENT",
+                       "recovery": "TESS_UNRESOLVED_DYNAMIC_LOCALIZATION_REVIEW_COMPATIBILITY_RETRY"},
+    )
 def _repair_closed_file_independent_prepare(
     store: InvestigationStore, investigation: Investigation
 ) -> Investigation | None:
@@ -605,6 +665,12 @@ def repair_obsolete_terminal_wait(
     control = investigation.metadata.get("controlState")
     if investigation.workflow_id != WORKFLOW_ID or not isinstance(control, dict):
         return investigation
+
+    localization_review_repair = _repair_unresolved_dynamic_localization_review_failure(
+        store, investigation, control
+    )
+    if localization_review_repair is not None:
+        return localization_review_repair
 
     independent_repair = _repair_shifted_stage_lookup_independent_prepare(
         store, investigation

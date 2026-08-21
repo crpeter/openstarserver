@@ -80,6 +80,7 @@ def build_residual_mode_localization_review_project(
     residual_localization_summary: dict[str, Any],
     output_dir: str | Path,
     investigation_id: str,
+    harmonic_orders: tuple[int, ...] = (1, 2),
 ) -> dict[str, Any]:
     from astropy.coordinates import SkyCoord
     from astropy import units as u
@@ -183,6 +184,7 @@ def build_residual_mode_localization_review_project(
                 absolute_times=absolute_times,
                 cube=corrected,
                 physical_frequency=physical_frequency,
+                harmonic_orders=harmonic_orders,
             )
 
             target_x, target_y = tpf.wcs.world_to_pixel(target)
@@ -359,6 +361,7 @@ def build_residual_mode_localization_review_project(
             "referenceFrequency": float(reference_frequency),
             "fractionalFrequencyDriftPerDay": float(q),
             "signalSectors": signal_sectors,
+            "subtractedHarmonicOrders": list(harmonic_orders),
         },
     }
     manifest_path = root / f"{_safe(project_id)}.json"
@@ -374,6 +377,7 @@ def build_residual_mode_localization_review_project(
         "ticID": int(tic_id),
         "targetSky": {"raDeg": float(ra_deg), "decDeg": float(dec_deg)},
         "physicalPeriodDays": float(physical_period_days),
+        "subtractedHarmonicOrders": list(harmonic_orders),
         "residualFrequencyAtReference": float(reference_frequency),
         "residualPeriodAtReferenceDays": float(residual_period),
         "fractionalFrequencyDriftPerDay": float(q),
