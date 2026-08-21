@@ -129,12 +129,13 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
         paths = []
         period = 10.3008408008
         for sector in range(4):
-            times = [sector * 70.0 + 24.0 * index / 399 for index in range(400)]
+            times = [sector * 70.0 + 24.0 * index / 1199 for index in range(1200)]
             flux = [
                 (0.8 + 0.08 * sector) * math.sin(2 * math.pi * time / period + 0.04 * sector)
                 + 0.32 * math.sin(4 * math.pi * time / period + 0.2)
                 + 0.12 * math.sin(6 * math.pi * time / period - 0.1)
                 + 0.5 * math.sin(8 * math.pi * time / period + 0.3)
+                + 0.8 * math.sin(2 * math.pi * time / 3.137 + 0.7)
                 + 0.001 * math.sin(index * 1.731)
                 for index, time in enumerate(times)
             ]
@@ -144,6 +145,22 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
             paths.append(str(path))
         investigation = store.create(
             "tess-discovery-sector-1-tic-277940827", WORKFLOW_ID, WORKFLOW_VERSION,
+        )
+        source_project = root / "project.json"
+        source_project.write_text(json.dumps({
+            "id": "tic-277940827-frozen", "workloadID": "openstar.lomb-scargle.v1",
+            "datasets": [{"id": "primary", "path": paths[0], "targetName": "TIC 277940827"}],
+        }))
+        investigation = self._complete(
+            store, investigation, "001-prepare-target", "openstar.tess.prepare-target",
+            {"datasetPath": paths[0], "sector": 0, "sourceProjectPath": str(source_project),
+             "sourceDatasetEntry": {"id": "primary", "path": paths[0],
+                                    "targetName": "TIC 277940827"}},
+        )
+        investigation = self._complete(
+            store, investigation, "006-prepare-independent", "openstar.tess.independent.prepare",
+            {"preparedSectors": [{"sector": sector, "datasetPath": paths[sector]}
+                                 for sector in range(1, 4)]},
         )
         investigation = self._complete(
             store, investigation, "019-morphology", "openstar.tess.morphology.analyze",
@@ -170,7 +187,25 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
         self.assertFalse(result["physicalMechanismResolved"])
         self.assertTrue(result["modelComparison"]["highestTestedHarmonicSupported"])
         self.assertNotEqual("openstar.tess.multimode.prepare", next_request.handler_id)
-        self.assertEqual("openstar.tess.finalize", next_request.handler_id)
+        self.assertEqual("openstar.tess.time-frequency.prepare", next_request.handler_id)
+        completed, run_request = engine.run_stage(
+            completed, next_request, software_id="integration", software_version="20.30",
+        )
+        preparation = completed.stages[-1].result
+        self.assertEqual([1, 2, 3, 4], preparation["familySubtraction"]["harmonicOrders"])
+        self.assertEqual("PERSISTED_DYNAMIC_HARMONIC_MODEL",
+                         preparation["familySubtraction"]["source"])
+        self.assertEqual("openstar.lomb-scargle.v1",
+                         preparation["familySubtraction"]["genericWorkerWorkloadID"])
+        manifest = json.loads(Path(preparation["projectPath"]).read_text())
+        self.assertEqual("openstar.lomb-scargle.v1", manifest["workloadID"])
+        self.assertEqual("openstar.tess.time-frequency.run", run_request.handler_id)
+        residual = json.loads(Path(preparation["preparedWindows"][0]["datasetPath"]).read_text())
+        fourth_projection = abs(sum(
+            value * math.sin(8 * math.pi * time / period + 0.3)
+            for time, value in zip(residual["times"], residual["flux"])
+        )) / len(residual["times"])
+        self.assertLess(fourth_projection, 0.02)
 
     def _interpret(self, periods, prominences, reliable=None):
         reliable = reliable or [True] * len(periods)

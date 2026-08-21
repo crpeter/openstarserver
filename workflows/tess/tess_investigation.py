@@ -2726,6 +2726,10 @@ def build_engine(
                     or dynamic_harmonic.get("recommendedNextTest") != "RESIDUAL_MULTIMODE_LOCALIZATION"):
                 raise RuntimeError("Dynamic residual time-frequency analysis was not recommended.")
             physical_period = float(dynamic_harmonic["referenceFamilyPeriodDays"])
+            harmonic_orders = tuple(dynamic_harmonic.get("supportedHarmonicOrders") or
+                                    dynamic_harmonic.get("harmonicOrdersTested") or ())
+            if not harmonic_orders:
+                raise RuntimeError("Dynamic residual analysis has no persisted supported harmonic family.")
         elif morphology_entry:
             if not continuation.get("timeFrequencyEvolutionWarranted"):
                 raise RuntimeError("Time-frequency continuation is not warranted by morphology evidence.")
@@ -2736,6 +2740,9 @@ def build_engine(
             if multimode is None or multimode.get("recommendedNextTest") != "TIME_FREQUENCY_EVOLUTION_ANALYSIS":
                 raise RuntimeError("v20.8 requires v20.7 to recommend TIME_FREQUENCY_EVOLUTION_ANALYSIS.")
             physical_period = float(morphology["resolvedPhysicalPeriodDays"])
+            harmonic_orders = (1, 2)
+        if entry_reason != "DYNAMIC_HARMONIC_RESIDUAL":
+            harmonic_orders = (1, 2)
         artifact_root = store.directory_for(investigation.id) / "artifacts"
         print("🪟 Preparing sliding-window residual time-frequency search")
         unresolved_reference = entry_reason in {
@@ -2743,7 +2750,7 @@ def build_engine(
         }
         reference_label = "unresolved family analysis reference" if unresolved_reference else "resolved physical period"
         print(f"   {reference_label}: {physical_period} days")
-        print("   fitting/subtracting the established fundamental + first harmonic locally")
+        print(f"   fitting/subtracting established harmonic orders {list(harmonic_orders)} locally")
         spec = build_time_frequency_project(
             source_project_path=prepared["sourceProjectPath"],
             source_dataset_entry=prepared["sourceDatasetEntry"],
@@ -2753,6 +2760,9 @@ def build_engine(
             physical_period_days=physical_period,
             output_dir=artifact_root,
             investigation_id=investigation.id,
+            harmonic_orders=harmonic_orders,
+            workload_id=("openstar.lomb-scargle.v1"
+                         if entry_reason == "DYNAMIC_HARMONIC_RESIDUAL" else None),
         )
         spec["periodReference"] = {
             "periodDays": physical_period,
@@ -2761,6 +2771,14 @@ def build_engine(
                 if unresolved_reference else "MORPHOLOGY_RESOLVED_PHYSICAL_PERIOD"
             ),
             "physicalCycleResolved": not unresolved_reference,
+        }
+        spec["familySubtraction"] = {
+            "source": ("PERSISTED_DYNAMIC_HARMONIC_MODEL" if entry_reason == "DYNAMIC_HARMONIC_RESIDUAL"
+                       else "ESTABLISHED_FUNDAMENTAL_AND_FIRST_HARMONIC"),
+            "harmonicOrders": list(harmonic_orders),
+            "frozenDatasetsReused": True,
+            "downloadPerformed": False,
+            "genericWorkerWorkloadID": "openstar.lomb-scargle.v1",
         }
         search = spec.get("frequencySearch") or {}
         sectors = {}
@@ -2795,6 +2813,7 @@ def build_engine(
                 "multimode": sha256_json(multimode),
                 "independentPreparation": sha256_json(independent_prepare),
                 "continuationEvidence": sha256_json(continuation),
+                "dynamicHarmonicModeling": sha256_json(dynamic_harmonic),
             },
             artifacts=tuple(artifacts),
         )

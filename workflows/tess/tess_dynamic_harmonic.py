@@ -124,14 +124,21 @@ def model_dynamic_harmonics(*, dataset_paths: Iterable[str | Path], reference_pe
     models = {"staticGlobalAmplitudeAndPhase": _bic(static["rss"], n, len(rows[0])),
               "sectorVaryingAmplitude": _bic(amplitude_model["rss"], n, len(amp_rows[0])),
               "sectorVaryingAmplitudeAndPhase": dynamic}
-    if len(orders) > 1:
-        reduced = [_sector_full(item, frequency, orders[:-1]) for item in data]
+    order_bic_gains: dict[int, float] = {}
+    for order in orders:
+        reduced_orders = tuple(value for value in orders if value != order)
+        if not reduced_orders:
+            continue
+        reduced = [_sector_full(item, frequency, reduced_orders) for item in data]
         reduced_model = _bic(sum(item["rss"] for item in reduced), n,
-                             sector_count * (1 + 2 * len(orders[:-1])))
-        models["dynamicWithoutHighestTestedHarmonic"] = reduced_model
-        highest_gain = reduced_model["bic"] - dynamic["bic"]
-    else:
-        highest_gain = None
+                             sector_count * (1 + 2 * len(reduced_orders)))
+        models[f"dynamicWithoutHarmonicOrder{order}"] = reduced_model
+        order_bic_gains[order] = reduced_model["bic"] - dynamic["bic"]
+    highest_gain = order_bic_gains.get(orders[-1])
+    if highest_gain is not None:
+        models["dynamicWithoutHighestTestedHarmonic"] = models[
+            f"dynamicWithoutHarmonicOrder{orders[-1]}"
+        ]
 
     amplitude_evolution, phase_evolution, ratios = [], [], []
     for index, order in enumerate(orders):
@@ -215,11 +222,17 @@ def model_dynamic_harmonics(*, dataset_paths: Iterable[str | Path], reference_pe
     else:
         classification, recommended = "DYNAMIC_HARMONIC_MODEL_UNRESOLVED", "LONG_BASELINE_TIME_FREQUENCY_CONFIRMATION"
 
+    supported_orders = [order for order in orders
+                        if order_bic_gains.get(order, MIN_BIC_IMPROVEMENT) >= MIN_BIC_IMPROVEMENT]
     return {"referenceFamilyPeriodDays": reference_period_days, "referenceFrequencyCyclesPerDay": frequency,
-            "harmonicOrdersTested": list(orders), "sectorFits": [{k: v for k, v in s.items() if k != "_fit"} for s in sectors],
+            "harmonicOrdersTested": list(orders), "supportedHarmonicOrders": supported_orders,
+            "sectorFits": [{k: v for k, v in s.items() if k != "_fit"} for s in sectors],
             "modelComparison": {"criterion": "BIC", "conservativeThreshold": MIN_BIC_IMPROVEMENT,
                                 "models": models, "bicImprovementDynamicOverStatic": static_gain,
                                 "bicImprovementFromHighestTestedHarmonic": highest_gain,
+                                "bicImprovementByHarmonicOrder": {
+                                    str(order): gain for order, gain in order_bic_gains.items()
+                                },
                                 "highestTestedHarmonicSupported": highest_gain is not None and highest_gain >= MIN_BIC_IMPROVEMENT},
             "amplitudeEvolution": amplitude_evolution, "phaseEvolution": phase_evolution,
             "harmonicAmplitudeRatios": ratios,
