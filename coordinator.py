@@ -1,5 +1,7 @@
 import argparse
+import builtins
 import json
+import os
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -21,6 +23,20 @@ COORDINATOR_BUILD = "openstar-coordinator-v20.2-workflow-control"
 RUNTIME = CoordinatorRuntime()
 _STATUS_LOG_LOCK = threading.Lock()
 _QUIET_STATUS_SIGNATURES: set[tuple[str, str]] = set()
+
+
+def _install_perf_timing_filter() -> None:
+    if os.getenv("OPENSTAR_PERF_TIMING") == "1":
+        return
+
+    original_print = builtins.print
+
+    def filtered_print(*args, **kwargs):
+        if args and str(args[0]).startswith("⏱️"):
+            return
+        original_print(*args, **kwargs)
+
+    builtins.print = filtered_print
 
 
 def _should_log_project_status(status):
@@ -375,4 +391,5 @@ def main():
 
 
 if __name__ == "__main__":
+    _install_perf_timing_filter()
     main()

@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import builtins
+import os
 import sys
 from pathlib import Path
 
@@ -20,6 +22,20 @@ from workflows.tess.tess_preprocessing import broad_tess_frequency_search
 
 SOFTWARE_ID = "openstar.tess-sector-sweep-runner"
 SOFTWARE_VERSION = "1"
+
+
+def _install_perf_timing_filter() -> None:
+    if os.getenv("OPENSTAR_PERF_TIMING") == "1":
+        return
+
+    original_print = builtins.print
+
+    def filtered_print(*args, **kwargs):
+        if args and str(args[0]).startswith("⏱️"):
+            return
+        original_print(*args, **kwargs)
+
+    builtins.print = filtered_print
 
 
 def run_tess_sector_sweep(sector: int, coordinator_url: str, state_dir: str | Path, *,
@@ -102,4 +118,6 @@ def main(argv=None):
         print(f"OpenStar TESS sector sweep: error={type(error).__name__}: {error}", file=sys.stderr); return 1
 
 
-if __name__ == "__main__": raise SystemExit(main())
+if __name__ == "__main__":
+    _install_perf_timing_filter()
+    raise SystemExit(main())

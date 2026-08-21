@@ -121,15 +121,29 @@ class OpenStarCoordinatorClient:
         poll_interval: float = 1.0,
         timeout: float | None = None,
     ) -> ProjectRunResult:
+        started = time.monotonic()
+        phase_started = started
         status = self.activate_project(project_path, require_terminal=False)
+        activated = time.monotonic()
         project_id = str(status["projectID"])
         final_status = self.wait_for_project(
             project_id,
             poll_interval=poll_interval,
             timeout=timeout,
         )
+        waited = time.monotonic()
         result = ProjectRunResult(project_id=project_id, status=final_status)
         self.remove_project(project_id)
+        removed = time.monotonic()
+        try:
+            print(
+                "⏱️ Coordinator project lifecycle: "
+                f"project={project_id} activate={activated - phase_started:.3f}s "
+                f"compute/wait={waited - activated:.3f}s "
+                f"cleanup={removed - waited:.3f}s total={removed - started:.3f}s"
+            )
+        except Exception:
+            pass
         return result
 
     def run_projects(

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import time
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Callable, Sequence
@@ -208,6 +209,7 @@ def register_tess_sector_scan_handlers(
     preprocessing = preprocessing or read_and_prepare_tess_light_curve
 
     def materialize(investigation, request):
+        materialize_started = time.monotonic()
         raw = investigation.metadata.get("archiveProduct")
         if not isinstance(raw, dict): raise RuntimeError("Investigation has no archive inventory product.")
         product = TessArchiveProduct(**raw)
@@ -216,7 +218,9 @@ def register_tess_sector_scan_handlers(
             raise RuntimeError("Archive product identity does not match the investigation.")
         artifact_dir = store.directory_for(investigation.id) / "artifacts" / "scan-input"
         try:
+            phase_started = time.monotonic()
             downloaded = provider.download_light_curve(product, artifact_dir / "source")
+            downloaded_at = time.monotonic()
         except TessArchiveTransientError as error:
             archive_provider = investigation.metadata.get("archiveProvider")
             raise RetryableExecutionError(
@@ -232,6 +236,7 @@ def register_tess_sector_scan_handlers(
                 input_hashes={"archiveProduct": sha256_json(asdict(product))},
             ) from error
         prepared = preprocessing(downloaded)
+        preprocessed_at = time.monotonic()
         dataset_path, project_path = artifact_dir / "dataset.json", artifact_dir / "project.json"
         dataset_id = f"tess-sector-{sector}-tic-{product.tic_id}"
         dataset = {"id": dataset_id, "targetName": product.target_name, "mission": "TESS",
@@ -254,17 +259,31 @@ def register_tess_sector_scan_handlers(
                     "datasets": [{"id": dataset_id, "path": str(dataset_path.resolve()),
                                   "targetName": product.target_name, "ticID": product.tic_id, "sector": sector}]}
         _atomic_json(project_path, manifest)
+        written_at = time.monotonic()
         result = {"datasetID": dataset_id, "datasetPath": str(dataset_path.resolve()),
                   "datasetSha256": sha256_file(dataset_path), "projectPath": str(project_path.resolve()),
                   "projectManifestSha256": sha256_file(project_path), "downloadedProductPath": str(downloaded.resolve()),
                   "downloadedProductSha256": sha256_file(downloaded), "archiveProduct": asdict(product),
                   "sampleCount": prepared.sample_count, "sourceSampleCount": prepared.source_sample_count,
                   "baselineDays": prepared.baseline_days, "cadenceSeconds": product.cadence_seconds}
-        return StageOutcome(result, _next_stage(request, "broad-distributed-scan", SCAN_HANDLER,
+        outcome = StageOutcome(result, _next_stage(request, "broad-distributed-scan", SCAN_HANDLER,
                             {"projectPath": str(project_path.resolve())}),
                             input_hashes={"archiveProduct": sha256_json(asdict(product)),
                                           "downloadedProduct": result["downloadedProductSha256"]},
                             artifacts=(_artifact(dataset_path), _artifact(project_path)))
+        hashed_at = time.monotonic()
+        try:
+            print(
+                f"⏱️ TESS materialize: tic={product.tic_id} "
+                f"download={downloaded_at - phase_started:.3f}s "
+                f"preprocess={preprocessed_at - downloaded_at:.3f}s "
+                f"write={written_at - preprocessed_at:.3f}s "
+                f"hash={hashed_at - written_at:.3f}s "
+                f"total={hashed_at - materialize_started:.3f}s"
+            )
+        except Exception:
+            pass
+        return outcome
 
     def scan(investigation, request):
         run = coordinator.run_project(request.parameters["projectPath"], poll_interval=poll_interval, timeout=timeout)
@@ -272,6 +291,7 @@ def register_tess_sector_scan_handlers(
                             node_contributions=run.node_contributions, project_ids=(run.project_id,))
 
     def persist(investigation, request):
+        persist_started = time.monotonic()
         prepared = _result(investigation, MATERIALIZE_HANDLER)
         run_status = _result(investigation, SCAN_HANDLER)
         target = _dataset_status(run_status)
@@ -292,8 +312,20 @@ def register_tess_sector_scan_handlers(
                     "coverageComplete": target.get("coverageComplete")}
         evidence_path = store.directory_for(investigation.id) / "artifacts" / "scan-evidence.json"
         _atomic_json(evidence_path, evidence)
-        return StageOutcome(evidence, stop=True, input_hashes={"dataset": prepared["datasetSha256"],
+        written_at = time.monotonic()
+        outcome = StageOutcome(evidence, stop=True, input_hashes={"dataset": prepared["datasetSha256"],
                             "coordinatorResult": sha256_json(run_status)}, artifacts=(_artifact(evidence_path),))
+        hashed_at = time.monotonic()
+        try:
+            print(
+                f"⏱️ TESS evidence persist: tic={investigation.metadata['ticID']} "
+                f"write={written_at - persist_started:.3f}s "
+                f"hash={hashed_at - written_at:.3f}s "
+                f"total={hashed_at - persist_started:.3f}s"
+            )
+        except Exception:
+            pass
+        return outcome
 
     engine.register_handler(MATERIALIZE_HANDLER, materialize)
     engine.register_handler(SCAN_HANDLER, scan)
