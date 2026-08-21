@@ -1,8 +1,11 @@
 import json
 import tempfile
 import unittest
+from copy import deepcopy
 from pathlib import Path
+from unittest.mock import patch
 
+import coordinator_state
 from coordinator_state import CoordinatorState
 
 
@@ -69,6 +72,62 @@ class CoordinatorResultSubmissionTests(unittest.TestCase):
         self.assertFalse(retry[0])
         self.assertEqual(0.75, self.state.completed[self.work["id"]]["bestPower"])
         self.assertEqual(1, len(self.state.completed))
+
+    def test_terminal_dataset_diagnostics_time_only_first_uncached_computation(self):
+        work_id = self.work["id"]
+        self.state.assigned.clear()
+        self.state.completed[work_id] = {
+            **self.result,
+            "bestPeriodDays": 1.0 / self.result["bestFrequency"],
+            "nodeID": "ios-test",
+        }
+        clock = (value / 10.0 for value in range(100))
+        with patch(
+            "coordinator_state.time.monotonic", side_effect=lambda: next(clock)
+        ), patch.object(
+            self.state,
+            "_independent_candidates_locked",
+            wraps=self.state._independent_candidates_locked,
+        ) as independent, patch.object(
+            self.state,
+            "_fold_metrics",
+            wraps=self.state._fold_metrics,
+        ) as fold, patch.object(
+            self.state,
+            "_distributed_chunk_mode_coverage_locked",
+            wraps=self.state._distributed_chunk_mode_coverage_locked,
+        ) as coverage, patch(
+            "coordinator_state.estimate_frequency_interval",
+            wraps=coordinator_state.estimate_frequency_interval,
+        ) as interval, patch("builtins.print") as output:
+            first = self.state._dataset_result_diagnostics_locked("dataset-1")
+            unchanged = deepcopy(first)
+            cached = self.state._dataset_result_diagnostics_locked("dataset-1")
+
+        self.assertEqual(unchanged, first)
+        self.assertEqual(unchanged, cached)
+        self.assertIs(first, cached)
+        self.assertEqual("LOW_CONFIDENCE", first["periodStatus"])
+        self.assertEqual(
+            {
+                "frequency": 1.2,
+                "periodDays": 1.0 / 1.2,
+                "power": 0.75,
+            },
+            first["authoritative"],
+        )
+        self.assertEqual(1.2, first["candidate"]["frequency"])
+        self.assertEqual(0.75, first["candidate"]["power"])
+        independent.assert_called_once_with("dataset-1")
+        self.assertEqual(3, fold.call_count)
+        coverage.assert_called_once_with("dataset-1")
+        interval.assert_called_once()
+        output.assert_called_once_with(
+            "⏱️ Dataset diagnostics: dataset=dataset-1 "
+            "independent=0.100s primaryFold=0.100s doubleFold=0.100s "
+            "halfFold=0.100s coverage=0.100s frequencyInterval=0.100s "
+            "total=1.300s"
+        )
 
 
 if __name__ == "__main__":

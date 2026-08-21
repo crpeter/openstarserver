@@ -2308,12 +2308,50 @@ class CoordinatorState:
         if cached is not None:
             return cached
 
+        diagnostic_started = time.monotonic()
+        phase_durations = {
+            "independent": 0.0,
+            "primaryFold": 0.0,
+            "doubleFold": 0.0,
+            "halfFold": 0.0,
+            "coverage": 0.0,
+            "frequencyInterval": 0.0,
+        }
+
+        def timed_phase(name, operation):
+            phase_started = time.monotonic()
+            value = operation()
+            phase_durations[name] = time.monotonic() - phase_started
+            return value
+
+        def cache_and_report(diagnostic):
+            self.dataset_diagnostic_cache[dataset_id] = diagnostic
+            total_duration = time.monotonic() - diagnostic_started
+            try:
+                print(
+                    "⏱️ Dataset diagnostics: "
+                    f"dataset={dataset_id} "
+                    f"independent={phase_durations['independent']:.3f}s "
+                    f"primaryFold={phase_durations['primaryFold']:.3f}s "
+                    f"doubleFold={phase_durations['doubleFold']:.3f}s "
+                    f"halfFold={phase_durations['halfFold']:.3f}s "
+                    f"coverage={phase_durations['coverage']:.3f}s "
+                    "frequencyInterval="
+                    f"{phase_durations['frequencyInterval']:.3f}s "
+                    f"total={total_duration:.3f}s"
+                )
+            except Exception:
+                # Operational diagnostics must not affect scientific results.
+                pass
+            return diagnostic
+
         dataset = self.datasets[dataset_id]
         times = dataset.get("times", [])
         flux = dataset.get("flux", [])
 
-        independent_candidates = self._independent_candidates_locked(
-            dataset_id
+        independent_candidates = timed_phase(
+            "independent",
+            lambda: self._independent_candidates_locked(dataset_id),
         )
 
         if best is None:
@@ -2331,27 +2369,23 @@ class CoordinatorState:
                 "preferredPhysicalPeriodDays": None,
                 "independentCandidates": independent_candidates,
             }
-            self.dataset_diagnostic_cache[dataset_id] = diagnostic
-            return diagnostic
+            return cache_and_report(diagnostic)
 
         best_frequency = float(best["bestFrequency"])
         best_period = float(best["bestPeriodDays"])
         best_power = float(best["bestPower"])
 
-        primary_fold = self._fold_metrics(
-            times,
-            flux,
-            best_period,
+        primary_fold = timed_phase(
+            "primaryFold",
+            lambda: self._fold_metrics(times, flux, best_period),
         )
-        doubled_fold = self._fold_metrics(
-            times,
-            flux,
-            best_period * 2.0,
+        doubled_fold = timed_phase(
+            "doubleFold",
+            lambda: self._fold_metrics(times, flux, best_period * 2.0),
         )
-        half_fold = self._fold_metrics(
-            times,
-            flux,
-            best_period * 0.5,
+        half_fold = timed_phase(
+            "halfFold",
+            lambda: self._fold_metrics(times, flux, best_period * 0.5),
         )
 
         primary_coherence = (
@@ -2385,13 +2419,18 @@ class CoordinatorState:
             "independentPeakProminenceRatio": prominence_ratio,
         }
 
-        frequency_interval, frequency_interval_diagnostics = (
-            estimate_frequency_interval(
+        distributed_coverage = timed_phase(
+            "coverage",
+            lambda: self._distributed_chunk_mode_coverage_locked(dataset_id),
+        )
+        frequency_interval, frequency_interval_diagnostics = timed_phase(
+            "frequencyInterval",
+            lambda: estimate_frequency_interval(
                 dataset,
                 best_frequency,
                 (),
-                self._distributed_chunk_mode_coverage_locked(dataset_id),
-            )
+                distributed_coverage,
+            ),
         )
         candidate["frequencyConfidenceInterval"] = frequency_interval
         candidate["frequencyUncertaintyDiagnostics"] = (
@@ -2501,8 +2540,7 @@ class CoordinatorState:
             "independentCandidates": independent_candidates,
         }
 
-        self.dataset_diagnostic_cache[dataset_id] = diagnostic
-        return diagnostic
+        return cache_and_report(diagnostic)
 
     def _dataset_node_contributions_locked(self, dataset_id):
         contributions = {}
