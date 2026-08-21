@@ -82,7 +82,7 @@ class CoordinatorRuntimeTests(unittest.TestCase):
         with patch("coordinator_runtime.time.monotonic", return_value=0.0):
             runtime = CoordinatorRuntime()
         runtime._project_became_terminal("previous", 10.0)
-        runtime._transition_activation = ("previous", "next", 10.0, 12.0)
+        runtime._transition_activations["next"] = ("previous", 10.0, 12.0)
         with patch(
             "coordinator_runtime.time.monotonic", return_value=13.0
         ), patch.object(runtime, "_operational_print") as output:
@@ -114,6 +114,49 @@ class CoordinatorRuntimeTests(unittest.TestCase):
             state._report_completions()
         self.assertEqual(10.0, state.terminal_monotonic)
         self.assertEqual([("terminal", 10.0)], observed)
+
+    def test_interleaved_concurrent_transitions_are_timed_independently(self):
+        with patch("coordinator_runtime.time.monotonic", return_value=0.0):
+            runtime = CoordinatorRuntime()
+        with patch(
+            "coordinator_runtime.time.monotonic",
+            side_effect=[11.0, 22.0, 13.0, 25.0],
+        ), patch.object(runtime, "_operational_print") as output:
+            runtime._project_became_terminal("A", 10.0)
+            runtime._record_project_activation("E")
+            runtime._project_became_terminal("B", 20.0)
+            runtime._record_project_activation("F")
+            runtime._record_first_claim("E")
+            runtime._record_first_claim("F")
+            runtime._record_first_claim("E")
+            runtime._record_first_claim("F")
+        self.assertEqual(
+            [
+                unittest.mock.call(
+                    "⏱️ Project transition activation: previous=A next=E "
+                    "terminal-to-activation=1.000s"
+                ),
+                unittest.mock.call(
+                    "⏱️ Project transition activation: previous=B next=F "
+                    "terminal-to-activation=2.000s"
+                ),
+                unittest.mock.call(
+                    "⏱️ Project transition: previous=A next=E "
+                    "terminal-to-activation=1.000s "
+                    "activation-to-first-claim=2.000s "
+                    "terminal-to-first-claim=3.000s"
+                ),
+                unittest.mock.call(
+                    "⏱️ Project transition: previous=B next=F "
+                    "terminal-to-activation=2.000s "
+                    "activation-to-first-claim=3.000s "
+                    "terminal-to-first-claim=5.000s"
+                ),
+            ],
+            output.call_args_list,
+        )
+        self.assertEqual({}, runtime._transition_terminals)
+        self.assertEqual({}, runtime._transition_activations)
 
     def activate_two(self):
         runtime = CoordinatorRuntime()
@@ -155,8 +198,8 @@ class CoordinatorRuntimeTests(unittest.TestCase):
         runtime = CoordinatorRuntime()
         runtime.activate_project(self.manifest("next"), require_terminal=False)
         runtime.register_node({"nodeID": "node", "capabilities": {}})
-        runtime._transition_terminal = ("previous", 10.0)
-        runtime._transition_activation = ("previous", "next", 10.0, 11.0)
+        runtime._transition_terminals["previous"] = 10.0
+        runtime._transition_activations["next"] = ("previous", 10.0, 11.0)
         with patch(
             "coordinator_runtime.time.monotonic", side_effect=[12.0, 12.0]
         ), patch.object(runtime, "_operational_print") as output:

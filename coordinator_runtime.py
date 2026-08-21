@@ -51,8 +51,13 @@ class CoordinatorRuntime:
         self._progress_last_logged_at = time.monotonic()
         self._progress_assigned = 0
         self._progress_accepted = 0
-        self._transition_terminal: tuple[str, float] | None = None
-        self._transition_activation: tuple[str, str, float, float] | None = None
+        # Terminal edges wait in insertion order for the next distinct project
+        # activation.  Activated transitions are keyed by the next project so
+        # concurrent investigations cannot overwrite one another before claim.
+        self._transition_terminals: dict[str, float] = {}
+        self._transition_activations: dict[
+            str, tuple[str, float, float]
+        ] = {}
 
     @staticmethod
     def _operational_print(message: str) -> None:
@@ -63,21 +68,44 @@ class CoordinatorRuntime:
 
     def _project_became_terminal(self, project_id: str, terminal_at: float) -> None:
         with self.lock:
-            self._transition_terminal = (project_id, terminal_at)
-            self._transition_activation = None
+            self._transition_terminals[project_id] = terminal_at
+
+    def _record_project_activation(self, project_id: str) -> None:
+        with self.lock:
+            if project_id in self._transition_activations:
+                return
+            previous = next(
+                (
+                    (previous_id, terminal_at)
+                    for previous_id, terminal_at in self._transition_terminals.items()
+                    if previous_id != project_id
+                ),
+                None,
+            )
+            if previous is None:
+                return
+            previous_id, terminal_at = previous
+            del self._transition_terminals[previous_id]
+            activated_at = time.monotonic()
+            self._transition_activations[project_id] = (
+                previous_id, terminal_at, activated_at
+            )
+        self._operational_print(
+            "⏱️ Project transition activation: "
+            f"previous={previous_id} next={project_id} "
+            f"terminal-to-activation={activated_at - terminal_at:.3f}s"
+        )
 
     def _record_first_claim(self, project_id: str) -> None:
         with self.lock:
-            transition = self._transition_activation
-            if transition is None or transition[1] != project_id:
+            transition = self._transition_activations.pop(project_id, None)
+            if transition is None:
                 return
-            previous_id, next_id, terminal_at, activated_at = transition
-            self._transition_activation = None
-            self._transition_terminal = None
+            previous_id, terminal_at, activated_at = transition
             claimed_at = time.monotonic()
         self._operational_print(
             "⏱️ Project transition: "
-            f"previous={previous_id} next={next_id} "
+            f"previous={previous_id} next={project_id} "
             f"terminal-to-activation={activated_at - terminal_at:.3f}s "
             f"activation-to-first-claim={claimed_at - activated_at:.3f}s "
             f"terminal-to-first-claim={claimed_at - terminal_at:.3f}s"
@@ -413,17 +441,7 @@ class CoordinatorRuntime:
             for work_id in new_work_ids:
                 self._work_project_index[normalize_id(work_id)] = project_id
             self._legacy_current_project_id = project_id
-            transition = self._transition_terminal
-            if transition is not None and transition[0] != project_id:
-                activated_at = time.monotonic()
-                self._transition_activation = (
-                    transition[0], project_id, transition[1], activated_at
-                )
-                self._operational_print(
-                    "⏱️ Project transition activation: "
-                    f"previous={transition[0]} next={project_id} "
-                    f"terminal-to-activation={activated_at - transition[1]:.3f}s"
-                )
+            self._record_project_activation(project_id)
 
         return self.project_status(project_id)  # type: ignore[return-value]
 
