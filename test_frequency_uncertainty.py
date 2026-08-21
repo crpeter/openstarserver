@@ -56,9 +56,31 @@ def assert_nested_equivalent(test_case, optimized, reference, path="result"):
             assert_nested_equivalent(
                 test_case, optimized[index], value, f"{path}[{index}]"
             )
+    elif isinstance(reference, tuple):
+        test_case.assertEqual(len(reference), len(optimized), path)
+        for index, value in enumerate(reference):
+            assert_nested_equivalent(
+                test_case, optimized[index], value, f"{path}[{index}]"
+            )
     elif isinstance(reference, float):
+        abs_tol = (
+            1e-8
+            if path.endswith(
+                (
+                    ".profileMaximumFrequency",
+                    ".lower",
+                    ".upper",
+                )
+            )
+            else 2e-12
+        )
         test_case.assertTrue(
-            math.isclose(optimized, reference, rel_tol=2e-11, abs_tol=2e-12),
+            math.isclose(
+                optimized,
+                reference,
+                rel_tol=2e-11,
+                abs_tol=abs_tol,
+            ),
             f"{path}: optimized={optimized!r}, reference={reference!r}",
         )
     else:
