@@ -54,6 +54,7 @@ from .tess_nonstationary import (
     interpret_nonstationary_project,
     summarize_nonstationary_modeling,
 )
+from .tess_mode_identification import identify_residual_mode
 from .tess_residual_localization import (
     build_residual_mode_pixel_project,
     interpret_residual_mode_pixel_project,
@@ -282,6 +283,10 @@ def broad_independent_continuation(
 def time_frequency_continuation(summary: dict[str, Any], *, request_id: str) -> StageRequest:
     """Continue only the explicitly recommended, still-unresolved experiment."""
 
+    run_mode_identification = (
+        summary.get("recommendedNextTest") == "MODE_IDENTIFICATION_OR_PULSATION_MODELING"
+        and summary.get("physicalMechanismResolved") is False
+    )
     run_nonstationary = (
         summary.get("recommendedNextTest")
         == "LONG_BASELINE_NONSTATIONARY_MODE_MODELING"
@@ -290,14 +295,29 @@ def time_frequency_continuation(summary: dict[str, Any], *, request_id: str) -> 
     return StageRequest(
         id=_next_stage_id(
             request_id,
-            "prepare-nonstationary" if run_nonstationary else "finalize",
+            "mode-identification" if run_mode_identification else
+            ("prepare-nonstationary" if run_nonstationary else "finalize"),
         ),
         handler_id=(
-            "openstar.tess.nonstationary.prepare"
+            "openstar.tess.mode-identification.analyze" if run_mode_identification else
+            ("openstar.tess.nonstationary.prepare"
             if run_nonstationary
             else "openstar.tess.finalize"
+            )
         ),
-        parameters={} if run_nonstationary else {"outputSuffix": "v20.8"},
+        parameters={} if (run_nonstationary or run_mode_identification) else {"outputSuffix": "v20.8"},
+        triggered_by_stage_id=request_id,
+    )
+
+
+def mode_identification_continuation(summary: dict[str, Any], *, request_id: str) -> StageRequest:
+    localize = (summary.get("recommendedNextTest") == "RESIDUAL_MODE_PIXEL_LOCALIZATION"
+                and summary.get("independentModeEvidenceSurvived") is True
+                and summary.get("physicalMechanismResolved") is False)
+    return StageRequest(
+        id=_next_stage_id(request_id, "prepare-residual-mode-localization" if localize else "finalize"),
+        handler_id=("openstar.tess.residual-mode-localization.prepare" if localize else "openstar.tess.finalize"),
+        parameters={} if localize else {"outputSuffix": "v20.9-mode-identification"},
         triggered_by_stage_id=request_id,
     )
 
@@ -812,6 +832,24 @@ def _render_report(conclusion: dict[str, Any]) -> str:
                 f"period={model.get('periodDays')} d, q={model.get('fractionalFrequencyDriftPerDay')}, "
                 f"sectors={model.get('signalSectors')}"
             )
+
+    mode_identification = conclusion.get("modeIdentification")
+    if mode_identification is not None:
+        relation = mode_identification.get("harmonicRelation") or {}
+        comparison = mode_identification.get("modelComparison") or {}
+        candidate = mode_identification.get("residualCandidate") or {}
+        lines.extend([
+            "", "## Stable residual mode identification", "",
+            f"- Established period family: {mode_identification.get('establishedPeriodFamily')}",
+            f"- Residual candidate period/frequency: {candidate.get('refinedPeriodDays')} days / {candidate.get('refinedFrequencyCyclesPerDay')} cycles/day",
+            f"- Tested harmonic relation: order {relation.get('testedOrder')}, commensurate within measured resolution={relation.get('commensurateWithinResolution')}",
+            f"- BIC model comparison: {comparison}",
+            f"- Independent-sector support: {mode_identification.get('independentSectorSupport')}",
+            f"- Classification: {mode_identification.get('classification')}",
+            f"- Independent-mode evidence survived: {mode_identification.get('independentModeEvidenceSurvived')}",
+            f"- Physical mechanism resolved: {mode_identification.get('physicalMechanismResolved')}",
+            f"- Recommended next test: {mode_identification.get('recommendedNextTest')}",
+        ])
 
     residual_localization = conclusion.get("residualModeLocalization")
     if residual_localization is not None:
@@ -2828,6 +2866,39 @@ def build_engine(
             artifacts=(_artifact(artifact_path, "application/json"),),
         )
 
+    def mode_identification_stage(investigation, request):
+        prepared = _result(investigation, "001-prepare-target")
+        independent = _latest_result_for_handler(investigation, "openstar.tess.independent.prepare")
+        time_frequency = _latest_result_for_handler(investigation, "openstar.tess.time-frequency.summarize")
+        if independent is None or time_frequency is None:
+            raise RuntimeError("Mode identification requires frozen sector data and time-frequency evidence.")
+        if time_frequency.get("recommendedNextTest") != "MODE_IDENTIFICATION_OR_PULSATION_MODELING":
+            raise RuntimeError("Mode identification was not recommended by time-frequency analysis.")
+        best = ((time_frequency.get("residualEvolution") or {}).get("bestCluster") or {})
+        residual_period = best.get("medianPeriodDays")
+        period_reference = time_frequency.get("periodReference") or {}
+        established_period = period_reference.get("periodDays") or time_frequency.get("physicalPeriodDays")
+        if residual_period is None or established_period is None:
+            raise RuntimeError("Mode identification requires measured family and residual periods.")
+        paths = [prepared["datasetPath"]]
+        paths.extend(item["datasetPath"] for item in independent.get("preparedSectors") or []
+                     if item.get("datasetPath"))
+        support = best.get("independentSectors") or time_frequency.get("acceptedIndependentSectors") or []
+        result = identify_residual_mode(dataset_paths=paths,
+                                        established_period_days=float(established_period),
+                                        residual_period_days=float(residual_period),
+                                        independent_sectors=support)
+        artifact_path = (store.directory_for(investigation.id) / "artifacts" /
+                         "mode-identification" / "mode-identification-v20.9.json")
+        _write_json(artifact_path, result)
+        return StageOutcome(
+            result=result,
+            next_stage=mode_identification_continuation(result, request_id=request.id),
+            input_hashes={"timeFrequencyEvolution": sha256_json(time_frequency),
+                          "independentPreparation": sha256_json(independent)},
+            artifacts=(_artifact(artifact_path, "application/json"),),
+        )
+
     def nonstationary_prepare_stage(investigation, request):
         prepared = _result(investigation, "001-prepare-target")
         independent_prepare = _latest_result_for_handler(
@@ -3036,16 +3107,37 @@ def build_engine(
             investigation,
             "openstar.tess.nonstationary.summarize",
         )
+        mode_identification = _latest_result_for_handler(
+            investigation, "openstar.tess.mode-identification.analyze",
+        )
         if identity is None:
             raise RuntimeError("v20.10 requires the completed catalog-identity stage.")
         if independent_prepare is None:
             raise RuntimeError("v20.10 requires frozen independent-sector metadata.")
-        if morphology is None or not morphology.get("physicalCycleResolved"):
+        mode_path = (mode_identification is not None
+                     and mode_identification.get("independentModeEvidenceSurvived") is True
+                     and mode_identification.get("recommendedNextTest") == "RESIDUAL_MODE_PIXEL_LOCALIZATION")
+        if morphology is None:
+            raise RuntimeError("v20.10 requires morphology evidence.")
+        if not mode_path and not morphology.get("physicalCycleResolved"):
             raise RuntimeError("v20.10 requires the morphology-resolved physical period.")
-        if nonstationary is None or nonstationary.get("recommendedNextTest") != "RESIDUAL_MODE_PIXEL_LOCALIZATION":
+        if not mode_path and (nonstationary is None or nonstationary.get("recommendedNextTest") != "RESIDUAL_MODE_PIXEL_LOCALIZATION"):
             raise RuntimeError("v20.10 requires v20.9 to recommend RESIDUAL_MODE_PIXEL_LOCALIZATION.")
 
-        physical_period = float(morphology["resolvedPhysicalPeriodDays"])
+        physical_period = float(
+            ((mode_identification or {}).get("establishedPeriodFamily") or {}).get("referencePeriodDays")
+            if mode_path else morphology["resolvedPhysicalPeriodDays"]
+        )
+        if mode_path:
+            candidate = mode_identification["modeCandidate"]
+            nonstationary = {
+                "preferredFrequencyAtReference": candidate["frequencyCyclesPerDay"],
+                "preferredPeriodAtReferenceDays": candidate["periodDays"],
+                "fractionalFrequencyDriftPerDay": 0.0,
+                "timeReferenceDays": 0.0,
+                "preferredModel": {"signalSectors": candidate["supportingSectors"]},
+                "recommendedNextTest": "RESIDUAL_MODE_PIXEL_LOCALIZATION",
+            }
         artifact_root = store.directory_for(investigation.id) / "artifacts"
         print("🎯 Preparing distributed drifting residual-mode pixel localization")
         print(f"   TIC: {prepared.get('ticID')}")
@@ -3089,6 +3181,7 @@ def build_engine(
                 "independentPreparation": sha256_json(independent_prepare),
                 "morphology": sha256_json(morphology),
                 "nonstationaryModeling": sha256_json(nonstationary),
+                "modeIdentification": sha256_json(mode_identification),
             },
             artifacts=tuple(artifacts),
         )
@@ -6454,6 +6547,9 @@ def build_engine(
             investigation,
             "openstar.tess.nonstationary.summarize",
         )
+        mode_identification = _latest_result_for_handler(
+            investigation, "openstar.tess.mode-identification.analyze",
+        )
         residual_mode_localization = _latest_result_for_handler(
             investigation,
             "openstar.tess.residual-mode-localization.interpret",
@@ -7458,6 +7554,8 @@ def build_engine(
             recommended_next_test = residual_mode_localization_review.get("recommendedNextTest")
         elif residual_mode_localization is not None:
             recommended_next_test = residual_mode_localization.get("recommendedNextTest")
+        elif mode_identification is not None:
+            recommended_next_test = mode_identification.get("recommendedNextTest")
         elif nonstationary_modeling is not None:
             recommended_next_test = nonstationary_modeling.get("recommendedNextTest")
         elif time_frequency_evolution is not None:
@@ -7501,6 +7599,7 @@ def build_engine(
             "multiModeDecomposition": multimode_decomposition,
             "timeFrequencyEvolution": time_frequency_evolution,
             "nonstationaryModeling": nonstationary_modeling,
+            "modeIdentification": mode_identification,
             "residualModeLocalization": residual_mode_localization,
             "residualModeLocalizationReview": residual_mode_localization_review,
             "multiSourceResidualDecomposition": multisource_residual,
@@ -7948,6 +8047,9 @@ def build_engine(
     engine.register_handler(
         "openstar.tess.nonstationary.prepare",
         nonstationary_prepare_stage,
+    )
+    engine.register_handler(
+        "openstar.tess.mode-identification.analyze", mode_identification_stage,
     )
     engine.register_handler(
         "openstar.tess.nonstationary.run",

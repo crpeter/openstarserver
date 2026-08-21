@@ -98,6 +98,38 @@ class TessAutonomyIntegrationTests(unittest.TestCase):
         )
         self.assertEqual("blind-c", branches[0].experiment.parameters["datasetID"])
 
+    def test_completed_mode_identification_boundary_is_append_only_and_idempotent(self):
+        target = self.source.enumerate_targets()[0]
+        investigation = self.store.create(target.investigation_id, WORKFLOW_ID, WORKFLOW_VERSION,
+                                          metadata=target.metadata)
+        investigation = self._complete(
+            investigation, "019-summarize-time-frequency", "openstar.tess.time-frequency.summarize",
+            {"recommendedNextTest": "MODE_IDENTIFICATION_OR_PULSATION_MODELING",
+             "physicalMechanismResolved": False})
+        investigation = self._complete(investigation, "020-finalize", "openstar.tess.finalize", {}, stop=True)
+        investigation = self.store.set_control_state(
+            investigation, status="COMPLETE",
+            control_state={"schedulerAction": "INVESTIGATION_COMPLETE"})
+        old_stages = investigation.stages
+        repaired = repair_obsolete_terminal_wait(self.store, investigation)
+        self.assertEqual("RUNNING", repaired.status)
+        self.assertEqual(old_stages, repaired.stages)
+        selected = repaired.metadata["controlState"]["selectedExperiment"]
+        self.assertEqual("openstar.tess.mode-identification.analyze", selected["handler_id"])
+        self.assertEqual(repaired, repair_obsolete_terminal_wait(self.store, repaired))
+
+    def test_unrelated_complete_investigation_is_unchanged(self):
+        target = self.source.enumerate_targets()[1]
+        investigation = self.store.create(target.investigation_id, WORKFLOW_ID, WORKFLOW_VERSION,
+                                          metadata=target.metadata)
+        investigation = self._complete(investigation, "020-finalize", "openstar.tess.finalize", {}, stop=True)
+        investigation = self.store.set_control_state(
+            investigation, status="COMPLETE",
+            control_state={"schedulerAction": "INVESTIGATION_COMPLETE"})
+        before = self.store.path_for(investigation.id).read_bytes()
+        self.assertEqual(investigation, repair_obsolete_terminal_wait(self.store, investigation))
+        self.assertEqual(before, self.store.path_for(investigation.id).read_bytes())
+
     def test_legacy_invalid_low_frequency_failure_resumes_independent_branch(self):
         target = self.source.enumerate_targets()[0]
         investigation = self.store.create(

@@ -415,6 +415,43 @@ def _repair_promoted_period_characterization_terminal(
     )
 
 
+def _repair_mode_identification_terminal(
+    store: InvestigationStore, investigation: Investigation, control: dict
+) -> Investigation | None:
+    """Append the stage introduced after the stable-residual terminal boundary."""
+    if (investigation.status != "COMPLETE"
+            or control.get("schedulerAction") != "INVESTIGATION_COMPLETE"):
+        return None
+    summary = _latest_complete(investigation, "openstar.tess.time-frequency.summarize")
+    result = (summary.result or {}) if summary is not None else {}
+    if not (summary is not None
+            and result.get("recommendedNextTest") == "MODE_IDENTIFICATION_OR_PULSATION_MODELING"
+            and result.get("physicalMechanismResolved") is False
+            and not any(stage.handler_id == "openstar.tess.mode-identification.analyze"
+                        for stage in investigation.stages)):
+        return None
+    # Only repair the old implementation boundary: no completed scientific
+    # stage other than finalize may follow the recommendation.
+    index = investigation.stages.index(summary)
+    if any(stage.status == "COMPLETE" and stage.handler_id != "openstar.tess.finalize"
+           for stage in investigation.stages[index + 1:]):
+        return None
+    prefixes = [int(stage.id.partition("-")[0]) for stage in investigation.stages
+                if stage.id.partition("-")[0].isdigit()]
+    continuation = StageRequest(
+        id=f"{max(prefixes, default=0) + 1:03d}-mode-identification",
+        handler_id="openstar.tess.mode-identification.analyze",
+        parameters={},
+        triggered_by_stage_id=summary.id,
+    )
+    return store.set_control_state(
+        investigation, status="RUNNING",
+        control_state={"branchAssessments": [], "selectedExperiment": asdict(continuation),
+                       "schedulerAction": "RUN_EXPERIMENT",
+                       "recovery": "TESS_MODE_IDENTIFICATION_COMPATIBILITY_CONTINUATION"},
+    )
+
+
 def _repair_closed_file_independent_prepare(
     store: InvestigationStore, investigation: Investigation
 ) -> Investigation | None:
@@ -554,6 +591,10 @@ def repair_obsolete_terminal_wait(
     )
     if period_repair is not None:
         return period_repair
+
+    mode_repair = _repair_mode_identification_terminal(store, investigation, control)
+    if mode_repair is not None:
+        return mode_repair
 
     if (
         investigation.status == "BLOCKED"
