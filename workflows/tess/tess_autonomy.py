@@ -452,6 +452,40 @@ def _repair_mode_identification_terminal(
     )
 
 
+def _repair_dynamic_harmonic_terminal(
+    store: InvestigationStore, investigation: Investigation, control: dict
+) -> Investigation | None:
+    """Append only the stage introduced after the old harmonic boundary."""
+    if (investigation.status != "COMPLETE"
+            or control.get("schedulerAction") != "INVESTIGATION_COMPLETE"):
+        return None
+    mode = _latest_complete(investigation, "openstar.tess.mode-identification.analyze")
+    result = (mode.result or {}) if mode is not None else {}
+    if not (mode is not None
+            and result.get("recommendedNextTest") == "DYNAMIC_HARMONIC_MODELING"
+            and result.get("physicalMechanismResolved") is False
+            and not any(stage.handler_id == "openstar.tess.dynamic-harmonic.analyze"
+                        for stage in investigation.stages)):
+        return None
+    index = investigation.stages.index(mode)
+    if any(stage.status == "COMPLETE" and stage.handler_id != "openstar.tess.finalize"
+           for stage in investigation.stages[index + 1:]):
+        return None
+    prefixes = [int(stage.id.partition("-")[0]) for stage in investigation.stages
+                if stage.id.partition("-")[0].isdigit()]
+    continuation = StageRequest(
+        id=f"{max(prefixes, default=0) + 1:03d}-dynamic-harmonic-modeling",
+        handler_id="openstar.tess.dynamic-harmonic.analyze",
+        parameters={}, triggered_by_stage_id=mode.id,
+    )
+    return store.set_control_state(
+        investigation, status="RUNNING",
+        control_state={"branchAssessments": [], "selectedExperiment": asdict(continuation),
+                       "schedulerAction": "RUN_EXPERIMENT",
+                       "recovery": "TESS_DYNAMIC_HARMONIC_COMPATIBILITY_CONTINUATION"},
+    )
+
+
 def _repair_closed_file_independent_prepare(
     store: InvestigationStore, investigation: Investigation
 ) -> Investigation | None:
@@ -595,6 +629,10 @@ def repair_obsolete_terminal_wait(
     mode_repair = _repair_mode_identification_terminal(store, investigation, control)
     if mode_repair is not None:
         return mode_repair
+
+    dynamic_repair = _repair_dynamic_harmonic_terminal(store, investigation, control)
+    if dynamic_repair is not None:
+        return dynamic_repair
 
     if (
         investigation.status == "BLOCKED"

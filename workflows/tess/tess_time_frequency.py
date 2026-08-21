@@ -139,8 +139,9 @@ def _fit_family(
     phase_times: np.ndarray,
     flux: np.ndarray,
     physical_frequency: float,
+    harmonic_orders: tuple[int, ...] = (1, 2),
 ) -> tuple[np.ndarray, dict[str, Any]]:
-    frequencies = [physical_frequency, 2.0 * physical_frequency]
+    frequencies = [order * physical_frequency for order in harmonic_orders]
     design = _design_matrix(phase_times, frequencies)
     coefficients, _, _, _ = np.linalg.lstsq(design, flux, rcond=None)
     model = design @ coefficients
@@ -152,8 +153,12 @@ def _fit_family(
     if total_ss > 1e-18:
         explained = max(0.0, min(1.0, 1.0 - residual_ss / total_ss))
 
-    a1, b1 = float(coefficients[1]), float(coefficients[2])
-    a2, b2 = float(coefficients[3]), float(coefficients[4])
+    coefficient_by_order = {
+        order: (float(coefficients[1 + 2 * index]), float(coefficients[2 + 2 * index]))
+        for index, order in enumerate(harmonic_orders)
+    }
+    a1, b1 = coefficient_by_order.get(1, (0.0, 0.0))
+    a2, b2 = coefficient_by_order.get(2, (0.0, 0.0))
     amp1 = math.hypot(a1, b1)
     amp2 = math.hypot(a2, b2)
     phase1 = math.atan2(b1, a1)
@@ -169,6 +174,11 @@ def _fit_family(
         normalized = residual / residual_std
 
     return normalized, {
+        "subtractedHarmonicOrders": list(harmonic_orders),
+        "harmonics": [{"order": order, "frequency": order * physical_frequency,
+                       "amplitude": math.hypot(*coefficient_by_order[order]),
+                       "phaseRad": math.atan2(coefficient_by_order[order][1], coefficient_by_order[order][0])}
+                      for order in harmonic_orders],
         "physicalFrequency": physical_frequency,
         "firstHarmonicFrequency": 2.0 * physical_frequency,
         "fundamentalAmplitude": amp1,
@@ -257,14 +267,17 @@ def _solve_linear_system(matrix: list[list[float]], vector: list[float]) -> list
 
 def _fit_family_python(
     times: list[float], flux: list[float], physical_frequency: float,
+    harmonic_orders: tuple[int, ...] = (1, 2),
 ) -> tuple[list[float], dict[str, Any]]:
-    """Coupled offset + fundamental + first-harmonic least-squares fit."""
+    """Coupled offset plus requested coherent harmonics least-squares fit."""
     rows = []
     for time in times:
         angle = 2.0 * math.pi * physical_frequency * time
-        rows.append([1.0, math.sin(angle), math.cos(angle), math.sin(2.0 * angle), math.cos(2.0 * angle)])
-    normal = [[sum(row[i] * row[j] for row in rows) for j in range(5)] for i in range(5)]
-    rhs = [sum(row[i] * value for row, value in zip(rows, flux)) for i in range(5)]
+        rows.append([1.0] + [basis for order in harmonic_orders
+                            for basis in (math.sin(order * angle), math.cos(order * angle))])
+    size = 1 + 2 * len(harmonic_orders)
+    normal = [[sum(row[i] * row[j] for row in rows) for j in range(size)] for i in range(size)]
+    rhs = [sum(row[i] * value for row, value in zip(rows, flux)) for i in range(size)]
     coefficients = _solve_linear_system(normal, rhs)
     model = [sum(coefficient * basis for coefficient, basis in zip(coefficients, row)) for row in rows]
     residual = [value - fitted for value, fitted in zip(flux, model)]
@@ -276,10 +289,18 @@ def _fit_family_python(
     mean = sum(flux) / len(flux)
     total_ss = sum((value - mean) ** 2 for value in flux)
     residual_ss = sum(value ** 2 for value in residual)
-    a1, b1, a2, b2 = coefficients[1:]
+    coefficient_by_order = {order: tuple(coefficients[1 + 2 * index:3 + 2 * index])
+                            for index, order in enumerate(harmonic_orders)}
+    a1, b1 = coefficient_by_order.get(1, (0.0, 0.0))
+    a2, b2 = coefficient_by_order.get(2, (0.0, 0.0))
     phase1 = math.atan2(b1, a1)
     phase2 = math.atan2(b2, a2)
     return normalized, {
+        "subtractedHarmonicOrders": list(harmonic_orders),
+        "harmonics": [{"order": order, "frequency": order * physical_frequency,
+                       "amplitude": math.hypot(*coefficient_by_order[order]),
+                       "phaseRad": math.atan2(coefficient_by_order[order][1], coefficient_by_order[order][0])}
+                      for order in harmonic_orders],
         "offset": coefficients[0],
         "physicalFrequency": physical_frequency,
         "firstHarmonicFrequency": 2.0 * physical_frequency,
@@ -303,6 +324,7 @@ def _build_time_frequency_project_python(**kwargs: Any) -> dict[str, Any]:
     source_entry = kwargs["source_dataset_entry"]
     period = float(kwargs["physical_period_days"])
     frequency = 1.0 / period
+    harmonic_orders = tuple(kwargs.get("harmonic_orders") or (1, 2))
     root = Path(kwargs["output_dir"]) / "time-frequency"
     root.mkdir(parents=True, exist_ok=True)
     items = _source_items(
@@ -325,7 +347,7 @@ def _build_time_frequency_project_python(**kwargs: Any) -> dict[str, Any]:
         times = [pair[0] for pair in pairs]
         flux = [pair[1] for pair in pairs]
         def subtract_family(selected_times: list[float], selected_flux: list[float]) -> tuple[list[float], dict[str, Any]]:
-            return _fit_family_python(selected_times, selected_flux, frequency)
+            return _fit_family_python(selected_times, selected_flux, frequency, harmonic_orders)
 
         _, full_fit = subtract_family(times, flux)
         family_track.append({
@@ -361,7 +383,7 @@ def _build_time_frequency_project_python(**kwargs: Any) -> dict[str, Any]:
 
     project_id = f"{source_project['id']}.investigation.{_safe(kwargs['investigation_id'])}.time-frequency-evolution-v1"
     manifest = {"id": project_id, "name": f"{source_project.get('name', source_project['id'])} — time-frequency evolution",
-                "workloadID": source_project["workloadID"], "datasets": entries,
+                "workloadID": kwargs.get("workload_id") or source_project["workloadID"], "datasets": entries,
                 "investigation": {"sourceProjectID": source_project["id"], "sourceDatasetID": source_entry["id"],
                                   "purpose": "sliding-window-time-frequency-evolution", "physicalPeriodDays": period}}
     manifest_path = root / f"{_safe(project_id)}.json"
@@ -369,6 +391,7 @@ def _build_time_frequency_project_python(**kwargs: Any) -> dict[str, Any]:
     work_units = math.ceil(TOTAL_FREQUENCIES / FREQUENCIES_PER_WORK_UNIT)
     return {"available": True, "projectID": project_id, "projectPath": str(manifest_path.resolve()),
             "physicalPeriodDays": period, "physicalFrequency": frequency, "firstHarmonicFrequency": 2*frequency,
+            "subtractedHarmonicOrders": list(harmonic_orders),
             "absoluteTimeReferenceDays": None, "frequencySearch": _frequency_search(), "windowLengthDays": WINDOW_LENGTH_DAYS,
             "windowsPerSector": WINDOWS_PER_SECTOR, "preparedWindows": prepared, "familyTrack": family_track,
             "totalWorkUnits": len(entries)*work_units, "workUnitsPerDataset": work_units}
@@ -384,9 +407,14 @@ def build_time_frequency_project(
     physical_period_days: float,
     output_dir: str | Path,
     investigation_id: str,
+    harmonic_orders: tuple[int, ...] = (1, 2),
+    workload_id: str | None = None,
 ) -> dict[str, Any]:
     if physical_period_days <= 0:
         raise ValueError("physical_period_days must be positive")
+    harmonic_orders = tuple(sorted({int(order) for order in harmonic_orders}))
+    if not harmonic_orders or harmonic_orders[0] < 1:
+        raise ValueError("harmonic_orders must contain positive integers")
 
     # The coordinator deployment normally provides NumPy, but the server's
     # dependency-minimal control-plane environment does not.  Preparing this
@@ -404,6 +432,8 @@ def build_time_frequency_project(
             physical_period_days=physical_period_days,
             output_dir=output_dir,
             investigation_id=investigation_id,
+            harmonic_orders=harmonic_orders,
+            workload_id=workload_id,
         )
 
     source_project = _load_json(source_project_path)
@@ -448,6 +478,7 @@ def build_time_frequency_project(
             phase_times=phase_times,
             flux=flux,
             physical_frequency=physical_frequency,
+            harmonic_orders=harmonic_orders,
         )
         family_track.append({
             "sectorKey": source_item["sectorKey"],
@@ -492,6 +523,7 @@ def build_time_frequency_project(
                 phase_times=phase_times,
                 flux=window_flux,
                 physical_frequency=physical_frequency,
+                harmonic_orders=harmonic_orders,
             )
             local_times = window_times - np.min(window_times)
             base_id = str(source_dataset.get("id") or source_dataset_entry["id"])
@@ -517,6 +549,7 @@ def build_time_frequency_project(
                 "windowIndex": index,
                 "physicalFundamentalFrequency": physical_frequency,
                 "firstHarmonicFrequency": 2.0 * physical_frequency,
+                "subtractedHarmonicOrders": list(harmonic_orders),
             })
             residual_dataset["science"] = science
             source = dict(residual_dataset.get("source") or {})
@@ -573,7 +606,7 @@ def build_time_frequency_project(
     manifest = {
         "id": project_id,
         "name": f"{source_project.get('name', source_project['id'])} — time-frequency evolution",
-        "workloadID": source_project["workloadID"],
+        "workloadID": workload_id or source_project["workloadID"],
         "datasets": dataset_entries,
         "investigation": {
             "sourceProjectID": source_project["id"],
@@ -596,6 +629,7 @@ def build_time_frequency_project(
         "physicalPeriodDays": float(physical_period_days),
         "physicalFrequency": physical_frequency,
         "firstHarmonicFrequency": 2.0 * physical_frequency,
+        "subtractedHarmonicOrders": list(harmonic_orders),
         "absoluteTimeReferenceDays": absolute_time_reference,
         "frequencySearch": _frequency_search(),
         "windowLengthDays": WINDOW_LENGTH_DAYS,

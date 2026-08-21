@@ -130,6 +130,26 @@ class TessAutonomyIntegrationTests(unittest.TestCase):
         self.assertEqual(investigation, repair_obsolete_terminal_wait(self.store, investigation))
         self.assertEqual(before, self.store.path_for(investigation.id).read_bytes())
 
+    def test_completed_dynamic_harmonic_boundary_is_append_only_and_idempotent(self):
+        target = self.source.enumerate_targets()[0]
+        investigation = self.store.create(target.investigation_id, WORKFLOW_ID, WORKFLOW_VERSION,
+                                          metadata=target.metadata)
+        investigation = self._complete(
+            investigation, "020-mode-identification", "openstar.tess.mode-identification.analyze",
+            {"recommendedNextTest": "DYNAMIC_HARMONIC_MODELING",
+             "physicalMechanismResolved": False})
+        investigation = self._complete(investigation, "021-finalize", "openstar.tess.finalize", {}, stop=True)
+        investigation = self.store.set_control_state(
+            investigation, status="COMPLETE",
+            control_state={"schedulerAction": "INVESTIGATION_COMPLETE"})
+        old_stages = investigation.stages
+        repaired = repair_obsolete_terminal_wait(self.store, investigation)
+        self.assertEqual("RUNNING", repaired.status)
+        self.assertEqual(old_stages, repaired.stages)
+        selected = repaired.metadata["controlState"]["selectedExperiment"]
+        self.assertEqual("openstar.tess.dynamic-harmonic.analyze", selected["handler_id"])
+        self.assertEqual(repaired, repair_obsolete_terminal_wait(self.store, repaired))
+
     def test_legacy_invalid_low_frequency_failure_resumes_independent_branch(self):
         target = self.source.enumerate_targets()[0]
         investigation = self.store.create(
