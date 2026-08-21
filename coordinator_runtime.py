@@ -51,6 +51,37 @@ class CoordinatorRuntime:
         self._progress_last_logged_at = time.monotonic()
         self._progress_assigned = 0
         self._progress_accepted = 0
+        self._transition_terminal: tuple[str, float] | None = None
+        self._transition_activation: tuple[str, str, float, float] | None = None
+
+    @staticmethod
+    def _operational_print(message: str) -> None:
+        try:
+            print(message)
+        except Exception:
+            pass
+
+    def _project_became_terminal(self, project_id: str, terminal_at: float) -> None:
+        with self.lock:
+            self._transition_terminal = (project_id, terminal_at)
+            self._transition_activation = None
+
+    def _record_first_claim(self, project_id: str) -> None:
+        with self.lock:
+            transition = self._transition_activation
+            if transition is None or transition[1] != project_id:
+                return
+            previous_id, next_id, terminal_at, activated_at = transition
+            self._transition_activation = None
+            self._transition_terminal = None
+            claimed_at = time.monotonic()
+        self._operational_print(
+            "⏱️ Project transition: "
+            f"previous={previous_id} next={next_id} "
+            f"terminal-to-activation={activated_at - terminal_at:.3f}s "
+            f"activation-to-first-claim={claimed_at - activated_at:.3f}s "
+            f"terminal-to-first-claim={claimed_at - terminal_at:.3f}s"
+        )
 
     def _record_progress(self, *, assigned: int = 0, accepted: int = 0) -> None:
         """Periodically summarize successful hot-path operations in one write."""
@@ -215,6 +246,7 @@ class CoordinatorRuntime:
                 if work is None:
                     continue
                 self._next_project_index = (position + 1) % len(self._project_order)
+                self._record_first_claim(project_id)
                 self._record_progress(assigned=1)
                 return work
 
@@ -241,6 +273,7 @@ class CoordinatorRuntime:
                 if not work:
                     continue
                 self._next_project_index = (position + 1) % len(self._project_order)
+                self._record_first_claim(project_id)
                 self._record_progress(assigned=len(work))
                 return work
 
@@ -338,6 +371,7 @@ class CoordinatorRuntime:
         if not resolved.exists():
             raise FileNotFoundError(f"Project manifest not found: {resolved}")
         new_state = CoordinatorState(resolved)
+        new_state.terminal_observer = self._project_became_terminal
         project_id = str(new_state.project_id)
         new_work_ids = list(new_state.work_units)
 
@@ -379,6 +413,17 @@ class CoordinatorRuntime:
             for work_id in new_work_ids:
                 self._work_project_index[normalize_id(work_id)] = project_id
             self._legacy_current_project_id = project_id
+            transition = self._transition_terminal
+            if transition is not None and transition[0] != project_id:
+                activated_at = time.monotonic()
+                self._transition_activation = (
+                    transition[0], project_id, transition[1], activated_at
+                )
+                self._operational_print(
+                    "⏱️ Project transition activation: "
+                    f"previous={transition[0]} next={project_id} "
+                    f"terminal-to-activation={activated_at - transition[1]:.3f}s"
+                )
 
         return self.project_status(project_id)  # type: ignore[return-value]
 

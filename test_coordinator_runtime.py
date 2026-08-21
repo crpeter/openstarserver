@@ -24,6 +24,7 @@ from coordinator_runtime import (
     ProjectBusyError,
     ProjectConflictError,
 )
+from coordinator_state import CoordinatorState
 
 
 class CoordinatorRuntimeTests(unittest.TestCase):
@@ -77,6 +78,43 @@ class CoordinatorRuntimeTests(unittest.TestCase):
             "📊 Coordinator progress: assigned=2, accepted=1, liveProjects=0"
         )
 
+    def test_transition_first_claim_is_once_and_ignores_unrelated_project(self):
+        with patch("coordinator_runtime.time.monotonic", return_value=0.0):
+            runtime = CoordinatorRuntime()
+        runtime._project_became_terminal("previous", 10.0)
+        runtime._transition_activation = ("previous", "next", 10.0, 12.0)
+        with patch(
+            "coordinator_runtime.time.monotonic", return_value=13.0
+        ), patch.object(runtime, "_operational_print") as output:
+            runtime._record_first_claim("unrelated")
+            output.assert_not_called()
+            runtime._record_first_claim("next")
+            runtime._record_first_claim("next")
+        output.assert_called_once_with(
+            "⏱️ Project transition: previous=previous next=next "
+            "terminal-to-activation=2.000s activation-to-first-claim=1.000s "
+            "terminal-to-first-claim=3.000s"
+        )
+
+    def test_terminal_timestamp_precedes_completion_reporting(self):
+        state = CoordinatorState(self.manifest("terminal"))
+        state.completed = {work_id: {} for work_id in state.work_units}
+        observed = []
+        state.terminal_observer = lambda project_id, at: observed.append(
+            (project_id, at)
+        )
+        with patch(
+            "coordinator_state.time.monotonic", side_effect=[10.0, 20.0]
+        ), state.lock:
+            state._capture_terminal_edge_locked()
+        state._notify_terminal_observer()
+        with patch.object(state, "_report_dataset_complete"), patch.object(
+            state, "_report_project_complete"
+        ):
+            state._report_completions()
+        self.assertEqual(10.0, state.terminal_monotonic)
+        self.assertEqual([("terminal", 10.0)], observed)
+
     def activate_two(self):
         runtime = CoordinatorRuntime()
         runtime.activate_project(self.manifest("a"), require_terminal=False)
@@ -112,6 +150,23 @@ class CoordinatorRuntimeTests(unittest.TestCase):
         owner = runtime._states[batch[0]["projectID"]]
         self.assertTrue(all(unit["id"] in owner.assigned for unit in batch))
         self.assertEqual(2, len(runtime._states["b"].pending))
+
+    def test_batch_claim_records_transition_without_changing_claimed_work(self):
+        runtime = CoordinatorRuntime()
+        runtime.activate_project(self.manifest("next"), require_terminal=False)
+        runtime.register_node({"nodeID": "node", "capabilities": {}})
+        runtime._transition_terminal = ("previous", 10.0)
+        runtime._transition_activation = ("previous", "next", 10.0, 11.0)
+        with patch(
+            "coordinator_runtime.time.monotonic", side_effect=[12.0, 12.0]
+        ), patch.object(runtime, "_operational_print") as output:
+            batch = runtime.claim_work_batch("node", 2)
+        self.assertEqual(2, len(batch))
+        self.assertTrue(all(unit["projectID"] == "next" for unit in batch))
+        self.assertTrue(
+            all(unit["id"] in runtime._states["next"].assigned for unit in batch)
+        )
+        output.assert_called_once()
 
     def test_partial_batch_and_invalid_batch_counts(self):
         runtime = self.activate_two()
@@ -617,6 +672,27 @@ class CoordinatorClientTests(unittest.TestCase):
         wait.assert_called_once_with("a", poll_interval=1.0, timeout=None)
         self.assertEqual(complete, result.status)
         remove.assert_called_once_with("a")
+
+    def test_run_project_phase_timing_preserves_lifecycle_result(self):
+        client = OpenStarCoordinatorClient()
+        complete = {"status": "COMPLETE", "projectID": "a"}
+        with patch.object(
+            client, "activate_project", return_value={"projectID": "a"}
+        ) as activate, patch.object(
+            client, "wait_for_project", return_value=complete
+        ) as wait, patch.object(client, "remove_project") as remove, patch(
+            "openstar_coordinator_client.time.monotonic",
+            side_effect=[1.0, 2.0, 5.0, 5.5],
+        ), patch("builtins.print") as output:
+            result = client.run_project("project.json")
+        self.assertIs(complete, result.status)
+        activate.assert_called_once_with("project.json", require_terminal=False)
+        wait.assert_called_once_with("a", poll_interval=1.0, timeout=None)
+        remove.assert_called_once_with("a")
+        output.assert_called_once_with(
+            "⏱️ Coordinator project lifecycle: project=a activate=1.000s "
+            "compute/wait=3.000s cleanup=0.500s total=4.500s"
+        )
 
     def test_run_project_transport_failure_does_not_remove_active_project(self):
         client = OpenStarCoordinatorClient()
