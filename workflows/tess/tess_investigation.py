@@ -55,6 +55,7 @@ from .tess_nonstationary import (
     summarize_nonstationary_modeling,
 )
 from .tess_mode_identification import identify_residual_mode
+from .tess_dynamic_harmonic import model_dynamic_harmonics
 from .tess_residual_localization import (
     build_residual_mode_pixel_project,
     interpret_residual_mode_pixel_project,
@@ -311,13 +312,28 @@ def time_frequency_continuation(summary: dict[str, Any], *, request_id: str) -> 
 
 
 def mode_identification_continuation(summary: dict[str, Any], *, request_id: str) -> StageRequest:
+    dynamic = (summary.get("recommendedNextTest") == "DYNAMIC_HARMONIC_MODELING"
+               and summary.get("physicalMechanismResolved") is False)
     localize = (summary.get("recommendedNextTest") == "RESIDUAL_MODE_PIXEL_LOCALIZATION"
                 and summary.get("independentModeEvidenceSurvived") is True
                 and summary.get("physicalMechanismResolved") is False)
     return StageRequest(
-        id=_next_stage_id(request_id, "prepare-residual-mode-localization" if localize else "finalize"),
-        handler_id=("openstar.tess.residual-mode-localization.prepare" if localize else "openstar.tess.finalize"),
-        parameters={} if localize else {"outputSuffix": "v20.9-mode-identification"},
+        id=_next_stage_id(request_id, "dynamic-harmonic-modeling" if dynamic else
+                          ("prepare-residual-mode-localization" if localize else "finalize")),
+        handler_id=("openstar.tess.dynamic-harmonic.analyze" if dynamic else
+                    ("openstar.tess.residual-mode-localization.prepare" if localize else "openstar.tess.finalize")),
+        parameters={} if (localize or dynamic) else {"outputSuffix": "v20.9-mode-identification"},
+        triggered_by_stage_id=request_id,
+    )
+
+
+def dynamic_harmonic_continuation(summary: dict[str, Any], *, request_id: str) -> StageRequest:
+    """Route dynamic-family evidence without assigning a physical mechanism."""
+    residual = summary.get("recommendedNextTest") == "RESIDUAL_MULTIMODE_LOCALIZATION"
+    return StageRequest(
+        id=_next_stage_id(request_id, "prepare-multimode" if residual else "finalize"),
+        handler_id="openstar.tess.multimode.prepare" if residual else "openstar.tess.finalize",
+        parameters={} if residual else {"outputSuffix": "v20.10-dynamic-harmonic"},
         triggered_by_stage_id=request_id,
     )
 
@@ -849,6 +865,24 @@ def _render_report(conclusion: dict[str, Any]) -> str:
             f"- Independent-mode evidence survived: {mode_identification.get('independentModeEvidenceSurvived')}",
             f"- Physical mechanism resolved: {mode_identification.get('physicalMechanismResolved')}",
             f"- Recommended next test: {mode_identification.get('recommendedNextTest')}",
+        ])
+
+    dynamic_harmonic = conclusion.get("dynamicHarmonicModeling")
+    if dynamic_harmonic is not None:
+        lines.extend([
+            "", "## Dynamic harmonic modeling", "",
+            f"- Reference physical/family period: {dynamic_harmonic.get('referenceFamilyPeriodDays')} days",
+            f"- Harmonic orders tested: {dynamic_harmonic.get('harmonicOrdersTested')}",
+            f"- Per-sector amplitudes/phases: {dynamic_harmonic.get('sectorFits')}",
+            f"- Model comparison/BIC: {dynamic_harmonic.get('modelComparison')}",
+            f"- Amplitude evolution: {dynamic_harmonic.get('amplitudeEvolution')}",
+            f"- Phase evolution: {dynamic_harmonic.get('phaseEvolution')}",
+            f"- Harmonic ratios: {dynamic_harmonic.get('harmonicAmplitudeRatios')}",
+            f"- Coherence assessment: {dynamic_harmonic.get('coherenceAssessment')}",
+            f"- Residual unexplained variance: {dynamic_harmonic.get('residualUnexplainedVarianceFraction')}",
+            f"- Classification: {dynamic_harmonic.get('classification')}",
+            f"- Physical mechanism resolved: {dynamic_harmonic.get('physicalMechanismResolved')}",
+            f"- Recommended next test: {dynamic_harmonic.get('recommendedNextTest')}",
         ])
 
     residual_localization = conclusion.get("residualModeLocalization")
@@ -2896,6 +2930,27 @@ def build_engine(
             next_stage=mode_identification_continuation(result, request_id=request.id),
             input_hashes={"timeFrequencyEvolution": sha256_json(time_frequency),
                           "independentPreparation": sha256_json(independent)},
+            artifacts=(_artifact(artifact_path, "application/json"),),
+        )
+
+    def dynamic_harmonic_stage(investigation, request):
+        mode = _latest_result_for_handler(investigation, "openstar.tess.mode-identification.analyze")
+        if mode is None or mode.get("recommendedNextTest") != "DYNAMIC_HARMONIC_MODELING":
+            raise RuntimeError("Dynamic harmonic modeling requires the persisted harmonic recommendation.")
+        family = mode.get("establishedPeriodFamily") or {}
+        period = family.get("referencePeriodDays")
+        paths = (mode.get("dataReuse") or {}).get("frozenDatasetPaths") or []
+        if period is None or not paths:
+            raise RuntimeError("Dynamic harmonic modeling requires frozen datasets and a family period.")
+        result = model_dynamic_harmonics(dataset_paths=paths, reference_period_days=float(period),
+                                         harmonic_orders=(1, 2, 3, 4))
+        artifact_path = (store.directory_for(investigation.id) / "artifacts" /
+                         "dynamic-harmonic" / "dynamic-harmonic-v20.10.json")
+        _write_json(artifact_path, result)
+        return StageOutcome(
+            result=result,
+            next_stage=dynamic_harmonic_continuation(result, request_id=request.id),
+            input_hashes={"modeIdentification": sha256_json(mode)},
             artifacts=(_artifact(artifact_path, "application/json"),),
         )
 
@@ -6550,6 +6605,9 @@ def build_engine(
         mode_identification = _latest_result_for_handler(
             investigation, "openstar.tess.mode-identification.analyze",
         )
+        dynamic_harmonic_modeling = _latest_result_for_handler(
+            investigation, "openstar.tess.dynamic-harmonic.analyze",
+        )
         residual_mode_localization = _latest_result_for_handler(
             investigation,
             "openstar.tess.residual-mode-localization.interpret",
@@ -7554,6 +7612,8 @@ def build_engine(
             recommended_next_test = residual_mode_localization_review.get("recommendedNextTest")
         elif residual_mode_localization is not None:
             recommended_next_test = residual_mode_localization.get("recommendedNextTest")
+        elif dynamic_harmonic_modeling is not None:
+            recommended_next_test = dynamic_harmonic_modeling.get("recommendedNextTest")
         elif mode_identification is not None:
             recommended_next_test = mode_identification.get("recommendedNextTest")
         elif nonstationary_modeling is not None:
@@ -7600,6 +7660,7 @@ def build_engine(
             "timeFrequencyEvolution": time_frequency_evolution,
             "nonstationaryModeling": nonstationary_modeling,
             "modeIdentification": mode_identification,
+            "dynamicHarmonicModeling": dynamic_harmonic_modeling,
             "residualModeLocalization": residual_mode_localization,
             "residualModeLocalizationReview": residual_mode_localization_review,
             "multiSourceResidualDecomposition": multisource_residual,
@@ -8050,6 +8111,9 @@ def build_engine(
     )
     engine.register_handler(
         "openstar.tess.mode-identification.analyze", mode_identification_stage,
+    )
+    engine.register_handler(
+        "openstar.tess.dynamic-harmonic.analyze", dynamic_harmonic_stage,
     )
     engine.register_handler(
         "openstar.tess.nonstationary.run",
