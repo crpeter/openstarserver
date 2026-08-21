@@ -79,19 +79,20 @@ def _uniform_indices(count: int, maximum: int) -> np.ndarray:
     return np.unique(np.linspace(0, count - 1, maximum, dtype=int))
 
 
-def _design_matrix(times: np.ndarray, physical_frequency: float) -> np.ndarray:
+def _design_matrix(
+    times: np.ndarray, physical_frequency: float, harmonic_orders: tuple[int, ...] = (1, 2)
+) -> np.ndarray:
     centered = times - float(np.mean(times))
     scale = float(np.std(centered))
     trend = centered / scale if scale > 0 else centered
     omega = 2.0 * math.pi * float(physical_frequency)
-    return np.column_stack([
-        np.ones(len(times), dtype=np.float64),
-        trend,
-        np.sin(omega * times),
-        np.cos(omega * times),
-        np.sin(2.0 * omega * times),
-        np.cos(2.0 * omega * times),
-    ])
+    columns = [np.ones(len(times), dtype=np.float64), trend]
+    for order in harmonic_orders:
+        columns.extend((
+            np.sin(float(order) * omega * times),
+            np.cos(float(order) * omega * times),
+        ))
+    return np.column_stack(columns)
 
 
 def _prewhiten_cube(
@@ -99,8 +100,9 @@ def _prewhiten_cube(
     absolute_times: np.ndarray,
     cube: np.ndarray,
     physical_frequency: float,
+    harmonic_orders: tuple[int, ...] = (1, 2),
 ) -> tuple[np.ndarray, np.ndarray]:
-    matrix = _design_matrix(absolute_times, physical_frequency)
+    matrix = _design_matrix(absolute_times, physical_frequency, harmonic_orders)
     pinv = np.linalg.pinv(matrix)
     flat = cube.reshape(len(absolute_times), -1).astype(np.float64)
     finite_fraction = np.mean(np.isfinite(flat), axis=0)
@@ -211,6 +213,7 @@ def build_residual_mode_pixel_project(
     nonstationary_summary: dict[str, Any],
     output_dir: str | Path,
     investigation_id: str,
+    harmonic_orders: tuple[int, ...] = (1, 2),
 ) -> dict[str, Any]:
     source_project = _load_json(source_project_path)
     source_workload_id = str(source_project.get("workloadID") or "")
@@ -255,7 +258,11 @@ def build_residual_mode_pixel_project(
     if not sectors:
         raise RuntimeError("No frozen TESS sectors overlap the v20.9 signal-sector set.")
 
+    family_suffix = "-h" + "-".join(str(value) for value in harmonic_orders)
+    corrected_family = tuple(harmonic_orders) != (1, 2)
     root = Path(output_dir) / "residual-mode-localization"
+    if corrected_family:
+        root = root / family_suffix.lstrip("-")
     root.mkdir(parents=True, exist_ok=True)
     search = _frequency_search(reference_frequency)
     physical_frequency = 1.0 / float(physical_period_days)
@@ -297,6 +304,7 @@ def build_residual_mode_pixel_project(
                 absolute_times=absolute_times,
                 cube=corrected,
                 physical_frequency=physical_frequency,
+                harmonic_orders=harmonic_orders,
             )
             target_x, target_y = tpf.wcs.world_to_pixel(target)
             pixel_scale = _pixel_scale_arcsec(tpf.wcs)
@@ -316,7 +324,7 @@ def build_residual_mode_pixel_project(
                         continue
                     dataset_id = (
                         f"{source_base_id}-residual-localization-sector-{sector}-"
-                        f"r{row:02d}-c{col:02d}-v1"
+                        f"r{row:02d}-c{col:02d}-v1{family_suffix if corrected_family else ''}"
                     )
                     target_name = (
                         f"{source_dataset_entry.get('targetName') or source_base_id} "
@@ -397,7 +405,7 @@ def build_residual_mode_pixel_project(
 
     project_id = (
         f"{source_project['id']}.investigation.{_safe(investigation_id)}."
-        "residual-mode-pixel-localization-v1"
+        f"residual-mode-pixel-localization-v1{family_suffix if corrected_family else ''}"
     )
     manifest = {
         "id": project_id,
@@ -415,6 +423,7 @@ def build_residual_mode_pixel_project(
             "referenceFrequency": float(reference_frequency),
             "fractionalFrequencyDriftPerDay": float(q),
             "signalSectors": signal_sectors,
+            "subtractedHarmonicOrders": list(harmonic_orders),
         },
     }
     manifest_path = root / f"{_safe(project_id)}.json"
@@ -430,6 +439,7 @@ def build_residual_mode_pixel_project(
         "ticID": int(tic_id),
         "targetSky": {"raDeg": float(ra_deg), "decDeg": float(dec_deg)},
         "physicalPeriodDays": float(physical_period_days),
+        "subtractedHarmonicOrders": list(harmonic_orders),
         "residualFrequencyAtReference": float(reference_frequency),
         "residualPeriodAtReferenceDays": 1.0 / float(reference_frequency),
         "fractionalFrequencyDriftPerDay": float(q),

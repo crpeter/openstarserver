@@ -327,6 +327,49 @@ def mode_identification_continuation(summary: dict[str, Any], *, request_id: str
     )
 
 
+def _dynamic_mode_localization_evidence(
+    dynamic: dict[str, Any] | None,
+    time_frequency_prepare: dict[str, Any] | None,
+    time_frequency: dict[str, Any] | None,
+    mode: dict[str, Any] | None,
+) -> tuple[float, tuple[int, ...], dict[str, Any]] | None:
+    """Adapt persisted unresolved-family evidence to the localization interface."""
+    if not all((dynamic, time_frequency_prepare, time_frequency, mode)):
+        return None
+    candidate = (mode or {}).get("modeCandidate") or {}
+    family_period = (dynamic or {}).get("referenceFamilyPeriodDays")
+    orders = tuple(int(value) for value in
+                   ((dynamic or {}).get("supportedHarmonicOrders") or ()))
+    reference_frequency = candidate.get("frequencyCyclesPerDay")
+    sectors = candidate.get("supportingSectors") or []
+    time_reference = (time_frequency_prepare or {}).get("absoluteTimeReferenceDays")
+    stable = ((time_frequency or {}).get("residualEvolution") or {}).get("classification")
+    if not (family_period and orders and reference_frequency and sectors
+            and time_reference is not None
+            and (mode or {}).get("independentModeEvidenceSurvived") is True
+            and (mode or {}).get("physicalMechanismResolved") is False
+            and stable == "STABLE_RESIDUAL_MODE"):
+        return None
+    evidence = {
+        "preferredFrequencyAtReference": float(reference_frequency),
+        "preferredPeriodAtReferenceDays": 1.0 / float(reference_frequency),
+        # A stable time-frequency classification is the persisted zero-drift
+        # model; this is evidence adaptation, not a fabricated measurement.
+        "fractionalFrequencyDriftPerDay": 0.0,
+        "timeReferenceDays": float(time_reference),
+        "preferredModel": {"signalSectors": [int(value) for value in sectors]},
+        "recommendedNextTest": "RESIDUAL_MODE_PIXEL_LOCALIZATION",
+        "evidenceSource": {
+            "path": "UNRESOLVED_FAMILY_DYNAMIC_HARMONIC_MODE_IDENTIFICATION",
+            "residualFrequency": "modeIdentification.modeCandidate.frequencyCyclesPerDay",
+            "signalSectors": "modeIdentification.modeCandidate.supportingSectors",
+            "timeReference": "timeFrequencyPreparation.absoluteTimeReferenceDays",
+            "drift": "timeFrequencySummary.residualEvolution.classification=STABLE_RESIDUAL_MODE",
+        },
+    }
+    return float(family_period), orders, evidence
+
+
 def dynamic_harmonic_continuation(summary: dict[str, Any], *, request_id: str) -> StageRequest:
     """Route dynamic-family evidence without assigning a physical mechanism."""
     residual = summary.get("recommendedNextTest") == "RESIDUAL_MULTIMODE_LOCALIZATION"
@@ -2888,12 +2931,22 @@ def build_engine(
             investigation,
             "openstar.tess.time-frequency.interpret",
         )
+        dynamic_harmonic = _latest_result_for_handler(
+            investigation, "openstar.tess.dynamic-harmonic.analyze",
+        )
         if morphology is None:
             raise RuntimeError("Time-frequency summary requires morphology evidence.")
         if interpreted is None:
             raise RuntimeError("Time-frequency summary requires the interpreted window search.")
         continuation = morphology.get("continuationEvidence") or {}
-        analysis_period = morphology.get("resolvedPhysicalPeriodDays")
+        preparation = _latest_result_for_handler(
+            investigation, "openstar.tess.time-frequency.prepare",
+        ) or {}
+        dynamic_reference = (preparation.get("periodReference") or {}).get("kind") == (
+            "UNRESOLVED_FAMILY_ANALYSIS_REFERENCE"
+        ) and dynamic_harmonic is not None
+        analysis_period = (dynamic_harmonic.get("referenceFamilyPeriodDays")
+                           if dynamic_reference else morphology.get("resolvedPhysicalPeriodDays"))
         if analysis_period is None and continuation.get("timeFrequencyEvolutionWarranted"):
             analysis_period = continuation.get("analysisReferencePeriodDays")
         if analysis_period is None:
@@ -2902,7 +2955,7 @@ def build_engine(
             interpretation=interpreted,
             physical_period_days=float(analysis_period),
         )
-        unresolved_reference = not bool(morphology.get("physicalCycleResolved"))
+        unresolved_reference = dynamic_reference or not bool(morphology.get("physicalCycleResolved"))
         summary["periodReference"] = {
             "periodDays": float(analysis_period),
             "kind": (
@@ -3229,6 +3282,18 @@ def build_engine(
         mode_identification = _latest_result_for_handler(
             investigation, "openstar.tess.mode-identification.analyze",
         )
+        dynamic_harmonic = _latest_result_for_handler(
+            investigation, "openstar.tess.dynamic-harmonic.analyze",
+        )
+        time_frequency_prepare = _latest_result_for_handler(
+            investigation, "openstar.tess.time-frequency.prepare",
+        )
+        time_frequency = _latest_result_for_handler(
+            investigation, "openstar.tess.time-frequency.summarize",
+        )
+        dynamic_path = _dynamic_mode_localization_evidence(
+            dynamic_harmonic, time_frequency_prepare, time_frequency, mode_identification,
+        )
         if identity is None:
             raise RuntimeError("v20.10 requires the completed catalog-identity stage.")
         if independent_prepare is None:
@@ -3247,7 +3312,10 @@ def build_engine(
             ((mode_identification or {}).get("establishedPeriodFamily") or {}).get("referencePeriodDays")
             if mode_path else morphology["resolvedPhysicalPeriodDays"]
         )
-        if mode_path:
+        harmonic_orders = (1, 2)
+        if dynamic_path is not None:
+            physical_period, harmonic_orders, nonstationary = dynamic_path
+        elif mode_path:
             candidate = mode_identification["modeCandidate"]
             nonstationary = {
                 "preferredFrequencyAtReference": candidate["frequencyCyclesPerDay"],
@@ -3275,7 +3343,15 @@ def build_engine(
             nonstationary_summary=nonstationary,
             output_dir=artifact_root,
             investigation_id=investigation.id,
+            harmonic_orders=harmonic_orders,
         )
+        spec["periodReference"] = {
+            "periodDays": physical_period,
+            "kind": ("UNRESOLVED_FAMILY_ANALYSIS_REFERENCE" if dynamic_path is not None
+                     else "MORPHOLOGY_RESOLVED_PHYSICAL_PERIOD"),
+            "physicalCycleResolved": dynamic_path is None,
+        }
+        spec["physicalMechanismResolved"] = False
         print(f"   generic workload: {spec.get('workloadID')}")
         print(f"   signal sectors: {spec.get('signalSectors')}")
         print(f"   prepared pixel datasets: {len(spec.get('preparedPixels') or [])}")
@@ -3301,6 +3377,8 @@ def build_engine(
                 "morphology": sha256_json(morphology),
                 "nonstationaryModeling": sha256_json(nonstationary),
                 "modeIdentification": sha256_json(mode_identification),
+                "dynamicHarmonicModeling": sha256_json(dynamic_harmonic),
+                "timeFrequencyEvolution": sha256_json(time_frequency),
             },
             artifacts=tuple(artifacts),
         )
@@ -3362,7 +3440,9 @@ def build_engine(
             store.directory_for(investigation.id)
             / "artifacts"
             / "residual-mode-localization"
-            / "residual-mode-localization-v20.10.json"
+            / ("residual-mode-localization-v20.10-harmonic-family-corrected.json"
+               if tuple(preparation.get("subtractedHarmonicOrders") or (1, 2)) != (1, 2)
+               else "residual-mode-localization-v20.10.json")
         )
         _write_json(artifact_path, localization)
         return StageOutcome(
@@ -3403,6 +3483,21 @@ def build_engine(
             investigation,
             "openstar.tess.nonstationary.summarize",
         )
+        dynamic_harmonic = _latest_result_for_handler(
+            investigation, "openstar.tess.dynamic-harmonic.analyze",
+        )
+        time_frequency_prepare = _latest_result_for_handler(
+            investigation, "openstar.tess.time-frequency.prepare",
+        )
+        time_frequency = _latest_result_for_handler(
+            investigation, "openstar.tess.time-frequency.summarize",
+        )
+        mode_identification = _latest_result_for_handler(
+            investigation, "openstar.tess.mode-identification.analyze",
+        )
+        dynamic_path = _dynamic_mode_localization_evidence(
+            dynamic_harmonic, time_frequency_prepare, time_frequency, mode_identification,
+        )
         residual_localization = _latest_result_for_handler(
             investigation,
             "openstar.tess.residual-mode-localization.interpret",
@@ -3411,9 +3506,11 @@ def build_engine(
             raise RuntimeError("v20.11 requires the completed catalog-identity stage.")
         if independent_prepare is None:
             raise RuntimeError("v20.11 requires frozen independent-sector metadata.")
-        if morphology is None or not morphology.get("physicalCycleResolved"):
+        if morphology is None:
+            raise RuntimeError("v20.11 requires persisted morphology evidence.")
+        if dynamic_path is None and not morphology.get("physicalCycleResolved"):
             raise RuntimeError("v20.11 requires the morphology-resolved physical period.")
-        if nonstationary is None:
+        if dynamic_path is None and nonstationary is None:
             raise RuntimeError("v20.11 requires the completed v20.9 nonstationary model.")
         if residual_localization is None:
             raise RuntimeError("v20.11 requires the completed v20.10 residual-mode localization.")
@@ -3422,7 +3519,11 @@ def build_engine(
                 "v20.10 did not recommend RESIDUAL_MODE_SOURCE_LOCALIZATION_REVIEW."
             )
 
-        physical_period = float(morphology["resolvedPhysicalPeriodDays"])
+        harmonic_orders = (1, 2)
+        if dynamic_path is not None:
+            physical_period, harmonic_orders, nonstationary = dynamic_path
+        else:
+            physical_period = float(morphology["resolvedPhysicalPeriodDays"])
         artifact_root = store.directory_for(investigation.id) / "artifacts"
         print("🧭 Preparing time-resolved residual-mode source localization review")
         print(f"   TIC: {prepared.get('ticID')}")
@@ -3442,7 +3543,15 @@ def build_engine(
             residual_localization_summary=residual_localization,
             output_dir=artifact_root,
             investigation_id=investigation.id,
+            harmonic_orders=harmonic_orders,
         )
+        spec["periodReference"] = {
+            "periodDays": physical_period,
+            "kind": ("UNRESOLVED_FAMILY_ANALYSIS_REFERENCE" if dynamic_path is not None
+                     else "MORPHOLOGY_RESOLVED_PHYSICAL_PERIOD"),
+            "physicalCycleResolved": dynamic_path is None,
+        }
+        spec["physicalMechanismResolved"] = False
         print(f"   generic workload: {spec.get('workloadID')}")
         print(f"   time windows: {len(spec.get('windowMetadata') or [])}")
         print(f"   prepared pixel-window datasets: {len(spec.get('preparedPixels') or [])}")
@@ -3468,6 +3577,9 @@ def build_engine(
                 "morphology": sha256_json(morphology),
                 "nonstationaryModeling": sha256_json(nonstationary),
                 "residualModeLocalization": sha256_json(residual_localization),
+                "dynamicHarmonicModeling": sha256_json(dynamic_harmonic),
+                "timeFrequencyEvolution": sha256_json(time_frequency),
+                "modeIdentification": sha256_json(mode_identification),
             },
             artifacts=tuple(artifacts),
         )
