@@ -1,5 +1,6 @@
 import math
 import random
+import time
 import unittest
 from unittest import mock
 
@@ -26,6 +27,130 @@ def signal_dataset(*, frequency, baseline, count=240, noise=0.08, seed=7):
             "totalFrequencies": 801,
         },
     }
+
+
+def benchmark_realistic_frequency_interval(sample_count=18000):
+    """Run the optimized profile on a TESS-sized series and return wall time."""
+    dataset = signal_dataset(
+        frequency=0.108,
+        baseline=27.0,
+        count=sample_count,
+        noise=0.08,
+    )
+    started = time.perf_counter()
+    result = estimate_frequency_interval(dataset, 0.108)
+    return time.perf_counter() - started, result
+
+
+def assert_nested_equivalent(test_case, optimized, reference, path="result"):
+    test_case.assertEqual(type(reference), type(optimized), path)
+    if isinstance(reference, dict):
+        test_case.assertEqual(reference.keys(), optimized.keys(), path)
+        for key in reference:
+            assert_nested_equivalent(
+                test_case, optimized[key], reference[key], f"{path}.{key}"
+            )
+    elif isinstance(reference, list):
+        test_case.assertEqual(len(reference), len(optimized), path)
+        for index, value in enumerate(reference):
+            assert_nested_equivalent(
+                test_case, optimized[index], value, f"{path}[{index}]"
+            )
+    elif isinstance(reference, float):
+        test_case.assertTrue(
+            math.isclose(optimized, reference, rel_tol=2e-11, abs_tol=2e-12),
+            f"{path}: optimized={optimized!r}, reference={reference!r}",
+        )
+    else:
+        test_case.assertEqual(reference, optimized, path)
+
+
+@unittest.skipIf(frequency_uncertainty.np is None, "NumPy is not installed")
+class VectorizedFrequencyUncertaintyEquivalenceTests(unittest.TestCase):
+    def assert_profile_equivalent(self, dataset, selected, **kwargs):
+        optimized = estimate_frequency_interval(dataset, selected, **kwargs)
+        with mock.patch("frequency_uncertainty.np", None):
+            reference = estimate_frequency_interval(dataset, selected, **kwargs)
+        assert_nested_equivalent(self, optimized, reference)
+        return optimized
+
+    def test_unweighted_profile_matches_scalar_reference(self):
+        self.assert_profile_equivalent(
+            signal_dataset(frequency=0.108, baseline=300.0), 0.108
+        )
+
+    def test_weighted_profile_matches_scalar_reference(self):
+        dataset = signal_dataset(frequency=0.108, baseline=180.0, noise=0.04)
+        dataset["measurementUncertainties"] = [
+            0.03 if index % 3 else 0.11
+            for index in range(len(dataset["times"]))
+        ]
+        _, diagnostics = self.assert_profile_equivalent(dataset, 0.108)
+        self.assertEqual(
+            "known-per-observation-standard-deviations",
+            diagnostics["noiseScaleTreatment"],
+        )
+
+    def test_relative_uncertainties_match_scalar_reference(self):
+        dataset = signal_dataset(frequency=0.108, baseline=180.0, noise=0.04)
+        dataset["measurementUncertainties"] = [
+            0.7 + (index % 5) * 0.1 for index in range(len(dataset["times"]))
+        ]
+        dataset["measurementUncertaintiesAreRelative"] = True
+        _, diagnostics = self.assert_profile_equivalent(dataset, 0.108)
+        self.assertEqual(
+            "profiled-global-residual-scale",
+            diagnostics["noiseScaleTreatment"],
+        )
+
+    def test_competing_mode_decision_matches_scalar_reference(self):
+        dataset = signal_dataset(frequency=0.108, baseline=239.0, noise=0.03)
+        dataset["times"] = [float(index) for index in range(240)]
+        randomizer = random.Random(19)
+        dataset["flux"] = [
+            math.sin(2.0 * math.pi * 0.108 * sample_time + 0.3)
+            + randomizer.gauss(0.0, 0.03)
+            for sample_time in dataset["times"]
+        ]
+        dataset["frequencySearch"]["maximumFrequency"] = 1.2
+        interval, diagnostics = self.assert_profile_equivalent(
+            dataset, 0.108, competing_frequencies=(1.108,)
+        )
+        self.assertIsNone(interval)
+        self.assertIn("competing peak", diagnostics["unavailableReason"])
+
+    def test_boundary_truncation_matches_scalar_reference(self):
+        dataset = signal_dataset(frequency=0.041, baseline=12.0, noise=0.3)
+        interval, diagnostics = self.assert_profile_equivalent(dataset, 0.041)
+        self.assertIsNone(interval)
+        self.assertIn("search boundary", diagnostics["unavailableReason"])
+
+    def test_singular_and_invalid_cases_match_scalar_reference(self):
+        singular = signal_dataset(frequency=0.108, baseline=0.0, count=12)
+        invalid = signal_dataset(frequency=0.108, baseline=20.0, count=12)
+        invalid["measurementUncertainties"] = [0.1] * 11 + [0.0]
+        singular_interval, singular_diagnostics = self.assert_profile_equivalent(
+            singular, 0.108
+        )
+        invalid_interval, invalid_diagnostics = self.assert_profile_equivalent(
+            invalid, 0.108
+        )
+        self.assertIsNone(singular_interval)
+        self.assertEqual(
+            "positive time baseline is required",
+            singular_diagnostics["unavailableReason"],
+        )
+        self.assertIsNone(invalid_interval)
+        self.assertEqual(
+            "measurement uncertainties are invalid",
+            invalid_diagnostics["unavailableReason"],
+        )
+
+    def test_realistic_tess_benchmark_helper(self):
+        elapsed, (interval, diagnostics) = benchmark_realistic_frequency_interval()
+        self.assertGreaterEqual(elapsed, 0.0)
+        self.assertIsNotNone(interval)
+        self.assertTrue(diagnostics["trustworthy"])
 
 
 class FrequencyUncertaintyTests(unittest.TestCase):
@@ -178,10 +303,17 @@ class FrequencyUncertaintyTests(unittest.TestCase):
                 "endFrequency": end,
             })
 
-        original = frequency_uncertainty._sinusoid_rss
-        with mock.patch(
-            "frequency_uncertainty._sinusoid_rss", wraps=original
-        ) as evaluated:
+        method = (
+            frequency_uncertainty._SinusoidProfile.rss
+            if frequency_uncertainty.np is not None
+            else frequency_uncertainty._sinusoid_rss_scalar
+        )
+        target = (
+            "frequency_uncertainty._SinusoidProfile.rss"
+            if frequency_uncertainty.np is not None
+            else "frequency_uncertainty._sinusoid_rss_scalar"
+        )
+        with mock.patch(target, autospec=True, wraps=method) as evaluated:
             interval, diagnostics = estimate_frequency_interval(
                 dataset,
                 0.108,

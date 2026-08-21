@@ -1,6 +1,13 @@
 """Generic profile-likelihood uncertainty for a sinusoidal frequency estimate."""
 
 import math
+from importlib.util import find_spec
+
+
+if find_spec("numpy") is not None:
+    import numpy as np
+else:
+    np = None
 
 
 _CHI_SQUARE_95_ONE_PARAMETER = 3.841458820694124
@@ -26,7 +33,8 @@ def _solve_3x3(matrix, vector):
     return [rows[index][3] for index in range(3)]
 
 
-def _sinusoid_rss(times, values, frequency, weights):
+def _sinusoid_rss_scalar(times, values, frequency, weights):
+    """Reference implementation retained for numerical equivalence testing."""
     columns = []
     for time in times:
         angle = 2.0 * math.pi * frequency * time
@@ -45,6 +53,62 @@ def _sinusoid_rss(times, values, frequency, weights):
         weight * (value - sum(a * b for a, b in zip(coefficients, row))) ** 2
         for row, value, weight in zip(columns, values, weights)
     )
+
+
+class _SinusoidProfile:
+    """Reusable observation arrays for repeated sinusoidal profile fits."""
+
+    def __init__(self, times, values, weights):
+        self.times = np.asarray(times, dtype=np.float64)
+        self.values = np.asarray(values, dtype=np.float64)
+        self.weights = np.asarray(weights, dtype=np.float64)
+        self.weight_sum = float(np.sum(self.weights))
+        self.weighted_value_sum = float(np.dot(self.weights, self.values))
+
+    def rss(self, frequency):
+        angles = (2.0 * math.pi * frequency) * self.times
+        cosine = np.cos(angles)
+        sine = np.sin(angles)
+        weighted_cosine = self.weights * cosine
+        weighted_sine = self.weights * sine
+        normal = (
+            (
+                self.weight_sum,
+                float(np.sum(weighted_cosine)),
+                float(np.sum(weighted_sine)),
+            ),
+            (
+                float(np.sum(weighted_cosine)),
+                float(np.dot(weighted_cosine, cosine)),
+                float(np.dot(weighted_cosine, sine)),
+            ),
+            (
+                float(np.sum(weighted_sine)),
+                float(np.dot(weighted_cosine, sine)),
+                float(np.dot(weighted_sine, sine)),
+            ),
+        )
+        rhs = (
+            self.weighted_value_sum,
+            float(np.dot(weighted_cosine, self.values)),
+            float(np.dot(weighted_sine, self.values)),
+        )
+        coefficients = _solve_3x3(normal, rhs)
+        if coefficients is None:
+            return None
+        residuals = (
+            self.values
+            - coefficients[0]
+            - coefficients[1] * cosine
+            - coefficients[2] * sine
+        )
+        return float(np.dot(self.weights, residuals * residuals))
+
+
+def _sinusoid_rss(times, values, frequency, weights):
+    if np is None:
+        return _sinusoid_rss_scalar(times, values, frequency, weights)
+    return _SinusoidProfile(times, values, weights).rss(frequency)
 
 
 def estimate_frequency_interval(
@@ -115,11 +179,18 @@ def estimate_frequency_interval(
             return None, diagnostics
 
     profile_evaluations = 0
+    profile = (
+        _SinusoidProfile(clean_times, clean_values, weights)
+        if np is not None
+        else None
+    )
 
     def evaluate_rss(trial_frequency):
         nonlocal profile_evaluations
         profile_evaluations += 1
-        return _sinusoid_rss(
+        if profile is not None:
+            return profile.rss(trial_frequency)
+        return _sinusoid_rss_scalar(
             clean_times, clean_values, trial_frequency, weights
         )
 
