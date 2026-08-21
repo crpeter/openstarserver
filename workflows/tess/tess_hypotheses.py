@@ -164,6 +164,8 @@ def catalog_coverage_complete(identity: dict[str, Any]) -> bool:
     interpretation, but TIC coordinates plus VSX/Gaia query availability are
     required before OpenStar may interpret "no catalog match" as evidence.
     """
+    if "catalogCoverageComplete" in identity:
+        return identity["catalogCoverageComplete"] is True
     tic = identity.get("tic") or {}
     vsx = identity.get("vsx") or {}
     gaia = identity.get("gaiaDR3") or {}
@@ -320,15 +322,17 @@ def plan(analysis: dict[str, Any], identity: dict[str, Any]) -> dict[str, Any]:
 
     if not analysis.get("catalogCoverageComplete"):
         claim = decision(
-            "HUMAN_REVIEW_REQUIRED",
-            "The required TIC/VSX/Gaia catalog path was not fully queryable, so OpenStar cannot treat a missing catalog period as scientific evidence.",
-            "Resolve the catalog-query errors and rerun the identity stage before making an uncataloged or independent-period claim.",
+            "CANDIDATE_PERIOD",
+            "The primary period is usable for independent follow-up, but external catalog coverage is incomplete.",
+            "No absence or uncataloged-period conclusion may be drawn from unavailable catalogs; their evidence gap remains unresolved.",
         )
         return {
-            "action": "STOP",
+            "action": "INDEPENDENT_SECTOR_FOLLOWUP",
             "claimDecision": claim.as_dict(),
             "reason": "catalog-coverage-incomplete",
             "queryErrors": list(query_errors),
+            "unresolvedCatalogDependencies": list(
+                identity.get("catalogsTransientlyUnavailable") or []),
         }
 
     if rotation.get("status") in {"ruled-out", "strongly-disfavored"}:
