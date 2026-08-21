@@ -4,7 +4,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from workflows.tess.tess_dynamic_harmonic import model_dynamic_harmonics
+from workflows.tess.tess_dynamic_harmonic import (
+    model_dynamic_harmonics,
+    refine_harmonic_family_frequency,
+)
 
 
 class TessDynamicHarmonicTests(unittest.TestCase):
@@ -63,6 +66,11 @@ class TessDynamicHarmonicTests(unittest.TestCase):
         self.assertEqual("HARMONIC_FAMILY_REQUIRES_FREQUENCY_REFINEMENT", result["classification"])
         self.assertEqual("openstar.lomb-scargle.v1",
                          result["frequencyRefinement"]["genericDistributedWorkloadIfNeeded"])
+        refined = refine_harmonic_family_frequency(result)
+        self.assertAlmostEqual(10.0, refined["refinedPeriodDays"], places=2)
+        self.assertFalse(refined["physicalPeriodChangeClaimed"])
+        self.assertEqual("openstar.lomb-scargle.v1",
+                         refined["distributedRefinement"]["workloadID"])
 
     def test_additional_mode_remains(self):
         result = self._run(residual=0.8)

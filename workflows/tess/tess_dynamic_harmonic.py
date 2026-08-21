@@ -232,3 +232,42 @@ def model_dynamic_harmonics(*, dataset_paths: Iterable[str | Path], reference_pe
             "physicalMechanismResolved": False, "recommendedNextTest": recommended,
             "dataReuse": {"frozenDatasetPaths": [str(Path(p).expanduser().resolve()) for p in paths], "downloadPerformed": False},
             "frequencyRefinement": {"genericDistributedWorkloadIfNeeded": GENERIC_REFINEMENT_WORKLOAD_ID}}
+
+
+def refine_harmonic_family_frequency(dynamic_result: dict[str, Any]) -> dict[str, Any]:
+    """Refine a coherent family frequency from harmonic-normalized phase slopes.
+
+    This is the deterministic interpretation of the frequency evidence already
+    measured by the dynamic fit.  If a wider search is subsequently required,
+    it remains an ordinary generic Lomb--Scargle workload.
+    """
+    if dynamic_result.get("recommendedNextTest") != "LOMB_SCARGLE_FREQUENCY_REFINEMENT":
+        raise ValueError("Frequency refinement was not recommended.")
+    coherence = dynamic_result.get("coherenceAssessment") or {}
+    slopes = [float(value) for value in coherence.get("normalizedPhaseSlopesRadiansPerDay") or []
+              if math.isfinite(float(value))]
+    if not slopes:
+        raise RuntimeError("Dynamic harmonic result has no coherent phase-slope evidence.")
+    slopes.sort()
+    slope = slopes[len(slopes) // 2]
+    old_frequency = float(dynamic_result["referenceFrequencyCyclesPerDay"])
+    refined_frequency = old_frequency + slope / (2 * math.pi)
+    if refined_frequency <= 0:
+        raise RuntimeError("Phase-slope refinement produced a non-positive frequency.")
+    return {
+        "classification": "COHERENT_HARMONIC_FAMILY_FREQUENCY_REFINED",
+        "originalFrequencyCyclesPerDay": old_frequency,
+        "refinedFrequencyCyclesPerDay": refined_frequency,
+        "originalPeriodDays": 1 / old_frequency,
+        "refinedPeriodDays": 1 / refined_frequency,
+        "frequencyCorrectionCyclesPerDay": refined_frequency - old_frequency,
+        "evidence": "COMMON_HARMONIC_NORMALIZED_PHASE_SLOPE",
+        "physicalPeriodChangeClaimed": False,
+        "physicalMechanismResolved": False,
+        "recommendedNextTest": "BINARY_ROTATION_EXTERNAL_EVIDENCE",
+        "distributedRefinement": {
+            "workloadID": GENERIC_REFINEMENT_WORKLOAD_ID,
+            "workerSemantics": "GENERIC_LOMB_SCARGLE",
+            "specializedTessWorkerLogic": False,
+        },
+    }

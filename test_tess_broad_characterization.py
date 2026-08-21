@@ -34,6 +34,7 @@ if _real_numpy is None:
 from workflows.tess.tess_investigation import build_engine
 from workflows.tess.tess_investigation import time_frequency_continuation
 from workflows.tess.tess_investigation import nonstationary_continuation
+from workflows.tess.tess_investigation import dynamic_harmonic_continuation
 from workflows.tess.tess_investigation import residual_mode_localization_continuation
 from workflows.tess.tess_investigation import residual_mode_localization_review_continuation
 from workflows.tess.tess_investigation import multisource_residual_continuation
@@ -51,6 +52,22 @@ if _installed_numpy_stub:
 
 
 class BroadIndependentCharacterizationTests(unittest.TestCase):
+    def test_dynamic_harmonic_routes_are_unresolved_family_safe(self):
+        residual = dynamic_harmonic_continuation(
+            {"recommendedNextTest": "RESIDUAL_MULTIMODE_LOCALIZATION"},
+            request_id="021-dynamic-harmonic-modeling",
+        )
+        self.assertEqual("openstar.tess.time-frequency.prepare", residual.handler_id)
+        self.assertEqual("DYNAMIC_HARMONIC_RESIDUAL", residual.parameters["entryReason"])
+        refinement = dynamic_harmonic_continuation(
+            {"recommendedNextTest": "LOMB_SCARGLE_FREQUENCY_REFINEMENT"},
+            request_id="021-dynamic-harmonic-modeling",
+        )
+        self.assertEqual(
+            "openstar.tess.dynamic-harmonic.frequency-refinement",
+            refinement.handler_id,
+        )
+
     def _complete(self, store, investigation, stage_id, handler_id, result):
         running = InvestigationStage(stage_id, handler_id, "RUNNING", None, {})
         investigation = store.append_running_stage(investigation, running)
@@ -102,6 +119,58 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
             encoding="utf-8",
         )
         return path
+
+    def test_tic_277940827_unresolved_family_dynamic_stage_does_not_enter_multimode(self):
+        """Regression for the persisted PR-54 terminal state of the real target."""
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        store = InvestigationStore(root / "investigations")
+        paths = []
+        period = 10.3008408008
+        for sector in range(4):
+            times = [sector * 70.0 + 24.0 * index / 399 for index in range(400)]
+            flux = [
+                (0.8 + 0.08 * sector) * math.sin(2 * math.pi * time / period + 0.04 * sector)
+                + 0.32 * math.sin(4 * math.pi * time / period + 0.2)
+                + 0.12 * math.sin(6 * math.pi * time / period - 0.1)
+                + 0.5 * math.sin(8 * math.pi * time / period + 0.3)
+                + 0.001 * math.sin(index * 1.731)
+                for index, time in enumerate(times)
+            ]
+            path = root / f"tic-277940827-sector-{sector}.json"
+            path.write_text(json.dumps({"times": times, "flux": flux,
+                                        "source": {"sector": sector}}))
+            paths.append(str(path))
+        investigation = store.create(
+            "tess-discovery-sector-1-tic-277940827", WORKFLOW_ID, WORKFLOW_VERSION,
+        )
+        investigation = self._complete(
+            store, investigation, "019-morphology", "openstar.tess.morphology.analyze",
+            {"physicalCycleResolved": False},
+        )
+        investigation = self._complete(
+            store, investigation, "020-mode-identification", "openstar.tess.mode-identification.analyze",
+            {"classification": "HIGHER_ORDER_HARMONIC_STRUCTURE",
+             "establishedPeriodFamily": {"referencePeriodDays": period},
+             "independentModeEvidenceSurvived": False,
+             "physicalMechanismResolved": False,
+             "recommendedNextTest": "DYNAMIC_HARMONIC_MODELING",
+             "dataReuse": {"frozenDatasetPaths": paths, "downloadPerformed": False}},
+        )
+        engine = build_engine(store, coordinator=types.SimpleNamespace(), poll_interval=0.0, timeout=None)
+        engine.chain_stages = False
+        completed, next_request = engine.run_stage(
+            investigation,
+            StageRequest("021-dynamic-harmonic-modeling", "openstar.tess.dynamic-harmonic.analyze",
+                         {}, "020-mode-identification"),
+            software_id="integration", software_version="20.30",
+        )
+        result = completed.stages[-1].result
+        self.assertFalse(result["physicalMechanismResolved"])
+        self.assertTrue(result["modelComparison"]["highestTestedHarmonicSupported"])
+        self.assertNotEqual("openstar.tess.multimode.prepare", next_request.handler_id)
+        self.assertEqual("openstar.tess.finalize", next_request.handler_id)
 
     def _interpret(self, periods, prominences, reliable=None):
         reliable = reliable or [True] * len(periods)
