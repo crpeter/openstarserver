@@ -18,11 +18,15 @@ from openstar_workflow import (
 )
 from workflows.tess.tess_autonomy import WORKFLOW_ID, repair_obsolete_terminal_wait
 from workflows.tess.tess_identity import (
+    AVAILABLE,
+    NOT_FOUND,
+    TRANSIENT_UNAVAILABLE,
     TRANSIENT_INFRASTRUCTURE,
     classify_query_exception,
     collect_identity,
     transient_required_catalog_failures,
 )
+from workflows.tess.tess_hypotheses import analyze, plan
 
 
 class CatalogTransientTests(unittest.TestCase):
@@ -140,6 +144,87 @@ class CatalogTransientTests(unittest.TestCase):
         }
         self.assertEqual([], transient_required_catalog_failures(identity))
 
+    @patch("workflows.tess.tess_identity._query_tess_products", return_value={"found": True})
+    @patch("workflows.tess.tess_identity._query_gaia_main", return_value={"found": False, "sources": []})
+    @patch("workflows.tess.tess_identity._query_vsx")
+    @patch("workflows.tess.tess_identity._query_simbad", return_value={"found": True})
+    @patch("workflows.tess.tess_identity._coordinate", return_value=object())
+    @patch("workflows.tess.tess_identity._query_tic", return_value={"found": True})
+    def test_vsx_timeout_preserves_partial_identity_and_evidence_gap(
+            self, _tic, _coordinate, _simbad, vsx, _gaia, _tess):
+        vsx.return_value = {
+            "found": False,
+            "queryError": "ReadTimeout: late",
+            "queryErrorType": "ReadTimeout",
+            "queryErrorClassification": TRANSIENT_INFRASTRUCTURE,
+        }
+        identity = collect_identity(231844926)
+
+        self.assertTrue(identity["identityResolved"])
+        self.assertFalse(identity["catalogCoverageComplete"])
+        self.assertEqual(TRANSIENT_UNAVAILABLE, identity["vsx"]["catalogState"])
+        self.assertIn("vsx", identity["catalogsTransientlyUnavailable"])
+        self.assertNotIn("vsx", identity["catalogsAvailable"])
+        self.assertEqual([], transient_required_catalog_failures(identity))
+        self.assertNotEqual(NOT_FOUND, identity["vsx"]["catalogState"])
+
+        analysis = analyze({
+            "preferredPhysicalPeriodDays": 1.5,
+            "periodStatus": "RELIABLE",
+            "periodConfidence": "high",
+        }, identity)
+        planned = plan(analysis, identity)
+        self.assertEqual("INDEPENDENT_SECTOR_FOLLOWUP", planned["action"])
+        self.assertEqual(["vsx"], planned["unresolvedCatalogDependencies"])
+        self.assertNotIn(
+            "no matching",
+            " ".join(planned["claimDecision"]["rationale"]).lower(),
+        )
+
+    @patch("workflows.tess.tess_identity._query_tess_products", return_value={"found": True})
+    @patch("workflows.tess.tess_identity._query_gaia_main", return_value={"found": False, "sources": []})
+    @patch("workflows.tess.tess_identity._query_vsx", return_value={"found": False, "matches": []})
+    @patch("workflows.tess.tess_identity._query_simbad", return_value={"found": True})
+    @patch("workflows.tess.tess_identity._coordinate", return_value=object())
+    @patch("workflows.tess.tess_identity._query_tic", return_value={"found": True})
+    def test_successful_empty_vsx_is_not_found_not_unavailable(self, *_mocks):
+        identity = collect_identity(1)
+        self.assertEqual(NOT_FOUND, identity["vsx"]["catalogState"])
+        self.assertIn("vsx", identity["catalogsAvailable"])
+        self.assertEqual([], identity["catalogsTransientlyUnavailable"])
+        self.assertTrue(identity["catalogCoverageComplete"])
+
+    def test_all_identity_defining_sources_unavailable_remains_retryable(self):
+        identity = {
+            "identityResolved": False,
+            "tic": {"queryErrorClassification": TRANSIENT_INFRASTRUCTURE},
+            "vsx": {"queryErrorClassification": TRANSIENT_INFRASTRUCTURE},
+            "gaiaDR3": {"queryErrorClassification": TRANSIENT_INFRASTRUCTURE},
+            "gaiaVariability": {},
+        }
+        self.assertEqual(["TIC", "VSX", "Gaia"],
+                         transient_required_catalog_failures(identity))
+
+    def test_gaia_outage_cannot_be_used_as_absence_evidence(self):
+        identity = {
+            "identityResolved": True,
+            "catalogCoverageComplete": False,
+            "catalogsTransientlyUnavailable": ["gaiaDR3"],
+            "queryErrors": ["Gaia: ReadTimeout: late"],
+            "tic": {"found": True, "catalogState": AVAILABLE},
+            "vsx": {"found": False, "matches": [], "catalogState": NOT_FOUND},
+            "gaiaDR3": {"found": False, "catalogState": TRANSIENT_UNAVAILABLE},
+            "gaiaVariability": {"catalogState": "DEPENDENCY_UNAVAILABLE"},
+        }
+        analysis = analyze({
+            "preferredPhysicalPeriodDays": 2.0,
+            "periodStatus": "RELIABLE", "periodConfidence": "high",
+        }, identity)
+        self.assertIsNone(analysis["bestCatalogMatch"])
+        planned = plan(analysis, identity)
+        self.assertEqual(["gaiaDR3"], planned["unresolvedCatalogDependencies"])
+        self.assertEqual("INDEPENDENT_SECTOR_FOLLOWUP", planned["action"])
+
 class CatalogRepairTests(unittest.TestCase):
     def _terminal(self, root, *, reason="catalog-coverage-incomplete", transient=True):
         store = InvestigationStore(root)
@@ -168,16 +253,13 @@ class CatalogRepairTests(unittest.TestCase):
             "schedulerAction": "INVESTIGATION_COMPLETE"})
         return store, inv
 
-    def test_terminal_timeout_repair_is_narrow_immutable_and_idempotent(self):
+    def test_historical_partial_identity_is_restart_safe_without_retry(self):
         with tempfile.TemporaryDirectory() as directory:
             store, inv = self._terminal(directory)
             stage_bytes = {path: path.read_bytes() for path in
                            (Path(directory) / "old/stages").glob("*.json")}
             repaired = repair_obsolete_terminal_wait(store, inv)
-            self.assertEqual("RUNNING", repaired.status)
-            selected = repaired.metadata["controlState"]["selectedExperiment"]
-            self.assertEqual("openstar.tess.catalog-identity", selected["handler_id"])
-            self.assertEqual("007-catalog-identity", selected["id"])
+            self.assertEqual(inv, repaired)
             self.assertEqual(stage_bytes, {path: path.read_bytes() for path in stage_bytes})
             self.assertEqual(repaired, repair_obsolete_terminal_wait(store, repaired))
 

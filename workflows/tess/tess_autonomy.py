@@ -272,6 +272,11 @@ _LEGACY_TRANSIENT_QUERY_TYPES = {
 
 
 def _transient_required_identity_failure(result: dict) -> bool:
+    # Catalog enrichment outages do not invalidate an identity already anchored
+    # by TIC.  This also makes historical snapshots (which predate aggregate
+    # coverage fields) restart-safe without scheduling repeated VizieR calls.
+    if result.get("identityResolved") is True or (result.get("tic") or {}).get("found"):
+        return False
     for key in ("tic", "vsx", "gaiaDR3", "gaiaVariability"):
         query = result.get(key) or {}
         if query.get("queryErrorClassification") == "TRANSIENT_INFRASTRUCTURE":

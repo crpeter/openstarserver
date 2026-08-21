@@ -21,6 +21,11 @@ GAIA_VARIABILITY_CATALOGS = (
 VSX_RADIUS_ARCSEC = 10.0
 GAIA_RADIUS_ARCSEC = 5.0
 TRANSIENT_INFRASTRUCTURE = "TRANSIENT_INFRASTRUCTURE"
+AVAILABLE = "AVAILABLE"
+NOT_FOUND = "NOT_FOUND"
+TRANSIENT_UNAVAILABLE = "TRANSIENT_UNAVAILABLE"
+PERMANENT_ERROR = "PERMANENT_ERROR"
+DEPENDENCY_UNAVAILABLE = "DEPENDENCY_UNAVAILABLE"
 
 
 def classify_query_exception(error: BaseException) -> str | None:
@@ -53,7 +58,26 @@ def _query_failure(error: BaseException) -> dict[str, Any]:
     classification = classify_query_exception(error)
     if classification:
         failure["queryErrorClassification"] = classification
+        failure["catalogState"] = TRANSIENT_UNAVAILABLE
+    else:
+        failure["catalogState"] = PERMANENT_ERROR
     return failure
+
+
+def _with_catalog_state(response: dict[str, Any]) -> dict[str, Any]:
+    """Add an explicit availability state without changing response evidence."""
+    result = dict(response)
+    if result.get("catalogState"):
+        return result
+    if result.get("queryError"):
+        result["catalogState"] = (
+            TRANSIENT_UNAVAILABLE
+            if result.get("queryErrorClassification") == TRANSIENT_INFRASTRUCTURE
+            else PERMANENT_ERROR
+        )
+    else:
+        result["catalogState"] = AVAILABLE if result.get("found") else NOT_FOUND
+    return result
 
 
 def _python_value(value: Any) -> Any:
@@ -458,6 +482,7 @@ def collect_identity(tic_id: int) -> dict[str, Any]:
         tic = _query_tic(tic_id)
     except Exception as error:
         tic = {"found": False, **_query_failure(error)}
+    tic = _with_catalog_state(tic)
     if tic.get("queryError"):
         query_errors.append(f"TIC: {tic['queryError']}")
 
@@ -471,6 +496,7 @@ def collect_identity(tic_id: int) -> dict[str, Any]:
         simbad = _query_simbad(tic_id)
     except Exception as error:
         simbad = {"found": False, **_query_failure(error)}
+    simbad = _with_catalog_state(simbad)
     if simbad.get("queryError"):
         query_errors.append(f"SIMBAD: {simbad['queryError']}")
 
@@ -478,6 +504,7 @@ def collect_identity(tic_id: int) -> dict[str, Any]:
         vsx = _query_vsx(coordinate)
     except Exception as error:
         vsx = {"found": False, **_query_failure(error)}
+    vsx = _with_catalog_state(vsx)
     if vsx.get("queryError"):
         query_errors.append(f"VSX: {vsx['queryError']}")
 
@@ -485,6 +512,7 @@ def collect_identity(tic_id: int) -> dict[str, Any]:
         gaia = _query_gaia_main(coordinate)
     except Exception as error:
         gaia = {"found": False, **_query_failure(error)}
+    gaia = _with_catalog_state(gaia)
     if gaia.get("queryError"):
         query_errors.append(f"Gaia: {gaia['queryError']}")
 
@@ -495,6 +523,15 @@ def collect_identity(tic_id: int) -> dict[str, Any]:
             gaia_variability = _query_gaia_variability(int(nearest["sourceID"]))
         except Exception as error:
             gaia_variability = {"classification": None, "tablesFound": [], "periodCandidates": [], **_query_failure(error)}
+    if not nearest and gaia.get("catalogState") in {TRANSIENT_UNAVAILABLE, PERMANENT_ERROR}:
+        gaia_variability["catalogState"] = DEPENDENCY_UNAVAILABLE
+        gaia_variability["dependency"] = "gaiaDR3"
+    else:
+        # An empty Gaia variability response is a successful catalog lookup.
+        gaia_variability = _with_catalog_state({
+            **gaia_variability,
+            "found": bool(gaia_variability.get("tablesFound")),
+        })
     for error in gaia_variability.get("queryErrors") or []:
         query_errors.append(f"Gaia variability: {error}")
     if gaia_variability.get("queryError"):
@@ -504,9 +541,37 @@ def collect_identity(tic_id: int) -> dict[str, Any]:
         tess = _query_tess_products(tic_id)
     except Exception as error:
         tess = {"found": False, "products": [], "officialProducts": [], **_query_failure(error)}
+    tess = _with_catalog_state(tess)
     if tess.get("queryError"):
         query_errors.append(f"TESS inventory: {tess['queryError']}")
 
+    # Keep the query identity beside each response/error so persisted evidence
+    # remains independently auditable and can safely become a future cache key.
+    tic["queryProvenance"] = {"service": "MAST", "catalog": "TIC", "ticID": int(tic_id)}
+    simbad["queryProvenance"] = {"service": "SIMBAD", "objectID": f"TIC {int(tic_id)}"}
+    vsx["queryProvenance"] = {
+        "service": "VizieR", "catalog": VSX_CATALOG,
+        "ticID": int(tic_id), "radiusArcsec": VSX_RADIUS_ARCSEC,
+    }
+    gaia["queryProvenance"] = {
+        "service": "VizieR", "catalog": GAIA_MAIN_CATALOG,
+        "ticID": int(tic_id), "radiusArcsec": GAIA_RADIUS_ARCSEC,
+    }
+    gaia_variability["queryProvenance"] = {
+        "service": "VizieR", "catalogs": list(GAIA_VARIABILITY_CATALOGS),
+        "gaiaSourceID": (nearest or {}).get("sourceID"),
+    }
+    tess["queryProvenance"] = {
+        "service": "MAST", "catalog": "TESS light-curve products",
+        "ticID": int(tic_id),
+    }
+
+    catalogs = {
+        "tic": tic, "simbad": simbad, "vsx": vsx, "gaiaDR3": gaia,
+        "gaiaVariability": gaia_variability, "tess": tess,
+    }
+    available_states = {AVAILABLE, NOT_FOUND}
+    required_coverage = ("tic", "vsx", "gaiaDR3", "gaiaVariability")
     return {
         "ticID": int(tic_id),
         "tic": tic,
@@ -517,12 +582,30 @@ def collect_identity(tic_id: int) -> dict[str, Any]:
         "tess": tess,
         "queryErrors": query_errors,
         "identityResolved": bool(tic.get("found")),
+        "catalogCoverageComplete": all(
+            catalogs[name].get("catalogState") in available_states
+            for name in required_coverage
+        ),
+        "catalogsAvailable": [
+            name for name, response in catalogs.items()
+            if response.get("catalogState") in available_states
+        ],
+        "catalogsTransientlyUnavailable": [
+            name for name, response in catalogs.items()
+            if response.get("catalogState") == TRANSIENT_UNAVAILABLE
+        ],
     }
 
 
 def transient_required_catalog_failures(identity: dict[str, Any]) -> list[str]:
-    """Return failed required period-catalog paths; optional enrichment is excluded."""
+    """Return transient failures that prevent establishing target identity.
+
+    Once TIC has established the target and coordinates, period-catalog outages
+    are persisted as evidence gaps rather than failing the whole identity stage.
+    """
     required = (("TIC", "tic"), ("VSX", "vsx"), ("Gaia", "gaiaDR3"),
                 ("Gaia variability", "gaiaVariability"))
+    if identity.get("identityResolved") or (identity.get("tic") or {}).get("found"):
+        return []
     return [name for name, key in required if
             (identity.get(key) or {}).get("queryErrorClassification") == TRANSIENT_INFRASTRUCTURE]
