@@ -182,32 +182,73 @@ class TessAutonomyIntegrationTests(unittest.TestCase):
         )
         for stage_id, handler, result in evidence:
             investigation = self._complete(investigation, stage_id, handler, result)
-        historical_stages = investigation.stages
-        running = InvestigationStage(
+        request = StageRequest(
             "018-review-prepare", "openstar.tess.residual-mode-localization-review.prepare",
-            "RUNNING", "017-localization-interpret", {},
+            {}, "017-localization-interpret",
         )
-        investigation = self.store.append_running_stage(investigation, running)
-        failed = self.store.build_terminal_stage(
-            stage_id=running.id, handler_id=running.handler_id, status="FAILED",
-            triggered_by_stage_id=running.triggered_by_stage_id, parameters={}, result=None,
-            error="RuntimeError: v20.11 requires the morphology-resolved physical period.",
-            software_id="legacy", software_version="20.9", started_at=running.started_at,
-        )
-        investigation = self.store.complete_current_stage(investigation, failed)
         investigation = self.store.set_control_state(
-            investigation, status="FAILED",
-            control_state={"schedulerAction": "INVESTIGATION_FAILED"},
+            investigation, status="RUNNING",
+            control_state={"schedulerAction": "RUN_EXPERIMENT",
+                           "selectedExperiment": asdict(request)},
         )
+        engine = WorkflowEngine(self.store)
+
+        def fail_review_prepare(_investigation, _request):
+            raise RuntimeError(
+                "v20.11 requires the morphology-resolved physical period."
+            )
+
+        engine.register_handler(request.handler_id, fail_review_prepare)
+        with self.assertRaisesRegex(RuntimeError, "morphology-resolved physical period"):
+            engine.run_stage(
+                investigation, request, software_id="legacy", software_version="20.9"
+            )
+        investigation = self.store.load(investigation.id)
+        self.assertEqual("FAILED", investigation.status)
+        self.assertEqual("RUN_EXPERIMENT",
+                         investigation.metadata["controlState"]["schedulerAction"])
+        old_stages = investigation.stages
+        old_stage_files = {
+            stage.id: self.store.stage_path_for(investigation.id, stage.id).read_bytes()
+            for stage in old_stages
+        }
 
         repaired = repair_obsolete_terminal_wait(self.store, investigation)
 
         self.assertEqual("RUNNING", repaired.status)
-        self.assertEqual(historical_stages + (failed,), repaired.stages)
+        self.assertEqual(old_stages, repaired.stages)
+        self.assertEqual(
+            "TESS_UNRESOLVED_DYNAMIC_LOCALIZATION_REVIEW_COMPATIBILITY_RETRY",
+            repaired.metadata["controlState"]["recovery"],
+        )
         selected = repaired.metadata["controlState"]["selectedExperiment"]
         self.assertEqual("openstar.tess.residual-mode-localization.prepare",
                          selected["handler_id"])
+        self.assertEqual(
+            old_stage_files,
+            {stage.id: self.store.stage_path_for(repaired.id, stage.id).read_bytes()
+             for stage in repaired.stages},
+        )
         self.assertEqual(repaired, repair_obsolete_terminal_wait(self.store, repaired))
+
+        unrelated = replace(
+            investigation,
+            metadata={**investigation.metadata,
+                      "controlState": {"schedulerAction": "RUN_EXPERIMENT",
+                                       "selectedExperiment": {
+                                           **asdict(request), "id": "another-stage"}}},
+        )
+        self.assertEqual(unrelated, repair_obsolete_terminal_wait(self.store, unrelated))
+        unrelated_failure = replace(
+            investigation,
+            stages=investigation.stages[:-1] + (
+                replace(investigation.stages[-1], error="RuntimeError: unrelated failure"),
+            ),
+        )
+        self.assertEqual(
+            unrelated_failure,
+            repair_obsolete_terminal_wait(self.store, unrelated_failure),
+        )
 
     def test_legacy_invalid_low_frequency_failure_resumes_independent_branch(self):
         target = self.source.enumerate_targets()[0]

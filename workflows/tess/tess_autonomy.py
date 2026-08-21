@@ -490,8 +490,7 @@ def _repair_unresolved_dynamic_localization_review_failure(
     store: InvestigationStore, investigation: Investigation, control: dict
 ) -> Investigation | None:
     """Resume only the obsolete v20.11 unresolved-family preparation failure."""
-    if (investigation.status != "FAILED" or not investigation.stages
-            or control.get("schedulerAction") != "INVESTIGATION_FAILED"):
+    if investigation.status != "FAILED" or not investigation.stages:
         return None
     failed = investigation.stages[-1]
     if (failed.status != "FAILED"
@@ -500,6 +499,19 @@ def _repair_unresolved_dynamic_localization_review_failure(
                 "requires the morphology-resolved physical period",
                 "requires the completed v20.9 nonstationary model",
             ))):
+        return None
+    scheduler_action = control.get("schedulerAction")
+    if scheduler_action not in ("RUN_EXPERIMENT", "INVESTIGATION_FAILED"):
+        return None
+    selected = control.get("selectedExperiment")
+    if selected is not None and (
+        not isinstance(selected, dict)
+        or selected.get("id") != failed.id
+        or selected.get("handler_id") != failed.handler_id
+        or not isinstance(selected.get("parameters"), dict)
+        or selected.get("parameters") != failed.parameters
+        or selected.get("triggered_by_stage_id") != failed.triggered_by_stage_id
+    ):
         return None
     morphology = _latest_complete(investigation, "openstar.tess.morphology.analyze")
     dynamic = _latest_complete(investigation, "openstar.tess.dynamic-harmonic.analyze")
