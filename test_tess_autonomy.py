@@ -520,6 +520,71 @@ class TessAutonomyIntegrationTests(unittest.TestCase):
             repair_obsolete_terminal_wait(self.store, unrelated_failure),
         )
 
+    def test_real_scheduler_chained_stage_022_failures_recover_append_only(self):
+        errors = (
+            "RuntimeError: v20.11 requires the morphology-resolved physical period.",
+            "RuntimeError: v20.11 requires the completed v20.9 nonstationary model.",
+        )
+        for offset, error in enumerate(errors):
+            with self.subTest(error=error):
+                investigation = self.store.create(
+                    f"real-stage-022-{offset}", WORKFLOW_ID, WORKFLOW_VERSION,
+                    metadata={},
+                )
+                stages = (
+                    InvestigationStage("010-morphology", "openstar.tess.morphology.analyze", "COMPLETE", None, {}, result={"physicalCycleResolved": False}),
+                    InvestigationStage("011-dynamic", "openstar.tess.dynamic-harmonic.analyze", "COMPLETE", "010-morphology", {}, result={"referenceFamilyPeriodDays": 10.3, "supportedHarmonicOrders": [1, 2, 3, 4]}),
+                    InvestigationStage("012-time-frequency-prepare", "openstar.tess.time-frequency.prepare", "COMPLETE", "011-dynamic", {}, result={"subtractedHarmonicOrders": [1, 2, 3, 4]}),
+                    InvestigationStage("013-time-frequency-summary", "openstar.tess.time-frequency.summarize", "COMPLETE", "012-time-frequency-prepare", {}, result={"residualEvolution": {"classification": "STABLE_RESIDUAL_MODE"}}),
+                    InvestigationStage("018-mode-identification", "openstar.tess.mode-identification.analyze", "COMPLETE", "013-time-frequency-summary", {}, result={"independentModeEvidenceSurvived": True}),
+                    InvestigationStage("019-prepare-residual-mode-localization", "openstar.tess.residual-mode-localization.prepare", "COMPLETE", "018-mode-identification", {}, result={"subtractedHarmonicOrders": [1, 2, 3, 4]}),
+                    InvestigationStage("020-run-residual-mode-localization", "openstar.tess.residual-mode-localization.run", "COMPLETE", "019-prepare-residual-mode-localization", {}, result={"status": "COMPLETE"}),
+                    InvestigationStage("021-interpret-residual-mode-localization", "openstar.tess.residual-mode-localization.interpret", "COMPLETE", "020-run-residual-mode-localization", {}, result={"recommendedNextTest": "RESIDUAL_MODE_SOURCE_LOCALIZATION_REVIEW"}),
+                    InvestigationStage("022-prepare-residual-mode-localization-review", "openstar.tess.residual-mode-localization-review.prepare", "FAILED", "021-interpret-residual-mode-localization", {}, error=error, failure_classification="NON_RETRYABLE"),
+                )
+                selected = stages[5]
+                investigation = replace(
+                    investigation, status="FAILED", stages=stages,
+                    metadata={"controlState": {
+                        "schedulerAction": "RUN_EXPERIMENT",
+                        "selectedExperiment": {
+                            "id": selected.id, "handler_id": selected.handler_id,
+                            "parameters": selected.parameters,
+                            "triggered_by_stage_id": selected.triggered_by_stage_id,
+                        },
+                    }},
+                )
+                self.store.save(investigation)
+                historical = investigation.stages
+
+                repaired = repair_obsolete_terminal_wait(self.store, investigation)
+                self.assertEqual("RUNNING", repaired.status)
+                self.assertEqual(historical, repaired.stages)
+                request = repaired.metadata["controlState"]["selectedExperiment"]
+                self.assertEqual("023-prepare-residual-mode-localization-review", request["id"])
+
+                workflow = WorkflowEngine(self.store)
+                workflow.register_handler(
+                    request["handler_id"],
+                    lambda _investigation, _request: StageOutcome(
+                        {"reviewPreparedFromPersistedEvidence": True}, stop=True
+                    ),
+                )
+                dispatcher = InvestigationDispatcher(self.store, workflow)
+                result = dispatcher.dispatch(
+                    repaired.id, software_id="test", software_version="current"
+                )
+                self.assertEqual("EXPERIMENT_DISPATCHED", result.disposition)
+                completed = self.store.load(repaired.id)
+                self.assertEqual(historical, completed.stages[:-1])
+                self.assertEqual(request["id"], completed.stages[-1].id)
+                self.assertEqual(completed, repair_obsolete_terminal_wait(self.store, completed))
+                restarted = dispatcher.dispatch(
+                    repaired.id, software_id="test", software_version="current"
+                )
+                self.assertEqual("EXPERIMENT_ALREADY_DISPATCHED", restarted.disposition)
+                self.assertEqual(len(historical) + 1, len(self.store.load(repaired.id).stages))
+
     def test_real_failed_multisource_prepare_appends_corrected_retry(self):
         target = self.source.enumerate_targets()[0]
         investigation = self.store.create(

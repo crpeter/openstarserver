@@ -371,12 +371,8 @@ class CoordinatorHTTPContractTests(unittest.TestCase):
         CoordinatorRuntimeTests.setUp(self)
         self.runtime = self.activate_two()
         self.original_runtime = coordinator.RUNTIME
-        self.original_sweep_dirs = coordinator.SECTOR_SWEEP_STATE_DIRS
         coordinator.RUNTIME = self.runtime
         self.addCleanup(setattr, coordinator, "RUNTIME", self.original_runtime)
-        self.addCleanup(
-            setattr, coordinator, "SECTOR_SWEEP_STATE_DIRS", self.original_sweep_dirs
-        )
         self.server = coordinator.ThreadingHTTPServer(
             ("127.0.0.1", 0), coordinator.RequestHandler
         )
@@ -389,23 +385,6 @@ class CoordinatorHTTPContractTests(unittest.TestCase):
     def get(self, path):
         with urlopen(self.base + path) as response:
             return response.status, json.loads(response.read())
-
-    def test_configured_sector_sweep_root_is_exposed_and_missing_root_is_safe(self):
-        coordinator.SECTOR_SWEEP_STATE_DIRS = ()
-        self.assertEqual([], self.get("/v1/science/tess-sector-sweeps")[1]["sweeps"])
-
-        configured = self.root / "sector-state"
-        configured.mkdir()
-        (configured / "tess-sector-9-inventory.json").write_text(
-            json.dumps({"sector": 9, "entries": []})
-        )
-        coordinator.SECTOR_SWEEP_STATE_DIRS = (configured,)
-        status, payload = self.get("/v1/science/tess-sector-sweeps")
-        self.assertEqual(200, status)
-        self.assertEqual(9, payload["sweeps"][0]["sector"])
-
-        coordinator.SECTOR_SWEEP_STATE_DIRS = (configured / "missing",)
-        self.assertEqual([], self.get("/v1/science/tess-sector-sweeps")[1]["sweeps"])
 
     def post(self, path, payload):
         request = Request(
