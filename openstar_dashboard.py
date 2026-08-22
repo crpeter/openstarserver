@@ -9,12 +9,13 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 from urllib.error import HTTPError, URLError
 from urllib.parse import unquote, urlparse
 from urllib.request import urlopen
 
 from dashboard import build_snapshot, history_snapshot
+from openstar_sector_sweep_status import sector_sweeps_projection
 
 ROOT = Path(__file__).resolve().parent
 
@@ -32,7 +33,6 @@ class CoordinatorClient:
         health = self.get("/v1/health")
         nodes = self.get("/v1/nodes")
         contributions = self.get("/v1/contributions/summary")
-        sector_sweeps = self.get("/v1/science/tess-sector-sweeps")
         entries = self.get("/v1/projects")
         # The project listing already contains the complete status snapshot.
         # Consuming it directly is both cheaper and internally consistent.
@@ -46,7 +46,6 @@ class CoordinatorClient:
             "nodes": nodes,
             "contributions": contributions,
             "projects": projects,
-            "sectorSweeps": sector_sweeps.get("sweeps", []),
         }
 
 
@@ -89,20 +88,28 @@ class DashboardApplication:
         coordinator: CoordinatorClient,
         telemetry: TelemetryStore | None = None,
         observation_cache_seconds: float = 1.5,
+        sector_sweep_state_dirs: Iterable[str | Path] = (),
     ):
         self.coordinator = coordinator
         self.telemetry = telemetry or TelemetryStore()
         self.observation_cache_seconds = observation_cache_seconds
+        self.sector_sweep_state_dirs = tuple(
+            Path(path).expanduser().resolve() for path in sector_sweep_state_dirs
+        )
         self._observation_lock = threading.Lock()
         self._cached_observation: dict[str, Any] | None = None
         self._cached_until = 0.0
 
     def observation(self) -> dict[str, Any]:
-        """Coalesce concurrent browser reads into one coordinator observation."""
+        """Coalesce concurrent browser reads into one dashboard observation."""
         with self._observation_lock:
             now = time.monotonic()
             if self._cached_observation is None or now >= self._cached_until:
-                self._cached_observation = self.coordinator.observation()
+                observation = self.coordinator.observation()
+                observation["sectorSweeps"] = sector_sweeps_projection(
+                    self.sector_sweep_state_dirs
+                )
+                self._cached_observation = observation
                 self._cached_until = time.monotonic() + self.observation_cache_seconds
             return self._cached_observation
 
@@ -237,9 +244,20 @@ def main():
     parser.add_argument("--coordinator", default="http://127.0.0.1:8080")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8081)
+    parser.add_argument(
+        "--sector-sweep-state-dir",
+        action="append",
+        default=[],
+        help="Durable TESS sector-sweep state root to observe read-only (repeatable).",
+    )
     args = parser.parse_args()
     server = make_server(
-        args.host, args.port, DashboardApplication(CoordinatorClient(args.coordinator))
+        args.host,
+        args.port,
+        DashboardApplication(
+            CoordinatorClient(args.coordinator),
+            sector_sweep_state_dirs=args.sector_sweep_state_dir,
+        ),
     )
     print(f"OpenStar dashboard: http://{args.host}:{args.port}/dashboard/")
     try:
