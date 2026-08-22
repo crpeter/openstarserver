@@ -264,8 +264,10 @@ class TessAutonomyIntegrationTests(unittest.TestCase):
               "supportedHarmonicOrders": [1, 2, 3, 4],
               "classification": "ADDITIONAL_VARIABILITY_REMAINS"}),
             ("035-review", "openstar.tess.residual-mode-localization-review.interpret",
-             {"classification": "RESIDUAL_MODE_SOURCE_SWITCHING_OR_BLEND",
-              "residualModeOrigin": "TIME_VARIABLE_OR_BLENDED",
+             {"crossTime": {
+                  "classification": "RESIDUAL_MODE_SOURCE_SWITCHING_OR_BLEND",
+                  "residualModeOrigin": "TIME_VARIABLE_OR_BLENDED",
+              },
               "recommendedNextTest": "MULTI_SOURCE_RESIDUAL_DECOMPOSITION"}),
         )
         for stage_id, handler, result in evidence:

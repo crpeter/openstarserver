@@ -584,13 +584,15 @@ def _repair_unresolved_dynamic_multisource_failure(
     )
     dynamic_result = (dynamic.result or {}) if dynamic else {}
     review_result = (review.result or {}) if review else {}
+    cross = review_result.get("crossTime") or {}
     if not (morphology and (morphology.result or {}).get("physicalCycleResolved") is False
             and dynamic
             and dynamic_result.get("referenceFamilyPeriodDays")
             and dynamic_result.get("supportedHarmonicOrders")
             and review
-            and review_result.get("classification")
+            and cross.get("classification")
                 == "RESIDUAL_MODE_SOURCE_SWITCHING_OR_BLEND"
+            and cross.get("residualModeOrigin") == "TIME_VARIABLE_OR_BLENDED"
             and review_result.get("recommendedNextTest")
                 == "MULTI_SOURCE_RESIDUAL_DECOMPOSITION"):
         return None
