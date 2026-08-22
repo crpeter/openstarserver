@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import http.client
 import json
-import math
 import os
 import re
 import socket
@@ -17,7 +16,22 @@ from typing import Any, Protocol, Sequence
 SCHEMA_VERSION = "1"
 SELECTION_ALGORITHM_VERSION = "spoc-cadence-preference-v1"
 PREFERRED_SPOC_CADENCE_SECONDS = 120.0
-TESS_ARCHIVE_TIMEOUT_SECONDS = float(
+def _archive_timeout_seconds(value: str) -> int:
+    """Parse the shared archive deadline as positive integral seconds."""
+    try:
+        timeout = int(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "OPENSTAR_TESS_ARCHIVE_TIMEOUT_SECONDS must be a positive integer."
+        ) from error
+    if timeout <= 0 or str(timeout) != value.strip():
+        raise ValueError(
+            "OPENSTAR_TESS_ARCHIVE_TIMEOUT_SECONDS must be a positive integer."
+        )
+    return timeout
+
+
+TESS_ARCHIVE_TIMEOUT_SECONDS = _archive_timeout_seconds(
     os.environ.get("OPENSTAR_TESS_ARCHIVE_TIMEOUT_SECONDS", "60")
 )
 
@@ -28,8 +42,6 @@ class TessArchiveTransientError(RuntimeError):
 
 def configure_tess_archive_timeout() -> None:
     """Configure the supported Astroquery/Astropy MAST transport deadlines."""
-    if not math.isfinite(TESS_ARCHIVE_TIMEOUT_SECONDS) or TESS_ARCHIVE_TIMEOUT_SECONDS <= 0:
-        raise ValueError("OPENSTAR_TESS_ARCHIVE_TIMEOUT_SECONDS must be finite and positive.")
     from astroquery import mast
 
     Observations = mast.Observations
@@ -46,7 +58,9 @@ def configure_tess_archive_timeout() -> None:
         # Dependency-light provider tests replace Astroquery with a test double.
         # A real Lightkurve/Astroquery installation always supplies Astropy.
         return
-    astropy_data_conf.remote_timeout = TESS_ARCHIVE_TIMEOUT_SECONDS
+    # Astropy's remote timeout is a floating-point ConfigItem, unlike the
+    # integer Astroquery MAST timeout.  Derive both from the one validated value.
+    astropy_data_conf.remote_timeout = float(TESS_ARCHIVE_TIMEOUT_SECONDS)
 
 
 def _exception_chain(error: BaseException):

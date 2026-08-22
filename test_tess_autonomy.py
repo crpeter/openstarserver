@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+from unittest import mock
 from dataclasses import asdict, replace
 from pathlib import Path
 
@@ -613,6 +614,70 @@ class TessAutonomyIntegrationTests(unittest.TestCase):
                 )
                 self.assertEqual("EXPERIMENT_ALREADY_DISPATCHED", restarted.disposition)
                 self.assertEqual(len(historical) + 1, len(self.store.load(repaired.id).stages))
+
+    def test_archive_timeout_stage_023_lineages_recover_append_only_and_fail_closed(self):
+        for resolved in (False, True):
+            with self.subTest(resolved=resolved):
+                family_period = 10.510316195053623 if resolved else 14.636494965204527
+                orders = [1, 2, 3] if resolved else [1, 2, 4]
+                frequency = 0.27101611598985065 if resolved else 0.27628980191811653
+                investigation = self.store.create(
+                    f"archive-timeout-{'resolved' if resolved else 'unresolved'}",
+                    WORKFLOW_ID, WORKFLOW_VERSION,
+                )
+                stages = (
+                    InvestigationStage("010-morphology", "openstar.tess.morphology.analyze", "COMPLETE", None, {}, result={"physicalCycleResolved": resolved, "resolvedPhysicalPeriodDays": family_period if resolved else None}),
+                    InvestigationStage("012-time-frequency-prepare", "openstar.tess.time-frequency.prepare", "COMPLETE", "010-morphology", {}, result={"absoluteTimeReferenceDays": 2500.0}),
+                    InvestigationStage("013-time-frequency-summary", "openstar.tess.time-frequency.summarize", "COMPLETE", "012-time-frequency-prepare", {}, result={"residualEvolution": {"classification": "STABLE_RESIDUAL_MODE"}}),
+                    InvestigationStage("018-mode-identification", "openstar.tess.mode-identification.analyze", "COMPLETE", "013-time-frequency-summary", {}, result={"classification": "INDEPENDENT_STABLE_MODE", "independentModeEvidenceSurvived": True, "physicalMechanismResolved": False, "establishedPeriodFamily": {"referencePeriodDays": family_period, "modeledHarmonicOrders": orders}, "modeCandidate": {"frequencyCyclesPerDay": frequency, "periodDays": 1 / frequency, "supportingSectors": [1, 28]}}),
+                    InvestigationStage("019-prepare-residual-mode-localization", "openstar.tess.residual-mode-localization.prepare", "COMPLETE", "018-mode-identification", {}, result={"subtractedHarmonicOrders": [1, 2]}),
+                    InvestigationStage("020-run-residual-mode-localization", "openstar.tess.residual-mode-localization.run", "COMPLETE", "019-prepare-residual-mode-localization", {}, result={}),
+                    InvestigationStage("021-interpret-residual-mode-localization", "openstar.tess.residual-mode-localization.interpret", "COMPLETE", "020-run-residual-mode-localization", {}, result={"recommendedNextTest": "RESIDUAL_MODE_SOURCE_LOCALIZATION_REVIEW"}),
+                    InvestigationStage("022-prepare-residual-mode-localization-review", "openstar.tess.residual-mode-localization-review.prepare", "FAILED", "021-interpret-residual-mode-localization", {}, error=("RuntimeError: v20.11 requires the completed v20.9 nonstationary model." if resolved else "RuntimeError: v20.11 requires the morphology-resolved physical period."), failure_classification="NON_RETRYABLE"),
+                    InvestigationStage("023-prepare-residual-mode-localization", "openstar.tess.residual-mode-localization.prepare", "FAILED", "022-prepare-residual-mode-localization-review", {}, error="RuntimeError: v20.10 could not prepare any residual-mode pixel datasets.", failure_classification="NON_RETRYABLE"),
+                )
+                selected = stages[-1]
+                failed = replace(investigation, status="FAILED", stages=stages, metadata={
+                    "controlState": {"schedulerAction": "RUN_EXPERIMENT",
+                                     "selectedExperiment": asdict(StageRequest(
+                                         selected.id, selected.handler_id,
+                                         selected.parameters,
+                                         selected.triggered_by_stage_id))}
+                })
+                self.store.save(failed)
+                # Materialize the two immutable ledger records represented by
+                # this production-history fixture.
+                for stage in stages[-2:]:
+                    self.store._atomic_write_json(
+                        self.store.stage_path_for(failed.id, stage.id),
+                        asdict(stage), replace=False,
+                    )
+                bytes_022 = self.store.stage_path_for(failed.id, stages[-2].id).read_bytes()
+                bytes_023 = self.store.stage_path_for(failed.id, stages[-1].id).read_bytes()
+
+                repaired = repair_obsolete_terminal_wait(self.store, failed)
+                request = repaired.metadata["controlState"]["selectedExperiment"]
+                self.assertEqual("RUNNING", repaired.status)
+                self.assertEqual("024-prepare-residual-mode-localization", request["id"])
+                self.assertEqual(stages[-1].id, request["triggered_by_stage_id"])
+                self.assertEqual(stages, repaired.stages)
+                self.assertEqual(bytes_022, self.store.stage_path_for(failed.id, stages[-2].id).read_bytes())
+                self.assertEqual(bytes_023, self.store.stage_path_for(failed.id, stages[-1].id).read_bytes())
+                self.assertEqual(repaired, repair_obsolete_terminal_wait(self.store, repaired))
+
+                # The registered production workflow recognizes the selected handler.
+                from workflows.tess.tess_investigation import build_engine
+                engine = build_engine(
+                    self.store, mock.Mock(), poll_interval=0.0, timeout=1.0
+                )
+                self.assertIn(request["handler_id"], engine.handlers)
+
+                for changed in (
+                    replace(failed, stages=stages[:-1] + (replace(stages[-1], triggered_by_stage_id="unrelated"),)),
+                    replace(failed, stages=(replace(stages[0], result={"physicalCycleResolved": True, "resolvedPhysicalPeriodDays": family_period + 1}),) + stages[1:]),
+                    replace(failed, stages=stages[:-2] + (replace(stages[-2], handler_id="openstar.tess.other.prepare"), stages[-1])),
+                ):
+                    self.assertEqual(changed, repair_obsolete_terminal_wait(self.store, changed))
 
     def test_real_failed_multisource_prepare_appends_corrected_retry(self):
         target = self.source.enumerate_targets()[0]
