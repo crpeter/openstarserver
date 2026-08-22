@@ -8,17 +8,18 @@ source .venv/bin/activate
 
 The optional dashboard is a separate process. It only performs `GET` requests against the
 coordinator's existing `/v1` APIs, so the coordinator and workers operate normally when the
-dashboard is stopped or absent.
+dashboard is stopped or absent. For sector-level progress, the sidecar may also read explicitly
+configured persisted TESS sweep roots directly; those reads never start, restart, or modify a
+sweep.
 
 ```bash
-# Terminal 1: existing coordinator. To expose an existing persisted sector
-# sweep, point the read-only status projection at its state root. This does not
-# start, restart, or modify the sweep. Repeat the flag for additional roots.
-python coordinator.py --idle --host 127.0.0.1 --port 8080 \
-  --sector-sweep-state-dir /path/to/existing-sector-sweep-state
+# Terminal 1: existing coordinator
+python coordinator.py --idle --host 127.0.0.1 --port 8080
 
-# Terminal 2: dashboard
-python openstar_dashboard.py --coordinator http://127.0.0.1:8080 --host 127.0.0.1 --port 8081
+# Terminal 2: dashboard. Repeat --sector-sweep-state-dir for additional roots.
+python openstar_dashboard.py --coordinator http://127.0.0.1:8080 \
+  --host 127.0.0.1 --port 8081 \
+  --sector-sweep-state-dir /path/to/existing-sector-sweep-state
 ```
 
 Open <http://127.0.0.1:8081/dashboard/>.
