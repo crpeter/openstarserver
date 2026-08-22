@@ -1,5 +1,6 @@
 import json
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -153,6 +154,26 @@ class ProjectionTests(unittest.TestCase):
         self.assertEqual("charging", phone["powerState"])
         self.assertTrue(phone["lowPowerMode"])
 
+    def test_newer_coordinator_timestamp_wins_over_older_heartbeat(self):
+        coordinator = FakeCoordinator()
+        coordinator.observed["nodes"][0]["lastSeenAt"] = 990
+        store = TelemetryStore()
+        store.update(
+            {"nodeID": "mac-1", "telemetry": {"deviceName": "Telemetry still joins"}},
+            now=500,
+        )
+        snapshot = build_snapshot(
+            coordinator.observed["nodes"],
+            coordinator.observed["contributions"],
+            coordinator.observed["projects"],
+            store.snapshot(),
+            now=1000,
+        )
+        mac = snapshot["workers"][0]
+        self.assertEqual(990, mac["lastSeenAt"])
+        self.assertEqual("coordinator_registration", mac["lastSeenSource"])
+        self.assertEqual("Telemetry still joins", mac["name"])
+
     def test_telemetry_store_is_ephemeral_copy_and_validates(self):
         store = TelemetryStore()
         payload = {"nodeID": "mac", "telemetry": {"thermalState": "serious"}}
@@ -179,13 +200,66 @@ class CoordinatorClientTests(unittest.TestCase):
             "/v1/health": {"ok": True},
             "/v1/nodes": [],
             "/v1/contributions/summary": {"allTime": {}, "currentSession": {}},
-            "/v1/projects": [{"projectID": "alpha beta"}],
-            "/v1/projects/alpha%20beta/status": {"projectID": "alpha beta"},
+            "/v1/projects": [
+                {"projectID": "alpha beta", "status": {"projectID": "alpha beta"}}
+            ],
         }
         client.get = lambda path: calls.append(path) or replies[path]
         client.observation()
         self.assertEqual(list(replies), calls)
         self.assertTrue(all(path.startswith("/v1/") for path in calls))
+
+    def test_project_list_nested_status_is_used_without_per_project_reads(self):
+        client = CoordinatorClient("http://coordinator")
+        calls = []
+        replies = {
+            "/v1/health": {},
+            "/v1/nodes": [],
+            "/v1/contributions/summary": {},
+            "/v1/projects": [
+                {
+                    "projectID": "one",
+                    "status": {"projectID": "one", "status": "RUNNING"},
+                },
+                {
+                    "projectID": "two",
+                    "status": {"projectID": "two", "status": "COMPLETE"},
+                },
+            ],
+        }
+        client.get = lambda path: calls.append(path) or replies[path]
+        observation = client.observation()
+        self.assertEqual(
+            ["one", "two"], [item["projectID"] for item in observation["projects"]]
+        )
+        self.assertEqual(4, len(calls))
+        self.assertFalse(any(path.endswith("/status") for path in calls))
+
+    def test_concurrent_snapshots_share_short_lived_observation(self):
+        coordinator = FakeCoordinator()
+        original = coordinator.observation
+
+        def slow_observation():
+            time.sleep(0.05)
+            return original()
+
+        coordinator.observation = slow_observation
+        application = DashboardApplication(coordinator, observation_cache_seconds=1.5)
+        barrier = threading.Barrier(4)
+        results = []
+
+        def read_snapshot():
+            barrier.wait()
+            results.append(application.snapshot()[0])
+
+        threads = [threading.Thread(target=read_snapshot) for _ in range(3)]
+        for thread in threads:
+            thread.start()
+        barrier.wait()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(3, len(results))
+        self.assertEqual(1, coordinator.calls)
 
     def test_coordinator_modules_have_no_dashboard_dependency(self):
         for path in (

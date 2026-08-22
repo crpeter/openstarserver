@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import threading
 import time
@@ -10,7 +11,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, unquote, urlparse
+from urllib.parse import unquote, urlparse
 from urllib.request import urlopen
 
 from dashboard import build_snapshot, history_snapshot
@@ -32,13 +33,13 @@ class CoordinatorClient:
         nodes = self.get("/v1/nodes")
         contributions = self.get("/v1/contributions/summary")
         entries = self.get("/v1/projects")
-        projects = []
-        for entry in entries:
-            project_id = str(entry.get("projectID") or "")
-            if project_id:
-                projects.append(
-                    self.get(f"/v1/projects/{quote(project_id, safe='')}/status")
-                )
+        # The project listing already contains the complete status snapshot.
+        # Consuming it directly is both cheaper and internally consistent.
+        projects = [
+            copy.deepcopy(entry["status"])
+            for entry in entries
+            if isinstance(entry.get("status"), dict)
+        ]
         return {
             "health": health,
             "nodes": nodes,
@@ -82,13 +83,29 @@ class TelemetryStore:
 
 class DashboardApplication:
     def __init__(
-        self, coordinator: CoordinatorClient, telemetry: TelemetryStore | None = None
+        self,
+        coordinator: CoordinatorClient,
+        telemetry: TelemetryStore | None = None,
+        observation_cache_seconds: float = 1.5,
     ):
         self.coordinator = coordinator
         self.telemetry = telemetry or TelemetryStore()
+        self.observation_cache_seconds = observation_cache_seconds
+        self._observation_lock = threading.Lock()
+        self._cached_observation: dict[str, Any] | None = None
+        self._cached_until = 0.0
+
+    def observation(self) -> dict[str, Any]:
+        """Coalesce concurrent browser reads into one coordinator observation."""
+        with self._observation_lock:
+            now = time.monotonic()
+            if self._cached_observation is None or now >= self._cached_until:
+                self._cached_observation = self.coordinator.observation()
+                self._cached_until = time.monotonic() + self.observation_cache_seconds
+            return self._cached_observation
 
     def snapshot(self) -> tuple[dict[str, Any], dict[str, Any]]:
-        observation = self.coordinator.observation()
+        observation = self.observation()
         snapshot = build_snapshot(
             observation["nodes"],
             observation["contributions"],

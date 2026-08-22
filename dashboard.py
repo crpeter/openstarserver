@@ -3,12 +3,21 @@
 from __future__ import annotations
 
 import copy
+import math
 import time
 from collections import Counter
 from typing import Any
 
 CONNECTED_SECONDS = 150.0
 RECENTLY_OFFLINE_SECONDS = 900.0
+
+
+def _timestamp(value: Any) -> float | None:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if math.isfinite(result) and result >= 0 else None
 
 
 def _value(node: dict[str, Any], telemetry: dict[str, Any], *names: str) -> Any:
@@ -63,9 +72,16 @@ def build_snapshot(
             if isinstance(heartbeat.get("telemetry"), dict)
             else {}
         )
-        heartbeat_at = heartbeat.get("receivedAt")
-        coordinator_seen = node.get("lastSeenAt") or node.get("registeredAt")
-        last_seen = heartbeat_at if heartbeat_at is not None else coordinator_seen
+        heartbeat_at = _timestamp(heartbeat.get("receivedAt"))
+        coordinator_seen = _timestamp(node.get("lastSeenAt"))
+        if coordinator_seen is None:
+            coordinator_seen = _timestamp(node.get("registeredAt"))
+        valid_timestamps = [
+            timestamp
+            for timestamp in (heartbeat_at, coordinator_seen)
+            if timestamp is not None
+        ]
+        last_seen = max(valid_timestamps) if valid_timestamps else None
         age = max(0.0, now - float(last_seen)) if last_seen else None
         connection = (
             "connected"
@@ -105,7 +121,7 @@ def build_snapshot(
                 "lastSeenAt": last_seen,
                 "lastSeenSource": (
                     "dashboard_heartbeat"
-                    if heartbeat_at is not None
+                    if heartbeat_at is not None and heartbeat_at == last_seen
                     else "coordinator_registration"
                 ),
                 "currentAssignments": copy.deepcopy(
