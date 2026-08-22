@@ -34,7 +34,10 @@ def frozen_residual_localization_family(
         return None
     if not (stable and (mode or {}).get("independentModeEvidenceSurvived") is True
             and (mode or {}).get("physicalMechanismResolved") is False
-            and family_period > 0 and frequency > 0 and candidate_period > 0
+            and math.isfinite(family_period) and family_period > 0
+            and math.isfinite(frequency) and frequency > 0
+            and math.isfinite(candidate_period) and candidate_period > 0
+            and math.isfinite(time_reference)
             and orders and sectors and all(value > 0 for value in orders)
             and len(set(orders)) == len(orders)
             and math.isclose(candidate_period, 1.0 / frequency, rel_tol=1e-6)):
@@ -63,7 +66,10 @@ def frozen_residual_localization_family(
             physical_period = float((morphology or {})["resolvedPhysicalPeriodDays"])
         except (KeyError, TypeError, ValueError):
             return None
-        if physical_period <= 0:
+        if (not math.isfinite(physical_period) or physical_period <= 0
+                or not math.isclose(
+                    physical_period, family_period, rel_tol=1e-9, abs_tol=1e-12
+                )):
             return None
         reference_kind = "MORPHOLOGY_RESOLVED_PHYSICAL_PERIOD"
     else:

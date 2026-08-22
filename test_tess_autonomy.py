@@ -572,6 +572,20 @@ class TessAutonomyIntegrationTests(unittest.TestCase):
                 self.store.save(investigation)
                 historical = investigation.stages
 
+                if resolved:
+                    inconsistent = replace(
+                        investigation,
+                        stages=(replace(
+                            investigation.stages[0],
+                            result={"physicalCycleResolved": True,
+                                    "resolvedPhysicalPeriodDays": family_period + 1.0},
+                        ),) + investigation.stages[1:],
+                    )
+                    self.assertEqual(
+                        inconsistent,
+                        repair_obsolete_terminal_wait(self.store, inconsistent),
+                    )
+
                 repaired = repair_obsolete_terminal_wait(self.store, investigation)
                 self.assertEqual("RUNNING", repaired.status)
                 self.assertEqual(historical, repaired.stages)
