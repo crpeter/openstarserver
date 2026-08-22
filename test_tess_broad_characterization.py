@@ -46,7 +46,12 @@ from workflows.tess.tess_investigation import multisource_residual_continuation
 from workflows.tess.tess_time_frequency import _fit_family_python
 from workflows.tess.tess_multisource_residual import interpret_multisource_residual_project
 from workflows.tess.tess_multisource_residual import _prewhiten_cube_raw
-from workflows.tess.tess_prf_refinement import compare_prf_hypotheses, diagnose_prf_cube
+from workflows.tess.tess_prf_refinement import (
+    _prewhitened_coherent_basis,
+    compare_prf_hypotheses,
+    diagnose_prf_cube,
+    run_prf_deblending,
+)
 from workflows.tess.tess_spoc_prf import _render_prf_template
 
 # The dependency stub exists only to make the optional-handler import graph
@@ -164,6 +169,99 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
                          captured["family_evidence"]["resultHash"])
         self.assertEqual("openstar.tess.multi-source-residual.run", next_request.handler_id)
         self.assertEqual("openstar.lomb-scargle.v1", result["workloadID"])
+
+    @unittest.skipIf(_real_numpy is None, "NumPy is required for PRF refinement")
+    def test_unresolved_dynamic_v2012_is_authoritative_prf_bridge(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        store = InvestigationStore(Path(temporary.name) / "investigations")
+        investigation = store.create("tic-277940827-prf", WORKFLOW_ID, WORKFLOW_VERSION)
+        family_source = {"stageID": "021-dynamic", "handlerID":
+                         "openstar.tess.dynamic-harmonic.analyze", "resultHash": "family"}
+        residual_source = {"stageID": "035-review", "handlerID":
+                           "openstar.tess.residual-mode-localization-review.interpret",
+                           "resultHash": "residual"}
+        decomposition_preparation = {
+            "physicalPeriodDays": 10.30084080080649,
+            "referenceFamilyPeriodDays": 10.30084080080649,
+            "subtractedHarmonicOrders": [1, 2, 3, 4],
+            "physicalCycleResolved": False,
+            "familyModelProvenance": {"sourceEvidence": family_source},
+            "referenceFrequency": 1 / 2.2071724078510457,
+            "fractionalFrequencyDriftPerDay": 0.0,
+            "timeReferenceDays": 2500.0,
+            "residualModelProvenance": {
+                "referenceFrequency": 1 / 2.2071724078510457,
+                "referencePeriodDays": 2.2071724078510457,
+                "fractionalFrequencyDriftPerDay": 0.0, "timeReferenceDays": 2500.0,
+                "signalSectors": [1], "sourceEvidence": residual_source,
+            },
+            "preparedSeries": [
+                {"sector": 1, "componentID": "target", "pixelCenter": {"x": 1, "y": 1}},
+                {"sector": 1, "componentID": "offset-2", "pixelCenter": {"x": 2, "y": 2}},
+            ],
+        }
+        decomposition = {
+            "recommendedNextTest": "PIXEL_RESPONSE_FUNCTION_DEBLENDING",
+            "physicalMechanismResolved": False, "bestOffsetComponentID": "offset-2",
+            "spatialComponents": [
+                {"componentID": "target", "componentType": "TARGET"},
+                {"componentID": "offset-2", "componentType": "OFFSET"},
+            ],
+        }
+        stages = (
+            ("001", "openstar.tess.prepare-target", {"ticID": 277940827}),
+            ("002", "openstar.tess.catalog-identity",
+             {"tic": {"metadata": {"raDeg": 10.0, "decDeg": -20.0}}}),
+            ("010", "openstar.tess.morphology.analyze", {"physicalCycleResolved": False}),
+            ("030", "openstar.tess.residual-mode-localization.interpret", {}),
+            ("035", "openstar.tess.residual-mode-localization-review.interpret", {}),
+            ("038", "openstar.tess.multi-source-residual.prepare", decomposition_preparation),
+            ("039", "openstar.tess.multi-source-residual.run", {}),
+            ("040", "openstar.tess.multi-source-residual.interpret", decomposition),
+        )
+        for stage_id, handler, result in stages:
+            investigation = self._complete(store, investigation, stage_id, handler, result)
+        engine = build_engine(store, mock.Mock(), poll_interval=0.0, timeout=1.0)
+        request = StageRequest("041", "openstar.tess.official-spoc-prf-forward-modeling.prepare", {})
+        completed, _ = engine.run_stage(investigation, request, software_id="test",
+                                        software_version="20.13")
+        prepared = completed.stages[-1].result
+        self.assertNotIn("nonstationaryResidual", prepared["priorEvidence"])
+        self.assertFalse(prepared["physicalCycleResolved"])
+        self.assertEqual([1, 2, 3, 4], prepared["subtractedHarmonicOrders"])
+        self.assertEqual(family_source,
+                         prepared["familyModelProvenance"]["sourceEvidence"])
+        self.assertEqual(residual_source,
+                         prepared["residualModelProvenance"]["sourceEvidence"])
+
+        times = _real_numpy.linspace(0.0, 20.0, 120)
+        cube = _real_numpy.ones((120, 2, 2))
+        tpf = types.SimpleNamespace(
+            time=types.SimpleNamespace(value=times),
+            flux=types.SimpleNamespace(value=cube),
+        )
+        with mock.patch("workflows.tess.tess_prf_refinement._download_tpf",
+                        return_value=(tpf, "frozen")), mock.patch(
+            "workflows.tess.tess_prf_refinement._prewhiten_cube_raw",
+            return_value=(cube, _real_numpy.ones((2, 2), dtype=bool)),
+        ) as prewhiten:
+            run_prf_deblending(prepared)
+        self.assertEqual((1, 2, 3, 4),
+                         prewhiten.call_args.kwargs["harmonic_orders"])
+
+        basis_two = _prewhitened_coherent_basis(
+            times=times, physical_frequency=1 / 10.30084080080649,
+            residual_frequency=3 / 10.30084080080649, time_reference=0.0, drift=0.0,
+            harmonic_orders=(1, 2),
+        )
+        basis_four = _prewhitened_coherent_basis(
+            times=times, physical_frequency=1 / 10.30084080080649,
+            residual_frequency=3 / 10.30084080080649, time_reference=0.0, drift=0.0,
+            harmonic_orders=(1, 2, 3, 4),
+        )
+        self.assertGreater(float(_real_numpy.std(basis_two[:, 0])), 0.5)
+        self.assertLess(float(_real_numpy.std(basis_four)), 1e-10)
 
     @unittest.skipIf(_real_numpy is None, "NumPy is required for pixel prewhitening")
     def test_multisource_prewhitening_subtracts_persisted_full_family(self):

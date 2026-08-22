@@ -3879,7 +3879,6 @@ def build_engine(
             "targetPreparation": "openstar.tess.prepare-target",
             "targetIdentity": "openstar.tess.catalog-identity",
             "physicalMorphology": "openstar.tess.morphology.analyze",
-            "nonstationaryResidual": "openstar.tess.nonstationary.summarize",
             "staticLocalization": "openstar.tess.residual-mode-localization.interpret",
             "localizationReview": "openstar.tess.residual-mode-localization-review.interpret",
             "decompositionPreparation": "openstar.tess.multi-source-residual.prepare",
@@ -3887,6 +3886,14 @@ def build_engine(
         }
         evidence = {name: _latest_result_for_handler(investigation, handler)
                     for name, handler in required_handlers.items()}
+        # v20.9 remains authoritative for the morphology-resolved route.  The
+        # unresolved dynamic-family route intentionally bypasses it, so its
+        # durable v20.12 preparation is the bridge to PRF refinement instead.
+        nonstationary = _latest_result_for_handler(
+            investigation, "openstar.tess.nonstationary.summarize"
+        )
+        if nonstationary is not None:
+            evidence["nonstationaryResidual"] = nonstationary
         missing = [name for name, value in evidence.items() if value is None]
         if missing:
             raise RuntimeError("PRF deblending requires persisted prior evidence: " + ", ".join(missing))
@@ -3895,8 +3902,13 @@ def build_engine(
                 or decomposition.get("physicalMechanismResolved") is not False):
             raise RuntimeError("Multi-source decomposition did not request unresolved PRF deblending.")
         morphology = evidence["physicalMorphology"]
-        if not morphology.get("physicalCycleResolved"):
-            raise RuntimeError("PRF deblending requires the established morphology-resolved physical cycle.")
+        decomposition_preparation = evidence["decompositionPreparation"]
+        if (not morphology.get("physicalCycleResolved")
+                and decomposition_preparation.get("physicalCycleResolved") is not False):
+            raise RuntimeError(
+                "PRF deblending requires either a morphology-resolved physical cycle or "
+                "persisted unresolved dynamic-family v20.12 preparation."
+            )
         spec = prepare_prf_deblending(
             evidence=evidence,
             output_dir=store.directory_for(investigation.id) / "artifacts",
