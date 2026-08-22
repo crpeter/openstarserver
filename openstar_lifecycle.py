@@ -81,8 +81,11 @@ def persisted_scheduling_state(
     Unlike ``prepare``, this helper never plans, synthesizes recovery, or writes.
     ``None`` means a scheduler round is required before a state is authoritative.
     """
+    # A persisted RUNNING stage is written before its handler starts. Without
+    # live scheduler evidence it is impossible to distinguish healthy in-flight
+    # execution from an orphan left by a stopped process.
     if any(stage.status == "RUNNING" for stage in investigation.stages):
-        return InvestigationSchedulingState.RECOVERY_REQUIRED
+        return None
     latest_failed = (
         investigation.stages[-1]
         if investigation.stages and investigation.stages[-1].status == "FAILED"

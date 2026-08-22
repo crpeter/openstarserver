@@ -191,6 +191,8 @@ class ProjectionTests(unittest.TestCase):
         self.assertIn("textContent", script)
         self.assertIn("/api/dashboard/workers/${encodeURIComponent(id)}", script)
         self.assertIn("renderSectors(activity.sectorSweeps || [])", script)
+        self.assertIn("In flight or recovery", script)
+        self.assertNotIn("Recovery required", script)
         self.assertIn("project.projectCompletedWorkUnits", script)
 
 

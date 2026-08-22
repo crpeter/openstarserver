@@ -91,9 +91,19 @@ class SectorSweepProjectionTests(unittest.TestCase):
             self.assertEqual(1, sweep["failed"])
             self.assertEqual(1, sweep["blockedPrerequisites"])
             self.assertEqual(1, sweep["waitingExternalData"])
-            self.assertEqual(1, sweep["recoveryRequired"])
+            self.assertEqual(0, sweep["recoveryRequired"])
+            self.assertEqual(1, sweep["inFlightOrRecovery"])
             self.assertEqual(1, sweep["runnable"])
             self.assertEqual(0, sweep["unclassified"])
+
+    def test_persisted_running_stage_is_not_definite_recovery(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.write_inventory(root, 1, 1)
+            self.write_investigation(root, 1, stage_status="RUNNING")
+            sweep = sector_sweep_projection(root)[0]
+            self.assertEqual(0, sweep["recoveryRequired"])
+            self.assertEqual(1, sweep["inFlightOrRecovery"])
+            self.assertEqual(0, sweep["runnable"])
 
     def test_unadmitted_inventory_is_not_runnable(self):
         with tempfile.TemporaryDirectory() as root:

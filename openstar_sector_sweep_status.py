@@ -48,6 +48,10 @@ def sector_sweep_projection(state_dir: str | Path) -> list[dict[str, Any]]:
         complete = sum(item.status == "COMPLETE" for item in admitted_items)
         remaining = max(0, inventory_count - complete)
         states = [persisted_scheduling_state(item) for item in admitted_items]
+        persisted_running = [
+            any(stage.status == "RUNNING" for stage in item.stages)
+            for item in admitted_items
+        ]
         state_counts = {
             state: sum(item == state for item in states)
             for state in InvestigationSchedulingState
@@ -66,6 +70,7 @@ def sector_sweep_projection(state_dir: str | Path) -> list[dict[str, Any]]:
                 "recoveryRequired": state_counts[
                     InvestigationSchedulingState.RECOVERY_REQUIRED
                 ],
+                "inFlightOrRecovery": sum(persisted_running),
                 "runnable": state_counts[InvestigationSchedulingState.RUNNABLE],
                 "waitingExternalData": state_counts[
                     InvestigationSchedulingState.WAITING_EXTERNAL_DATA
@@ -74,7 +79,10 @@ def sector_sweep_projection(state_dir: str | Path) -> list[dict[str, Any]]:
                     InvestigationSchedulingState.BLOCKED_PREREQUISITES
                 ],
                 "failed": state_counts[InvestigationSchedulingState.FAILED],
-                "unclassified": sum(item is None for item in states),
+                "unclassified": sum(
+                    state is None and not running
+                    for state, running in zip(states, persisted_running)
+                ),
                 "progress": progress,
             }
         )
