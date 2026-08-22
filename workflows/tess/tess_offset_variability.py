@@ -252,12 +252,20 @@ def build_offset_source_variability_project(
     identity: dict[str, Any],
     primary_sector: int | None,
     independent_spec: dict[str, Any],
-    physical_period_days: float,
-    nonstationary_summary: dict[str, Any],
     multisource_summary: dict[str, Any],
     offset_source_identification: dict[str, Any],
     output_dir: str | Path,
     investigation_id: str,
+    physical_period_days: float | None = None,
+    nonstationary_summary: dict[str, Any] | None = None,
+    reference_family_period_days: float | None = None,
+    harmonic_orders: tuple[int, ...] | list[int] | None = None,
+    physical_cycle_resolved: bool | None = None,
+    residual_reference_frequency: float | None = None,
+    residual_time_reference_days: float | None = None,
+    fractional_frequency_drift_per_day: float | None = None,
+    frozen_sectors: list[int] | None = None,
+    family_residual_provenance: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     source_project = _load_json(source_project_path)
     source_workload_id = str(source_project.get("workloadID") or "")
@@ -273,12 +281,19 @@ def build_offset_source_variability_project(
     }:
         raise RuntimeError("v20.14 requires v20.13 to recommend offset-source variability validation.")
 
+    nonstationary_summary = nonstationary_summary or {}
     best_offset = _best_offset_summary(multisource_summary)
-    reference_frequency = _float(best_offset.get("combinedFrequency"))
+    reference_frequency = _float(residual_reference_frequency)
+    if reference_frequency is None or reference_frequency <= 0:
+        reference_frequency = _float(best_offset.get("combinedFrequency"))
     if reference_frequency is None or reference_frequency <= 0:
         reference_frequency = _float(nonstationary_summary.get("preferredFrequencyAtReference"))
-    q = _float(nonstationary_summary.get("fractionalFrequencyDriftPerDay"))
-    time_reference = _float(nonstationary_summary.get("timeReferenceDays"))
+    q = _float(fractional_frequency_drift_per_day)
+    if q is None:
+        q = _float(nonstationary_summary.get("fractionalFrequencyDriftPerDay"))
+    time_reference = _float(residual_time_reference_days)
+    if time_reference is None:
+        time_reference = _float(nonstationary_summary.get("timeReferenceDays"))
     if reference_frequency is None or reference_frequency <= 0 or q is None or time_reference is None:
         raise RuntimeError("v20.14 requires the completed v20.9 drift model and v20.12 offset frequency.")
 
@@ -302,15 +317,25 @@ def build_offset_source_variability_project(
         for value in ((nonstationary_summary.get("preferredModel") or {}).get("signalSectors") or [])
         if _int(value) is not None
     ]
-    sectors = _sector_candidates(
-        primary_sector=primary_sector,
-        independent_spec=independent_spec,
-        signal_sectors=signal_sectors,
-    )
+    sectors = ([(int(value), "frozen-family-residual-bridge") for value in frozen_sectors]
+               if frozen_sectors else _sector_candidates(
+                   primary_sector=primary_sector,
+                   independent_spec=independent_spec,
+                   signal_sectors=signal_sectors))
     if not sectors:
         raise RuntimeError("v20.14 found no frozen sectors to validate the catalog counterpart.")
 
-    physical_frequency = 1.0 / float(physical_period_days)
+    family_period = _float(reference_family_period_days)
+    if family_period is None:
+        family_period = _float(physical_period_days)
+    if family_period is None or family_period <= 0:
+        raise RuntimeError("v20.14 requires a persisted family prewhitening period.")
+    orders = tuple(int(value) for value in (harmonic_orders or (1, 2)))
+    if not orders or any(value <= 0 for value in orders):
+        raise RuntimeError("v20.14 requires positive persisted harmonic orders.")
+    physical_frequency = 1.0 / family_period
+    cycle_resolved = (bool(physical_cycle_resolved) if physical_cycle_resolved is not None
+                      else reference_family_period_days is None and physical_period_days is not None)
     search = _frequency_search(float(reference_frequency))
     target_sky = _skycoord(float(target_ra), float(target_dec))
     candidate_sky = _skycoord(candidate_ra, candidate_dec)
@@ -360,6 +385,7 @@ def build_offset_source_variability_project(
                 absolute_times=absolute_times,
                 cube=corrected,
                 physical_frequency=physical_frequency,
+                harmonic_orders=orders,
             )
             component_series, diagnostic = _catalog_guided_series(
                 residual_cube=residual_cube,
@@ -405,6 +431,9 @@ def build_offset_source_variability_project(
                         "sectorRole": role,
                         "referenceFrequency": float(reference_frequency),
                         "fractionalFrequencyDriftPerDay": float(q),
+                        "referenceFamilyPeriodDays": float(family_period),
+                        "subtractedHarmonicOrders": list(orders),
+                        "physicalCycleResolved": cycle_resolved,
                         "catalogCounterpart": {
                             "ticID": _int(candidate_ids.get("ticID")),
                             "gaiaDR3SourceID": _int(candidate_ids.get("gaiaDR3SourceID")),
@@ -477,6 +506,9 @@ def build_offset_source_variability_project(
                 "componentID": component_id,
                 "referenceFrequency": float(reference_frequency),
                 "fractionalFrequencyDriftPerDay": float(q),
+                "referenceFamilyPeriodDays": float(family_period),
+                "subtractedHarmonicOrders": list(orders),
+                "physicalCycleResolved": cycle_resolved,
                 "catalogCounterpart": {
                     "ticID": _int(candidate_ids.get("ticID")),
                     "gaiaDR3SourceID": _int(candidate_ids.get("gaiaDR3SourceID")),
@@ -530,6 +562,9 @@ def build_offset_source_variability_project(
             ),
             "referenceFrequency": float(reference_frequency),
             "fractionalFrequencyDriftPerDay": float(q),
+            "referenceFamilyPeriodDays": float(family_period),
+            "subtractedHarmonicOrders": list(orders),
+            "physicalCycleResolved": cycle_resolved,
             "catalogCounterpart": {
                 "ticID": _int(candidate_ids.get("ticID")),
                 "gaiaDR3SourceID": _int(candidate_ids.get("gaiaDR3SourceID")),
@@ -563,6 +598,11 @@ def build_offset_source_variability_project(
         "bestOffsetComponentID": multisource_summary.get("bestOffsetComponentID"),
         "referenceFrequency": float(reference_frequency),
         "referencePeriodDays": float(1.0 / reference_frequency),
+        "referenceFamilyPeriodDays": float(family_period),
+        "subtractedHarmonicOrders": list(orders),
+        "physicalCycleResolved": cycle_resolved,
+        "familyResidualModelProvenance": dict(family_residual_provenance or {}),
+        "frozenSectors": [int(sector) for sector, _ in sectors],
         "fractionalFrequencyDriftPerDay": float(q),
         "timeReferenceDays": float(time_reference),
         "frequencySearch": search,

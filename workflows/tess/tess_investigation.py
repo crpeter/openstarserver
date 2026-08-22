@@ -77,6 +77,11 @@ from .tess_prf_deblend import (
     build_calibrated_prf_deblending_project,
     interpret_calibrated_prf_deblending_project,
 )
+from .tess_catalog_guided_localization import (
+    prepare_catalog_guided_localization,
+    run_catalog_guided_localization,
+    interpret_catalog_guided_localization,
+)
 from .tess_difference_image import (
     build_difference_image_project,
     interpret_difference_image_project,
@@ -505,6 +510,11 @@ def catalog_counterpart_variability_continuation(
         and candidate.get("decDeg") is not None
         and (ids.get("ticID") is not None or ids.get("gaiaDR3SourceID") is not None)
     )
+    run_localization = (
+        summary.get("recommendedNextTest") == "CATALOG_GUIDED_SOURCE_LOCALIZATION"
+        and summary.get("physicalMechanismResolved") is False
+        and len(summary.get("plausibleCatalogCandidates") or []) >= 2
+    )
     run_validation = (
         summary.get("recommendedNextTest")
         == "INDEPENDENT_COUNTERPART_PHOTOMETRIC_VARIABILITY_VALIDATION"
@@ -514,14 +524,16 @@ def catalog_counterpart_variability_continuation(
     return StageRequest(
         id=_next_stage_id(
             request_id,
-            "prepare-offset-source-variability" if run_validation else "finalize",
+            "prepare-catalog-guided-source-localization" if run_localization
+            else "prepare-offset-source-variability" if run_validation else "finalize",
         ),
         handler_id=(
-            "openstar.tess.offset-source-variability.prepare"
-            if run_validation
+            "openstar.tess.catalog-guided-source-localization.prepare" if run_localization
+            else "openstar.tess.offset-source-variability.prepare" if run_validation
             else "openstar.tess.finalize"
         ),
-        parameters={} if run_validation else {"outputSuffix": "catalog-counterpart"},
+        parameters={} if (run_validation or run_localization)
+        else {"outputSuffix": "catalog-counterpart"},
         triggered_by_stage_id=request_id,
     )
 
@@ -3980,6 +3992,73 @@ def build_engine(
             artifacts=(_artifact(path, "application/json"),),
         )
 
+    def catalog_guided_localization_prepare_stage(investigation, request):
+        catalog = _latest_result_for_handler(
+            investigation, "openstar.tess.catalog-counterpart-identification.analyze")
+        prf = _latest_result_for_handler(
+            investigation, "openstar.tess.official-spoc-prf-forward-modeling.prepare")
+        if catalog is None or prf is None:
+            raise RuntimeError("Catalog-guided localization requires persisted catalog and PRF evidence.")
+        preparation = prepare_catalog_guided_localization(
+            catalog_summary=catalog, prf_preparation=prf,
+            output_dir=store.directory_for(investigation.id) / "artifacts",
+            investigation_id=investigation.id)
+        return StageOutcome(
+            result=preparation,
+            next_stage=StageRequest(_next_stage_id(request.id, "run-catalog-guided-source-localization"),
+                                    "openstar.tess.catalog-guided-source-localization.run", {}, request.id),
+            input_hashes={"catalogCounterpart": sha256_json(catalog),
+                          "officialSPOCPRFPreparation": sha256_json(prf)},
+            artifacts=(_artifact(Path(preparation["preparationPath"]), "application/json"),))
+
+    def catalog_guided_localization_run_stage(investigation, request):
+        preparation = _latest_result_for_handler(
+            investigation, "openstar.tess.catalog-guided-source-localization.prepare")
+        if preparation is None:
+            raise RuntimeError("Catalog-guided localization run requires completed preparation.")
+        # Acquisition/rendering remains coordinator-local; catalog semantics never enter a
+        # generic worker request. Frozen arrays are an optional deterministic test boundary.
+        result = run_catalog_guided_localization(
+            preparation, sector_inputs=request.parameters.get("sectorInputs"))
+        path = Path(preparation["artifactRoot"]) / "run.json"
+        _write_json(path, result)
+        return StageOutcome(
+            result=result,
+            next_stage=StageRequest(_next_stage_id(request.id, "interpret-catalog-guided-source-localization"),
+                                    "openstar.tess.catalog-guided-source-localization.interpret", {}, request.id),
+            input_hashes={"preparation": sha256_json(preparation)},
+            artifacts=(_artifact(path, "application/json"),))
+
+    def catalog_guided_localization_interpret_stage(investigation, request):
+        preparation = _latest_result_for_handler(
+            investigation, "openstar.tess.catalog-guided-source-localization.prepare")
+        run = _latest_result_for_handler(
+            investigation, "openstar.tess.catalog-guided-source-localization.run")
+        if preparation is None or run is None:
+            raise RuntimeError("Catalog-guided localization interpretation requires prepare and run.")
+        result = interpret_catalog_guided_localization(preparation, run)
+        path = Path(preparation["artifactRoot"]) / "interpretation.json"
+        _write_json(path, result)
+        candidate = result.get("preferredCandidate") or {}
+        ids = candidate.get("catalogIDs") or {}
+        justified = (candidate.get("raDeg") is not None and candidate.get("decDeg") is not None
+                     and (ids.get("ticID") is not None or ids.get("gaiaDR3SourceID") is not None))
+        continue_validation = (
+            result.get("sourceAttributionResolved") is True and justified
+            and result.get("recommendedNextTest")
+            == "INDEPENDENT_COUNTERPART_PHOTOMETRIC_VARIABILITY_VALIDATION")
+        unresolved = not continue_validation
+        return StageOutcome(
+            result=result,
+            next_stage=(StageRequest(
+                _next_stage_id(request.id, "prepare-offset-source-variability"),
+                "openstar.tess.offset-source-variability.prepare", {}, request.id)
+                if continue_validation else None),
+            stop=unresolved,
+            final_status="QUIESCENT_AWAITING_DATA" if unresolved else "COMPLETE",
+            input_hashes={"preparation": sha256_json(preparation), "run": sha256_json(run)},
+            artifacts=(_artifact(path, "application/json"),))
+
     def offset_source_identification_stage(investigation, request):
         prepared = _latest_result_for_handler(investigation, "openstar.tess.prepare-target")
         identity = _latest_result_for_handler(investigation, "openstar.tess.catalog-identity")
@@ -4050,19 +4129,36 @@ def build_engine(
         independent_prepare = _latest_result_for_handler(investigation, "openstar.tess.independent.prepare")
         morphology = _latest_result_for_handler(investigation, "openstar.tess.morphology.analyze")
         nonstationary = _latest_result_for_handler(investigation, "openstar.tess.nonstationary.summarize")
-        independent_prepare = _latest_result_for_handler(investigation, "openstar.tess.independent.prepare")
+        catalog_guided_prepare = _latest_result_for_handler(
+            investigation, "openstar.tess.catalog-guided-source-localization.prepare")
+        official_prf_prepare = _latest_result_for_handler(
+            investigation, "openstar.tess.official-spoc-prf-forward-modeling.prepare")
         multisource = _latest_result_for_handler(investigation, "openstar.tess.multi-source-residual.interpret")
-        catalog_counterpart = _latest_result_for_handler(
+        catalog_counterpart = (_latest_result_for_handler(
+            investigation, "openstar.tess.catalog-guided-source-localization.interpret")
+            or _latest_result_for_handler(
             investigation, "openstar.tess.catalog-counterpart-identification.analyze"
-        )
+        ))
         offset_source = catalog_counterpart or _latest_result_for_handler(
             investigation, "openstar.tess.offset-source-identification.analyze")
         if prepared is None or identity is None or independent_prepare is None:
             raise RuntimeError("v20.14 requires frozen target, identity, and independent-sector preparation.")
-        if morphology is None or not morphology.get("physicalCycleResolved"):
-            raise RuntimeError("v20.14 requires the morphology-resolved physical period.")
-        if nonstationary is None or multisource is None or offset_source is None:
-            raise RuntimeError("v20.14 requires completed drift, decomposition, and catalog results.")
+        dynamic_bridge = catalog_guided_prepare or official_prf_prepare
+        unresolved_dynamic_route = bool(
+            dynamic_bridge and dynamic_bridge.get("physicalCycleResolved") is False
+            and dynamic_bridge.get("referenceFamilyPeriodDays") is not None
+            and dynamic_bridge.get("subtractedHarmonicOrders")
+            and dynamic_bridge.get("residualReferenceFrequency") is not None
+            and dynamic_bridge.get("residualTimeReferenceDays") is not None
+            and dynamic_bridge.get("fractionalFrequencyDriftPerDay") is not None)
+        historical_route = bool(
+            morphology and morphology.get("physicalCycleResolved") and nonstationary)
+        if not historical_route and not unresolved_dynamic_route:
+            raise RuntimeError(
+                "v20.14 requires either resolved morphology/nonstationary evidence or the "
+                "persisted unresolved family/residual PRF bridge.")
+        if multisource is None or offset_source is None:
+            raise RuntimeError("v20.14 requires completed decomposition and catalog results.")
         if offset_source.get("recommendedNextTest") not in {
             "OFFSET_SOURCE_VARIABILITY_VALIDATION",
             "OFFSET_SOURCE_VARIABILITY_MATCH_TEST",
@@ -4080,7 +4176,13 @@ def build_engine(
         print(f"   counterpart Gaia DR3: {ids.get('gaiaDR3SourceID')}")
         print(f"   offset component: {multisource.get('bestOffsetComponentID')}")
         print("   simultaneously deblending target-control and catalog-counterpart residual series per sector")
-        print("   established 13.72-day family is removed before distributed residual searches")
+        family_period = (float(dynamic_bridge["referenceFamilyPeriodDays"])
+                         if unresolved_dynamic_route
+                         else float(morphology["resolvedPhysicalPeriodDays"]))
+        harmonic_orders = ([int(value) for value in dynamic_bridge["subtractedHarmonicOrders"]]
+                           if unresolved_dynamic_route else None)
+        print(f"   persisted {family_period}-day family is removed before distributed residual searches")
+        print(f"   physical cycle resolved: {not unresolved_dynamic_route}")
         spec = build_offset_source_variability_project(
             source_project_path=prepared["sourceProjectPath"],
             source_dataset_entry=prepared["sourceDatasetEntry"],
@@ -4088,12 +4190,30 @@ def build_engine(
             identity=identity,
             primary_sector=prepared.get("sector"),
             independent_spec=independent_prepare,
-            physical_period_days=float(morphology["resolvedPhysicalPeriodDays"]),
-            nonstationary_summary=nonstationary,
             multisource_summary=multisource,
             offset_source_identification=offset_source,
             output_dir=artifact_root,
             investigation_id=investigation.id,
+            physical_period_days=(float(morphology["resolvedPhysicalPeriodDays"])
+                                  if historical_route else None),
+            nonstationary_summary=nonstationary if historical_route else None,
+            reference_family_period_days=family_period if unresolved_dynamic_route else None,
+            harmonic_orders=harmonic_orders,
+            physical_cycle_resolved=False if unresolved_dynamic_route else True,
+            residual_reference_frequency=(dynamic_bridge["residualReferenceFrequency"]
+                                          if unresolved_dynamic_route else None),
+            residual_time_reference_days=(dynamic_bridge["residualTimeReferenceDays"]
+                                          if unresolved_dynamic_route else None),
+            fractional_frequency_drift_per_day=(
+                dynamic_bridge["fractionalFrequencyDriftPerDay"]
+                if unresolved_dynamic_route else None),
+            frozen_sectors=(list(dynamic_bridge.get("sectors") or [])
+                            if unresolved_dynamic_route else None),
+            family_residual_provenance=(
+                {"bridgeVersion": dynamic_bridge.get("version"),
+                 "preparationPath": dynamic_bridge.get("preparationPath"),
+                 "priorEvidence": dynamic_bridge.get("priorEvidence")}
+                if unresolved_dynamic_route else None),
         )
         print(f"   generic workload: {spec.get('workloadID')}")
         print(f"   reference residual period: {spec.get('referencePeriodDays')} days")
@@ -4116,8 +4236,9 @@ def build_engine(
             ),
             input_hashes={
                 "identity": sha256_json(identity),
-                "morphology": sha256_json(morphology),
-                "nonstationaryModeling": sha256_json(nonstationary),
+                "familyResidualBridge": sha256_json(
+                    dynamic_bridge if unresolved_dynamic_route
+                    else {"morphology": morphology, "nonstationary": nonstationary}),
                 "multiSourceResidual": sha256_json(multisource),
                 "offsetSourceIdentification": sha256_json(offset_source),
             },
@@ -8441,6 +8562,18 @@ def build_engine(
     engine.register_handler(
         "openstar.tess.catalog-counterpart-identification.analyze",
         catalog_counterpart_identification_stage,
+    )
+    engine.register_handler(
+        "openstar.tess.catalog-guided-source-localization.prepare",
+        catalog_guided_localization_prepare_stage,
+    )
+    engine.register_handler(
+        "openstar.tess.catalog-guided-source-localization.run",
+        catalog_guided_localization_run_stage,
+    )
+    engine.register_handler(
+        "openstar.tess.catalog-guided-source-localization.interpret",
+        catalog_guided_localization_interpret_stage,
     )
     engine.register_handler(
         "openstar.tess.offset-source-variability.prepare",
