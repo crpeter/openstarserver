@@ -208,7 +208,7 @@ class ScienceRunBackfillTests(unittest.TestCase):
             ]
             self.assertEqual({state: 2}, active_sector_sweep_processes(commands))
 
-    def test_backfill_marks_only_process_proven_active_run_as_running(self):
+    def test_backfill_marks_process_observed_run_as_discovered_active(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             sector_one = root / "sector-one"
@@ -225,7 +225,8 @@ class ScienceRunBackfillTests(unittest.TestCase):
             by_sector = {item["metadata"]["sector"]: item for item in registered}
 
             self.assertEqual("DISCOVERED_INCOMPLETE", by_sector[1]["status"])
-            self.assertEqual("RUNNING", by_sector[2]["status"])
+            self.assertEqual("DISCOVERED_ACTIVE", by_sector[2]["status"])
+            self.assertTrue(by_sector[2]["metadata"]["activeAtBackfill"])
             self.assertEqual(2, len(catalog.list_runs()))
             self.assertEqual(2, by_sector[2]["summary"]["sectorSweep"]["sector"])
 
