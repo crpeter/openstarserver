@@ -620,7 +620,7 @@ def build_multisource_residual_project(
             "purpose": "multi-source-residual-decomposition",
             "workerSemantics": (
                 "Each dataset is one spatially decomposed, established-family-prewhitened, "
-                "v20.9 drift-corrected component light curve. Workers execute ordinary Lomb-Scargle only."
+                "persisted drift-corrected component light curve. Workers execute ordinary Lomb-Scargle only."
             ),
             "referenceFrequency": float(reference_frequency),
             "familyPrewhitening": {
@@ -630,6 +630,7 @@ def build_multisource_residual_project(
                 "sourceEvidence": family_evidence,
             },
             "fractionalFrequencyDriftPerDay": float(q),
+            "residualModelEvidence": nonstationary_summary.get("sourceEvidence"),
             "spatialComponents": components,
         },
     }
@@ -658,6 +659,14 @@ def build_multisource_residual_project(
         "referencePeriodDays": float(1.0 / reference_frequency),
         "fractionalFrequencyDriftPerDay": float(q),
         "timeReferenceDays": float(time_reference),
+        "residualModelProvenance": {
+            "referenceFrequency": float(reference_frequency),
+            "referencePeriodDays": float(1.0 / reference_frequency),
+            "fractionalFrequencyDriftPerDay": float(q),
+            "timeReferenceDays": float(time_reference),
+            "signalSectors": signal_sectors,
+            "sourceEvidence": nonstationary_summary.get("sourceEvidence"),
+        },
         "frequencySearch": search,
         "spatialComponents": components,
         "preparedSeries": prepared_series,

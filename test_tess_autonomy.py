@@ -257,6 +257,12 @@ class TessAutonomyIntegrationTests(unittest.TestCase):
             metadata=target.metadata,
         )
         evidence = (
+            ("001-prepared", "openstar.tess.prepare-target",
+             {"sourceProjectPath": str(self.project),
+              "sourceDatasetEntry": {"id": "blind-c"},
+              "ticID": 277940827, "sector": 1}),
+            ("002-identity", "openstar.tess.catalog-identity", {}),
+            ("003-independent", "openstar.tess.independent.prepare", {}),
             ("010-morphology", "openstar.tess.morphology.analyze",
              {"physicalCycleResolved": False}),
             ("021-dynamic", "openstar.tess.dynamic-harmonic.analyze",
@@ -264,7 +270,12 @@ class TessAutonomyIntegrationTests(unittest.TestCase):
               "supportedHarmonicOrders": [1, 2, 3, 4],
               "classification": "ADDITIONAL_VARIABILITY_REMAINS"}),
             ("035-review", "openstar.tess.residual-mode-localization-review.interpret",
-             {"crossTime": {
+             {"residualFrequencyAtReference": 1 / 2.2071724078510457,
+              "residualPeriodAtReferenceDays": 2.2071724078510457,
+              "fractionalFrequencyDriftPerDay": 0.0,
+              "timeReferenceDays": 2500.0,
+              "signalSectors": [94, 95, 102, 103],
+              "crossTime": {
                   "classification": "RESIDUAL_MODE_SOURCE_SWITCHING_OR_BLEND",
                   "residualModeOrigin": "TIME_VARIABLE_OR_BLENDED",
               },
@@ -294,6 +305,21 @@ class TessAutonomyIntegrationTests(unittest.TestCase):
                 investigation, request, software_id="legacy", software_version="20.11"
             )
         failed = self.store.load(investigation.id)
+        repaired_once = repair_obsolete_terminal_wait(self.store, failed)
+        retry_037 = StageRequest(**repaired_once.metadata["controlState"]["selectedExperiment"])
+
+        def obsolete_nonstationary_gate(_investigation, _request):
+            raise RuntimeError(
+                "v20.12 requires the completed v20.9 nonstationary model."
+            )
+
+        engine_037 = WorkflowEngine(self.store)
+        engine_037.register_handler(request.handler_id, obsolete_nonstationary_gate)
+        with self.assertRaisesRegex(RuntimeError, "v20.9 nonstationary"):
+            engine_037.run_stage(
+                repaired_once, retry_037, software_id="legacy", software_version="20.11"
+            )
+        failed = self.store.load(investigation.id)
         historical_stages = failed.stages
         historical_files = {
             stage.id: self.store.stage_path_for(failed.id, stage.id).read_bytes()
@@ -305,15 +331,29 @@ class TessAutonomyIntegrationTests(unittest.TestCase):
         self.assertEqual("RUNNING", repaired.status)
         self.assertEqual(historical_stages, repaired.stages)
         selected = repaired.metadata["controlState"]["selectedExperiment"]
-        self.assertEqual("037-prepare-multi-source-residual", selected["id"])
+        self.assertEqual("038-prepare-multi-source-residual", selected["id"])
         self.assertEqual(request.handler_id, selected["handler_id"])
-        self.assertEqual(request.id, selected["triggered_by_stage_id"])
+        self.assertEqual(retry_037.id, selected["triggered_by_stage_id"])
         self.assertEqual(
             historical_files,
             {stage.id: self.store.stage_path_for(repaired.id, stage.id).read_bytes()
              for stage in repaired.stages},
         )
         self.assertEqual(repaired, repair_obsolete_terminal_wait(self.store, repaired))
+
+        def legitimate_new_failure(_investigation, _request):
+            raise RuntimeError("v20.12 could not prepare a spatial component dataset.")
+
+        engine_038 = WorkflowEngine(self.store)
+        engine_038.register_handler(request.handler_id, legitimate_new_failure)
+        retry_038 = StageRequest(**selected)
+        with self.assertRaisesRegex(RuntimeError, "spatial component"):
+            engine_038.run_stage(
+                repaired, retry_038, software_id="current", software_version="20.12"
+            )
+        new_failure = self.store.load(investigation.id)
+        self.assertEqual("NON_RETRYABLE", new_failure.stages[-1].failure_classification)
+        self.assertEqual(new_failure, repair_obsolete_terminal_wait(self.store, new_failure))
 
     def test_legacy_invalid_low_frequency_failure_resumes_independent_branch(self):
         target = self.source.enumerate_targets()[0]

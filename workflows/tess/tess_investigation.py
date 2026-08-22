@@ -3667,11 +3667,20 @@ def build_engine(
             and stage.handler_id == "openstar.tess.dynamic-harmonic.analyze"
         ), None)
         dynamic = (dynamic_stage.result or {}) if dynamic_stage is not None else None
-        nonstationary = _latest_result_for_handler(investigation, "openstar.tess.nonstationary.summarize")
-        review = _latest_result_for_handler(
-            investigation,
-            "openstar.tess.residual-mode-localization-review.interpret",
-        )
+        nonstationary_stage = next((
+            stage for stage in reversed(investigation.stages)
+            if stage.status == "COMPLETE"
+            and stage.handler_id == "openstar.tess.nonstationary.summarize"
+        ), None)
+        nonstationary = ((nonstationary_stage.result or {})
+                         if nonstationary_stage is not None else None)
+        review_stage = next((
+            stage for stage in reversed(investigation.stages)
+            if stage.status == "COMPLETE"
+            and stage.handler_id
+                == "openstar.tess.residual-mode-localization-review.interpret"
+        ), None)
+        review = (review_stage.result or {}) if review_stage is not None else None
         if prepared is None:
             raise RuntimeError("v20.12 requires the completed target-preparation stage.")
         if identity is None:
@@ -3695,12 +3704,45 @@ def build_engine(
             family_stage = dynamic_stage
         if resolved_period is None:
             raise RuntimeError("v20.12 harmonic-family reference period is unavailable.")
-        if nonstationary is None:
-            raise RuntimeError("v20.12 requires the completed v20.9 nonstationary model.")
         if review is None:
             raise RuntimeError("v20.12 requires the completed v20.11 localization review.")
         if review.get("recommendedNextTest") != "MULTI_SOURCE_RESIDUAL_DECOMPOSITION":
             raise RuntimeError("v20.11 did not recommend MULTI_SOURCE_RESIDUAL_DECOMPOSITION.")
+
+        # The unresolved dynamic-family route deliberately bypasses v20.9.  In
+        # that route v20.11 persists the same residual frequency/drift
+        # quantities after combining the dynamic-harmonic, time-frequency and
+        # mode-identification evidence.  Adapt that durable evidence to the
+        # historical shape consumed by the v20.12 project builder.
+        if nonstationary is not None:
+            residual_model = dict(nonstationary)
+            residual_model_evidence = {
+                "stageID": nonstationary_stage.id,
+                "handlerID": nonstationary_stage.handler_id,
+                "resultHash": sha256_json(nonstationary),
+            }
+        elif not physical_cycle_resolved:
+            residual_model = {
+                "preferredFrequencyAtReference": review.get(
+                    "residualFrequencyAtReference"
+                ),
+                "preferredPeriodAtReferenceDays": review.get(
+                    "residualPeriodAtReferenceDays"
+                ),
+                "fractionalFrequencyDriftPerDay": review.get(
+                    "fractionalFrequencyDriftPerDay"
+                ),
+                "timeReferenceDays": review.get("timeReferenceDays"),
+                "preferredModel": {"signalSectors": review.get("signalSectors") or []},
+            }
+            residual_model_evidence = {
+                "stageID": review_stage.id,
+                "handlerID": review_stage.handler_id,
+                "resultHash": sha256_json(review),
+            }
+        else:
+            raise RuntimeError("v20.12 requires the completed v20.9 nonstationary model.")
+        residual_model["sourceEvidence"] = residual_model_evidence
 
         physical_period = float(resolved_period)
         family_evidence = {
@@ -3712,8 +3754,8 @@ def build_engine(
         artifact_root = store.directory_for(investigation.id) / "artifacts"
         print("🧩 Preparing multi-source residual decomposition")
         print(f"   TIC: {prepared.get('ticID')}")
-        print(f"   residual period at reference: {nonstationary.get('preferredPeriodAtReferenceDays')} days")
-        print(f"   fractional frequency drift/day: {nonstationary.get('fractionalFrequencyDriftPerDay')}")
+        print(f"   residual period at reference: {residual_model.get('preferredPeriodAtReferenceDays')} days")
+        print(f"   fractional frequency drift/day: {residual_model.get('fractionalFrequencyDriftPerDay')}")
         print("   inferring target + offset spatial components from v20.11 time-resolved localization")
         print("   spatially decomposed residual component light curves become ordinary generic Lomb-Scargle datasets")
         spec = build_multisource_residual_project(
@@ -3727,7 +3769,7 @@ def build_engine(
             harmonic_orders=tuple(int(value) for value in harmonic_orders),
             physical_cycle_resolved=physical_cycle_resolved,
             family_evidence=family_evidence,
-            nonstationary_summary=nonstationary,
+            nonstationary_summary=residual_model,
             localization_review=review,
             output_dir=artifact_root,
             investigation_id=investigation.id,
@@ -3761,7 +3803,7 @@ def build_engine(
                 "independentPreparation": sha256_json(independent_prepare),
                 "morphology": sha256_json(morphology),
                 "harmonicFamilyEvidence": family_evidence["resultHash"],
-                "nonstationaryModeling": sha256_json(nonstationary),
+                "residualFrequencyDriftModel": residual_model_evidence["resultHash"],
                 "localizationReview": sha256_json(review),
             },
             artifacts=tuple(artifacts),
