@@ -774,6 +774,29 @@ class TessAutonomyIntegrationTests(unittest.TestCase):
             stage.id: self.store.stage_path_for(failed.id, stage.id).read_bytes()
             for stage in historical_stages
         }
+        unrelated_failed_stage = replace(
+            failed.stages[-1], triggered_by_stage_id="unrelated-completed-stage"
+        )
+        unrelated_lineage = replace(
+            failed,
+            stages=failed.stages[:-1] + (unrelated_failed_stage,),
+            metadata={
+                **failed.metadata,
+                "controlState": {
+                    **failed.metadata["controlState"],
+                    "selectedExperiment": asdict(StageRequest(
+                        unrelated_failed_stage.id,
+                        unrelated_failed_stage.handler_id,
+                        unrelated_failed_stage.parameters,
+                        unrelated_failed_stage.triggered_by_stage_id,
+                    )),
+                },
+            },
+        )
+        self.assertEqual(
+            unrelated_lineage,
+            repair_obsolete_terminal_wait(self.store, unrelated_lineage),
+        )
 
         repaired = repair_obsolete_terminal_wait(self.store, failed)
 

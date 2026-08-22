@@ -63,6 +63,60 @@ if _installed_numpy_stub:
 
 
 class BroadIndependentCharacterizationTests(unittest.TestCase):
+    def test_resolved_multisource_prepare_preserves_legacy_input_hashes(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        store = InvestigationStore(root / "investigations")
+        investigation = store.create("resolved-v2012-provenance", WORKFLOW_ID,
+                                     WORKFLOW_VERSION)
+        source_project = root / "source.json"
+        source_project.write_text("{}", encoding="utf-8")
+        morphology = {
+            "physicalCycleResolved": True,
+            "resolvedPhysicalPeriodDays": 10.510316195053623,
+        }
+        nonstationary = {
+            "preferredFrequencyAtReference": 0.27101611598985065,
+            "preferredPeriodAtReferenceDays": 1 / 0.27101611598985065,
+            "fractionalFrequencyDriftPerDay": 0.0004,
+            "timeReferenceDays": 2500.0,
+            "preferredModel": {"signalSectors": [28, 68]},
+        }
+        for stage_id, handler, result in (
+            ("001-prepared", "openstar.tess.prepare-target", {
+                "sourceProjectPath": str(source_project),
+                "sourceDatasetEntry": {"id": "tic"}, "ticID": 1, "sector": 1,
+            }),
+            ("002-identity", "openstar.tess.catalog-identity", {}),
+            ("003-independent", "openstar.tess.independent.prepare", {}),
+            ("010-morphology", "openstar.tess.morphology.analyze", morphology),
+            ("020-nonstationary", "openstar.tess.nonstationary.summarize",
+             nonstationary),
+            ("029-review", "openstar.tess.residual-mode-localization-review.interpret", {
+                "recommendedNextTest": "MULTI_SOURCE_RESIDUAL_DECOMPOSITION",
+            }),
+        ):
+            investigation = self._complete(store, investigation, stage_id, handler, result)
+
+        project_path = root / "multisource.json"
+        project_path.write_text("{}", encoding="utf-8")
+        engine = build_engine(store, mock.Mock(), poll_interval=0.0, timeout=1.0)
+        request = StageRequest("030-prepare-multi-source-residual",
+                               "openstar.tess.multi-source-residual.prepare", {})
+        with mock.patch(
+            "workflows.tess.tess_investigation.build_multisource_residual_project",
+            return_value={"projectPath": str(project_path), "preparedSeries": []},
+        ):
+            completed, _ = engine.run_stage(
+                investigation, request, software_id="test", software_version="20.12"
+            )
+
+        hashes = completed.stages[-1].provenance.input_hashes
+        self.assertEqual(sha256_json(morphology), hashes["harmonicFamilyEvidence"])
+        self.assertEqual(sha256_json(nonstationary),
+                         hashes["residualFrequencyDriftModel"])
+
     def test_unresolved_dynamic_family_reaches_multisource_prepare_with_provenance(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)

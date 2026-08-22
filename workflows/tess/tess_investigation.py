@@ -3833,6 +3833,12 @@ def build_engine(
                 "adapter": "frozen_residual_localization_family",
                 "referenceKind": reference_kind,
             }
+        if physical_cycle_resolved:
+            harmonic_family_input_hash = family_evidence["resultHash"]
+            residual_model_input_hash = residual_model_evidence["resultHash"]
+        else:
+            harmonic_family_input_hash = sha256_json(family_evidence)
+            residual_model_input_hash = sha256_json(residual_model_evidence)
         artifact_root = store.directory_for(investigation.id) / "artifacts"
         print("🧩 Preparing multi-source residual decomposition")
         print(f"   TIC: {prepared.get('ticID')}")
@@ -3884,8 +3890,8 @@ def build_engine(
                 "identity": sha256_json(identity),
                 "independentPreparation": sha256_json(independent_prepare),
                 "morphology": sha256_json(morphology),
-                "harmonicFamilyEvidence": sha256_json(family_evidence),
-                "residualFrequencyDriftModel": sha256_json(residual_model_evidence),
+                "harmonicFamilyEvidence": harmonic_family_input_hash,
+                "residualFrequencyDriftModel": residual_model_input_hash,
                 "localizationReview": sha256_json(review),
             },
             artifacts=tuple(artifacts),

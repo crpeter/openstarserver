@@ -725,6 +725,7 @@ def _repair_unresolved_dynamic_multisource_failure(
             and family is not None
             and review
             and valid_review_lineage
+            and failed.triggered_by_stage_id == review.id
             and cross.get("classification")
                 == "RESIDUAL_MODE_SOURCE_SWITCHING_OR_BLEND"
             and cross.get("residualModeOrigin") == "TIME_VARIABLE_OR_BLENDED"
