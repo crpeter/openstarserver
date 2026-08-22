@@ -183,6 +183,84 @@ class TessAutonomyIntegrationTests(unittest.TestCase):
         with_complete = self.store.complete_current_stage(with_running, terminal)
         self.assertEqual((), plan_tess_branches(with_complete, target))
 
+    def test_stage_053_variable_multisource_schedules_time_resolved_once_append_only(self):
+        target = self.source.enumerate_targets()[0]
+        investigation = self.store.create(
+            target.investigation_id, WORKFLOW_ID, WORKFLOW_VERSION,
+            metadata={**target.metadata, "ticID": 277940827})
+        for number in range(1, 51):
+            investigation = self._complete(
+                investigation, f"{number:03d}-persisted-science", "persisted.science",
+                {"stage": number})
+        investigation = self._complete(
+            investigation, "051-prepare-source-switching-temporal-model",
+            "openstar.tess.source-switching-temporal-model.prepare", {})
+        investigation = self._complete(
+            investigation, "052-run-source-switching-temporal-model",
+            "openstar.tess.source-switching-temporal-model.run", {})
+        investigation = self._complete(
+            investigation, "053-interpret-source-switching-temporal-model",
+            "openstar.tess.source-switching-temporal-model.interpret",
+            {"classification": "SECTOR_VARIABLE_MULTI_SOURCE",
+             "sourceIdentifiable": True, "sourceAttributionResolved": False,
+             "physicalMechanismResolved": False,
+             "recommendedNextTest": "ADDITIONAL_SOURCE_LOCALIZATION_DATA"})
+        original = investigation.stages
+        branches = plan_tess_branches(investigation, target)
+        self.assertEqual(1, len(branches))
+        request = branches[0].experiment
+        self.assertEqual("054-prepare-time-resolved-residual-phase-localization", request.id)
+        self.assertEqual("openstar.tess.time-resolved-residual-phase-localization.prepare",
+                         request.handler_id)
+        self.assertEqual(original, investigation.stages)
+        running = InvestigationStage(request.id, request.handler_id, "RUNNING",
+                                     request.triggered_by_stage_id, {})
+        with_running = self.store.append_running_stage(investigation, running)
+        self.assertEqual((), plan_tess_branches(with_running, target))
+
+    def test_stage_056_candidate_recovery_schedules_validation_exactly_once(self):
+        target = self.source.enumerate_targets()[0]
+        for classification, tic_id in (("STABLE_CANDIDATE_1_LOCALIZATION", 111),
+                                       ("STABLE_CANDIDATE_2_LOCALIZATION", 222)):
+            with self.subTest(classification=classification):
+                candidate = {"raDeg": 10.1, "decDeg": -20.1,
+                             "catalogIDs": {"ticID": tic_id}}
+                investigation = self.store.create(
+                    f"{target.investigation_id}-{tic_id}", WORKFLOW_ID, WORKFLOW_VERSION,
+                    metadata={**target.metadata, "ticID": 277940827})
+                investigation = self._complete(
+                    investigation, "053-interpret-source-switching-temporal-model",
+                    "openstar.tess.source-switching-temporal-model.interpret",
+                    {"classification": "SECTOR_VARIABLE_MULTI_SOURCE",
+                     "sourceIdentifiable": True, "sourceAttributionResolved": False,
+                     "physicalMechanismResolved": False,
+                     "recommendedNextTest": "ADDITIONAL_SOURCE_LOCALIZATION_DATA"})
+                investigation = self._complete(
+                    investigation, "056-interpret-time-resolved-residual-phase-localization",
+                    "openstar.tess.time-resolved-residual-phase-localization.interpret",
+                    {"classification": classification, "sourceAttributionResolved": True,
+                     "physicalMechanismResolved": False, "preferredCandidate": candidate,
+                     "catalogCandidates": [candidate, {"raDeg": 11., "decDeg": -21.}],
+                     "recommendedNextTest":
+                     "INDEPENDENT_COUNTERPART_PHOTOMETRIC_VARIABILITY_VALIDATION"})
+                branches = plan_tess_branches(investigation, target)
+                self.assertEqual(1, len(branches))
+                request = branches[0].experiment
+                self.assertEqual("057-prepare-offset-source-variability", request.id)
+                self.assertEqual("openstar.tess.offset-source-variability.prepare",
+                                 request.handler_id)
+                running = InvestigationStage(request.id, request.handler_id, "RUNNING",
+                                             request.triggered_by_stage_id, {})
+                with_running = self.store.append_running_stage(investigation, running)
+                self.assertEqual((), plan_tess_branches(with_running, target))
+                terminal = self.store.build_terminal_stage(
+                    stage_id=request.id, handler_id=request.handler_id, status="COMPLETE",
+                    triggered_by_stage_id=request.triggered_by_stage_id, parameters={}, result={},
+                    error=None, software_id="test", software_version="1",
+                    started_at=running.started_at)
+                with_complete = self.store.complete_current_stage(with_running, terminal)
+                self.assertEqual((), plan_tess_branches(with_complete, target))
+
     def test_stage_053_candidate_two_recovery_is_idempotent(self):
         target = self.source.enumerate_targets()[0]
         candidate_1 = {"raDeg": 10.1, "decDeg": -20.1,
