@@ -1030,8 +1030,11 @@ def interpret_multisource_residual_project(
         "claimLevelChanged": False,
         "recommendedNextTest": next_test,
         "interpretationGuard": (
-            "This decomposes only the v20.9 drifting residual structure. It does not alter "
-            "v20.6's target association for the established 13.72-day family. Spatial templates "
-            "are deterministic Gaussian approximations, not calibrated TESS PRF solutions."
+            "This decomposes only the persisted residual model after subtracting the "
+            f"{preparation.get('referenceFamilyPeriodDays')} day reference family with harmonic "
+            f"orders {preparation.get('subtractedHarmonicOrders')}; physicalCycleResolved="
+            f"{preparation.get('physicalCycleResolved')}. It does not reinterpret the family "
+            "reference period as a resolved physical cycle. Spatial templates are deterministic "
+            "Gaussian approximations, not calibrated TESS PRF solutions."
         ),
     }

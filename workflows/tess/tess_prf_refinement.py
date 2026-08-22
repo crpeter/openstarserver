@@ -68,8 +68,31 @@ def prepare_prf_deblending(*, evidence: dict[str, dict[str, Any]], output_dir: P
     dec_deg = identity_metadata.get("decDeg")
     if ra_deg is None or dec_deg is None:
         raise RuntimeError("PRF deblending requires the persisted target sky position.")
-    morphology = evidence["physicalMorphology"]
-    nonstationary = evidence["nonstationaryResidual"]
+    # v20.12 preparation is the canonical compatibility boundary: it records
+    # either the v20.9 morphology route or the unresolved dynamic-family route
+    # without upgrading a reference family into a resolved physical cycle.
+    family = decomposition_preparation.get("familyModelProvenance") or {}
+    residual_model = decomposition_preparation.get("residualModelProvenance") or {}
+    physical_period = decomposition_preparation.get(
+        "referenceFamilyPeriodDays", decomposition_preparation.get("physicalPeriodDays")
+    )
+    harmonic_orders = decomposition_preparation.get("subtractedHarmonicOrders")
+    physical_cycle_resolved = decomposition_preparation.get("physicalCycleResolved")
+    if physical_period is None or not harmonic_orders or physical_cycle_resolved is None:
+        raise RuntimeError("PRF deblending requires persisted v20.12 family prewhitening evidence.")
+    nonstationary = evidence.get("nonstationaryResidual") or {}
+    residual_frequency = residual_model.get(
+        "referenceFrequency", nonstationary.get("preferredFrequencyAtReference")
+    )
+    time_reference = residual_model.get(
+        "timeReferenceDays", nonstationary.get("timeReferenceDays")
+    )
+    drift = residual_model.get(
+        "fractionalFrequencyDriftPerDay",
+        nonstationary.get("fractionalFrequencyDriftPerDay"),
+    )
+    if residual_frequency is None or time_reference is None or drift is None:
+        raise RuntimeError("PRF deblending requires persisted v20.12 residual-model evidence.")
     root = Path(output_dir) / "prf-deblending"
     root.mkdir(parents=True, exist_ok=True)
     result = {
@@ -88,10 +111,15 @@ def prepare_prf_deblending(*, evidence: dict[str, dict[str, Any]], output_dir: P
         "ticID": prepared.get("ticID"),
         "targetSky": {"raDeg": float(ra_deg), "decDeg": float(dec_deg),
                       "provenance": "persisted target TIC identity; no neighbor lookup"},
-        "physicalPeriodDays": morphology["resolvedPhysicalPeriodDays"],
-        "residualReferenceFrequency": nonstationary["preferredFrequencyAtReference"],
-        "residualTimeReferenceDays": nonstationary["timeReferenceDays"],
-        "fractionalFrequencyDriftPerDay": nonstationary["fractionalFrequencyDriftPerDay"],
+        "physicalPeriodDays": float(physical_period),
+        "referenceFamilyPeriodDays": float(physical_period),
+        "subtractedHarmonicOrders": [int(value) for value in harmonic_orders],
+        "physicalCycleResolved": bool(physical_cycle_resolved),
+        "familyModelProvenance": family,
+        "residualReferenceFrequency": float(residual_frequency),
+        "residualTimeReferenceDays": float(time_reference),
+        "fractionalFrequencyDriftPerDay": float(drift),
+        "residualModelProvenance": residual_model,
         "priorEvidence": evidence,
     }
     _write_json(Path(result["preparationPath"]), result)
@@ -322,13 +350,14 @@ def _coherent_pixel_fit(*, times: np.ndarray, cube: np.ndarray, frequency: float
 
 def _prewhitened_coherent_basis(*, times: np.ndarray, physical_frequency: float,
                                 residual_frequency: float, time_reference: float,
-                                drift: float) -> np.ndarray:
+                                drift: float,
+                                harmonic_orders: tuple[int, ...] = (1, 2)) -> np.ndarray:
     """Apply the frozen full-sector physical-family residual maker to the PRF basis."""
     warped = _drift_corrected_times(times, time_reference_days=time_reference,
                                     fractional_frequency_drift_per_day=drift)
     phase = 2.0 * math.pi * residual_frequency * warped
     coherent = np.column_stack((np.sin(phase), np.cos(phase)))
-    physical = _physical_design_matrix(times, physical_frequency)
+    physical = _physical_design_matrix(times, physical_frequency, harmonic_orders)
     return coherent - physical @ (np.linalg.pinv(physical) @ coherent)
 
 
@@ -517,7 +546,8 @@ def diagnose_prf_cube(*, times: np.ndarray, cube: np.ndarray,
                       template_matrix: np.ndarray, physical_frequency: float,
                       residual_frequency: float, time_reference: float, drift: float,
                       injected_component_id: str, block_count: int = 4,
-                      oracle_source_vectors: dict[str, list[float]] | None = None) -> dict[str, Any]:
+                      oracle_source_vectors: dict[str, list[float]] | None = None,
+                      harmonic_orders: tuple[int, ...] = (1, 2)) -> dict[str, Any]:
     """Diagnostic-only full-cube ablation and contiguous held-out validation."""
     times = np.asarray(times, dtype=float)
     cube = np.asarray(cube, dtype=float)
@@ -530,6 +560,7 @@ def diagnose_prf_cube(*, times: np.ndarray, cube: np.ndarray,
     )
     prewhitened, valid = _prewhiten_cube_raw(
         absolute_times=times, cube=corrected, physical_frequency=physical_frequency,
+        harmonic_orders=harmonic_orders,
     )
     valid_flat = valid.reshape(-1)
     templates = np.asarray(template_matrix, dtype=float)[valid_flat]
@@ -550,6 +581,7 @@ def diagnose_prf_cube(*, times: np.ndarray, cube: np.ndarray,
     common_preprocessed_basis = _prewhitened_coherent_basis(
         times=times, physical_frequency=physical_frequency,
         residual_frequency=residual_frequency, time_reference=time_reference, drift=drift,
+        harmonic_orders=harmonic_orders,
     )
     production_predictive_validation = _temporal_predictive_validation(
         times=times, prewhitened=prewhitened, valid=valid, templates=templates,
@@ -678,6 +710,8 @@ def run_prf_deblending(preparation: dict[str, Any]) -> dict[str, Any]:
             residual, valid = _prewhiten_cube_raw(
                 absolute_times=times, cube=corrected,
                 physical_frequency=1.0 / float(preparation["physicalPeriodDays"]),
+                harmonic_orders=tuple(int(value) for value in
+                                      preparation["subtractedHarmonicOrders"]),
             )
             camera, ccd, tpf_col, tpf_row = _tpf_detector_geometry(tpf)
             centers = preparation["sectorPixelCenters"][str(sector)]
@@ -745,6 +779,8 @@ def run_prf_deblending(preparation: dict[str, Any]) -> dict[str, Any]:
                     residual_frequency=float(preparation["residualReferenceFrequency"]),
                     time_reference=float(preparation["residualTimeReferenceDays"]),
                     drift=float(preparation["fractionalFrequencyDriftPerDay"]),
+                    harmonic_orders=tuple(int(value) for value in
+                                          preparation["subtractedHarmonicOrders"]),
                 )
                 temporal_validation = _temporal_predictive_validation(
                     times=times, prewhitened=residual, valid=valid,
