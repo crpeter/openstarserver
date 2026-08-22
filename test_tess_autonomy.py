@@ -183,6 +183,54 @@ class TessAutonomyIntegrationTests(unittest.TestCase):
         with_complete = self.store.complete_current_stage(with_running, terminal)
         self.assertEqual((), plan_tess_branches(with_complete, target))
 
+    def test_stage_053_candidate_two_recovery_is_idempotent(self):
+        target = self.source.enumerate_targets()[0]
+        candidate_1 = {"raDeg": 10.1, "decDeg": -20.1,
+                       "catalogIDs": {"ticID": 111}}
+        candidate_2 = {"raDeg": 10.2, "decDeg": -20.2,
+                       "catalogIDs": {"gaiaDR3SourceID": 222}}
+        investigation = self.store.create(
+            target.investigation_id, WORKFLOW_ID, WORKFLOW_VERSION,
+            metadata={**target.metadata, "ticID": 277940827})
+        evidence = (
+            ("047-interpret-catalog-guided-source-localization",
+             "openstar.tess.catalog-guided-source-localization.interpret",
+             {"classification": "UNRESOLVED", "sourceAttributionResolved": False,
+              "recommendedNextTest": "ADDITIONAL_SOURCE_LOCALIZATION_DATA"}),
+            ("050-interpret-residual-phase-difference-imaging",
+             "openstar.tess.residual-phase-difference-imaging.interpret",
+             {"classification": "SOURCE_SWITCHING_BY_SECTOR",
+              "recommendedNextTest": "SOURCE_SWITCHING_TEMPORAL_MODEL"}),
+            ("051-prepare-source-switching-temporal-model",
+             "openstar.tess.source-switching-temporal-model.prepare", {}),
+            ("052-run-source-switching-temporal-model",
+             "openstar.tess.source-switching-temporal-model.run", {}),
+            ("053-interpret-source-switching-temporal-model",
+             "openstar.tess.source-switching-temporal-model.interpret",
+             {"classification": "STATIONARY_CANDIDATE_2_SOURCE",
+              "sourceAttributionResolved": True, "preferredCandidate": candidate_2,
+              "catalogCandidates": [candidate_1, candidate_2],
+              "recommendedNextTest":
+              "INDEPENDENT_COUNTERPART_PHOTOMETRIC_VARIABILITY_VALIDATION"}),
+        )
+        for stage_id, handler, result in evidence:
+            investigation = self._complete(investigation, stage_id, handler, result)
+        branches = plan_tess_branches(investigation, target)
+        self.assertEqual(1, len(branches))
+        request = branches[0].experiment
+        self.assertEqual("054-prepare-offset-source-variability", request.id)
+        self.assertEqual("openstar.tess.offset-source-variability.prepare", request.handler_id)
+        running = InvestigationStage(
+            request.id, request.handler_id, "RUNNING", request.triggered_by_stage_id, {})
+        with_running = self.store.append_running_stage(investigation, running)
+        self.assertEqual((), plan_tess_branches(with_running, target))
+        terminal = self.store.build_terminal_stage(
+            stage_id=request.id, handler_id=request.handler_id, status="COMPLETE",
+            triggered_by_stage_id=request.triggered_by_stage_id, parameters={}, result={},
+            error=None, software_id="test", software_version="1", started_at=running.started_at)
+        with_complete = self.store.complete_current_stage(with_running, terminal)
+        self.assertEqual((), plan_tess_branches(with_complete, target))
+
     def test_completed_mode_identification_boundary_is_append_only_and_idempotent(self):
         target = self.source.enumerate_targets()[0]
         investigation = self.store.create(target.investigation_id, WORKFLOW_ID, WORKFLOW_VERSION,

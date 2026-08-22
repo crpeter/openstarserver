@@ -11,6 +11,7 @@ from workflows.tess.tess_catalog_guided_localization import (
     COMPONENT_IDS,
     _compare_hypotheses,
     _fit_shared_astrometric_shift,
+    _prewhiten_production_cube,
     _temporal_predictive_validation,
     interpret_catalog_guided_localization,
     prepare_catalog_guided_localization,
@@ -119,6 +120,18 @@ class CatalogGuidedLocalizationTests(unittest.TestCase):
                 render_templates=lambda _dx, _dy: np.ones((16, 3)))
         self.assertFalse(result["available"])
         self.assertIn("unique minimum", result["reason"])
+
+    def test_production_prewhitening_preserves_persisted_order_and_sequence(self):
+        times=np.arange(8,dtype=float); cube=np.ones((8,2,2)); expected=(4,2)
+        returned=(np.zeros_like(cube),np.ones((2,2),bool))
+        with mock.patch(
+            "workflows.tess.tess_catalog_guided_localization._prewhiten_cube_raw",
+            return_value=returned) as prewhiten:
+            actual=_prewhiten_production_cube(
+                times=times,corrected=cube,reference_family_period_days=10.0,
+                harmonic_orders=expected)
+        self.assertIs(returned,actual)
+        self.assertEqual(expected,prewhiten.call_args.kwargs["harmonic_orders"])
 
     def test_inadequate_astrometric_explained_variance_is_rejected(self):
         calls = iter(range(9))

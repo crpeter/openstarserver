@@ -113,7 +113,9 @@ def run_source_switching_temporal_model(preparation: dict[str, Any], *,
                                         sector_inputs: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     # The catalog-guided acquisition path is the authoritative official-PRF path:
     # it preserves frozen WCS positions and exposes one shared astrometric renderer.
-    inputs = _production_sector_inputs(preparation) if sector_inputs is None else sector_inputs
+    inputs = (_production_sector_inputs(
+        preparation, harmonic_orders=tuple(preparation["subtractedHarmonicOrders"]))
+        if sector_inputs is None else sector_inputs)
     sectors = []
     for item in inputs:
         times = np.asarray(item["times"], float)
@@ -136,7 +138,8 @@ def run_source_switching_temporal_model(preparation: dict[str, Any], *,
         raise RuntimeError("Temporal model inputs do not match the frozen sector ordering.")
 
     usable_sectors = [sector for sector in sectors if sector.get("usable")]
-    source_sets = {"TARGET_STATIONARY": (0,), "CANDIDATE_1_STATIONARY": (1,),
+    source_sets = {"NO_COHERENT_SOURCE": (),
+                   "TARGET_STATIONARY": (0,), "CANDIDATE_1_STATIONARY": (1,),
                    "CANDIDATE_2_STATIONARY": (2,),
                    "TARGET_PLUS_CANDIDATE_1_STATIONARY": (0, 1),
                    "TARGET_PLUS_CANDIDATE_2_STATIONARY": (0, 2),
@@ -157,6 +160,19 @@ def run_source_switching_temporal_model(preparation: dict[str, Any], *,
         models[name] = {"rss": fit["rss"], "bic": len(all_y) * math.log(fit["rss"] / len(all_y))
                         + fit["k"] * math.log(len(all_y)), "parameterCount": fit["k"],
                         "rank": fit["rank"]}
+
+    # This joint fit is the conditional-significance reference for stationary
+    # attribution: every source is tested while both competitors remain present.
+    stationary_joint = _fit(np.vstack([s["x"] for s in usable_sectors]), all_y)
+    stationary_sources = {}
+    for j, component in enumerate(COMPONENT_IDS):
+        vector = stationary_joint["beta"][[j, 3 + j]]
+        covariance = stationary_joint["covariance"][np.ix_([j, 3 + j], [j, 3 + j])]
+        stationary_sources[component] = {
+            "sinAmplitude": float(vector[0]), "cosAmplitude": float(vector[1]),
+            "coherentAmplitude": float(np.linalg.norm(vector)),
+            "covariance": covariance.tolist(),
+            "conditionalChiSquare": float(vector @ np.linalg.pinv(covariance) @ vector)}
 
     vectors = []
     varying_rss = 0.0
@@ -231,6 +247,8 @@ def run_source_switching_temporal_model(preparation: dict[str, Any], *,
         models[name]["heldOutRSS"] = cv[name]
     return {"version": "openstar.tess-source-switching-temporal-run.v1",
             "models": models, "perSectorSourceCoherentVectors": vectors,
+            "stationaryAllSourceCoherentVectors": stationary_sources,
+            "stationaryJointCoherentVectorCovariance": stationary_joint["covariance"].tolist(),
             "sourceIdentifiable": bool(identifiable), "physicalCycleResolved": False,
             "sectorUsability": [{key: value for key, value in sector.items()
                                   if key not in {"times", "x", "y"}} for sector in sectors],
@@ -254,9 +272,52 @@ def interpret_source_switching_temporal_model(preparation: dict[str, Any],
                          "TARGET_PLUS_CANDIDATE_2_STATIONARY": "MULTI_SOURCE_STATIONARY_BLEND",
                          "CANDIDATE_1_PLUS_CANDIDATE_2_STATIONARY": "MULTI_SOURCE_STATIONARY_BLEND",
                          "ALL_SOURCES_STATIONARY": "MULTI_SOURCE_STATIONARY_BLEND"}
+    stationary_components = {
+        "TARGET_STATIONARY": ("target",),
+        "CANDIDATE_1_STATIONARY": ("candidate-1",),
+        "CANDIDATE_2_STATIONARY": ("candidate-2",),
+        "TARGET_PLUS_CANDIDATE_1_STATIONARY": ("target", "candidate-1"),
+        "TARGET_PLUS_CANDIDATE_2_STATIONARY": ("target", "candidate-2"),
+        "CANDIDATE_1_PLUS_CANDIDATE_2_STATIONARY": ("candidate-1", "candidate-2"),
+        "ALL_SOURCES_STATIONARY": tuple(COMPONENT_IDS),
+    }
+    stationary_vectors = run.get("stationaryAllSourceCoherentVectors") or {}
+    stationary_covariance = np.asarray(
+        run.get("stationaryJointCoherentVectorCovariance") or np.zeros((6, 6)), float)
+
+    def conditionally_supported(model: str) -> bool:
+        selected = stationary_components[model]
+        if any(stationary_vectors.get(component, {}).get("conditionalChiSquare", 0.0)
+               <= 5.991464547 for component in selected):
+            return False
+        if len(selected) != 1:
+            return True
+        winner = selected[0]
+        source = stationary_vectors[winner]
+        amplitude = float(source["coherentAmplitude"])
+        vector = np.array([source["sinAmplitude"], source["cosAmplitude"]])
+        gradient = vector / amplitude if amplitude else np.zeros(2)
+        full_gradient = np.zeros(6)
+        index = list(COMPONENT_IDS).index(winner)
+        full_gradient[[index, 3 + index]] = gradient
+        for competitor in COMPONENT_IDS:
+            if competitor == winner:
+                continue
+            other = stationary_vectors[competitor]
+            other_amplitude = float(other["coherentAmplitude"])
+            other_vector = np.array([other["sinAmplitude"], other["cosAmplitude"]])
+            other_gradient = other_vector / other_amplitude if other_amplitude else np.zeros(2)
+            contrast = full_gradient.copy()
+            other_index = list(COMPONENT_IDS).index(competitor)
+            contrast[[other_index, 3 + other_index]] = -other_gradient
+            sigma = math.sqrt(max(0.0, float(contrast @ stationary_covariance @ contrast)))
+            if amplitude - other_amplitude <= 1.959963985 * sigma:
+                return False
+        return True
     classification = "UNRESOLVED"
     if run.get("sourceIdentifiable"):
-        if bic_winner in stationary_labels and predictive_winner == bic_winner:
+        if (bic_winner in stationary_labels and predictive_winner == bic_winner
+                and conditionally_supported(bic_winner)):
             classification = stationary_labels[bic_winner]
         elif bic_winner == predictive_winner == "SECTOR_VARYING_SOURCE_AMPLITUDES":
             dominant = []

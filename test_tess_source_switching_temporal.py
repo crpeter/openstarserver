@@ -49,6 +49,15 @@ class SourceSwitchingTemporalTests(unittest.TestCase):
         result, _ = self._classify([([2,0,0],[.4,0,0])]*4)
         self.assertEqual("STATIONARY_TARGET_SOURCE", result["classification"])
 
+    def test_pure_noise_is_unresolved(self):
+        result, _ = self._classify([([0,0,0],[0,0,0])]*4, noise=.08)
+        self.assertEqual("UNRESOLVED", result["classification"])
+        self.assertFalse(result["sourceAttributionResolved"])
+
+    def test_very_weak_coherent_vector_is_unresolved(self):
+        result, _ = self._classify([([.002,0,0],[.001,0,0])]*4, noise=.08)
+        self.assertEqual("UNRESOLVED", result["classification"])
+
     def test_stationary_candidate_one_wins(self):
         candidate1={"raDeg":1.1,"decDeg":2.1,"catalogIDs":{"ticID":1}}
         candidate2={"raDeg":1.2,"decDeg":2.2,"catalogIDs":{"ticID":2}}
@@ -137,8 +146,18 @@ class SourceSwitchingTemporalTests(unittest.TestCase):
             "workflows.tess.tess_source_switching_temporal._fit_shared_astrometric_shift",
             return_value=calibrated) as calibrate:
             run_source_switching_temporal_model(self.preparation)
-        acquire.assert_called_once_with(self.preparation)
+        acquire.assert_called_once_with(
+            self.preparation, harmonic_orders=tuple(self.preparation["subtractedHarmonicOrders"]))
         self.assertEqual(4, calibrate.call_count)
+
+    def test_production_preserves_nondefault_harmonic_orders_verbatim(self):
+        self.preparation["subtractedHarmonicOrders"]=[4,2]
+        with mock.patch(
+            "workflows.tess.tess_source_switching_temporal._production_sector_inputs",
+            side_effect=RuntimeError("acquisition boundary")) as acquire:
+            with self.assertRaisesRegex(RuntimeError, "acquisition boundary"):
+                run_source_switching_temporal_model(self.preparation)
+        acquire.assert_called_once_with(self.preparation, harmonic_orders=(4,2))
 
     def test_production_path_has_no_synthetic_template_fallback(self):
         item=self._inputs([([1,0,0],[0,0,0])]*4)[0]
@@ -162,7 +181,13 @@ class SourceSwitchingTemporalTests(unittest.TestCase):
                 other="CANDIDATE_2_STATIONARY" if index == 0 else "CANDIDATE_1_STATIONARY"
                 run={"models":{model:{"bic":0.,"heldOutRSS":0.},
                                other:{"bic":10.,"heldOutRSS":10.}},
-                     "sourceIdentifiable":True,"perSectorSourceCoherentVectors":[]}
+                     "sourceIdentifiable":True,"perSectorSourceCoherentVectors":[],
+                     "stationaryAllSourceCoherentVectors":{
+                         component:{"sinAmplitude":2. if list(("target","candidate-1","candidate-2")).index(component)==index+1 else 0.,
+                                    "cosAmplitude":0.,"coherentAmplitude":2. if list(("target","candidate-1","candidate-2")).index(component)==index+1 else 0.,
+                                    "conditionalChiSquare":100. if list(("target","candidate-1","candidate-2")).index(component)==index+1 else 0.}
+                         for component in ("target","candidate-1","candidate-2")},
+                     "stationaryJointCoherentVectorCovariance":(np.eye(6)*.001).tolist()}
                 for stage_id, handler, result in (
                     ("051-prepare-source-switching-temporal-model",
                      "openstar.tess.source-switching-temporal-model.prepare",preparation),
