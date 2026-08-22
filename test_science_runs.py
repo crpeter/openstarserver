@@ -1,8 +1,13 @@
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+import run_openstar_autonomous_tess
+import run_openstar_tess_ranked_followup
+import run_openstar_tess_sector_sweep
 from backfill_openstar_science_runs import (
     active_sector_sweep_processes,
     backfill_sector_sweeps,
@@ -86,6 +91,93 @@ class ScienceRunCatalogTests(unittest.TestCase):
             self.assertEqual(first.run_id, second.run_id)
             second.finish(status="COMPLETE", summary={"done": True})
             self.assertEqual("COMPLETE", catalog.get(first.run_id)["status"])
+
+
+class ScienceRunRunnerRegistrationTests(unittest.TestCase):
+    def catalog_from(self, temporary: str) -> ScienceRunCatalog:
+        return ScienceRunCatalog(Path(temporary, "science.sqlite3"), create=False)
+
+    def test_sector_sweep_main_registers_without_dashboard_configuration(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            catalog_path = Path(temporary, "science.sqlite3")
+            state = Path(temporary, "sector-two")
+            projection = {
+                "sector": 2,
+                "status": "RUNNING",
+                "inventory": 10,
+                "admitted": 10,
+                "complete": 4,
+                "remaining": 6,
+                "recoveryRequired": 0,
+                "inFlightOrRecovery": 1,
+                "runnable": 5,
+                "waitingExternalData": 0,
+                "blockedPrerequisites": 0,
+                "failed": 0,
+                "unclassified": 0,
+                "progress": 0.4,
+            }
+            with patch.dict(os.environ, {"OPENSTAR_SCIENCE_RUN_CATALOG": str(catalog_path)}), \
+                 patch.object(run_openstar_tess_sector_sweep, "run_tess_sector_sweep", return_value=0), \
+                 patch.object(run_openstar_tess_sector_sweep, "sector_sweep_projection", return_value=[projection]):
+                code = run_openstar_tess_sector_sweep.main([
+                    "--sector", "2",
+                    "--coordinator-url", "http://127.0.0.1:8080",
+                    "--state-dir", str(state),
+                ])
+
+            self.assertEqual(0, code)
+            runs = self.catalog_from(temporary).list_runs()
+            self.assertEqual(1, len(runs))
+            self.assertEqual("tess-sector-sweep", runs[0]["kind"])
+            self.assertEqual(2, runs[0]["metadata"]["sector"])
+            self.assertEqual("FINISHED", runs[0]["status"])
+            self.assertEqual(projection, runs[0]["summary"]["sectorSweep"])
+
+    def test_ranked_followup_main_registers_deep_run(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            catalog_path = Path(temporary, "science.sqlite3")
+            shallow = Path(temporary, "shallow")
+            deep = Path(temporary, "deep")
+            with patch.dict(os.environ, {"OPENSTAR_SCIENCE_RUN_CATALOG": str(catalog_path)}), \
+                 patch.object(run_openstar_tess_ranked_followup, "run_tess_ranked_followup", return_value=0):
+                code = run_openstar_tess_ranked_followup.main([
+                    "--sector", "2",
+                    "--sector-state-dir", str(shallow),
+                    "--deep-state-dir", str(deep),
+                    "--coordinator-url", "http://127.0.0.1:8080",
+                    "--promote-top", "5",
+                ])
+
+            self.assertEqual(0, code)
+            run = self.catalog_from(temporary).list_runs()[0]
+            self.assertEqual("tess-ranked-followup", run["kind"])
+            self.assertEqual(str(deep.resolve()), run["stateRoot"])
+            self.assertEqual("FINISHED", run["status"])
+
+    def test_autonomous_main_registers_state_root(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            catalog_path = Path(temporary, "science.sqlite3")
+            state = Path(temporary, "autonomous")
+            project = Path(temporary, "project.json")
+            with patch.dict(os.environ, {"OPENSTAR_SCIENCE_RUN_CATALOG": str(catalog_path)}), \
+                 patch.object(run_openstar_autonomous_tess, "run_autonomous_tess", return_value=0):
+                code = run_openstar_autonomous_tess.main([
+                    "--project", str(project),
+                    "--coordinator-url", "http://127.0.0.1:8080",
+                    "--state-dir", str(state),
+                ])
+
+            self.assertEqual(0, code)
+            run = self.catalog_from(temporary).list_runs()[0]
+            self.assertEqual("autonomous-investigation", run["kind"])
+            self.assertEqual(str(state.resolve()), run["stateRoot"])
+            self.assertEqual("FINISHED", run["status"])
+
+    def test_generic_investigation_runner_uses_science_recorder(self):
+        source = Path("run_investigation.py").read_text(encoding="utf-8")
+        self.assertIn("ScienceRunRecorder", source)
+        self.assertIn('kind="investigation"', source)
 
 
 class ScienceRunBackfillTests(unittest.TestCase):
