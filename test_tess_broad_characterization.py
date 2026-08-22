@@ -63,6 +63,60 @@ if _installed_numpy_stub:
 
 
 class BroadIndependentCharacterizationTests(unittest.TestCase):
+    def test_resolved_multisource_prepare_preserves_legacy_input_hashes(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        store = InvestigationStore(root / "investigations")
+        investigation = store.create("resolved-v2012-provenance", WORKFLOW_ID,
+                                     WORKFLOW_VERSION)
+        source_project = root / "source.json"
+        source_project.write_text("{}", encoding="utf-8")
+        morphology = {
+            "physicalCycleResolved": True,
+            "resolvedPhysicalPeriodDays": 10.510316195053623,
+        }
+        nonstationary = {
+            "preferredFrequencyAtReference": 0.27101611598985065,
+            "preferredPeriodAtReferenceDays": 1 / 0.27101611598985065,
+            "fractionalFrequencyDriftPerDay": 0.0004,
+            "timeReferenceDays": 2500.0,
+            "preferredModel": {"signalSectors": [28, 68]},
+        }
+        for stage_id, handler, result in (
+            ("001-prepared", "openstar.tess.prepare-target", {
+                "sourceProjectPath": str(source_project),
+                "sourceDatasetEntry": {"id": "tic"}, "ticID": 1, "sector": 1,
+            }),
+            ("002-identity", "openstar.tess.catalog-identity", {}),
+            ("003-independent", "openstar.tess.independent.prepare", {}),
+            ("010-morphology", "openstar.tess.morphology.analyze", morphology),
+            ("020-nonstationary", "openstar.tess.nonstationary.summarize",
+             nonstationary),
+            ("029-review", "openstar.tess.residual-mode-localization-review.interpret", {
+                "recommendedNextTest": "MULTI_SOURCE_RESIDUAL_DECOMPOSITION",
+            }),
+        ):
+            investigation = self._complete(store, investigation, stage_id, handler, result)
+
+        project_path = root / "multisource.json"
+        project_path.write_text("{}", encoding="utf-8")
+        engine = build_engine(store, mock.Mock(), poll_interval=0.0, timeout=1.0)
+        request = StageRequest("030-prepare-multi-source-residual",
+                               "openstar.tess.multi-source-residual.prepare", {})
+        with mock.patch(
+            "workflows.tess.tess_investigation.build_multisource_residual_project",
+            return_value={"projectPath": str(project_path), "preparedSeries": []},
+        ):
+            completed, _ = engine.run_stage(
+                investigation, request, software_id="test", software_version="20.12"
+            )
+
+        hashes = completed.stages[-1].provenance.input_hashes
+        self.assertEqual(sha256_json(morphology), hashes["harmonicFamilyEvidence"])
+        self.assertEqual(sha256_json(nonstationary),
+                         hashes["residualFrequencyDriftModel"])
+
     def test_unresolved_dynamic_family_reaches_multisource_prepare_with_provenance(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
@@ -80,8 +134,24 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
             ("010-morphology", "openstar.tess.morphology.analyze",
              {"physicalCycleResolved": False}),
             ("021-dynamic", "openstar.tess.dynamic-harmonic.analyze",
-             {"referenceFamilyPeriodDays": 10.30084080080649,
-              "supportedHarmonicOrders": [1, 2, 3, 4]}),
+             {"classification": "ADDITIONAL_VARIABILITY_REMAINS"}),
+            ("022-time-frequency-prepare", "openstar.tess.time-frequency.prepare",
+             {"absoluteTimeReferenceDays": 2500.0}),
+            ("023-time-frequency-summary", "openstar.tess.time-frequency.summarize",
+             {"residualEvolution": {"classification": "STABLE_RESIDUAL_MODE"}}),
+            ("024-mode", "openstar.tess.mode-identification.analyze", {
+                "independentModeEvidenceSurvived": True,
+                "physicalMechanismResolved": False,
+                "establishedPeriodFamily": {
+                    "referencePeriodDays": 10.30084080080649,
+                    "modeledHarmonicOrders": [1, 2, 3, 4],
+                },
+                "modeCandidate": {
+                    "frequencyCyclesPerDay": 1 / 2.2071724078510457,
+                    "periodDays": 2.2071724078510457,
+                    "supportingSectors": [94, 95, 102, 103],
+                },
+            }),
             ("035-review", "openstar.tess.residual-mode-localization-review.interpret",
              {"residualFrequencyAtReference": 1 / 2.2071724078510457,
               "residualPeriodAtReferenceDays": 2.2071724078510457,
@@ -113,35 +183,7 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
             control_state={"schedulerAction": "RUN_EXPERIMENT",
                            "selectedExperiment": vars(request_036)},
         )
-        legacy = WorkflowEngine(store)
-        legacy.register_handler(
-            request_036.handler_id,
-            lambda _investigation, _request: (_ for _ in ()).throw(RuntimeError(
-                "v20.12 requires the morphology-resolved physical period."
-            )),
-        )
-        with self.assertRaisesRegex(RuntimeError, "morphology-resolved"):
-            legacy.run_stage(investigation, request_036, software_id="legacy",
-                             software_version="20.11")
-        investigation = repair_obsolete_terminal_wait(store, store.load(investigation.id))
-        request_037 = StageRequest(
-            **investigation.metadata["controlState"]["selectedExperiment"]
-        )
-        legacy_037 = WorkflowEngine(store)
-        legacy_037.register_handler(
-            request_037.handler_id,
-            lambda _investigation, _request: (_ for _ in ()).throw(RuntimeError(
-                "v20.12 requires the completed v20.9 nonstationary model."
-            )),
-        )
-        with self.assertRaisesRegex(RuntimeError, "v20.9 nonstationary"):
-            legacy_037.run_stage(investigation, request_037, software_id="legacy",
-                                 software_version="20.11")
-        investigation = repair_obsolete_terminal_wait(store, store.load(investigation.id))
-        request = StageRequest(
-            **investigation.metadata["controlState"]["selectedExperiment"]
-        )
-        self.assertEqual("038-prepare-multi-source-residual", request.id)
+        request = request_036
         with mock.patch("workflows.tess.tess_investigation.build_multisource_residual_project",
                         side_effect=fake_build):
             completed, next_request = engine.run_stage(
@@ -151,7 +193,10 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
         self.assertEqual((1, 2, 3, 4), captured["harmonic_orders"])
         self.assertEqual(10.30084080080649, captured["physical_period_days"])
         self.assertFalse(captured["physical_cycle_resolved"])
-        self.assertEqual("021-dynamic", captured["family_evidence"]["stageID"])
+        sources = captured["family_evidence"]["sources"]
+        self.assertEqual(["010-morphology", "021-dynamic", "022-time-frequency-prepare",
+                          "023-time-frequency-summary", "024-mode"],
+                         [item["stageID"] for item in sources])
         residual = captured["nonstationary_summary"]
         self.assertAlmostEqual(1 / 2.2071724078510457,
                                residual["preferredFrequencyAtReference"])
@@ -160,13 +205,10 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
         self.assertEqual(0.0, residual["fractionalFrequencyDriftPerDay"])
         self.assertEqual(2500.0, residual["timeReferenceDays"])
         self.assertEqual([94, 95, 102, 103], residual["preferredModel"]["signalSectors"])
-        self.assertEqual("035-review", residual["sourceEvidence"]["stageID"])
-        self.assertEqual("openstar.tess.residual-mode-localization-review.interpret",
-                         residual["sourceEvidence"]["handlerID"])
-        self.assertEqual("openstar.tess.dynamic-harmonic.analyze",
-                         captured["family_evidence"]["handlerID"])
-        self.assertEqual(sha256_json(evidence[4][2]),
-                         captured["family_evidence"]["resultHash"])
+        self.assertEqual("frozen_residual_localization_family",
+                         residual["sourceEvidence"]["adapter"])
+        self.assertEqual("UNRESOLVED_FAMILY_ANALYSIS_REFERENCE",
+                         captured["family_evidence"]["referenceKind"])
         self.assertEqual("openstar.tess.multi-source-residual.run", next_request.handler_id)
         self.assertEqual("openstar.lomb-scargle.v1", result["workloadID"])
 
