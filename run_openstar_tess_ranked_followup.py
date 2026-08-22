@@ -18,8 +18,10 @@ from workflows.tess.tess_autonomy import (
     repair_obsolete_terminal_wait,
 )
 from workflows.tess.tess_ranked_followup import (
-    TessDeepAdmissionStore, TessRankedFollowupTargetSource, verified_reusable_primary,
+    TessDeepAdmissionStore, TessNoveltyScreenStore, TessRankedFollowupTargetSource,
+    shallow_primary_for_screen, verified_reusable_primary,
 )
+from workflows.tess.tess_identity import collect_identity
 from workflows.tess.tess_sector_archive import TessSectorInventoryStore
 from workflows.tess.tess_sector_ranking import TessSectorRankingStore, aggregate_tess_sector_ranking
 
@@ -62,10 +64,19 @@ def _claim(investigation) -> str | None:
 
 def run_tess_ranked_followup(sector: int, sector_state_dir: str | Path,
                              deep_state_dir: str | Path, coordinator_url: str,
-                             promote_top: int, *, max_concurrent_investigations: int | None = None,
+                             promote_top: int | None = None, *, promote_novel: int | None = None,
+                             known_period_validation_quota: int = 0,
+                             max_concurrent_investigations: int | None = None,
                              poll_interval: float = 1.0, timeout: float | None = None,
                              coordinator=None) -> int:
-    if sector < 1 or promote_top < 1: raise ValueError("sector and promote_top must be positive")
+    if sector < 1: raise ValueError("sector must be positive")
+    if (promote_top is None) == (promote_novel is None):
+        raise ValueError("select exactly one of promote_top or promote_novel")
+    if promote_top is not None and promote_top < 1: raise ValueError("promote_top must be positive")
+    if promote_novel is not None and promote_novel < 1: raise ValueError("promote_novel must be positive")
+    if known_period_validation_quota < 0: raise ValueError("known quota cannot be negative")
+    if promote_top is not None and known_period_validation_quota:
+        raise ValueError("known quota is only valid with promote_novel")
     sector_root, deep_root = validate_state_roots(sector_state_dir, deep_state_dir)
     inventory = TessSectorInventoryStore(sector_root / f"tess-sector-{sector}-inventory.json").load()
     if inventory.sector != sector: raise RuntimeError("Inventory sector does not match requested sector")
@@ -73,7 +84,18 @@ def run_tess_ranked_followup(sector: int, sector_state_dir: str | Path,
     # This is the sole intended write to shallow state.
     TessSectorRankingStore(sector_root / f"tess-sector-{sector}-ranking.json").save(ranking)
     ledger = TessDeepAdmissionStore(deep_root / f"tess-sector-{sector}-deep-admissions.json", sector)
-    admissions, new, excluded = ledger.admit(ranking, promote_top)
+    novelty_stats = {key: 0 for key in ("novelty_screened_this_run", "novel_candidates_found",
+        "known_period_matches_screened", "catalog_coverage_incomplete")}
+    if promote_top is not None:
+        admissions, new, excluded = ledger.admit(ranking, promote_top)
+    else:
+        shallow_store = InvestigationStore(sector_root / "investigations")
+        screen = TessNoveltyScreenStore(
+            deep_root / f"tess-sector-{sector}-novelty-screening.json", sector)
+        selected, novelty_stats = screen.select(ranking, promote_novel,
+            known_period_validation_quota, {item.ticID for item in ledger.load()},
+            collect_identity, lambda entry: shallow_primary_for_screen(shallow_store, entry))
+        admissions, new, excluded = ledger.admit_selected(ranking, selected)
 
     store = InvestigationStore(deep_root / "investigations")
     shallow_store = InvestigationStore(sector_root / "investigations")
@@ -110,6 +132,9 @@ def run_tess_ranked_followup(sector: int, sector_state_dir: str | Path,
     print(f"ranked={ranking.content['eligibleRankedCount']}")
     print(f"admitted={len(admissions)}")
     print(f"new_admissions={len(new)}")
+    for key, value in novelty_stats.items(): print(f"{key}={value}")
+    print(f"new_novel_admissions={sum(a.admissionBasis == 'NOVEL_PRIORITY' for a in new)}")
+    print(f"new_known_validation_admissions={sum(a.admissionBasis == 'KNOWN_PERIOD_VALIDATION' for a in new)}")
     for key in ("complete", "runnable", "waiting_external", "blocked", "failed"):
         state = {"waiting_external": "WAITING_EXTERNAL_DATA", "blocked": "BLOCKED_PREREQUISITES"}.get(key, key.upper())
         print(f"{key}={counts.get(state, 0)}")
@@ -117,6 +142,7 @@ def run_tess_ranked_followup(sector: int, sector_state_dir: str | Path,
     for admission in sorted(admissions, key=lambda item: (item.admittedRankingRank, item.ticID)):
         outcome = outcomes[admission.deepInvestigationID]
         line = f"rank={admission.admittedRankingRank} tic={admission.ticID} state={outcome.state.value}"
+        if admission.admissionBasis: line += f" admission_basis={admission.admissionBasis}"
         claim = _claim(outcome.investigation)
         if claim: line += f" claim={claim}"
         print(line)
@@ -128,20 +154,30 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Run durable ranked TESS deep follow-up.")
     parser.add_argument("--sector", type=int, required=True)
     parser.add_argument("--sector-state-dir", required=True); parser.add_argument("--deep-state-dir", required=True)
-    parser.add_argument("--coordinator-url", required=True); parser.add_argument("--promote-top", type=int, required=True)
+    parser.add_argument("--coordinator-url", required=True)
+    promotion = parser.add_mutually_exclusive_group(required=True)
+    promotion.add_argument("--promote-top", type=int)
+    promotion.add_argument("--promote-novel", type=int)
+    parser.add_argument("--known-period-validation-quota", type=int, default=0)
     parser.add_argument("--max-concurrent-investigations", type=int)
     parser.add_argument("--poll-interval", type=float, default=1.0); parser.add_argument("--timeout", type=float)
     args = parser.parse_args(argv)
-    for name in ("sector", "promote_top", "max_concurrent_investigations", "poll_interval", "timeout"):
+    for name in ("sector", "promote_top", "promote_novel", "max_concurrent_investigations", "poll_interval", "timeout"):
         value = getattr(args, name)
         if value is not None and value <= 0: parser.error(f"--{name.replace('_', '-')} must be positive")
+    if args.known_period_validation_quota < 0:
+        parser.error("--known-period-validation-quota cannot be negative")
+    if args.promote_top is not None and args.known_period_validation_quota:
+        parser.error("--known-period-validation-quota requires --promote-novel")
     return args
 
 
 def main(argv=None):
     args = parse_args(argv)
     try: return run_tess_ranked_followup(args.sector, args.sector_state_dir, args.deep_state_dir,
-        args.coordinator_url, args.promote_top, max_concurrent_investigations=args.max_concurrent_investigations,
+        args.coordinator_url, args.promote_top, promote_novel=args.promote_novel,
+        known_period_validation_quota=args.known_period_validation_quota,
+        max_concurrent_investigations=args.max_concurrent_investigations,
         poll_interval=args.poll_interval, timeout=args.timeout)
     except KeyboardInterrupt: return 130
     except Exception as error:

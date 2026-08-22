@@ -12,6 +12,9 @@ from openstar_investigation import sha256_file, sha256_json
 from openstar_targets import InvestigationTarget
 from workflows.tess.tess_autonomy import WORKFLOW_ID, WORKFLOW_VERSION
 from workflows.tess.tess_primary_reuse import coordinator_dataset_identity_matches
+from workflows.tess.tess_hypotheses import (
+    catalog_coverage_complete, catalog_period_evidence, primary_period_days,
+)
 from workflows.tess.tess_sector_ranking import TessSectorRanking
 from workflows.tess.tess_sector_scan import (
     EVIDENCE_HANDLER, MATERIALIZE_HANDLER, SCAN_HANDLER,
@@ -49,6 +52,8 @@ class TessDeepAdmission:
     rankingPolicyID: str
     rankingPolicyVersion: str
     sourceRankingSha256: str
+    admissionBasis: str | None = None
+    noveltyScreeningSha256: str | None = None
 
 
 class TessDeepAdmissionStore:
@@ -67,7 +72,7 @@ class TessDeepAdmissionStore:
         sector = self.sector if self.sector is not None else (admissions[0].sector if admissions else None)
         if sector is None: raise ValueError("Cannot save an empty ledger without a sector")
         _atomic_json(self.path, {"schemaVersion": "1", "sector": sector,
-                                "admissions": [asdict(item) for item in admissions]})
+                                "admissions": [_admission_dict(item) for item in admissions]})
 
     def admit(self, ranking: TessSectorRanking, top_n: int):
         if top_n < 1: raise ValueError("top_n must be positive")
@@ -83,6 +88,123 @@ class TessDeepAdmissionStore:
             existing.append(admission); known.add(tic); new.append(admission)
         if new: self.save(existing)
         return tuple(existing), tuple(new), tuple(excluded)
+
+    def admit_selected(self, ranking: TessSectorRanking,
+                       selected: Sequence[tuple[dict[str, Any], str, str]]):
+        """Append explicitly screened entries without changing legacy admit()."""
+        existing = list(self.load()); known = {item.ticID for item in existing}
+        new, excluded = [], []
+        ranking_hash = sha256_json(ranking.content)
+        for entry, basis, screen_hash in selected:
+            tic = int(entry["ticID"])
+            if tic in known: continue
+            try:
+                admission = _verified_admission(ranking, entry, ranking_hash)
+                admission = TessDeepAdmission(**{**asdict(admission),
+                    "admissionBasis": basis, "noveltyScreeningSha256": screen_hash})
+            except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as error:
+                excluded.append({"ticID": tic, "reason": str(error)}); continue
+            existing.append(admission); known.add(tic); new.append(admission)
+        if new: self.save(existing)
+        return tuple(existing), tuple(new), tuple(excluded)
+
+
+NOVEL = "NOVEL_NO_CATALOG_PERIOD_MATCH"
+KNOWN = "KNOWN_CATALOG_PERIOD_MATCH"
+INCOMPLETE = "CATALOG_COVERAGE_INCOMPLETE"
+INVALID = "INVALID_OR_UNSCREENABLE"
+
+
+def _admission_dict(admission: TessDeepAdmission) -> dict[str, Any]:
+    """Serialize without changing the shape of pre-novelty ledger records."""
+    value = asdict(admission)
+    for key in ("admissionBasis", "noveltyScreeningSha256"):
+        if value[key] is None:
+            del value[key]
+    return value
+
+
+class TessNoveltyScreenStore:
+    """Durable catalog triage, separate from immutable shallow evidence."""
+    schema_version = "1"
+
+    def __init__(self, path: str | Path, sector: int):
+        self.path, self.sector = Path(path), sector
+
+    def _load(self) -> list[dict[str, Any]]:
+        if not self.path.exists(): return []
+        value = json.loads(self.path.read_text(encoding="utf-8"))
+        if int(value["sector"]) != self.sector: raise RuntimeError("Novelty screen sector mismatch")
+        return list(value.get("screens", []))
+
+    def _save(self, screens):
+        _atomic_json(self.path, {"schemaVersion": self.schema_version,
+            "sector": self.sector, "screens": screens})
+
+    @staticmethod
+    def key(ranking: TessSectorRanking, entry: dict[str, Any]) -> str:
+        return sha256_json({"sector": ranking.sector, "ticID": int(entry["ticID"]),
+            "sourceScanInvestigationID": entry["scanInvestigationID"],
+            "sourceEvidenceSha256": entry["sourceEvidenceSha256"],
+            "rankingPolicyID": ranking.content["rankingPolicyID"],
+            "rankingPolicyVersion": ranking.content["rankingPolicyVersion"]})
+
+    def select(self, ranking: TessSectorRanking, novel_count: int, known_quota: int,
+               already_admitted: set[int], identity_collector, primary_resolver):
+        """Screen in rank order until the requested complete-coverage tranche exists."""
+        if novel_count < 1 or known_quota < 0: raise ValueError("invalid novelty admission counts")
+        screens = self._load(); by_key = {}
+        for item in screens: by_key[item["screeningKey"]] = item
+        novel, incomplete, known, invalid = [], [], [], []
+        queried = known_screened = 0
+        for entry in ranking.content["rankedEntries"]:
+            tic = int(entry["ticID"])
+            if tic in already_admitted: continue
+            key = self.key(ranking, entry); screen = by_key.get(key)
+            # Complete coverage is immutable cache evidence; incomplete results
+            # get one retry per invocation, never a tight in-run retry loop.
+            if screen is None or screen["classification"] == INCOMPLETE:
+                try:
+                    primary = primary_resolver(entry)
+                except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+                    primary = {}
+                period = primary_period_days(primary or {})
+                if period is None:
+                    identity = None; evidence = []
+                    classification = INVALID
+                else:
+                    identity = identity_collector(tic); queried += 1
+                    evidence = catalog_period_evidence(identity, period)
+                    classification = (INCOMPLETE if not catalog_coverage_complete(identity)
+                        else KNOWN if any(item["matches"] for item in evidence) else NOVEL)
+                screen = {"screeningKey": key, "sector": self.sector, "ticID": tic,
+                    "sourceScanInvestigationID": entry["scanInvestigationID"],
+                    "sourceEvidenceSha256": entry["sourceEvidenceSha256"],
+                    "rankingPolicyID": ranking.content["rankingPolicyID"],
+                    "rankingPolicyVersion": ranking.content["rankingPolicyVersion"],
+                    "observedPeriodDays": period, "catalogIdentityEvidence": identity,
+                    "catalogCoverageComplete": bool(identity and catalog_coverage_complete(identity)),
+                    "matchingCatalogEvidence": [x for x in evidence if x["matches"]],
+                    "classification": classification}
+                screens.append(screen); by_key[key] = screen; self._save(screens)
+            pair = (entry, screen)
+            if screen["classification"] == KNOWN:
+                known_screened += 1
+                if len(known) < known_quota:
+                    known.append(pair)
+            else:
+                {NOVEL: novel, INCOMPLETE: incomplete, INVALID: invalid}[screen["classification"]].append(pair)
+            # The known quota is a ceiling on controls encountered while
+            # finding the novel tranche, never a reason to query farther.
+            if len(novel) >= novel_count: break
+        chosen = [(e, "NOVEL_PRIORITY", sha256_json(s)) for e, s in novel[:novel_count]]
+        if len(chosen) < novel_count:
+            chosen += [(e, "CATALOG_COVERAGE_INCOMPLETE", sha256_json(s))
+                       for e, s in incomplete[:novel_count - len(chosen)]]
+        chosen += [(e, "KNOWN_PERIOD_VALIDATION", sha256_json(s)) for e, s in known[:known_quota]]
+        stats = {"novelty_screened_this_run": queried, "novel_candidates_found": len(novel),
+            "known_period_matches_screened": known_screened, "catalog_coverage_incomplete": len(incomplete)}
+        return chosen, stats
 
 
 def _verified_admission(ranking: TessSectorRanking, entry: dict[str, Any], ranking_hash: str) -> TessDeepAdmission:
@@ -105,6 +227,22 @@ def _verified_admission(ranking: TessSectorRanking, entry: dict[str, Any], ranki
         str(entry["datasetID"]), str(artifact), str(entry["datasetSha256"]),
         str(entry["sourceEvidenceSha256"]), int(entry["rank"]),
         str(ranking.content["rankingPolicyID"]), str(ranking.content["rankingPolicyVersion"]), ranking_hash)
+
+
+def shallow_primary_for_screen(store, entry: dict[str, Any]) -> dict[str, Any]:
+    """Read (never recompute) the persisted shallow coordinator target result."""
+    investigation = store.load(str(entry["scanInvestigationID"]))
+    stages = [stage for stage in investigation.stages
+              if stage.handler_id == SCAN_HANDLER and stage.status == "COMPLETE"]
+    if len(stages) != 1 or not isinstance(stages[0].result, dict): return {}
+    datasets = stages[0].result.get("datasets") or []
+    matches = [item for item in datasets if isinstance(item, dict)
+               and coordinator_dataset_identity_matches(item, str(entry["datasetID"]))]
+    if len(matches) != 1: return {}
+    # Older coordinator results have only bestPeriodDays.  Expose it through
+    # analyze's established candidate fallback rather than inventing a rule.
+    return {**matches[0], "candidatePeriodDays": matches[0].get(
+        "candidatePeriodDays", matches[0].get("bestPeriodDays"))}
 
 
 def verified_reusable_primary(store, admission: TessDeepAdmission) -> dict[str, Any] | None:
