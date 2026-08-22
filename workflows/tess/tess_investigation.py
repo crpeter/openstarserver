@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from .tess_localization_evidence import frozen_residual_localization_family
+
 from openstar_coordinator_client import OpenStarCoordinatorClient
 from openstar_investigation import (
     ArtifactReference,
@@ -3527,8 +3529,9 @@ def build_engine(
         mode_identification = _latest_result_for_handler(
             investigation, "openstar.tess.mode-identification.analyze",
         )
-        dynamic_path = _dynamic_mode_localization_evidence(
-            dynamic_harmonic, time_frequency_prepare, time_frequency, mode_identification,
+        family_context = frozen_residual_localization_family(
+            morphology, dynamic_harmonic, time_frequency_prepare, time_frequency,
+            mode_identification,
         )
         residual_localization = _latest_result_for_handler(
             investigation,
@@ -3540,9 +3543,9 @@ def build_engine(
             raise RuntimeError("v20.11 requires frozen independent-sector metadata.")
         if morphology is None:
             raise RuntimeError("v20.11 requires persisted morphology evidence.")
-        if dynamic_path is None and not morphology.get("physicalCycleResolved"):
-            raise RuntimeError("v20.11 requires the morphology-resolved physical period.")
-        if dynamic_path is None and nonstationary is None:
+        if family_context is None and not morphology.get("physicalCycleResolved"):
+            raise RuntimeError("v20.11 requires a complete frozen residual-mode family.")
+        if family_context is None and nonstationary is None:
             raise RuntimeError("v20.11 requires the completed v20.9 nonstationary model.")
         if residual_localization is None:
             raise RuntimeError("v20.11 requires the completed v20.10 residual-mode localization.")
@@ -3552,8 +3555,9 @@ def build_engine(
             )
 
         harmonic_orders = (1, 2)
-        if dynamic_path is not None:
-            physical_period, harmonic_orders, nonstationary = dynamic_path
+        reference_kind = "MORPHOLOGY_RESOLVED_PHYSICAL_PERIOD"
+        if family_context is not None:
+            physical_period, harmonic_orders, nonstationary, reference_kind = family_context
         else:
             physical_period = float(morphology["resolvedPhysicalPeriodDays"])
         artifact_root = store.directory_for(investigation.id) / "artifacts"
@@ -3579,9 +3583,8 @@ def build_engine(
         )
         spec["periodReference"] = {
             "periodDays": physical_period,
-            "kind": ("UNRESOLVED_FAMILY_ANALYSIS_REFERENCE" if dynamic_path is not None
-                     else "MORPHOLOGY_RESOLVED_PHYSICAL_PERIOD"),
-            "physicalCycleResolved": dynamic_path is None,
+            "kind": reference_kind,
+            "physicalCycleResolved": morphology.get("physicalCycleResolved") is True,
         }
         spec["physicalMechanismResolved"] = False
         print(f"   generic workload: {spec.get('workloadID')}")

@@ -15,6 +15,7 @@ from openstar_autonomy import (
 from openstar_investigation import Investigation, InvestigationStore
 from openstar_targets import InvestigationTarget
 from openstar_workflow import StageRequest, WorkflowEngine
+from .tess_localization_evidence import frozen_residual_localization_family
 
 # Kept identical to the public identifiers in tess_investigation.  Importing that
 # module eagerly would also import optional numerical/astronomy dependencies,
@@ -508,11 +509,8 @@ def _repair_unresolved_dynamic_localization_review_failure(
     if selected is not None:
         if not isinstance(selected, dict):
             return None
-        # A scheduler decision dispatches a whole linked StageOutcome chain.
-        # Consequently selectedExperiment normally still describes the first
-        # stage in that chain when a later stage fails.  Accept that real
-        # persisted shape, but only when the selected request exactly matches
-        # an immutable historical stage and the failure descends from it.
+        # The real persisted failures retain the failed request itself.  Do not
+        # broaden recovery to an earlier request merely because it is an ancestor.
         selected_stage = next(
             (stage for stage in investigation.stages if stage.id == selected.get("id")),
             None,
@@ -525,13 +523,7 @@ def _repair_unresolved_dynamic_localization_review_failure(
             != selected_stage.triggered_by_stage_id
         ):
             return None
-        ancestors = {failed.id}
-        cursor = failed
-        stages_by_id = {stage.id: stage for stage in investigation.stages}
-        while cursor.triggered_by_stage_id in stages_by_id:
-            cursor = stages_by_id[cursor.triggered_by_stage_id]
-            ancestors.add(cursor.id)
-        if selected_stage.id not in ancestors:
+        if selected_stage.id != failed.id:
             return None
     morphology = _latest_complete(investigation, "openstar.tess.morphology.analyze")
     dynamic = _latest_complete(investigation, "openstar.tess.dynamic-harmonic.analyze")
@@ -541,21 +533,21 @@ def _repair_unresolved_dynamic_localization_review_failure(
     localization = _latest_complete(
         investigation, "openstar.tess.residual-mode-localization.interpret"
     )
-    dynamic_result = (dynamic.result or {}) if dynamic else {}
     mode_result = (mode.result or {}) if mode else {}
-    tf_result = (tf_summary.result or {}) if tf_summary else {}
     localization_result = (localization.result or {}) if localization else {}
-    orders = list(dynamic_result.get("supportedHarmonicOrders") or [])
-    if not (morphology and (morphology.result or {}).get("physicalCycleResolved") is False
-            and dynamic and orders
-            and tf_prepare and tf_summary
-            and ((tf_result.get("residualEvolution") or {}).get("classification")
-                 == "STABLE_RESIDUAL_MODE")
-            and mode and mode_result.get("independentModeEvidenceSurvived") is True
+    family_context = frozen_residual_localization_family(
+        morphology.result if morphology else None,
+        dynamic.result if dynamic else None,
+        tf_prepare.result if tf_prepare else None,
+        tf_summary.result if tf_summary else None,
+        mode_result if mode else None,
+    )
+    if not (family_context is not None
             and localization
             and localization_result.get("recommendedNextTest")
                  == "RESIDUAL_MODE_SOURCE_LOCALIZATION_REVIEW"):
         return None
+    orders = list(family_context[1])
     localization_prepare = _latest_complete(
         investigation, "openstar.tess.residual-mode-localization.prepare"
     )

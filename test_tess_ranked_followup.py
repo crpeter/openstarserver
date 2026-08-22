@@ -417,15 +417,15 @@ class RankedFollowupTests(unittest.TestCase):
             stages = (
                 InvestigationStage("010-morphology", "openstar.tess.morphology.analyze", "COMPLETE", None, {}, result={"physicalCycleResolved": False}),
                 InvestigationStage("011-dynamic", "openstar.tess.dynamic-harmonic.analyze", "COMPLETE", "010-morphology", {}, result={"referenceFamilyPeriodDays": 10.3, "supportedHarmonicOrders": [1, 2, 3, 4]}),
-                InvestigationStage("012-time-frequency-prepare", "openstar.tess.time-frequency.prepare", "COMPLETE", "011-dynamic", {}, result={}),
+                InvestigationStage("012-time-frequency-prepare", "openstar.tess.time-frequency.prepare", "COMPLETE", "011-dynamic", {}, result={"absoluteTimeReferenceDays": 2500.0}),
                 InvestigationStage("013-time-frequency-summary", "openstar.tess.time-frequency.summarize", "COMPLETE", "012-time-frequency-prepare", {}, result={"residualEvolution": {"classification": "STABLE_RESIDUAL_MODE"}}),
-                InvestigationStage("018-mode-identification", "openstar.tess.mode-identification.analyze", "COMPLETE", "013-time-frequency-summary", {}, result={"independentModeEvidenceSurvived": True}),
+                InvestigationStage("018-mode-identification", "openstar.tess.mode-identification.analyze", "COMPLETE", "013-time-frequency-summary", {}, result={"independentModeEvidenceSurvived": True, "physicalMechanismResolved": False, "establishedPeriodFamily": {"referencePeriodDays": 10.3, "modeledHarmonicOrders": [1, 2, 3, 4]}, "modeCandidate": {"frequencyCyclesPerDay": 0.25, "periodDays": 4.0, "supportingSectors": [2, 29, 68, 69]}}),
                 InvestigationStage("019-prepare-residual-mode-localization", "openstar.tess.residual-mode-localization.prepare", "COMPLETE", "018-mode-identification", {}, result={"subtractedHarmonicOrders": [1, 2, 3, 4]}),
                 InvestigationStage("020-run-residual-mode-localization", "openstar.tess.residual-mode-localization.run", "COMPLETE", "019-prepare-residual-mode-localization", {}, result={}),
                 InvestigationStage("021-interpret-residual-mode-localization", "openstar.tess.residual-mode-localization.interpret", "COMPLETE", "020-run-residual-mode-localization", {}, result={"recommendedNextTest": "RESIDUAL_MODE_SOURCE_LOCALIZATION_REVIEW"}),
                 InvestigationStage("022-prepare-residual-mode-localization-review", "openstar.tess.residual-mode-localization-review.prepare", "FAILED", "021-interpret-residual-mode-localization", {}, error="RuntimeError: v20.11 requires the completed v20.9 nonstationary model.", failure_classification="NON_RETRYABLE"),
             )
-            selected = stages[5]
+            selected = stages[-1]
             failed = replace(investigation, status="FAILED", stages=stages, metadata={
                 **investigation.metadata,
                 "controlState": {"schedulerAction": "RUN_EXPERIMENT", "selectedExperiment": {

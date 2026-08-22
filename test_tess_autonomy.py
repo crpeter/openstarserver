@@ -441,7 +441,10 @@ class TessAutonomyIntegrationTests(unittest.TestCase):
               "physicalMechanismResolved": False}),
             ("014-mode", "openstar.tess.mode-identification.analyze",
              {"independentModeEvidenceSurvived": True, "physicalMechanismResolved": False,
+              "establishedPeriodFamily": {"referencePeriodDays": 10.30084080080649,
+                                            "modeledHarmonicOrders": [1, 2, 3, 4]},
               "modeCandidate": {"frequencyCyclesPerDay": 1 / 2.206,
+                                "periodDays": 2.206,
                                 "supportingSectors": [94, 95, 102, 103]}}),
             ("015-localization-prepare", "openstar.tess.residual-mode-localization.prepare",
              {"subtractedHarmonicOrders": [1, 2],
@@ -477,6 +480,15 @@ class TessAutonomyIntegrationTests(unittest.TestCase):
         self.assertEqual("FAILED", investigation.status)
         self.assertEqual("RUN_EXPERIMENT",
                          investigation.metadata["controlState"]["schedulerAction"])
+        failed_request = investigation.stages[-1]
+        investigation = self.store.set_control_state(
+            investigation, status="FAILED",
+            control_state={"schedulerAction": "RUN_EXPERIMENT", "selectedExperiment": {
+                "id": failed_request.id, "handler_id": failed_request.handler_id,
+                "parameters": failed_request.parameters,
+                "triggered_by_stage_id": failed_request.triggered_by_stage_id,
+            }},
+        )
         old_stages = investigation.stages
         old_stage_files = {
             stage.id: self.store.stage_path_for(investigation.id, stage.id).read_bytes()
@@ -531,18 +543,21 @@ class TessAutonomyIntegrationTests(unittest.TestCase):
                     f"real-stage-022-{offset}", WORKFLOW_ID, WORKFLOW_VERSION,
                     metadata={},
                 )
+                resolved = offset == 1
+                family_period = 14.636494965204527 if not resolved else 10.510316195053623
+                orders = [1, 2, 4] if not resolved else [1, 2, 3]
+                frequency = 0.27628980191811653 if not resolved else 0.27101611598985065
                 stages = (
-                    InvestigationStage("010-morphology", "openstar.tess.morphology.analyze", "COMPLETE", None, {}, result={"physicalCycleResolved": False}),
-                    InvestigationStage("011-dynamic", "openstar.tess.dynamic-harmonic.analyze", "COMPLETE", "010-morphology", {}, result={"referenceFamilyPeriodDays": 10.3, "supportedHarmonicOrders": [1, 2, 3, 4]}),
-                    InvestigationStage("012-time-frequency-prepare", "openstar.tess.time-frequency.prepare", "COMPLETE", "011-dynamic", {}, result={"subtractedHarmonicOrders": [1, 2, 3, 4]}),
+                    InvestigationStage("010-morphology", "openstar.tess.morphology.analyze", "COMPLETE", None, {}, result={"physicalCycleResolved": resolved, "resolvedPhysicalPeriodDays": family_period if resolved else None}),
+                    InvestigationStage("012-time-frequency-prepare", "openstar.tess.time-frequency.prepare", "COMPLETE", "010-morphology", {}, result={"subtractedHarmonicOrders": orders, "absoluteTimeReferenceDays": 2500.0}),
                     InvestigationStage("013-time-frequency-summary", "openstar.tess.time-frequency.summarize", "COMPLETE", "012-time-frequency-prepare", {}, result={"residualEvolution": {"classification": "STABLE_RESIDUAL_MODE"}}),
-                    InvestigationStage("018-mode-identification", "openstar.tess.mode-identification.analyze", "COMPLETE", "013-time-frequency-summary", {}, result={"independentModeEvidenceSurvived": True}),
-                    InvestigationStage("019-prepare-residual-mode-localization", "openstar.tess.residual-mode-localization.prepare", "COMPLETE", "018-mode-identification", {}, result={"subtractedHarmonicOrders": [1, 2, 3, 4]}),
+                    InvestigationStage("018-mode-identification", "openstar.tess.mode-identification.analyze", "COMPLETE", "013-time-frequency-summary", {}, result={"classification": "INDEPENDENT_STABLE_MODE", "independentModeEvidenceSurvived": True, "physicalMechanismResolved": False, "recommendedNextTest": "RESIDUAL_MODE_PIXEL_LOCALIZATION", "establishedPeriodFamily": {"referencePeriodDays": family_period, "modeledHarmonicOrders": orders}, "modeCandidate": {"frequencyCyclesPerDay": frequency, "periodDays": 1 / frequency, "supportingSectors": [2, 29, 68, 69]}}),
+                    InvestigationStage("019-prepare-residual-mode-localization", "openstar.tess.residual-mode-localization.prepare", "COMPLETE", "018-mode-identification", {}, result={"subtractedHarmonicOrders": orders}),
                     InvestigationStage("020-run-residual-mode-localization", "openstar.tess.residual-mode-localization.run", "COMPLETE", "019-prepare-residual-mode-localization", {}, result={"status": "COMPLETE"}),
                     InvestigationStage("021-interpret-residual-mode-localization", "openstar.tess.residual-mode-localization.interpret", "COMPLETE", "020-run-residual-mode-localization", {}, result={"recommendedNextTest": "RESIDUAL_MODE_SOURCE_LOCALIZATION_REVIEW"}),
                     InvestigationStage("022-prepare-residual-mode-localization-review", "openstar.tess.residual-mode-localization-review.prepare", "FAILED", "021-interpret-residual-mode-localization", {}, error=error, failure_classification="NON_RETRYABLE"),
                 )
-                selected = stages[5]
+                selected = stages[-1]
                 investigation = replace(
                     investigation, status="FAILED", stages=stages,
                     metadata={"controlState": {
@@ -556,6 +571,20 @@ class TessAutonomyIntegrationTests(unittest.TestCase):
                 )
                 self.store.save(investigation)
                 historical = investigation.stages
+
+                if resolved:
+                    inconsistent = replace(
+                        investigation,
+                        stages=(replace(
+                            investigation.stages[0],
+                            result={"physicalCycleResolved": True,
+                                    "resolvedPhysicalPeriodDays": family_period + 1.0},
+                        ),) + investigation.stages[1:],
+                    )
+                    self.assertEqual(
+                        inconsistent,
+                        repair_obsolete_terminal_wait(self.store, inconsistent),
+                    )
 
                 repaired = repair_obsolete_terminal_wait(self.store, investigation)
                 self.assertEqual("RUNNING", repaired.status)
