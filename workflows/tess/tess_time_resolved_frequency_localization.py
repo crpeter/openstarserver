@@ -24,6 +24,9 @@ _PRESERVED = ("referenceFamilyPeriodDays", "subtractedHarmonicOrders",
               "residualTimeReferenceDays", "fractionalFrequencyDriftPerDay",
               "targetSky", "catalogCandidates", "sectors")
 _IDENTITIES = {"TARGET_SUPPORTED", "CANDIDATE_1_SUPPORTED", "CANDIDATE_2_SUPPORTED"}
+# TESS times are persisted as JSON doubles.  This tolerance is tight enough to
+# reject a different cadence while allowing a final-bit serialization change.
+WINDOW_TIME_TOLERANCE_DAYS = 1e-7
 
 
 def prepare_time_resolved_frequency_localization(
@@ -111,7 +114,33 @@ def run_time_resolved_frequency_localization(
             spec = frozen[(sector, number)]
             start, end = int(spec["cadenceStartIndex"]), int(spec["cadenceEndIndex"])
             indices = np.arange(start, end + 1)
-            diagnostic = {**spec}
+            persisted_range = [float(value) for value in spec["timeRangeDays"]]
+            in_range = start >= 0 and end >= start and end < len(times)
+            reacquired_count = int(len(indices)) if in_range else 0
+            reacquired_range = ([float(times[start]), float(times[end])]
+                                if in_range else None)
+            monotonic = bool(in_range and np.all(np.diff(times[indices]) > 0.0))
+            reproduced = bool(
+                in_range
+                and reacquired_count == int(spec["cadenceCount"])
+                and monotonic
+                and np.allclose(reacquired_range, persisted_range, rtol=0.0,
+                                atol=WINDOW_TIME_TOLERANCE_DAYS)
+            )
+            diagnostic = {**spec,
+                "persistedTimeRangeDays": persisted_range,
+                "reacquiredTimeRangeDays": reacquired_range,
+                "persistedCadenceCount": int(spec["cadenceCount"]),
+                "reacquiredCadenceCount": reacquired_count,
+                "windowReproduced": reproduced}
+            if not reproduced:
+                diagnostic.update({"classification": "NO_QUALITY_LOCALIZATION",
+                    "qualityState": "WINDOW_REPRODUCTION_MISMATCH",
+                    "qualityFailure": (
+                        "Reacquired cadences do not reproduce the persisted stage-055 window."
+                    )})
+                results.append(diagnostic)
+                continue
             try:
                 wt, wc = times[indices], cube[indices]
                 warped = _time_warp(wt-float(preparation["residualTimeReferenceDays"]),
@@ -155,7 +184,7 @@ def _motion(windows: list[dict[str, Any]]) -> bool:
 
 def interpret_time_resolved_frequency_localization(preparation: dict[str, Any],
                                                    run: dict[str, Any]) -> dict[str, Any]:
-    evidence = []; all_quality = []
+    evidence = []
     for sector in run.get("sectorResults") or []:
         windows = sector.get("windowResults") or []; quality = [w for w in windows
             if w.get("qualityState") == "QUALITY_LOCALIZATION"]
@@ -177,14 +206,16 @@ def interpret_time_resolved_frequency_localization(preparation: dict[str, Any],
                 "assessment": "REINFORCED" if agreement else "CONFLICTING_UNRESOLVED" if conflict else "INCONCLUSIVE"})
         evidence.append({"sector": sector["sector"], "classification": label,
                          "windowResults": windows, "stage056Comparison": comparisons})
-        all_quality.extend(quality)
     labels = [s["classification"] for s in evidence]
     conflicts = any(c["assessment"] == "CONFLICTING_UNRESOLVED" for s in evidence for c in s["stage056Comparison"])
     stable = {x for x in labels if x.startswith("STABLE_")}
     if conflicts: classification = "UNRESOLVED"
     elif "WITHIN_SECTOR_SOURCE_SWITCHING_CONFIRMED" in labels: classification = "WITHIN_SECTOR_SOURCE_SWITCHING_CONFIRMED"
     elif len(stable) > 1: classification = "CROSS_SECTOR_SOURCE_SWITCHING_CONFIRMED"
-    elif "TIME_VARIABLE_LOCALIZATION_CONFIRMED" in labels or _motion(all_quality): classification = "TIME_VARIABLE_LOCALIZATION_CONFIRMED"
+    # Raw TPF pixel coordinates have sector-specific WCS frames.  Cross-sector
+    # conclusions therefore use only frozen source identities; unmatched
+    # centroid motion is confirmed only within a sector above.
+    elif "TIME_VARIABLE_LOCALIZATION_CONFIRMED" in labels: classification = "TIME_VARIABLE_LOCALIZATION_CONFIRMED"
     elif len(stable) == 1 and all(x == next(iter(stable)) for x in labels): classification = next(iter(stable))
     elif "MULTI_SOURCE_OR_BLENDED" in labels: classification = "MULTI_SOURCE_OR_BLENDED"
     else: classification = "UNRESOLVED"

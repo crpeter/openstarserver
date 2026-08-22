@@ -107,5 +107,46 @@ class TimeResolvedFrequencyLocalizationTests(unittest.TestCase):
         self.assertEqual("UNRESOLVED",result["classification"])
         self.assertTrue(any(c["assessment"]=="CONFLICTING_UNRESOLVED" for s in result["sectorEvidence"] for c in s["stage056Comparison"]))
 
+    def test_sector_detector_coordinates_are_never_compared_as_common_coordinates(self):
+        # The same frozen TARGET identity lands at very different detector
+        # pixels in each sector, while remaining stable inside each sector.
+        prep,_,_=self.experiment([["target","target"]]*4)
+        detector_positions=[(1.,1.),(18.,2.),(3.,21.),(24.,25.)]
+        sectors=[]
+        for sector,(x,y) in zip(self.base["sectors"],detector_positions):
+            windows=[]
+            for number in (1,2):
+                windows.append({"windowIndex":number,
+                    "stage056Classification":"TARGET_SUPPORTED",
+                    "classification":"TARGET_SUPPORTED",
+                    "qualityState":"QUALITY_LOCALIZATION",
+                    "centroidUncertaintyPixels":.1,
+                    "response":{"centroidX":x,"centroidY":y}})
+            sectors.append({"sector":sector,"windowResults":windows})
+        result=interpret_time_resolved_frequency_localization(
+            prep,{"sectorResults":sectors})
+        self.assertEqual("STABLE_TARGET_LOCALIZATION",result["classification"])
+        self.assertNotEqual("TIME_VARIABLE_LOCALIZATION_CONFIRMED",result["classification"])
+
+    def test_reacquired_shifted_window_fails_closed(self):
+        original=self.inputs([["target","target"]]*4)
+        old=run_time_resolved_residual_phase_localization(self.base,sector_inputs=original)
+        stage056={"classification":"TIME_VARIABLE_LOCALIZATION",
+            "sourceAttributionResolved":False,"physicalMechanismResolved":False,
+            "recommendedNextTest":"TIME_VARIABLE_SOURCE_LOCALIZATION_FOLLOWUP"}
+        shifted=[]
+        for item in original:
+            shifted.append({**item,"times":np.asarray(item["times"])+.01})
+        with tempfile.TemporaryDirectory() as root:
+            prep=prepare_time_resolved_frequency_localization(stage054=self.base,
+                stage055=old,stage056=stage056,output_dir=Path(root),investigation_id="x")
+            run=run_time_resolved_frequency_localization(prep,sector_inputs=shifted)
+        windows=[w for sector in run["sectorResults"] for w in sector["windowResults"]]
+        self.assertTrue(all(not w["windowReproduced"] for w in windows))
+        self.assertTrue(all(w["qualityState"]=="WINDOW_REPRODUCTION_MISMATCH" for w in windows))
+        self.assertTrue(all(w["classification"]=="NO_QUALITY_LOCALIZATION" for w in windows))
+        self.assertTrue(all(w["persistedCadenceCount"]==w["reacquiredCadenceCount"] for w in windows))
+        self.assertTrue(all(w["persistedTimeRangeDays"]!=w["reacquiredTimeRangeDays"] for w in windows))
+
 
 if __name__ == "__main__": unittest.main()
