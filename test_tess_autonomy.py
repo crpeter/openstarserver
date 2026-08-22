@@ -14,6 +14,7 @@ from openstar_workflow import StageOutcome, WorkflowEngine
 from openstar_workflow import StageRequest
 from workflows.tess.tess_autonomy import (
     TessInvestigationTargetSource,
+    _repair_resolved_family_multisource_failure,
     plan_tess_branches,
     repair_obsolete_terminal_wait,
 )
@@ -826,6 +827,202 @@ class TessAutonomyIntegrationTests(unittest.TestCase):
         new_failure = self.store.load(investigation.id)
         self.assertEqual("NON_RETRYABLE", new_failure.stages[-1].failure_classification)
         self.assertEqual(new_failure, repair_obsolete_terminal_wait(self.store, new_failure))
+
+    def test_resolved_family_v2012_failure_repairs_append_only_and_fails_closed(self):
+        investigation = self.store.create(
+            "tess-discovery-sector-1-tic-29495621", WORKFLOW_ID, WORKFLOW_VERSION,
+        )
+        family_period = 10.510316195053623
+        residual_frequency = 0.27101611598985065
+        evidence = (
+            ("010-morphology", "openstar.tess.morphology.analyze", {
+                "physicalCycleResolved": True,
+                "resolvedPhysicalPeriodDays": family_period,
+            }),
+            ("021-time-frequency-prepare", "openstar.tess.time-frequency.prepare", {
+                "absoluteTimeReferenceDays": 2500.0,
+            }),
+            ("022-time-frequency-summary", "openstar.tess.time-frequency.summarize", {
+                "residualEvolution": {"classification": "STABLE_RESIDUAL_MODE"},
+            }),
+            ("023-mode", "openstar.tess.mode-identification.analyze", {
+                "independentModeEvidenceSurvived": True,
+                "physicalMechanismResolved": False,
+                "establishedPeriodFamily": {
+                    "referencePeriodDays": family_period,
+                    "modeledHarmonicOrders": [1, 2, 3],
+                },
+                "modeCandidate": {
+                    "frequencyCyclesPerDay": residual_frequency,
+                    "periodDays": 1 / residual_frequency,
+                    "supportingSectors": [28, 68, 92, 95],
+                },
+            }),
+            ("025-prepare-residual-mode-localization",
+             "openstar.tess.residual-mode-localization.prepare", {}),
+            ("026-run-residual-mode-localization",
+             "openstar.tess.residual-mode-localization.run", {}),
+            ("027-interpret-residual-mode-localization",
+             "openstar.tess.residual-mode-localization.interpret", {
+                 "recommendedNextTest": "RESIDUAL_MODE_SOURCE_LOCALIZATION_REVIEW",
+             }),
+            ("028-prepare-residual-mode-localization-review",
+             "openstar.tess.residual-mode-localization-review.prepare", {}),
+            ("029-run-residual-mode-localization-review",
+             "openstar.tess.residual-mode-localization-review.run", {}),
+            ("030-interpret-residual-mode-localization-review",
+             "openstar.tess.residual-mode-localization-review.interpret", {
+                 "crossTime": {
+                     "classification": "RESIDUAL_MODE_SOURCE_SWITCHING_OR_BLEND",
+                     "residualModeOrigin": "TIME_VARIABLE_OR_BLENDED",
+                 },
+                 "recommendedNextTest": "MULTI_SOURCE_RESIDUAL_DECOMPOSITION",
+             }),
+        )
+        for stage_id, handler, result in evidence:
+            investigation = self._complete(investigation, stage_id, handler, result)
+        lineage = {
+            "026-run-residual-mode-localization":
+                "025-prepare-residual-mode-localization",
+            "027-interpret-residual-mode-localization":
+                "026-run-residual-mode-localization",
+            "028-prepare-residual-mode-localization-review":
+                "027-interpret-residual-mode-localization",
+            "029-run-residual-mode-localization-review":
+                "028-prepare-residual-mode-localization-review",
+            "030-interpret-residual-mode-localization-review":
+                "029-run-residual-mode-localization-review",
+        }
+        investigation = replace(
+            investigation,
+            stages=tuple(replace(stage, triggered_by_stage_id=lineage.get(stage.id))
+                         for stage in investigation.stages),
+        )
+        self.store.save(investigation)
+        request = StageRequest(
+            "031-prepare-multi-source-residual",
+            "openstar.tess.multi-source-residual.prepare", {},
+            "030-interpret-residual-mode-localization-review",
+        )
+        investigation = self.store.set_control_state(
+            investigation, status="RUNNING",
+            control_state={"schedulerAction": "RUN_EXPERIMENT",
+                           "selectedExperiment": asdict(request)},
+        )
+        engine = WorkflowEngine(self.store)
+
+        def obsolete_gate(_investigation, _request):
+            raise RuntimeError(
+                "v20.12 requires the completed v20.9 nonstationary model."
+            )
+
+        engine.register_handler(request.handler_id, obsolete_gate)
+        with self.assertRaisesRegex(RuntimeError, "completed v20.9"):
+            engine.run_stage(
+                investigation, request, software_id="legacy", software_version="20.12"
+            )
+        failed = self.store.load(investigation.id)
+        historical_stages = failed.stages
+        historical_files = {
+            stage.id: self.store.stage_path_for(failed.id, stage.id).read_bytes()
+            for stage in historical_stages
+        }
+
+        def changed(*, stage=None, stages=None, selected=None):
+            updated_stages = stages or (
+                failed.stages[:-1] + (stage or failed.stages[-1],)
+            )
+            updated_selected = selected
+            if updated_selected is None:
+                tail = updated_stages[-1]
+                updated_selected = asdict(StageRequest(
+                    tail.id, tail.handler_id, tail.parameters,
+                    tail.triggered_by_stage_id,
+                ))
+            return replace(
+                failed, stages=updated_stages,
+                metadata={**failed.metadata, "controlState": {
+                    **failed.metadata["controlState"],
+                    "selectedExperiment": updated_selected,
+                }},
+            )
+
+        tail = failed.stages[-1]
+        review_index = next(i for i, stage in enumerate(failed.stages)
+                            if stage.id.startswith("030-"))
+        morphology_index = next(i for i, stage in enumerate(failed.stages)
+                                if stage.handler_id == "openstar.tess.morphology.analyze")
+        mode_index = next(i for i, stage in enumerate(failed.stages)
+                          if stage.handler_id == "openstar.tess.mode-identification.analyze")
+        cases = {
+            "wrong error": changed(stage=replace(tail, error="RuntimeError: other")),
+            "wrong handler": changed(stage=replace(tail, handler_id="other.handler")),
+            "wrong classification": changed(
+                stage=replace(tail, failure_classification="TRANSIENT_INFRASTRUCTURE")),
+            "mismatched selection": changed(selected={**asdict(request), "parameters": {"x": 1}}),
+            "unrelated trigger": changed(
+                stage=replace(tail, triggered_by_stage_id="unrelated-stage")),
+            "broken chain": changed(stages=tuple(
+                replace(stage, triggered_by_stage_id="broken")
+                if stage.id == "029-run-residual-mode-localization-review" else stage
+                for stage in failed.stages
+            )),
+            "missing review": changed(stages=failed.stages[:review_index]
+                                      + failed.stages[review_index + 1:]),
+            "wrong recommendation": changed(stages=tuple(
+                replace(stage, result={**stage.result,
+                    "recommendedNextTest": "OTHER"}) if i == review_index else stage
+                for i, stage in enumerate(failed.stages)
+            )),
+            "wrong classification science": changed(stages=tuple(
+                replace(stage, result={**stage.result, "crossTime": {
+                    **stage.result["crossTime"], "classification": "ON_TARGET"}})
+                if i == review_index else stage
+                for i, stage in enumerate(failed.stages)
+            )),
+            "unresolved morphology": changed(stages=tuple(
+                replace(stage, result={"physicalCycleResolved": False})
+                if i == morphology_index else stage
+                for i, stage in enumerate(failed.stages)
+            )),
+            "invalid frozen family": changed(stages=tuple(
+                replace(stage, result={}) if i == mode_index else stage
+                for i, stage in enumerate(failed.stages)
+            )),
+        }
+        nonstationary = InvestigationStage(
+            "024-nonstationary", "openstar.tess.nonstationary.summarize", "COMPLETE",
+            None, {}, result={"preferredFrequencyAtReference": residual_frequency},
+        )
+        cases["real v20.9"] = changed(
+            stages=failed.stages[:-1] + (nonstationary, failed.stages[-1],)
+        )
+        for label, candidate in cases.items():
+            with self.subTest(label=label):
+                self.assertIsNone(_repair_resolved_family_multisource_failure(
+                    self.store, candidate, candidate.metadata["controlState"]
+                ))
+        with mock.patch(
+            "workflows.tess.tess_autonomy.frozen_residual_localization_family",
+            return_value=(family_period, (1, 2, 3), {},
+                          "UNRESOLVED_FAMILY_ANALYSIS_REFERENCE"),
+        ):
+            self.assertIsNone(_repair_resolved_family_multisource_failure(
+                self.store, failed, failed.metadata["controlState"]
+            ))
+
+        repaired = repair_obsolete_terminal_wait(self.store, failed)
+        selected = repaired.metadata["controlState"]["selectedExperiment"]
+        self.assertEqual("032-prepare-multi-source-residual", selected["id"])
+        self.assertEqual("031-prepare-multi-source-residual",
+                         selected["triggered_by_stage_id"])
+        self.assertEqual(historical_stages, repaired.stages)
+        self.assertEqual(
+            historical_files,
+            {stage.id: self.store.stage_path_for(repaired.id, stage.id).read_bytes()
+             for stage in repaired.stages},
+        )
+        self.assertEqual(repaired, repair_obsolete_terminal_wait(self.store, repaired))
 
     def test_legacy_invalid_low_frequency_failure_resumes_independent_branch(self):
         target = self.source.enumerate_targets()[0]

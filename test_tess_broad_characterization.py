@@ -63,6 +63,92 @@ if _installed_numpy_stub:
 
 
 class BroadIndependentCharacterizationTests(unittest.TestCase):
+    def test_resolved_without_v209_uses_frozen_family_for_multisource_prepare(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        store = InvestigationStore(root / "investigations")
+        investigation = store.create("tic-29495621-v2012", WORKFLOW_ID, WORKFLOW_VERSION)
+        source_project = root / "source.json"
+        source_project.write_text("{}", encoding="utf-8")
+        family_period = 10.510316195053623
+        residual_frequency = 0.27101611598985065
+        evidence = (
+            ("001-prepared", "openstar.tess.prepare-target", {
+                "sourceProjectPath": str(source_project),
+                "sourceDatasetEntry": {"id": "tic"}, "ticID": 29495621, "sector": 1,
+            }),
+            ("002-identity", "openstar.tess.catalog-identity", {}),
+            ("003-independent", "openstar.tess.independent.prepare", {}),
+            ("010-morphology", "openstar.tess.morphology.analyze", {
+                "physicalCycleResolved": True,
+                "resolvedPhysicalPeriodDays": family_period,
+            }),
+            ("022-time-frequency-prepare", "openstar.tess.time-frequency.prepare", {
+                "absoluteTimeReferenceDays": 2500.0,
+            }),
+            ("023-time-frequency-summary", "openstar.tess.time-frequency.summarize", {
+                "residualEvolution": {"classification": "STABLE_RESIDUAL_MODE"},
+            }),
+            ("024-mode", "openstar.tess.mode-identification.analyze", {
+                "independentModeEvidenceSurvived": True,
+                "physicalMechanismResolved": False,
+                "establishedPeriodFamily": {
+                    "referencePeriodDays": family_period,
+                    "modeledHarmonicOrders": [1, 2, 3],
+                },
+                "modeCandidate": {
+                    "frequencyCyclesPerDay": residual_frequency,
+                    "periodDays": 1 / residual_frequency,
+                    "supportingSectors": [28, 68, 92, 95],
+                },
+            }),
+            ("030-review", "openstar.tess.residual-mode-localization-review.interpret", {
+                "recommendedNextTest": "MULTI_SOURCE_RESIDUAL_DECOMPOSITION",
+            }),
+        )
+        for stage_id, handler, result in evidence:
+            investigation = self._complete(store, investigation, stage_id, handler, result)
+
+        project_path = root / "multisource.json"
+        project_path.write_text("{}", encoding="utf-8")
+        captured = {}
+
+        def fake_build(**kwargs):
+            captured.update(kwargs)
+            return {"projectPath": str(project_path), "preparedSeries": []}
+
+        engine = build_engine(store, mock.Mock(), poll_interval=0.0, timeout=1.0)
+        request = StageRequest("031-prepare-multi-source-residual",
+                               "openstar.tess.multi-source-residual.prepare", {})
+        with mock.patch(
+            "workflows.tess.tess_investigation.build_multisource_residual_project",
+            side_effect=fake_build,
+        ):
+            completed, _ = engine.run_stage(
+                investigation, request, software_id="test", software_version="20.12"
+            )
+
+        self.assertTrue(captured["physical_cycle_resolved"])
+        self.assertEqual(family_period, captured["physical_period_days"])
+        self.assertEqual((1, 2, 3), captured["harmonic_orders"])
+        residual = captured["nonstationary_summary"]
+        self.assertEqual(residual_frequency, residual["preferredFrequencyAtReference"])
+        self.assertEqual(1 / residual_frequency,
+                         residual["preferredPeriodAtReferenceDays"])
+        self.assertEqual(0.0, residual["fractionalFrequencyDriftPerDay"])
+        self.assertEqual(2500.0, residual["timeReferenceDays"])
+        self.assertEqual([28, 68, 92, 95], residual["preferredModel"]["signalSectors"])
+        self.assertEqual("frozen_residual_localization_family",
+                         residual["sourceEvidence"]["adapter"])
+        self.assertEqual("MORPHOLOGY_RESOLVED_PHYSICAL_PERIOD",
+                         captured["family_evidence"]["referenceKind"])
+        source_handlers = {item["handlerID"]
+                           for item in residual["sourceEvidence"]["sources"]}
+        self.assertNotIn("openstar.tess.nonstationary.summarize", source_handlers)
+        self.assertFalse(any(stage.handler_id == "openstar.tess.nonstationary.summarize"
+                             for stage in completed.stages))
+
     def test_resolved_multisource_prepare_preserves_legacy_input_hashes(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
@@ -104,9 +190,15 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
         engine = build_engine(store, mock.Mock(), poll_interval=0.0, timeout=1.0)
         request = StageRequest("030-prepare-multi-source-residual",
                                "openstar.tess.multi-source-residual.prepare", {})
+        captured = {}
+
+        def fake_build(**kwargs):
+            captured.update(kwargs)
+            return {"projectPath": str(project_path), "preparedSeries": []}
+
         with mock.patch(
             "workflows.tess.tess_investigation.build_multisource_residual_project",
-            return_value={"projectPath": str(project_path), "preparedSeries": []},
+            side_effect=fake_build,
         ):
             completed, _ = engine.run_stage(
                 investigation, request, software_id="test", software_version="20.12"
@@ -116,6 +208,9 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
         self.assertEqual(sha256_json(morphology), hashes["harmonicFamilyEvidence"])
         self.assertEqual(sha256_json(nonstationary),
                          hashes["residualFrequencyDriftModel"])
+        self.assertNotIn("adapter", captured["family_evidence"])
+        self.assertEqual("020-nonstationary",
+                         captured["nonstationary_summary"]["sourceEvidence"]["stageID"])
 
     def test_unresolved_dynamic_family_reaches_multisource_prepare_with_provenance(self):
         temporary = tempfile.TemporaryDirectory()
