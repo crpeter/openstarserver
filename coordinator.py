@@ -1,5 +1,6 @@
 import argparse
 import builtins
+import copy
 import json
 import os
 import threading
@@ -55,6 +56,48 @@ def _should_log_project_status(status):
             return False
         _QUIET_STATUS_SIGNATURES.add(signature)
     return True
+
+
+def _registered_nodes_with_live_activity(runtime: CoordinatorRuntime) -> list[dict]:
+    """Overlay live scheduler sightings onto durable node identity records."""
+    durable = runtime.registered_nodes()
+    by_id = {
+        str(node.get("nodeID") or node.get("id") or "").strip().lower(): node
+        for node in durable
+    }
+
+    with runtime.lock:
+        states = list(runtime._states.values())
+
+    for state in states:
+        with state.lock:
+            live_nodes = [copy.deepcopy(node) for node in state.nodes.values()]
+        for live in live_nodes:
+            node_id = str(live.get("nodeID") or live.get("id") or "").strip()
+            if not node_id:
+                continue
+            key = node_id.lower()
+            existing = by_id.get(key)
+            if existing is None:
+                existing = {"nodeID": node_id}
+                durable.append(existing)
+                by_id[key] = existing
+
+            live_seen = live.get("lastSeenAt")
+            durable_seen = existing.get("lastSeenAt")
+            try:
+                should_update = live_seen is not None and (
+                    durable_seen is None or float(live_seen) > float(durable_seen)
+                )
+            except (TypeError, ValueError):
+                should_update = live_seen is not None
+            if should_update:
+                existing["lastSeenAt"] = live_seen
+
+            if existing.get("registeredAt") is None and live.get("registeredAt") is not None:
+                existing["registeredAt"] = live["registeredAt"]
+
+    return durable
 
 
 class RequestHandler(BaseHTTPRequestHandler):
@@ -133,7 +176,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/v1/nodes":
-            self._send_json(200, RUNTIME.registered_nodes())
+            self._send_json(200, _registered_nodes_with_live_activity(RUNTIME))
             return
 
         if path == "/v1/contributions/summary":
