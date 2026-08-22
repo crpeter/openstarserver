@@ -177,6 +177,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         return
 
+    def _write_body(self, body: bytes) -> None:
+        """Ignore clients that navigate/refresh after a response has started."""
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            return
+
     def send_json(self, status: int, payload: Any):
         body = json.dumps(payload, separators=(",", ":"), allow_nan=False).encode()
         self.send_response(status)
@@ -184,7 +191,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
-        self.wfile.write(body)
+        self._write_body(body)
 
     def send_asset(self, relative: str, content_type: str):
         body = (ROOT / relative).read_bytes()
@@ -192,7 +199,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        self._write_body(body)
 
     def do_GET(self):
         path = urlparse(self.path).path
