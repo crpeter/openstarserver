@@ -12,7 +12,11 @@ from typing import Any
 
 import numpy as np
 
-from .tess_sector_archive import TessArchiveTransientError
+from .tess_sector_archive import (
+    TESS_ARCHIVE_TIMEOUT_SECONDS,
+    TessArchiveTransientError,
+    _is_transient_transport_error,
+)
 
 from .tess_multisource_residual import MIN_COMPONENT_SAMPLES, _prewhiten_cube_raw
 from .tess_offset_variability import (
@@ -56,7 +60,6 @@ from .tess_residual_localization import (
 # sector-1--3 calibration is separate and the sector-4+ model is rooted at
 # start_s0004.  Blind C's frozen sectors are all later than sector 4.
 MAST_PRF_ROOT = "https://archive.stsci.edu/missions/tess/models/prf_fitsfiles"
-HTTP_TIMEOUT_SECONDS = 60
 USER_AGENT = "OpenStar/20.18 official-SPOC-PRF-forward-modeling"
 
 # Static forward-model quality guards.  These do not decide variability;
@@ -127,8 +130,17 @@ def _drift_corrected_times(
 
 def _http_get(url: str) -> bytes:
     request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
-        return response.read()
+    try:
+        with urllib.request.urlopen(
+            request, timeout=TESS_ARCHIVE_TIMEOUT_SECONDS
+        ) as response:
+            return response.read()
+    except Exception as error:
+        if _is_transient_transport_error(error):
+            raise TessArchiveTransientError(
+                f"MAST official SPOC PRF transport failed temporarily: {url}"
+            ) from error
+        raise
 
 
 def _model_start_sector(sector: int) -> int:
