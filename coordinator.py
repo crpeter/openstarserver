@@ -13,7 +13,6 @@ from coordinator_runtime import (
     ProjectConflictError,
 )
 from coordinator_state import first_value
-from dashboard import activity_snapshot, dashboard_snapshot, history_snapshot
 from openstar_contributions import DEFAULT_CONTRIBUTION_DB
 
 DEFAULT_PROJECT_PATH = "data/projects/openstar.tess-validation-v1.json"
@@ -108,29 +107,6 @@ class RequestHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.end_headers()
 
-    def _send_file(self, path, content_type):
-        try:
-            body = Path(path).read_bytes()
-        except OSError:
-            self._send_error_json(404, "Not found.")
-            return
-        self.send_response(200)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header(
-            "Cache-Control",
-            (
-                "no-cache"
-                if content_type.startswith("text/html")
-                else "public, max-age=3600"
-            ),
-        )
-        self.end_headers()
-        try:
-            self.wfile.write(body)
-        except (BrokenPipeError, ConnectionResetError):
-            pass
-
     def _send_error_json(self, status_code, message):
         self._send_json(
             status_code,
@@ -142,65 +118,6 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = urlparse(self.path).path
-
-        static_files = {
-            "/": ("dashboard/index.html", "text/html; charset=utf-8"),
-            "/dashboard": ("dashboard/index.html", "text/html; charset=utf-8"),
-            "/dashboard/": ("dashboard/index.html", "text/html; charset=utf-8"),
-            "/dashboard/app.css": ("dashboard/app.css", "text/css; charset=utf-8"),
-            "/dashboard/app.js": ("dashboard/app.js", "text/javascript; charset=utf-8"),
-        }
-        if path in static_files:
-            self._send_file(*static_files[path])
-            return
-
-        if path in {"/api/dashboard/summary", "/api/dashboard/workers"}:
-            snapshot = dashboard_snapshot(RUNTIME)
-            self._send_json(
-                200,
-                (
-                    snapshot
-                    if path.endswith("summary")
-                    else {
-                        "workers": snapshot["workers"],
-                        "updatedAt": snapshot["summary"]["updatedAt"],
-                    }
-                ),
-            )
-            return
-        worker_prefix = "/api/dashboard/workers/"
-        if path.startswith(worker_prefix):
-            worker_id = unquote(path[len(worker_prefix) :]).strip("/")
-            snapshot = dashboard_snapshot(RUNTIME)
-            worker = next(
-                (
-                    item
-                    for item in snapshot["workers"]
-                    if item["id"].lower() == worker_id.lower()
-                ),
-                None,
-            )
-            if worker is None:
-                self._send_error_json(404, "Unknown worker.")
-            else:
-                worker["recentCompleted"] = [
-                    item
-                    for item in snapshot["recentCompleted"]
-                    if item["nodeID"].lower() == worker_id.lower()
-                ][-20:]
-                worker["recentFailures"] = [
-                    item
-                    for item in snapshot["recentFailures"]
-                    if str(item.get("nodeID", "")).lower() == worker_id.lower()
-                ][-20:]
-                self._send_json(200, worker)
-            return
-        if path == "/api/dashboard/activity":
-            self._send_json(200, activity_snapshot(RUNTIME))
-            return
-        if path == "/api/dashboard/history":
-            self._send_json(200, history_snapshot(RUNTIME))
-            return
 
         if path == "/v1/health":
             print(f"🌐 GET {path}")
@@ -349,15 +266,11 @@ class RequestHandler(BaseHTTPRequestHandler):
                 return
 
             max_work_units = payload.get("maxWorkUnits")
-            telemetry = payload.get("telemetry")
-            telemetry = telemetry if isinstance(telemetry, dict) else None
             try:
                 if max_work_units is None:
-                    work_unit = RUNTIME.claim_work(node_id, telemetry)
+                    work_unit = RUNTIME.claim_work(node_id)
                 else:
-                    work_unit = RUNTIME.claim_work_batch(
-                        node_id, max_work_units, telemetry
-                    )
+                    work_unit = RUNTIME.claim_work_batch(node_id, max_work_units)
             except ValueError as error:
                 self._send_error_json(400, str(error))
                 return

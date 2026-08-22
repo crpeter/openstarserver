@@ -40,7 +40,6 @@ class CoordinatorRuntime:
         self._project_order: list[str] = []
         self._work_project_index: dict[str, str] = {}
         self._node_registrations: dict[str, dict[str, Any]] = {}
-        self._node_activity: dict[str, float] = {}
         self._next_project_index = 0
         self._legacy_current_project_id: str | None = None
         self.coordinator_session_id = str(uuid.uuid4())
@@ -56,7 +55,9 @@ class CoordinatorRuntime:
         # activation.  Activated transitions are keyed by the next project so
         # concurrent investigations cannot overwrite one another before claim.
         self._transition_terminals: dict[str, float] = {}
-        self._transition_activations: dict[str, tuple[str, float, float]] = {}
+        self._transition_activations: dict[
+            str, tuple[str, float, float]
+        ] = {}
 
     @staticmethod
     def _operational_print(message: str) -> None:
@@ -87,9 +88,7 @@ class CoordinatorRuntime:
             del self._transition_terminals[previous_id]
             activated_at = time.monotonic()
             self._transition_activations[project_id] = (
-                previous_id,
-                terminal_at,
-                activated_at,
+                previous_id, terminal_at, activated_at
             )
         self._operational_print(
             "⏱️ Project transition activation: "
@@ -146,30 +145,11 @@ class CoordinatorRuntime:
     def registered_nodes(self) -> list[dict[str, Any]]:
         if self.contribution_store is not None:
             try:
-                nodes = copy.deepcopy(self.contribution_store.nodes())
-                with self.lock:
-                    registrations = copy.deepcopy(self._node_registrations)
-                    activity = dict(self._node_activity)
-                for node in nodes:
-                    key = self._node_key(node["nodeID"])
-                    live = registrations.get(key, {})
-                    if isinstance(live.get("telemetry"), dict):
-                        node["telemetry"] = live["telemetry"]
-                    node["lastSeenAt"] = max(
-                        float(node.get("lastSeenAt") or 0), activity.get(key, 0)
-                    )
-                return nodes
+                return copy.deepcopy(self.contribution_store.nodes())
             except Exception as error:
                 self._ledger_failed("node query", error)
         with self.lock:
-            nodes = [
-                copy.deepcopy(value) for value in self._node_registrations.values()
-            ]
-            for node in nodes:
-                node["lastSeenAt"] = self._node_activity.get(
-                    self._node_key(node["nodeID"]), node.get("lastSeenAt")
-                )
-            return nodes
+            return [copy.deepcopy(value) for value in self._node_registrations.values()]
 
     def contribution_summary(self) -> dict[str, Any]:
         if self.contribution_store is None:
@@ -266,14 +246,12 @@ class CoordinatorRuntime:
             raise KeyError("Missing node ID.")
         normalized = dict(payload)
         normalized["nodeID"] = str(node_id)
-        now = time.time()
         if self.contribution_store is not None:
             try:
-                self.contribution_store.upsert_node(normalized, now)
+                self.contribution_store.upsert_node(normalized, time.time())
             except Exception as error:
                 self._ledger_failed("node registration", error)
         with self.lock:
-            self._node_activity[self._node_key(node_id)] = now
             self._node_registrations[self._node_key(node_id)] = copy.deepcopy(
                 normalized
             )
@@ -281,29 +259,7 @@ class CoordinatorRuntime:
         for state in states:
             state.register_node(normalized)
 
-    def record_node_activity(
-        self, node_id: Any, telemetry: dict[str, Any] | None = None
-    ) -> None:
-        """Track protocol activity; optional telemetry is generic and additive."""
-        now = time.time()
-        key = self._node_key(node_id)
-        with self.lock:
-            self._node_activity[key] = now
-            registration = self._node_registrations.get(key)
-            if registration is not None and isinstance(telemetry, dict):
-                registration["telemetry"] = copy.deepcopy(telemetry)
-        if self.contribution_store is not None:
-            try:
-                self.contribution_store.touch_node(
-                    str(node_id),
-                    now,
-                    telemetry if isinstance(telemetry, dict) else None,
-                )
-            except Exception as error:
-                self._ledger_failed("node activity write", error)
-
-    def claim_work(self, node_id: Any, telemetry: dict[str, Any] | None = None):
-        self.record_node_activity(node_id, telemetry)
+    def claim_work(self, node_id: Any):
         # Keep the legacy call path intact as well as its single-object result.
         with self.lock:
             if not self._project_order:
@@ -324,13 +280,7 @@ class CoordinatorRuntime:
 
             return None
 
-    def claim_work_batch(
-        self,
-        node_id: Any,
-        max_work_units: int,
-        telemetry: dict[str, Any] | None = None,
-    ):
-        self.record_node_activity(node_id, telemetry)
+    def claim_work_batch(self, node_id: Any, max_work_units: int):
         if isinstance(max_work_units, bool) or not isinstance(max_work_units, int):
             raise ValueError("maxWorkUnits must be a positive integer.")
         if not 1 <= max_work_units <= MAX_WORK_UNITS_PER_CLAIM:
@@ -364,19 +314,7 @@ class CoordinatorRuntime:
             state = self._states.get(project_id) if project_id is not None else None
         if state is None:
             return False, "Unknown work unit.", 404
-        with state.lock:
-            assignment = state.assigned.get(normalized)
-            activity_node_id = assignment.get("nodeID") if assignment else None
-        if activity_node_id is not None:
-            telemetry = payload.get("telemetry")
-            self.record_node_activity(
-                activity_node_id, telemetry if isinstance(telemetry, dict) else None
-            )
-        result_payload = dict(payload)
-        # Operational telemetry is deliberately excluded from scientific result
-        # storage and retry identity; it belongs to the node activity channel.
-        result_payload.pop("telemetry", None)
-        response = state.submit_result(work_id, result_payload)
+        response = state.submit_result(work_id, payload)
         if response[0] and self.contribution_store is not None:
             normalized_work_id = normalize_id(work_id)
             with state.lock:

@@ -3,235 +3,209 @@ import threading
 import unittest
 import urllib.error
 import urllib.request
-from http.server import ThreadingHTTPServer
 from pathlib import Path
-from types import SimpleNamespace
-from unittest.mock import patch
 
-import coordinator
-from coordinator_runtime import CoordinatorRuntime
-from dashboard import activity_snapshot, dashboard_snapshot
+from dashboard import build_snapshot
+from openstar_dashboard import (
+    DashboardApplication,
+    CoordinatorClient,
+    TelemetryStore,
+    make_server,
+)
 
 
-class FakeRuntime:
+class FakeCoordinator:
     def __init__(self):
-        self.lock = threading.RLock()
-        self._states = {}
-        self.nodes = [
-            {
-                "nodeID": "mac-1",
-                "lastSeenAt": 990,
-                "platform": "macOS",
-                "hardwareIdentifier": "Mac14,7",
-                "capabilities": {
-                    "gpuName": "Apple M2",
-                    "workloads": ["openstar.lomb-scargle.v1"],
+        self.calls = 0
+        self.observed = {
+            "health": {"ok": True},
+            "nodes": [
+                {
+                    "nodeID": "mac-1",
+                    "lastSeenAt": 100,
+                    "platform": "macOS",
+                    "hardwareIdentifier": "Mac14,7",
+                    "capabilities": {"gpuName": "Apple M2"},
+                },
+                {
+                    "nodeID": "phone-1",
+                    "lastSeenAt": 100,
+                    "platform": "iOS",
+                    "hardwareIdentifier": "iPhone15,2",
+                    "capabilities": {},
+                },
+            ],
+            "contributions": {
+                "currentSession": {
+                    "totalWorkerComputeSeconds": 8,
+                    "aggregateSampleFrequencyEvaluationsPerMetalSecond": 25,
+                },
+                "allTime": {
+                    "totalAcceptedWorkUnits": 4,
+                    "totalWorkerComputeSeconds": 12,
+                    "nodes": [
+                        {
+                            "nodeID": "mac-1",
+                            "hardwareIdentifier": "Mac14,7",
+                            "acceptedWorkUnits": 4,
+                            "workerComputeSeconds": 12,
+                            "metalSeconds": 10,
+                            "sampleFrequencyEvaluationsPerMetalSecond": 25,
+                        }
+                    ],
                 },
             },
-            {
-                "nodeID": "phone-1",
-                "lastSeenAt": 800,
-                "platform": "iOS",
-                "hardwareIdentifier": "iPhone15,2",
-                "capabilities": {"batteryLevel": 0.72},
-            },
-            {"nodeID": "old", "lastSeenAt": 1, "capabilities": {}},
-        ]
+            "projects": [
+                {
+                    "projectID": "project",
+                    "workloadID": "openstar.lomb-scargle.v1",
+                    "projectAssignedWorkUnits": 3,
+                    "projectCompletedWorkUnits": 7,
+                    "projectFailedWorkUnits": 1,
+                    "projectTotalWorkUnits": 11,
+                    "projectProgress": 8 / 11,
+                }
+            ],
+        }
 
-    def registered_nodes(self):
-        return json.loads(json.dumps(self.nodes))
+    def observation(self):
+        self.calls += 1
+        return json.loads(json.dumps(self.observed))
 
-    def contribution_summary(self):
-        devices = [
+
+class ProjectionTests(unittest.TestCase):
+    def test_coordinator_and_telemetry_join_only_by_node_id(self):
+        coordinator = FakeCoordinator()
+        store = TelemetryStore()
+        store.update(
             {
                 "nodeID": "mac-1",
-                "acceptedWorkUnits": 4,
-                "workerComputeSeconds": 12.0,
-                "metalSeconds": 10.0,
-                "sampleFrequencyEvaluationsPerMetalSecond": 25.0,
-            }
-        ]
-        scope = {
-            "totalAcceptedWorkUnits": 4,
-            "totalWorkerComputeSeconds": 12.0,
-            "aggregateSampleFrequencyEvaluationsPerMetalSecond": 25.0,
-            "nodes": devices,
-        }
-        return {"currentSession": dict(scope), "allTime": dict(scope)}
-
-    def projects(self):
-        return []
-
-
-class DashboardProjectionTests(unittest.TestCase):
-    def test_classification_aggregation_and_optional_telemetry(self):
-        runtime = FakeRuntime()
-        before = json.dumps(runtime.nodes, sort_keys=True)
-        result = dashboard_snapshot(runtime, now=1000)
-        self.assertEqual(3, result["summary"]["knownWorkers"])
-        self.assertEqual(1, result["summary"]["connectedWorkers"])
-        self.assertEqual(1, result["summary"]["idleWorkers"])
-        self.assertEqual(2, result["summary"]["offlineWorkers"])
-        self.assertEqual(1, result["summary"]["recentlyDisconnectedWorkers"])
-        self.assertEqual(4, result["summary"]["completedWorkUnits"])
-        self.assertEqual(
-            {"macOS", "iOS", None}, {w["platform"] for w in result["workers"]}
-        )
-        self.assertIsNone(result["workers"][1]["osVersion"])
-        self.assertEqual(before, json.dumps(runtime.nodes, sort_keys=True))
-
-    def test_active_assignment_wins_over_idle(self):
-        runtime = FakeRuntime()
-        state = SimpleNamespace(
-            lock=threading.RLock(),
-            project_id="project",
-            workload_id="generic",
-            assigned={
-                "unit": {"nodeID": "mac-1", "assignedAt": 995, "leaseExpiresAt": 1115}
+                "telemetry": {
+                    "deviceName": "Build Mac",
+                    "batteryLevel": 0.8,
+                    "thermalState": "nominal",
+                    "computeState": "computing",
+                },
             },
-            work_units={
-                "unit": {
-                    "projectID": "project",
-                    "workloadID": "generic",
-                    "datasetID": "data",
-                }
-            },
-            completed={},
-            execution_failure_history={},
+            now=990,
         )
-        runtime._states["project"] = state
-        result = dashboard_snapshot(runtime, now=1000)
-        self.assertEqual("active", result["workers"][0]["computeState"])
-        self.assertEqual(1, result["summary"]["runningWorkUnits"])
-        self.assertIsNone(result["workers"][0]["currentAssignment"]["progress"])
-
-    def test_batch_assignments_are_not_overwritten(self):
-        runtime = FakeRuntime()
-        leases = {
-            name: {"nodeID": "mac-1", "assignedAt": 995, "leaseExpiresAt": 1115}
-            for name in ("unit-1", "unit-2", "unit-3")
-        }
-        units = {
-            name: {"projectID": "project", "workloadID": "generic", "datasetID": "data"}
-            for name in leases
-        }
-        runtime._states["project"] = SimpleNamespace(
-            lock=threading.RLock(),
-            project_id="project",
-            workload_id="generic",
-            assigned=leases,
-            work_units=units,
-            completed={},
-            execution_failure_history={},
+        store.update(
+            {"nodeID": "unknown", "telemetry": {"deviceName": "Must not appear"}},
+            now=999,
         )
-        result = dashboard_snapshot(runtime, now=1000)
-        worker = result["workers"][0]
-        self.assertEqual(3, result["summary"]["runningWorkUnits"])
-        self.assertEqual(3, worker["runningWorkUnits"])
+        snapshot = build_snapshot(
+            coordinator.observed["nodes"],
+            coordinator.observed["contributions"],
+            coordinator.observed["projects"],
+            store.snapshot(),
+            now=1000,
+        )
         self.assertEqual(
-            {"unit-1", "unit-2", "unit-3"},
-            {item["workUnitID"] for item in worker["currentAssignments"]},
+            ["mac-1", "phone-1"], [worker["id"] for worker in snapshot["workers"]]
         )
+        mac = snapshot["workers"][0]
+        self.assertEqual("Build Mac", mac["name"])
+        self.assertEqual("active", mac["computeState"])
+        self.assertEqual("dashboard_heartbeat", mac["lastSeenSource"])
+        self.assertEqual(3, snapshot["summary"]["runningWorkUnits"])
+        self.assertEqual(4, snapshot["summary"]["completedWorkUnits"])
 
-    def test_claim_activity_after_registration_keeps_worker_connected(self):
-        runtime = CoordinatorRuntime()
-        with patch("coordinator_runtime.time.time", return_value=10):
-            runtime.register_node(
-                {"nodeID": "phone", "capabilities": {"platform": "iOS"}}
-            )
-        with patch("coordinator_runtime.time.time", return_value=500):
-            self.assertIsNone(runtime.claim_work("phone"))
-        worker = dashboard_snapshot(runtime, now=501)["workers"][0]
-        self.assertEqual("connected", worker["connectionState"])
-        self.assertEqual(500, worker["lastSeenAt"])
+    def test_missing_optional_telemetry_is_unavailable(self):
+        coordinator = FakeCoordinator()
+        snapshot = build_snapshot(
+            coordinator.observed["nodes"],
+            coordinator.observed["contributions"],
+            coordinator.observed["projects"],
+            {},
+            now=1001,
+        )
+        phone = snapshot["workers"][1]
+        self.assertIsNone(phone["batteryLevel"])
+        self.assertIsNone(phone["osVersion"])
+        self.assertEqual("coordinator_registration", phone["lastSeenSource"])
+        self.assertEqual("offline", phone["connectionState"])
 
-    def test_dynamic_generic_telemetry_refreshes_on_activity(self):
-        runtime = CoordinatorRuntime()
-        runtime.register_node({"nodeID": "phone", "capabilities": {}})
-        runtime.record_node_activity(
-            "phone",
+    def test_heartbeat_refreshes_liveness_and_dynamic_telemetry(self):
+        coordinator = FakeCoordinator()
+        store = TelemetryStore()
+        store.update(
             {
-                "batteryLevel": 0.4,
-                "thermalState": "serious",
-                "deviceName": "Chris's iPhone",
-                "osVersion": "18.1",
-                "appVersion": "1.2",
-                "lowPowerMode": True,
+                "nodeID": "phone-1",
+                "telemetry": {
+                    "osVersion": "18.1",
+                    "appVersion": "1.2",
+                    "powerState": "charging",
+                    "lowPowerMode": True,
+                    "workUnitProgress": 0.4,
+                },
             },
+            now=500,
         )
-        worker = dashboard_snapshot(runtime)["workers"][0]
-        self.assertEqual(0.4, worker["batteryLevel"])
-        self.assertEqual("serious", worker["thermalState"])
-        self.assertEqual("Chris's iPhone", worker["name"])
-        self.assertTrue(worker["lowPowerMode"])
-
-    def test_result_submission_refreshes_activity(self):
-        runtime = CoordinatorRuntime()
-        runtime.register_node({"nodeID": "mac", "capabilities": {}})
-        submitted = []
-
-        def reject_result(_work, payload):
-            submitted.append(payload)
-            return False, "invalid", 400
-
-        state = SimpleNamespace(
-            lock=threading.RLock(),
-            assigned={"unit": {"nodeID": "mac"}},
-            submit_result=reject_result,
+        snapshot = build_snapshot(
+            coordinator.observed["nodes"],
+            coordinator.observed["contributions"],
+            coordinator.observed["projects"],
+            store.snapshot(),
+            now=501,
         )
-        runtime._states["project"] = state
-        runtime._work_project_index["unit"] = "project"
-        with patch("coordinator_runtime.time.time", return_value=900):
-            runtime.submit_result("unit", {"telemetry": {"powerState": "charging"}})
-        self.assertEqual(900, runtime.registered_nodes()[0]["lastSeenAt"])
+        phone = snapshot["workers"][1]
+        self.assertEqual("connected", phone["connectionState"])
+        self.assertEqual("charging", phone["powerState"])
+        self.assertTrue(phone["lowPowerMode"])
+
+    def test_telemetry_store_is_ephemeral_copy_and_validates(self):
+        store = TelemetryStore()
+        payload = {"nodeID": "mac", "telemetry": {"thermalState": "serious"}}
+        store.update(payload, now=10)
+        payload["telemetry"]["thermalState"] = "changed"
         self.assertEqual(
-            "charging", runtime.registered_nodes()[0]["telemetry"]["powerState"]
+            "serious", store.snapshot()["mac"]["telemetry"]["thermalState"]
         )
-        self.assertNotIn("telemetry", submitted[0])
+        with self.assertRaises(ValueError):
+            store.update({"telemetry": {}})
 
-    def test_frontend_uses_safe_dom_text_and_fetches_detail(self):
+    def test_frontend_has_no_inner_html_sink(self):
         script = Path("dashboard/app.js").read_text(encoding="utf-8")
         self.assertNotIn("innerHTML", script)
         self.assertIn("textContent", script)
         self.assertIn("/api/dashboard/workers/${encodeURIComponent(id)}", script)
-        runtime = FakeRuntime()
-        runtime.nodes[0]["capabilities"][
-            "deviceName"
-        ] = '<img src=x onerror="alert(1)">'
-        self.assertEqual(
-            '<img src=x onerror="alert(1)">',
-            dashboard_snapshot(runtime, now=1000)["workers"][0]["name"],
-        )
-
-    def test_activity_is_read_only(self):
-        runtime = FakeRuntime()
-        state = SimpleNamespace(
-            lock=threading.RLock(),
-            project_id="p",
-            project_name="Project",
-            workload_id="generic",
-            work_units={"u": {}},
-            pending=["u"],
-            assigned={},
-            completed={},
-            failed={},
-        )
-        runtime._states["p"] = state
-        before = list(state.pending)
-        self.assertEqual(
-            1, activity_snapshot(runtime)["projects"][0]["projectPendingWorkUnits"]
-        )
-        self.assertEqual(before, state.pending)
 
 
-class DashboardAPITests(unittest.TestCase):
+class CoordinatorClientTests(unittest.TestCase):
+    def test_uses_only_documented_read_only_coordinator_routes(self):
+        client = CoordinatorClient("http://coordinator")
+        calls = []
+        replies = {
+            "/v1/health": {"ok": True},
+            "/v1/nodes": [],
+            "/v1/contributions/summary": {"allTime": {}, "currentSession": {}},
+            "/v1/projects": [{"projectID": "alpha beta"}],
+            "/v1/projects/alpha%20beta/status": {"projectID": "alpha beta"},
+        }
+        client.get = lambda path: calls.append(path) or replies[path]
+        client.observation()
+        self.assertEqual(list(replies), calls)
+        self.assertTrue(all(path.startswith("/v1/") for path in calls))
+
+    def test_coordinator_modules_have_no_dashboard_dependency(self):
+        for path in (
+            "coordinator.py",
+            "coordinator_runtime.py",
+            "coordinator_state.py",
+            "openstar_contributions.py",
+        ):
+            source = Path(path).read_text(encoding="utf-8")
+            self.assertNotIn("dashboard", source.lower(), path)
+
+
+class SidecarHTTPTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.runtime = FakeRuntime()
-        cls.runtime.nodes[0]["lastSeenAt"] = 9999999999
-        cls.patcher = patch.object(coordinator, "RUNTIME", cls.runtime)
-        cls.patcher.start()
-        cls.server = ThreadingHTTPServer(("127.0.0.1", 0), coordinator.RequestHandler)
+        cls.coordinator = FakeCoordinator()
+        cls.telemetry = TelemetryStore()
+        cls.server = make_server(
+            "127.0.0.1", 0, DashboardApplication(cls.coordinator, cls.telemetry)
+        )
         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
         cls.thread.start()
         cls.base = f"http://127.0.0.1:{cls.server.server_port}"
@@ -240,28 +214,62 @@ class DashboardAPITests(unittest.TestCase):
     def tearDownClass(cls):
         cls.server.shutdown()
         cls.server.server_close()
-        cls.patcher.stop()
 
-    def get(self, path):
-        with urllib.request.urlopen(self.base + path) as response:
-            return response.status, response.headers, response.read()
-
-    def test_read_only_endpoints_and_assets(self):
-        before = json.dumps(self.runtime.nodes, sort_keys=True)
-        status, headers, body = self.get("/api/dashboard/summary")
-        self.assertEqual(200, status)
-        self.assertEqual(3, json.loads(body)["summary"]["knownWorkers"])
-        self.assertIn("application/json", headers["Content-Type"])
-        self.assertEqual(before, json.dumps(self.runtime.nodes, sort_keys=True))
-        self.assertIn(b"OpenStar", self.get("/dashboard/")[2])
-
-    def test_worker_detail_and_missing_worker(self):
-        self.assertEqual(
-            "mac-1", json.loads(self.get("/api/dashboard/workers/mac-1")[2])["id"]
+    def request(self, path, payload=None):
+        data = None if payload is None else json.dumps(payload).encode()
+        request = urllib.request.Request(
+            self.base + path,
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST" if payload is not None else "GET",
         )
-        with self.assertRaises(urllib.error.HTTPError) as error:
-            self.get("/api/dashboard/workers/missing")
-        self.assertEqual(404, error.exception.code)
+        with urllib.request.urlopen(request) as response:
+            return response.status, (
+                json.loads(response.read())
+                if "json" in response.headers.get("Content-Type", "")
+                else response.read()
+            )
+
+    def test_summary_workers_activity_history_and_assets(self):
+        self.assertEqual(
+            2, self.request("/api/dashboard/summary")[1]["summary"]["knownWorkers"]
+        )
+        self.assertEqual(2, len(self.request("/api/dashboard/workers")[1]["workers"]))
+        self.assertEqual(
+            "project",
+            self.request("/api/dashboard/activity")[1]["projects"][0]["projectID"],
+        )
+        self.assertFalse(self.request("/api/dashboard/history")[1]["available"])
+        self.assertIn(b"OpenStar", self.request("/dashboard/")[1])
+
+    def test_heartbeat_and_worker_detail(self):
+        self.assertEqual(
+            202,
+            self.request(
+                "/api/telemetry/heartbeat",
+                {
+                    "nodeID": "mac-1",
+                    "telemetry": {
+                        "deviceName": '<img src=x onerror="alert(1)">',
+                        "recentFailures": [{"message": "hot"}],
+                    },
+                },
+            )[0],
+        )
+        detail = self.request("/api/dashboard/workers/mac-1")[1]
+        self.assertEqual('<img src=x onerror="alert(1)">', detail["name"])
+        self.assertEqual("hot", detail["recentFailures"][0]["message"])
+
+    def test_sidecar_failure_or_absence_cannot_write_to_coordinator(self):
+        before = json.dumps(self.coordinator.observed, sort_keys=True)
+        self.request(
+            "/api/telemetry/heartbeat", {"nodeID": "phone-1", "batteryLevel": 0.5}
+        )
+        self.assertEqual(before, json.dumps(self.coordinator.observed, sort_keys=True))
+        self.server.shutdown()
+        self.assertEqual(before, json.dumps(self.coordinator.observed, sort_keys=True))
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
 
 
 if __name__ == "__main__":

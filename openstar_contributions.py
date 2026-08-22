@@ -215,25 +215,6 @@ class ContributionStore:
                 (values[0], seen_at, seen_at, *values[1:]),
             )
 
-    def touch_node(
-        self, node_id: str, seen_at: float, telemetry: dict[str, Any] | None = None
-    ) -> None:
-        """Record generic activity and optional dynamic device telemetry."""
-        with self._lock, self._connection as connection:
-            row = connection.execute(
-                "SELECT capabilities_json FROM nodes WHERE node_id=? COLLATE NOCASE",
-                (str(node_id),),
-            ).fetchone()
-            if row is None:
-                return
-            capabilities = json.loads(row["capabilities_json"])
-            if telemetry:
-                capabilities["telemetry"] = dict(telemetry)
-            connection.execute(
-                "UPDATE nodes SET last_seen_at=?, capabilities_json=? WHERE node_id=? COLLATE NOCASE",
-                (seen_at, _json(capabilities), str(node_id)),
-            )
-
     def nodes(self) -> list[dict[str, Any]]:
         with self._lock:
             connection = self._connection
