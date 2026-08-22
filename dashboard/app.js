@@ -5,7 +5,7 @@ const duration = seconds => seconds == null ? "—" : seconds < 60 ? `${seconds.
 const relative = timestamp => {
   if (!timestamp) return "Never";
   const seconds = Math.max(0, Date.now() / 1000 - timestamp);
-  return seconds < 60 ? "just now" : seconds < 3600 ? `${Math.floor(seconds / 60)}m ago` : seconds < 86400 ? `${Math.floor(seconds / 3600)}h ago` : `${Math.floor(seconds / 86400)}d ago`;
+  return seconds < 2 ? "now" : seconds < 60 ? `${Math.floor(seconds)}s ago` : seconds < 3600 ? `${Math.floor(seconds / 60)}m ago` : seconds < 86400 ? `${Math.floor(seconds / 3600)}h ago` : `${Math.floor(seconds / 86400)}d ago`;
 };
 const relativeISO = value => value && !Number.isNaN(Date.parse(value)) ? relative(Date.parse(value) / 1000) : "Never";
 
@@ -62,6 +62,12 @@ function workerLabel(worker) {
 function workerDeviceType(worker) {
   return [worker.hardwareModel, worker.platform].filter(Boolean).join(" · ") || "Unknown device";
 }
+function connectionBadge(worker) {
+  const state = worker.connectionState || "offline";
+  if (state === "connected") return {className: "active", text: "ONLINE"};
+  if (state === "recently_disconnected") return {className: "idle", text: "RECENTLY DISCONNECTED"};
+  return {className: "offline", text: "OFFLINE"};
+}
 
 let workers = [];
 
@@ -91,10 +97,11 @@ function createWorkerRow(worker) {
 }
 function updateWorkerRow(row, worker) {
   const refs = row._refs;
+  const connection = connectionBadge(worker);
   setText(refs.name, workerLabel(worker));
   setText(refs.info, [worker.hardwareModel, worker.platform, worker.osVersion].filter(Boolean).join(" · ") || "Telemetry unavailable");
-  setClass(refs.badge, `badge ${worker.computeState}`);
-  setText(refs.badge, worker.computeState.toUpperCase());
+  setClass(refs.badge, `badge ${connection.className}`);
+  setText(refs.badge, connection.text);
   if (worker.currentAssignments.length) {
     setText(refs.assignmentMain, `${worker.currentAssignments.length} × ${worker.currentAssignments[0].workloadID || "work unit"}`);
     setText(refs.assignmentSub, worker.currentAssignments[0].projectID || "Unknown project");
@@ -352,5 +359,6 @@ async function refresh() {
 
 $("#filter").addEventListener("input", renderWorkers);
 refresh();
+setInterval(renderWorkers, 1000);
 setInterval(refreshActivity, 2000);
 setInterval(refreshFleet, 10000);
