@@ -110,8 +110,9 @@ def backfill_sector_sweeps(
         )
         if projection is None:
             continue
-        if active.get(state_root) == sector:
-            status = "RUNNING"
+        active_at_backfill = active.get(state_root) == sector
+        if active_at_backfill:
+            status = "DISCOVERED_ACTIVE"
         elif projection.get("status") == "COMPLETE":
             status = "COMPLETE"
         else:
@@ -127,7 +128,12 @@ def backfill_sector_sweeps(
                 status=status,
                 state_root=state_root,
                 workflow_id=WORKFLOW_ID,
-                metadata={"mission": "TESS", "sector": sector, "backfilled": True},
+                metadata={
+                    "mission": "TESS",
+                    "sector": sector,
+                    "backfilled": True,
+                    "activeAtBackfill": active_at_backfill,
+                },
                 summary={"sectorSweep": projection},
             )
         )
