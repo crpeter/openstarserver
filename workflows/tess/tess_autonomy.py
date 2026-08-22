@@ -558,6 +558,60 @@ def _repair_unresolved_dynamic_localization_review_failure(
                        "schedulerAction": "RUN_EXPERIMENT",
                        "recovery": "TESS_UNRESOLVED_DYNAMIC_LOCALIZATION_REVIEW_COMPATIBILITY_RETRY"},
     )
+
+
+def _repair_unresolved_dynamic_multisource_failure(
+    store: InvestigationStore, investigation: Investigation, control: dict
+) -> Investigation | None:
+    """Retry the obsolete v20.12 physical-cycle gate without rewriting history."""
+    if investigation.status != "FAILED" or not investigation.stages:
+        return None
+    failed = investigation.stages[-1]
+    if (failed.status != "FAILED"
+            or failed.handler_id != "openstar.tess.multi-source-residual.prepare"):
+        return None
+    if control.get("schedulerAction") not in ("RUN_EXPERIMENT", "INVESTIGATION_FAILED"):
+        return None
+    selected = control.get("selectedExperiment")
+    if selected is not None and (not isinstance(selected, dict)
+            or selected.get("id") != failed.id
+            or selected.get("handler_id") != failed.handler_id):
+        return None
+    morphology = _latest_complete(investigation, "openstar.tess.morphology.analyze")
+    dynamic = _latest_complete(investigation, "openstar.tess.dynamic-harmonic.analyze")
+    review = _latest_complete(
+        investigation, "openstar.tess.residual-mode-localization-review.interpret"
+    )
+    dynamic_result = (dynamic.result or {}) if dynamic else {}
+    review_result = (review.result or {}) if review else {}
+    cross = review_result.get("crossTime") or {}
+    if not (morphology and (morphology.result or {}).get("physicalCycleResolved") is False
+            and dynamic
+            and dynamic_result.get("referenceFamilyPeriodDays")
+            and dynamic_result.get("supportedHarmonicOrders")
+            and review
+            and cross.get("classification")
+                == "RESIDUAL_MODE_SOURCE_SWITCHING_OR_BLEND"
+            and cross.get("residualModeOrigin") == "TIME_VARIABLE_OR_BLENDED"
+            and review_result.get("recommendedNextTest")
+                == "MULTI_SOURCE_RESIDUAL_DECOMPOSITION"):
+        return None
+    prefixes = [int(stage.id.partition("-")[0]) for stage in investigation.stages
+                if stage.id.partition("-")[0].isdigit()]
+    retry = StageRequest(
+        id=f"{max(prefixes, default=0) + 1:03d}-prepare-multi-source-residual",
+        handler_id=failed.handler_id,
+        parameters=dict(failed.parameters),
+        triggered_by_stage_id=failed.id,
+    )
+    return store.set_control_state(
+        investigation, status="RUNNING",
+        control_state={"branchAssessments": [], "selectedExperiment": asdict(retry),
+                       "schedulerAction": "RUN_EXPERIMENT",
+                       "recovery": "TESS_UNRESOLVED_DYNAMIC_MULTISOURCE_COMPATIBILITY_RETRY"},
+    )
+
+
 def _repair_closed_file_independent_prepare(
     store: InvestigationStore, investigation: Investigation
 ) -> Investigation | None:
@@ -683,6 +737,12 @@ def repair_obsolete_terminal_wait(
     )
     if localization_review_repair is not None:
         return localization_review_repair
+
+    multisource_repair = _repair_unresolved_dynamic_multisource_failure(
+        store, investigation, control
+    )
+    if multisource_repair is not None:
+        return multisource_repair
 
     independent_repair = _repair_shifted_stage_lookup_independent_prepare(
         store, investigation

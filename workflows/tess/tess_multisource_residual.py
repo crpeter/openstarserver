@@ -20,6 +20,7 @@ from .tess_residual_localization import (
     _int,
     _load_json,
     _local_sky_jacobian,
+    _design_matrix as _harmonic_design_matrix,
     _safe,
     _sector_candidates,
     _time_warp,
@@ -42,22 +43,9 @@ DOMINANCE_POWER_RATIO = 1.25
 SPATIAL_SUPPORT_CONFIDENCE = 0.99
 SPATIAL_SUPPORT_CHI2_THRESHOLD = -2.0 * math.log(1.0 - SPATIAL_SUPPORT_CONFIDENCE)
 
-
-def _design_matrix(times: np.ndarray, physical_frequency: float) -> np.ndarray:
-    centered = times - float(np.mean(times))
-    scale = float(np.std(centered))
-    trend = centered / scale if scale > 0 else centered
-    omega = 2.0 * math.pi * float(physical_frequency)
-    return np.column_stack(
-        [
-            np.ones(len(times), dtype=np.float64),
-            trend,
-            np.sin(omega * times),
-            np.cos(omega * times),
-            np.sin(2.0 * omega * times),
-            np.cos(2.0 * omega * times),
-        ]
-    )
+# Preserve the internal helper consumed by later server-side PRF stages while
+# sharing the harmonic-order-aware implementation with residual localization.
+_design_matrix = _harmonic_design_matrix
 
 
 def _prewhiten_cube_raw(
@@ -65,8 +53,11 @@ def _prewhiten_cube_raw(
     absolute_times: np.ndarray,
     cube: np.ndarray,
     physical_frequency: float,
+    harmonic_orders: tuple[int, ...] = (1, 2),
 ) -> tuple[np.ndarray, np.ndarray]:
-    matrix = _design_matrix(absolute_times, physical_frequency)
+    matrix = _harmonic_design_matrix(
+        absolute_times, physical_frequency, harmonic_orders
+    )
     pinv = np.linalg.pinv(matrix)
     flat = cube.reshape(len(absolute_times), -1).astype(np.float64)
     finite_fraction = np.mean(np.isfinite(flat), axis=0)
@@ -362,6 +353,9 @@ def build_multisource_residual_project(
     primary_sector: int | None,
     independent_spec: dict[str, Any],
     physical_period_days: float,
+    harmonic_orders: tuple[int, ...],
+    physical_cycle_resolved: bool,
+    family_evidence: dict[str, Any],
     nonstationary_summary: dict[str, Any],
     localization_review: dict[str, Any],
     output_dir: str | Path,
@@ -456,6 +450,7 @@ def build_multisource_residual_project(
                 absolute_times=absolute_times,
                 cube=corrected,
                 physical_frequency=physical_frequency,
+                harmonic_orders=harmonic_orders,
             )
 
             target_x, target_y = tpf.wcs.world_to_pixel(target)
@@ -628,6 +623,12 @@ def build_multisource_residual_project(
                 "v20.9 drift-corrected component light curve. Workers execute ordinary Lomb-Scargle only."
             ),
             "referenceFrequency": float(reference_frequency),
+            "familyPrewhitening": {
+                "referenceFamilyPeriodDays": float(physical_period_days),
+                "subtractedHarmonicOrders": list(harmonic_orders),
+                "physicalCycleResolved": bool(physical_cycle_resolved),
+                "sourceEvidence": family_evidence,
+            },
             "fractionalFrequencyDriftPerDay": float(q),
             "spatialComponents": components,
         },
@@ -644,6 +645,15 @@ def build_multisource_residual_project(
         "ticID": int(tic_id),
         "targetSky": {"raDeg": float(ra_deg), "decDeg": float(dec_deg)},
         "physicalPeriodDays": float(physical_period_days),
+        "referenceFamilyPeriodDays": float(physical_period_days),
+        "subtractedHarmonicOrders": list(harmonic_orders),
+        "physicalCycleResolved": bool(physical_cycle_resolved),
+        "familyModelProvenance": {
+            "referenceFamilyPeriodDays": float(physical_period_days),
+            "subtractedHarmonicOrders": list(harmonic_orders),
+            "physicalCycleResolved": bool(physical_cycle_resolved),
+            "sourceEvidence": family_evidence,
+        },
         "referenceFrequency": float(reference_frequency),
         "referencePeriodDays": float(1.0 / reference_frequency),
         "fractionalFrequencyDriftPerDay": float(q),
