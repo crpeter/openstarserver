@@ -3,17 +3,27 @@ import unittest
 import sys
 import types
 from pathlib import Path
+from unittest import mock
 
 try:
-    import numpy  # noqa: F401
+    import numpy as np
+    HAS_NUMPY = True
 except ModuleNotFoundError:
     sys.modules["numpy"] = types.ModuleType("numpy")
+    HAS_NUMPY = False
+    _installed_numpy_stub = True
+else:
+    _installed_numpy_stub = False
 
 from workflows.tess.tess_catalog_guided_localization import (
-    HYPOTHESES, interpret_catalog_guided_localization,
+    HYPOTHESES, _calibrate_shared_astrometric_offset,
+    _temporal_predictive_validation, interpret_catalog_guided_localization,
     prepare_catalog_guided_localization,
 )
 from workflows.tess.tess_investigation import catalog_counterpart_variability_continuation
+
+if _installed_numpy_stub:
+    sys.modules.pop("numpy", None)
 
 
 class CatalogGuidedLocalizationTest(unittest.TestCase):
@@ -72,6 +82,73 @@ class CatalogGuidedLocalizationTest(unittest.TestCase):
         unresolved = interpret_catalog_guided_localization(preparation, {"sectorResults": sectors[:1]})
         self.assertIsNone(unresolved["preferredCandidate"])
         self.assertEqual("HIGHER_RESOLUTION_SPATIAL_FOLLOWUP", unresolved["recommendedNextTest"])
+
+    @unittest.skipUnless(HAS_NUMPY, "NumPy is required for predictive validation")
+    def test_refit_complexity_does_not_substitute_for_frozen_prediction(self):
+        times = np.arange(80, dtype=float)
+        phase = 2.0 * np.pi * times / 10.0
+        basis = np.column_stack((np.sin(phase), np.cos(phase)))
+        templates = np.eye(3)
+        pixels = np.zeros((80, 3))
+        pixels[:, 0] = basis @ np.array([1.0, 0.3])
+        pixels[:40, 1] = basis[:40] @ np.array([0.9, 0.2])
+        pixels[40:, 1] = basis[40:] @ np.array([-0.9, -0.2])
+        pixels += np.random.default_rng(4).normal(0.0, 0.01, pixels.shape)
+        result = _temporal_predictive_validation(
+            times=times, pixels=pixels, coherent_basis=basis,
+            templates=templates, component_ids=["target", "candidate-1", "candidate-2"],
+            block_count=2,
+        )
+        self.assertTrue(all(fold["independentHeldOutDiagnostic"]["bestModel"]
+                            == "TARGET_PLUS_CANDIDATE_1" for fold in result["folds"]))
+        self.assertNotEqual("TARGET_PLUS_CANDIDATE_1", result["predictiveWinner"])
+
+    @unittest.skipUnless(HAS_NUMPY, "NumPy is required for predictive validation")
+    def test_stable_candidate_survives_frozen_train_to_held_out_prediction(self):
+        times = np.arange(120, dtype=float)
+        phase = 2.0 * np.pi * times / 11.0
+        basis = np.column_stack((np.sin(phase), np.cos(phase)))
+        templates = np.eye(3)
+        pixels = np.zeros((120, 3))
+        pixels[:, 1] = basis @ np.array([1.2, -0.4])
+        pixels += np.random.default_rng(7).normal(0.0, 0.01, pixels.shape)
+        result = _temporal_predictive_validation(
+            times=times, pixels=pixels, coherent_basis=basis,
+            templates=templates, component_ids=["target", "candidate-1", "candidate-2"],
+        )
+        self.assertTrue(result["consistent"])
+        self.assertEqual("CANDIDATE_1_ONLY", result["predictiveWinner"])
+        for fold in result["folds"]:
+            self.assertIn("trainingParameterEstimates",
+                          fold["models"]["CANDIDATE_1_ONLY"])
+            self.assertIn("heldOutLogLikelihood", fold["models"]["CANDIDATE_1_ONLY"])
+
+    @unittest.skipUnless(HAS_NUMPY, "NumPy is required for astrometric calibration")
+    def test_astrometric_calibration_applies_one_real_shared_shift(self):
+        sources = [{"componentID": name, "x": float(index), "y": float(index),
+                    "image": np.ones((2, 2)), "header": {}}
+                   for index, name in enumerate(("target", "candidate-1", "candidate-2"))]
+
+        def render(*, source_x, source_y, **_kwargs):
+            return np.array([source_x, source_y, 1.0, source_x + source_y])
+
+        def fit(_design, _image, _count):
+            # The deterministic objective selects the one common (+0.2, -0.2) trial.
+            dx = _design[0, 0] - sources[0]["x"]
+            dy = _design[1, 0] - sources[0]["y"]
+            return ((dx - 0.2) ** 2 + (dy + 0.2) ** 2,
+                    np.ones(_design.shape[1]), 0.9)
+
+        with mock.patch("workflows.tess.tess_catalog_guided_localization._render_prf_template",
+                        side_effect=render), mock.patch(
+            "workflows.tess.tess_catalog_guided_localization._fit_static_image", side_effect=fit):
+            result = _calibrate_shared_astrometric_offset(
+                corrected_cube=np.ones((20, 2, 2)), valid_pixels=np.ones((2, 2), dtype=bool),
+                source_models=sources)
+        self.assertEqual(0.2, result["dxPixels"])
+        self.assertEqual(-0.2, result["dyPixels"])
+        self.assertEqual(["target", "candidate-1", "candidate-2"],
+                         result["sharedAcrossComponentIDs"])
 
 
 if __name__ == "__main__":
