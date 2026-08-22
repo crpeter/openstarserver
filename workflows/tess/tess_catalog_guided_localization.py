@@ -281,8 +281,21 @@ def analyze_catalog_guided_sector(*, sector: int, times: np.ndarray,
     }
 
 
-def _production_sector_inputs(preparation: dict[str, Any]) -> list[dict[str, Any]]:
+def _prewhiten_production_cube(*, times: np.ndarray, corrected: np.ndarray,
+                                reference_family_period_days: float,
+                                harmonic_orders: tuple[int, ...]) -> tuple[np.ndarray, np.ndarray]:
+    """Prewhiten acquisition pixels with the caller's frozen harmonic evidence."""
+    return _prewhiten_cube_raw(
+        absolute_times=times, cube=corrected,
+        physical_frequency=1.0 / float(reference_family_period_days),
+        harmonic_orders=tuple(harmonic_orders))
+
+
+def _production_sector_inputs(
+    preparation: dict[str, Any], *, harmonic_orders: tuple[int, ...] | None = None,
+) -> list[dict[str, Any]]:
     """Acquire TPF/WCS and official PRFs from the persisted scientific evidence."""
+    orders = HARMONIC_ORDERS if harmonic_orders is None else tuple(harmonic_orders)
     target_sky = preparation["targetSky"]
     candidates = preparation["catalogCandidates"]
     coordinates = [
@@ -304,10 +317,10 @@ def _production_sector_inputs(preparation: dict[str, Any]) -> list[dict[str, Any
         if len(times) < 100:
             raise RuntimeError(f"Sector {sector} has only {len(times)} usable cadences.")
         corrected, background = _background_subtract_cube(cube)
-        residual, valid = _prewhiten_cube_raw(
-            absolute_times=times, cube=corrected,
-            physical_frequency=1.0 / float(preparation["referenceFamilyPeriodDays"]),
-            harmonic_orders=HARMONIC_ORDERS)
+        residual, valid = _prewhiten_production_cube(
+            times=times, corrected=corrected,
+            reference_family_period_days=float(preparation["referenceFamilyPeriodDays"]),
+            harmonic_orders=orders)
         rows, cols = valid.shape
         centers = []
         for component_id, coordinate in zip(COMPONENT_IDS, coordinates):
@@ -346,7 +359,8 @@ def _production_sector_inputs(preparation: dict[str, Any]) -> list[dict[str, Any
             "physicalFrequency": 1.0 / float(preparation["referenceFamilyPeriodDays"]),
             "acquisitionProvenance": {"tpf": source, "backgroundSubtraction": background,
                                       "componentPixelCenters": centers,
-                                      "officialPRFModels": [item["modelFiles"] for item in models]},
+                                      "officialPRFModels": [item["modelFiles"] for item in models],
+                                      "subtractedHarmonicOrders": list(orders)},
         })
     return inputs
 
