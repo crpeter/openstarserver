@@ -307,8 +307,16 @@ class TessAutonomyIntegrationTests(unittest.TestCase):
         failed = self.store.load(investigation.id)
         repaired_once = repair_obsolete_terminal_wait(self.store, failed)
         retry_037 = StageRequest(**repaired_once.metadata["controlState"]["selectedExperiment"])
-        with self.assertRaisesRegex(RuntimeError, "morphology-resolved"):
-            engine.run_stage(
+
+        def obsolete_nonstationary_gate(_investigation, _request):
+            raise RuntimeError(
+                "v20.12 requires the completed v20.9 nonstationary model."
+            )
+
+        engine_037 = WorkflowEngine(self.store)
+        engine_037.register_handler(request.handler_id, obsolete_nonstationary_gate)
+        with self.assertRaisesRegex(RuntimeError, "v20.9 nonstationary"):
+            engine_037.run_stage(
                 repaired_once, retry_037, software_id="legacy", software_version="20.11"
             )
         failed = self.store.load(investigation.id)
@@ -333,6 +341,19 @@ class TessAutonomyIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(repaired, repair_obsolete_terminal_wait(self.store, repaired))
 
+        def legitimate_new_failure(_investigation, _request):
+            raise RuntimeError("v20.12 could not prepare a spatial component dataset.")
+
+        engine_038 = WorkflowEngine(self.store)
+        engine_038.register_handler(request.handler_id, legitimate_new_failure)
+        retry_038 = StageRequest(**selected)
+        with self.assertRaisesRegex(RuntimeError, "spatial component"):
+            engine_038.run_stage(
+                repaired, retry_038, software_id="current", software_version="20.12"
+            )
+        new_failure = self.store.load(investigation.id)
+        self.assertEqual("NON_RETRYABLE", new_failure.stages[-1].failure_classification)
+        self.assertEqual(new_failure, repair_obsolete_terminal_wait(self.store, new_failure))
 
     def test_legacy_invalid_low_frequency_failure_resumes_independent_branch(self):
         target = self.source.enumerate_targets()[0]

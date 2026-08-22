@@ -563,12 +563,17 @@ def _repair_unresolved_dynamic_localization_review_failure(
 def _repair_unresolved_dynamic_multisource_failure(
     store: InvestigationStore, investigation: Investigation, control: dict
 ) -> Investigation | None:
-    """Retry the obsolete v20.12 physical-cycle gate without rewriting history."""
+    """Retry only the two obsolete v20.12 compatibility gates append-only."""
     if investigation.status != "FAILED" or not investigation.stages:
         return None
     failed = investigation.stages[-1]
     if (failed.status != "FAILED"
-            or failed.handler_id != "openstar.tess.multi-source-residual.prepare"):
+            or failed.handler_id != "openstar.tess.multi-source-residual.prepare"
+            or failed.failure_classification != "NON_RETRYABLE"
+            or failed.error not in {
+                "RuntimeError: v20.12 requires the morphology-resolved physical period.",
+                "RuntimeError: v20.12 requires the completed v20.9 nonstationary model.",
+            }):
         return None
     if control.get("schedulerAction") not in ("RUN_EXPERIMENT", "INVESTIGATION_FAILED"):
         return None
