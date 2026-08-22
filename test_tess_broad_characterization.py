@@ -40,6 +40,7 @@ from workflows.tess.tess_investigation import residual_mode_localization_review_
 from workflows.tess.tess_investigation import multisource_residual_continuation
 from workflows.tess.tess_time_frequency import _fit_family_python
 from workflows.tess.tess_multisource_residual import interpret_multisource_residual_project
+from workflows.tess.tess_multisource_residual import _prewhiten_cube_raw
 from workflows.tess.tess_prf_refinement import compare_prf_hypotheses, diagnose_prf_cube
 from workflows.tess.tess_spoc_prf import _render_prf_template
 
@@ -52,6 +53,76 @@ if _installed_numpy_stub:
 
 
 class BroadIndependentCharacterizationTests(unittest.TestCase):
+    def test_unresolved_dynamic_family_reaches_multisource_prepare_with_provenance(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        store = InvestigationStore(root / "investigations")
+        investigation = store.create("tic-277940827", WORKFLOW_ID, WORKFLOW_VERSION)
+        source_project = root / "source.json"
+        source_project.write_text("{}", encoding="utf-8")
+        evidence = (
+            ("001-prepared", "openstar.tess.prepare-target",
+             {"sourceProjectPath": str(source_project), "sourceDatasetEntry": {"id": "tic"},
+              "ticID": 277940827, "sector": 1}),
+            ("002-identity", "openstar.tess.catalog-identity", {}),
+            ("003-independent", "openstar.tess.independent.prepare", {}),
+            ("010-morphology", "openstar.tess.morphology.analyze",
+             {"physicalCycleResolved": False}),
+            ("021-dynamic", "openstar.tess.dynamic-harmonic.analyze",
+             {"referenceFamilyPeriodDays": 10.30084080080649,
+              "supportedHarmonicOrders": [1, 2, 3, 4]}),
+            ("030-nonstationary", "openstar.tess.nonstationary.summarize", {}),
+            ("035-review", "openstar.tess.residual-mode-localization-review.interpret",
+             {"recommendedNextTest": "MULTI_SOURCE_RESIDUAL_DECOMPOSITION"}),
+        )
+        for stage_id, handler, result in evidence:
+            investigation = self._complete(store, investigation, stage_id, handler, result)
+        project_path = root / "multisource.json"
+        project_path.write_text("{}", encoding="utf-8")
+        captured = {}
+
+        def fake_build(**kwargs):
+            captured.update(kwargs)
+            return {"projectPath": str(project_path), "workloadID": "openstar.lomb-scargle.v1",
+                    "spatialComponents": [], "preparedSeries": [], "totalWorkUnits": 0}
+
+        engine = build_engine(store, mock.Mock(), poll_interval=0.0, timeout=1.0)
+        request = StageRequest("036-prepare-multi-source-residual",
+                               "openstar.tess.multi-source-residual.prepare", {})
+        with mock.patch("workflows.tess.tess_investigation.build_multisource_residual_project",
+                        side_effect=fake_build):
+            completed, next_request = engine.run_stage(
+                investigation, request, software_id="test", software_version="20.12"
+            )
+        result = completed.stages[-1].result
+        self.assertEqual((1, 2, 3, 4), captured["harmonic_orders"])
+        self.assertEqual(10.30084080080649, captured["physical_period_days"])
+        self.assertFalse(captured["physical_cycle_resolved"])
+        self.assertEqual("021-dynamic", captured["family_evidence"]["stageID"])
+        self.assertEqual("openstar.tess.multi-source-residual.run", next_request.handler_id)
+        self.assertEqual("openstar.lomb-scargle.v1", result["workloadID"])
+
+    @unittest.skipIf(_real_numpy is None, "NumPy is required for pixel prewhitening")
+    def test_multisource_prewhitening_subtracts_persisted_full_family(self):
+        times = _real_numpy.linspace(0.0, 30.0, 1200, dtype=float)
+        frequency = 1.0 / 10.30084080080649
+        full_family = sum(
+            _real_numpy.sin(2.0 * math.pi * order * frequency * times)
+            for order in (1, 2, 3, 4)
+        )
+        cube = full_family[:, None, None]
+        residual_two, _ = _prewhiten_cube_raw(
+            absolute_times=times, cube=cube, physical_frequency=frequency,
+            harmonic_orders=(1, 2),
+        )
+        residual_full, _ = _prewhiten_cube_raw(
+            absolute_times=times, cube=cube, physical_frequency=frequency,
+            harmonic_orders=(1, 2, 3, 4),
+        )
+        self.assertGreater(float(_real_numpy.std(residual_two)), 0.5)
+        self.assertLess(float(_real_numpy.std(residual_full)), 1e-10)
+
     def test_dynamic_harmonic_routes_are_unresolved_family_safe(self):
         residual = dynamic_harmonic_continuation(
             {"recommendedNextTest": "RESIDUAL_MULTIMODE_LOCALIZATION"},

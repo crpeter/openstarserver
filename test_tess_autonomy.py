@@ -250,6 +250,69 @@ class TessAutonomyIntegrationTests(unittest.TestCase):
             repair_obsolete_terminal_wait(self.store, unrelated_failure),
         )
 
+    def test_real_failed_multisource_prepare_appends_corrected_retry(self):
+        target = self.source.enumerate_targets()[0]
+        investigation = self.store.create(
+            target.investigation_id, WORKFLOW_ID, WORKFLOW_VERSION,
+            metadata=target.metadata,
+        )
+        evidence = (
+            ("010-morphology", "openstar.tess.morphology.analyze",
+             {"physicalCycleResolved": False}),
+            ("021-dynamic", "openstar.tess.dynamic-harmonic.analyze",
+             {"referenceFamilyPeriodDays": 10.30084080080649,
+              "supportedHarmonicOrders": [1, 2, 3, 4],
+              "classification": "ADDITIONAL_VARIABILITY_REMAINS"}),
+            ("035-review", "openstar.tess.residual-mode-localization-review.interpret",
+             {"classification": "RESIDUAL_MODE_SOURCE_SWITCHING_OR_BLEND",
+              "residualModeOrigin": "TIME_VARIABLE_OR_BLENDED",
+              "recommendedNextTest": "MULTI_SOURCE_RESIDUAL_DECOMPOSITION"}),
+        )
+        for stage_id, handler, result in evidence:
+            investigation = self._complete(
+                investigation, stage_id, handler, result
+            )
+        request = StageRequest(
+            "036-prepare-multi-source-residual",
+            "openstar.tess.multi-source-residual.prepare", {}, "035-review",
+        )
+        investigation = self.store.set_control_state(
+            investigation, status="RUNNING",
+            control_state={"schedulerAction": "RUN_EXPERIMENT",
+                           "selectedExperiment": asdict(request)},
+        )
+        engine = WorkflowEngine(self.store)
+
+        def obsolete_gate(_investigation, _request):
+            raise RuntimeError("v20.12 requires the morphology-resolved physical period.")
+
+        engine.register_handler(request.handler_id, obsolete_gate)
+        with self.assertRaisesRegex(RuntimeError, "morphology-resolved"):
+            engine.run_stage(
+                investigation, request, software_id="legacy", software_version="20.11"
+            )
+        failed = self.store.load(investigation.id)
+        historical_stages = failed.stages
+        historical_files = {
+            stage.id: self.store.stage_path_for(failed.id, stage.id).read_bytes()
+            for stage in historical_stages
+        }
+
+        repaired = repair_obsolete_terminal_wait(self.store, failed)
+
+        self.assertEqual("RUNNING", repaired.status)
+        self.assertEqual(historical_stages, repaired.stages)
+        selected = repaired.metadata["controlState"]["selectedExperiment"]
+        self.assertEqual("037-prepare-multi-source-residual", selected["id"])
+        self.assertEqual(request.handler_id, selected["handler_id"])
+        self.assertEqual(request.id, selected["triggered_by_stage_id"])
+        self.assertEqual(
+            historical_files,
+            {stage.id: self.store.stage_path_for(repaired.id, stage.id).read_bytes()
+             for stage in repaired.stages},
+        )
+        self.assertEqual(repaired, repair_obsolete_terminal_wait(self.store, repaired))
+
     def test_legacy_invalid_low_frequency_failure_resumes_independent_branch(self):
         target = self.source.enumerate_targets()[0]
         investigation = self.store.create(

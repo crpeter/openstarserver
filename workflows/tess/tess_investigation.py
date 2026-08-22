@@ -3661,6 +3661,12 @@ def build_engine(
         identity = _latest_result_for_handler(investigation, "openstar.tess.catalog-identity")
         independent_prepare = _latest_result_for_handler(investigation, "openstar.tess.independent.prepare")
         morphology = _latest_result_for_handler(investigation, "openstar.tess.morphology.analyze")
+        dynamic_stage = next((
+            stage for stage in reversed(investigation.stages)
+            if stage.status == "COMPLETE"
+            and stage.handler_id == "openstar.tess.dynamic-harmonic.analyze"
+        ), None)
+        dynamic = (dynamic_stage.result or {}) if dynamic_stage is not None else None
         nonstationary = _latest_result_for_handler(investigation, "openstar.tess.nonstationary.summarize")
         review = _latest_result_for_handler(
             investigation,
@@ -3672,8 +3678,23 @@ def build_engine(
             raise RuntimeError("v20.12 requires the completed catalog-identity stage.")
         if independent_prepare is None:
             raise RuntimeError("v20.12 requires frozen independent-sector metadata.")
-        if morphology is None or not morphology.get("physicalCycleResolved"):
-            raise RuntimeError("v20.12 requires the morphology-resolved physical period.")
+        resolved_period = (morphology or {}).get("resolvedPhysicalPeriodDays")
+        harmonic_orders = (1, 2)
+        family_stage = None
+        physical_cycle_resolved = bool((morphology or {}).get("physicalCycleResolved"))
+        if not physical_cycle_resolved:
+            dynamic_period = (dynamic or {}).get("referenceFamilyPeriodDays")
+            dynamic_orders = tuple((dynamic or {}).get("supportedHarmonicOrders") or ())
+            if dynamic_period is None or not dynamic_orders:
+                raise RuntimeError(
+                    "v20.12 requires either a morphology-resolved physical period or "
+                    "an established unresolved dynamic harmonic family."
+                )
+            resolved_period = dynamic_period
+            harmonic_orders = dynamic_orders
+            family_stage = dynamic_stage
+        if resolved_period is None:
+            raise RuntimeError("v20.12 harmonic-family reference period is unavailable.")
         if nonstationary is None:
             raise RuntimeError("v20.12 requires the completed v20.9 nonstationary model.")
         if review is None:
@@ -3681,7 +3702,13 @@ def build_engine(
         if review.get("recommendedNextTest") != "MULTI_SOURCE_RESIDUAL_DECOMPOSITION":
             raise RuntimeError("v20.11 did not recommend MULTI_SOURCE_RESIDUAL_DECOMPOSITION.")
 
-        physical_period = float(morphology["resolvedPhysicalPeriodDays"])
+        physical_period = float(resolved_period)
+        family_evidence = {
+            "stageID": family_stage.id if family_stage is not None else None,
+            "handlerID": (family_stage.handler_id if family_stage is not None
+                          else "openstar.tess.morphology.analyze"),
+            "resultHash": sha256_json(dynamic if family_stage is not None else morphology),
+        }
         artifact_root = store.directory_for(investigation.id) / "artifacts"
         print("🧩 Preparing multi-source residual decomposition")
         print(f"   TIC: {prepared.get('ticID')}")
@@ -3697,6 +3724,9 @@ def build_engine(
             primary_sector=prepared.get("sector"),
             independent_spec=independent_prepare,
             physical_period_days=physical_period,
+            harmonic_orders=tuple(int(value) for value in harmonic_orders),
+            physical_cycle_resolved=physical_cycle_resolved,
+            family_evidence=family_evidence,
             nonstationary_summary=nonstationary,
             localization_review=review,
             output_dir=artifact_root,
@@ -3730,6 +3760,7 @@ def build_engine(
                 "identity": sha256_json(identity),
                 "independentPreparation": sha256_json(independent_prepare),
                 "morphology": sha256_json(morphology),
+                "harmonicFamilyEvidence": family_evidence["resultHash"],
                 "nonstationaryModeling": sha256_json(nonstationary),
                 "localizationReview": sha256_json(review),
             },
