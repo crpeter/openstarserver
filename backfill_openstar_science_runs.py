@@ -85,14 +85,40 @@ def discover_sector_inventory_paths(search_roots: Iterable[str | Path]) -> list[
     return sorted(found)
 
 
+def _number(value) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _candidate_score(candidate: dict) -> tuple[int, int, int, int, int, str]:
+    """Prefer the active run, then the most substantial durable run for a sector."""
+    projection = candidate["projection"]
+    return (
+        1 if candidate["active"] else 0,
+        1 if projection.get("status") == "COMPLETE" else 0,
+        _number(projection.get("inventory")),
+        _number(projection.get("admitted")),
+        _number(projection.get("complete")),
+        str(candidate["state_root"]),
+    )
+
+
 def backfill_sector_sweeps(
     catalog: ScienceRunCatalog,
     search_roots: Iterable[str | Path],
     *,
     active: dict[Path, int] | None = None,
 ) -> list[dict]:
+    """Register one canonical pre-catalog sector run per sector.
+
+    Old development/smoke roots are ambiguous because they predate the catalog. Prefer an
+    actually active process when one exists; otherwise retain the most substantial persisted
+    run. Future instrumented runs are never collapsed because they self-register explicitly.
+    """
     active = local_active_sector_sweeps() if active is None else active
-    registered = []
+    candidates_by_sector: dict[int, list[dict]] = {}
     for inventory_path in discover_sector_inventory_paths(search_roots):
         try:
             inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
@@ -110,19 +136,57 @@ def backfill_sector_sweeps(
         )
         if projection is None:
             continue
-        active_at_backfill = active.get(state_root) == sector
+        candidates_by_sector.setdefault(sector, []).append(
+            {
+                "sector": sector,
+                "state_root": state_root,
+                "projection": projection,
+                "active": active.get(state_root) == sector,
+            }
+        )
+
+    winners = {
+        sector: max(candidates, key=_candidate_score)
+        for sector, candidates in candidates_by_sector.items()
+    }
+    winner_ids = {
+        sector: science_run_id(
+            "tess-sector-sweep", winner["state_root"], identity=str(sector)
+        )
+        for sector, winner in winners.items()
+    }
+
+    # Clean up only ambiguous pre-catalog entries created by this backfill. Never delete
+    # instrumented runs or any authoritative investigation/science state.
+    for existing in catalog.list_runs():
+        metadata = existing.get("metadata")
+        if (
+            existing.get("kind") == "tess-sector-sweep"
+            and isinstance(metadata, dict)
+            and metadata.get("backfilled") is True
+        ):
+            try:
+                sector = int(metadata.get("sector"))
+            except (TypeError, ValueError):
+                sector = None
+            if sector is None or existing.get("id") != winner_ids.get(sector):
+                catalog.delete(existing["id"])
+
+    registered = []
+    for sector in sorted(winners):
+        winner = winners[sector]
+        state_root = winner["state_root"]
+        projection = winner["projection"]
+        active_at_backfill = winner["active"]
         if active_at_backfill:
             status = "DISCOVERED_ACTIVE"
         elif projection.get("status") == "COMPLETE":
             status = "COMPLETE"
         else:
             status = "DISCOVERED_INCOMPLETE"
-        run_id = science_run_id(
-            "tess-sector-sweep", state_root, identity=str(sector)
-        )
         registered.append(
             catalog.register(
-                run_id,
+                winner_ids[sector],
                 kind="tess-sector-sweep",
                 display_name=f"TESS Sector {sector} Sweep",
                 status=status,
