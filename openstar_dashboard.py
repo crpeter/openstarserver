@@ -32,6 +32,7 @@ class CoordinatorClient:
         health = self.get("/v1/health")
         nodes = self.get("/v1/nodes")
         contributions = self.get("/v1/contributions/summary")
+        sector_sweeps = self.get("/v1/science/tess-sector-sweeps")
         entries = self.get("/v1/projects")
         # The project listing already contains the complete status snapshot.
         # Consuming it directly is both cheaper and internally consistent.
@@ -45,6 +46,7 @@ class CoordinatorClient:
             "nodes": nodes,
             "contributions": contributions,
             "projects": projects,
+            "sectorSweeps": sector_sweeps.get("sweeps", []),
         }
 
 
@@ -187,6 +189,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     200,
                     {
                         "projects": observation["projects"],
+                        "sectorSweeps": observation.get("sectorSweeps", []),
                         "health": observation["health"],
                         "updatedAt": time.time(),
                     },

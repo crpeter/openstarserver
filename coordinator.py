@@ -14,6 +14,7 @@ from coordinator_runtime import (
 )
 from coordinator_state import first_value
 from openstar_contributions import DEFAULT_CONTRIBUTION_DB
+from openstar_sector_sweep_status import sector_sweeps_projection
 
 DEFAULT_PROJECT_PATH = "data/projects/openstar.tess-validation-v1.json"
 DEFAULT_HOST = "0.0.0.0"
@@ -21,6 +22,7 @@ DEFAULT_PORT = 8080
 COORDINATOR_BUILD = "openstar-coordinator-v20.2-workflow-control"
 
 RUNTIME = CoordinatorRuntime()
+SECTOR_SWEEP_STATE_DIRS = []
 _STATUS_LOG_LOCK = threading.Lock()
 _QUIET_STATUS_SIGNATURES: set[tuple[str, str]] = set()
 
@@ -143,6 +145,12 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self._send_error_json(503, f"Contribution ledger unavailable: {error}")
                 return
             self._send_json(200, summary)
+            return
+
+        if path == "/v1/science/tess-sector-sweeps":
+            self._send_json(
+                200, {"sweeps": sector_sweeps_projection(SECTOR_SWEEP_STATE_DIRS)}
+            )
             return
 
         if path == "/v1/projects/current/status":
@@ -344,12 +352,21 @@ def parse_args():
         default=str(DEFAULT_CONTRIBUTION_DB),
         help="Path to the durable SQLite contribution ledger.",
     )
+    parser.add_argument(
+        "--sector-sweep-state-dir",
+        action="append",
+        default=[],
+        help="Durable TESS sector-sweep state root to expose read-only (repeatable).",
+    )
     return parser.parse_args()
 
 
 def main():
-    global RUNTIME
+    global RUNTIME, SECTOR_SWEEP_STATE_DIRS
     args = parse_args()
+    SECTOR_SWEEP_STATE_DIRS = tuple(
+        Path(path).expanduser().resolve() for path in args.sector_sweep_state_dir
+    )
     try:
         RUNTIME = CoordinatorRuntime(args.contribution_db)
     except (OSError, RuntimeError) as error:

@@ -13,6 +13,7 @@ from openstar_coordinator_client import OpenStarCoordinatorClient
 from openstar_dispatch import InvestigationDispatcher
 from openstar_investigation import InvestigationStore
 from openstar_scheduler import InvestigationScheduler
+from openstar_sector_sweep_status import sector_sweep_projection
 from workflows.tess.tess_sector_archive import MastTessSectorArchiveProvider, TessSectorInventoryStore
 from workflows.tess.tess_sector_scan import (
     WORKFLOW_ID, TessSectorScanTargetSource, plan_tess_sector_scan,
@@ -79,7 +80,11 @@ def run_tess_sector_sweep(sector: int, coordinator_url: str, state_dir: str | Pa
     counts: dict[str, int] = {}
     for outcome in result.outcomes: counts[outcome.state.value] = counts.get(outcome.state.value, 0) + 1
     summary = " ".join(f"{key.lower()}={counts[key]}" for key in sorted(counts))
-    print(f"OpenStar TESS sector sweep: sector={sector} frequencies-per-work-unit={scan_profile['frequenciesPerWorkUnit']} inventory={len(inventory.entries)} admitted={len(result.outcomes)} {summary}")
+    projection = next((item for item in sector_sweep_projection(root) if item["sector"] == sector), None)
+    projected = "" if projection is None else " " + " ".join(
+        f"{key}={projection[key]}" for key in ("remaining", "recoveryRequired", "runnable", "progress")
+    )
+    print(f"OpenStar TESS sector sweep: sector={sector} frequencies-per-work-unit={scan_profile['frequenciesPerWorkUnit']} inventory={len(inventory.entries)} admitted={len(result.outcomes)} {summary}{projected}")
     for outcome in result.outcomes:
         if outcome.error is not None:
             print(f"OpenStar TESS sector sweep target failure: investigation={outcome.investigation.id} error={type(outcome.error).__name__}: {outcome.error}", file=sys.stderr)

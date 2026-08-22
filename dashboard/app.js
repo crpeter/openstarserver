@@ -41,6 +41,21 @@ function labelledRows(fields) {
   return Object.entries(fields).map(([label, value]) => element("div", {className: "row"}, [element("span", {text: label}), element("b", {text: value ?? "Unavailable"})]));
 }
 function jsonBlock(value) { return element("pre", {text: JSON.stringify(value, null, 2)}); }
+function renderSectors(sweeps) {
+  const panel = $("#sectorPanel");
+  panel.hidden = !sweeps.length;
+  if (!sweeps.length) { replace($("#sectors"), []); return; }
+  replace($("#sectors"), sweeps.map(sweep => {
+    const percent = Math.max(0, Math.min(1, sweep.progress || 0));
+    const metrics = [["Remaining", sweep.remaining], ["Runnable", sweep.runnable], ["Recovery required", sweep.recoveryRequired], ["Admitted", sweep.admitted], ["Inventory", sweep.inventory]];
+    return element("article", {className: "sector"}, [
+      element("div", {className: "sector-heading"}, [element("h3", {text: `TESS Sector ${sweep.sector}`}), element("span", {className: `badge ${sweep.status === "COMPLETE" ? "active" : "idle"}`, text: sweep.status})]),
+      element("div", {className: "sector-total"}, [element("b", {text: `${fmt(sweep.complete)} / ${fmt(sweep.inventory)}`}), element("span", {text: " targets complete"}), element("strong", {text: `${(percent * 100).toFixed(1)}%`})]),
+      element("div", {className: "sector-bar", title: `${(percent * 100).toFixed(1)}% complete`}, [Object.assign(element("i"), {style: `width:${percent * 100}%`})]),
+      element("div", {className: "sector-metrics"}, metrics.map(([label, value]) => element("div", {}, [element("span", {text: label}), element("b", {text: fmt(value)})])))
+    ]);
+  }));
+}
 async function openDetail(id) {
   const dialog = $("#detail");
   const body = $("#detailBody");
@@ -62,6 +77,7 @@ async function refresh() {
     const cards = [["Known workers", snapshot.summary.knownWorkers], ["Connected", snapshot.summary.connectedWorkers], ["Computing", snapshot.summary.activeWorkers], ["Running units", snapshot.summary.runningWorkUnits], ["Completed", snapshot.summary.completedWorkUnits], ["Compute time", duration(snapshot.summary.workerComputeSeconds)]];
     replace($("#stats"), cards.map(([label, value]) => element("div", {className: "stat"}, [element("span", {text: label}), element("b", {text: value})])));
     renderWorkers();
+    renderSectors(activity.sectorSweeps || []);
     $("#updated").textContent = `${snapshot.summary.health.toUpperCase()} · updated ${relative(snapshot.summary.updatedAt)}`;
     replace($("#activity"), [element("div", {className: "rows"}, activity.projects.length ? activity.projects.map(project => element("div", {className: "row"}, [element("div", {}, [element("b", {text: project.projectID || "Project"}), element("small", {text: ` · ${project.workloadID || "No workload"}`}), element("div", {className: "bar"}, [Object.assign(element("i"), {style: `width:${100 * (project.projectProgress || 0)}%`})])]), element("span", {text: `${project.projectCompletedWorkUnits || 0} / ${project.projectTotalWorkUnits || 0}`})])) : [element("p", {text: "No active projects"})])]);
     replace($("#contribution"), [element("div", {className: "rows"}, history.contributionByWorker.length ? history.contributionByWorker.slice(0, 8).map(node => element("div", {className: "row"}, [element("span", {text: node.nodeID}), element("b", {text: `${fmt(node.acceptedWorkUnits)} units`})])) : [element("p", {text: "Contributions will appear after accepted work."})])]);

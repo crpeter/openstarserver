@@ -190,6 +190,8 @@ class ProjectionTests(unittest.TestCase):
         self.assertNotIn("innerHTML", script)
         self.assertIn("textContent", script)
         self.assertIn("/api/dashboard/workers/${encodeURIComponent(id)}", script)
+        self.assertIn("renderSectors(activity.sectorSweeps || [])", script)
+        self.assertIn("project.projectCompletedWorkUnits", script)
 
 
 class CoordinatorClientTests(unittest.TestCase):
@@ -200,6 +202,7 @@ class CoordinatorClientTests(unittest.TestCase):
             "/v1/health": {"ok": True},
             "/v1/nodes": [],
             "/v1/contributions/summary": {"allTime": {}, "currentSession": {}},
+            "/v1/science/tess-sector-sweeps": {"sweeps": []},
             "/v1/projects": [
                 {"projectID": "alpha beta", "status": {"projectID": "alpha beta"}}
             ],
@@ -216,6 +219,7 @@ class CoordinatorClientTests(unittest.TestCase):
             "/v1/health": {},
             "/v1/nodes": [],
             "/v1/contributions/summary": {},
+            "/v1/science/tess-sector-sweeps": {"sweeps": []},
             "/v1/projects": [
                 {
                     "projectID": "one",
@@ -232,7 +236,7 @@ class CoordinatorClientTests(unittest.TestCase):
         self.assertEqual(
             ["one", "two"], [item["projectID"] for item in observation["projects"]]
         )
-        self.assertEqual(4, len(calls))
+        self.assertEqual(5, len(calls))
         self.assertFalse(any(path.endswith("/status") for path in calls))
 
     def test_concurrent_snapshots_share_short_lived_observation(self):
