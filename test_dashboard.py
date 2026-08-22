@@ -14,6 +14,7 @@ from openstar_dashboard import (
     TelemetryStore,
     make_server,
 )
+from openstar_science_runs import ScienceRunCatalog, science_run_id
 
 
 class FakeCoordinator:
@@ -191,6 +192,7 @@ class ProjectionTests(unittest.TestCase):
         self.assertNotIn("innerHTML", script)
         self.assertIn("textContent", script)
         self.assertIn("/api/dashboard/workers/${encodeURIComponent(id)}", script)
+        self.assertIn("renderScienceRuns(activity.scienceRuns || [])", script)
         self.assertIn("renderSectors(activity.sectorSweeps || [])", script)
         self.assertIn("In flight or recovery", script)
         self.assertNotIn("Recovery required", script)
@@ -240,56 +242,83 @@ class CoordinatorClientTests(unittest.TestCase):
         self.assertEqual(4, len(calls))
         self.assertFalse(any(path.endswith("/status") for path in calls))
 
-    def test_dashboard_reads_configured_sector_sweep_state_directly(self):
-        with tempfile.TemporaryDirectory() as root:
-            Path(root, "tess-sector-9-inventory.json").write_text(
+    def test_dashboard_discovers_cataloged_sector_sweep_and_science_history(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = root / "sector-state"
+            state.mkdir()
+            (state / "tess-sector-9-inventory.json").write_text(
                 json.dumps({"sector": 9, "entries": []}),
                 encoding="utf-8",
+            )
+            catalog = ScienceRunCatalog(root / "science.sqlite3")
+            run_id = science_run_id("tess-sector-sweep", state, identity="9")
+            catalog.register(
+                run_id,
+                kind="tess-sector-sweep",
+                display_name="TESS Sector 9 Sweep",
+                state_root=state,
+                status="RUNNING",
+                metadata={"mission": "TESS", "sector": 9},
             )
             coordinator = FakeCoordinator()
             application = DashboardApplication(
                 coordinator,
-                sector_sweep_state_dirs=(root,),
+                science_run_catalog=ScienceRunCatalog(catalog.path, create=False),
             )
 
             _, observation = application.snapshot()
 
             self.assertEqual(1, coordinator.calls)
+            self.assertEqual(run_id, observation["scienceRuns"][0]["id"])
             self.assertEqual(9, observation["sectorSweeps"][0]["sector"])
+            self.assertEqual("RUNNING", observation["sectorSweeps"][0]["runStatus"])
 
-    def test_dashboard_without_configured_sector_state_has_no_sector_sweeps(self):
-        coordinator = FakeCoordinator()
-        application = DashboardApplication(coordinator)
+    def test_dashboard_without_cataloged_science_has_no_science_runs(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            coordinator = FakeCoordinator()
+            catalog = ScienceRunCatalog(Path(temporary, "missing.sqlite3"), create=False)
+            application = DashboardApplication(
+                coordinator,
+                science_run_catalog=catalog,
+            )
 
-        _, observation = application.snapshot()
+            _, observation = application.snapshot()
 
-        self.assertEqual([], observation["sectorSweeps"])
+            self.assertEqual([], observation["scienceRuns"])
+            self.assertEqual([], observation["sectorSweeps"])
 
     def test_concurrent_snapshots_share_short_lived_observation(self):
-        coordinator = FakeCoordinator()
-        original = coordinator.observation
+        with tempfile.TemporaryDirectory() as temporary:
+            coordinator = FakeCoordinator()
+            original = coordinator.observation
 
-        def slow_observation():
-            time.sleep(0.05)
-            return original()
+            def slow_observation():
+                time.sleep(0.05)
+                return original()
 
-        coordinator.observation = slow_observation
-        application = DashboardApplication(coordinator, observation_cache_seconds=1.5)
-        barrier = threading.Barrier(4)
-        results = []
+            coordinator.observation = slow_observation
+            catalog = ScienceRunCatalog(Path(temporary, "missing.sqlite3"), create=False)
+            application = DashboardApplication(
+                coordinator,
+                observation_cache_seconds=1.5,
+                science_run_catalog=catalog,
+            )
+            barrier = threading.Barrier(4)
+            results = []
 
-        def read_snapshot():
+            def read_snapshot():
+                barrier.wait()
+                results.append(application.snapshot()[0])
+
+            threads = [threading.Thread(target=read_snapshot) for _ in range(3)]
+            for thread in threads:
+                thread.start()
             barrier.wait()
-            results.append(application.snapshot()[0])
-
-        threads = [threading.Thread(target=read_snapshot) for _ in range(3)]
-        for thread in threads:
-            thread.start()
-        barrier.wait()
-        for thread in threads:
-            thread.join()
-        self.assertEqual(3, len(results))
-        self.assertEqual(1, coordinator.calls)
+            for thread in threads:
+                thread.join()
+            self.assertEqual(3, len(results))
+            self.assertEqual(1, coordinator.calls)
 
     def test_coordinator_modules_have_no_dashboard_dependency(self):
         for path in (
@@ -301,8 +330,10 @@ class CoordinatorClientTests(unittest.TestCase):
             source = Path(path).read_text(encoding="utf-8")
             self.assertNotIn("dashboard", source.lower(), path)
         coordinator_source = Path("coordinator.py").read_text(encoding="utf-8")
+        dashboard_source = Path("openstar_dashboard.py").read_text(encoding="utf-8")
         self.assertNotIn("tess-sector-sweeps", coordinator_source)
         self.assertNotIn("sector-sweep-state-dir", coordinator_source)
+        self.assertNotIn("sector-sweep-state-dir", dashboard_source)
 
 
 class SidecarHTTPTests(unittest.TestCase):
@@ -310,8 +341,20 @@ class SidecarHTTPTests(unittest.TestCase):
     def setUpClass(cls):
         cls.coordinator = FakeCoordinator()
         cls.telemetry = TelemetryStore()
+        cls.science_temp = tempfile.TemporaryDirectory()
+        cls.science_catalog = ScienceRunCatalog(
+            Path(cls.science_temp.name, "science.sqlite3")
+        )
         cls.server = make_server(
-            "127.0.0.1", 0, DashboardApplication(cls.coordinator, cls.telemetry)
+            "127.0.0.1",
+            0,
+            DashboardApplication(
+                cls.coordinator,
+                cls.telemetry,
+                science_run_catalog=ScienceRunCatalog(
+                    cls.science_catalog.path, create=False
+                ),
+            ),
         )
         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
         cls.thread.start()
@@ -321,6 +364,7 @@ class SidecarHTTPTests(unittest.TestCase):
     def tearDownClass(cls):
         cls.server.shutdown()
         cls.server.server_close()
+        cls.science_temp.cleanup()
 
     def request(self, path, payload=None):
         data = None if payload is None else json.dumps(payload).encode()
@@ -342,13 +386,10 @@ class SidecarHTTPTests(unittest.TestCase):
             2, self.request("/api/dashboard/summary")[1]["summary"]["knownWorkers"]
         )
         self.assertEqual(2, len(self.request("/api/dashboard/workers")[1]["workers"]))
-        self.assertEqual(
-            "project",
-            self.request("/api/dashboard/activity")[1]["projects"][0]["projectID"],
-        )
-        self.assertEqual(
-            [], self.request("/api/dashboard/activity")[1]["sectorSweeps"]
-        )
+        activity = self.request("/api/dashboard/activity")[1]
+        self.assertEqual("project", activity["projects"][0]["projectID"])
+        self.assertEqual([], activity["scienceRuns"])
+        self.assertEqual([], activity["sectorSweeps"])
         self.assertFalse(self.request("/api/dashboard/history")[1]["available"])
         self.assertIn(b"OpenStar", self.request("/dashboard/")[1])
 
