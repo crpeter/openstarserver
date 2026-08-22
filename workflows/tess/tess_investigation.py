@@ -96,6 +96,11 @@ from .tess_source_switching_temporal import (
     run_source_switching_temporal_model,
     interpret_source_switching_temporal_model,
 )
+from .tess_time_resolved_residual_phase_localization import (
+    prepare_time_resolved_residual_phase_localization,
+    run_time_resolved_residual_phase_localization,
+    interpret_time_resolved_residual_phase_localization,
+)
 from .tess_frequency_localized_pixel import (
     build_frequency_localized_pixel_project,
     interpret_frequency_localized_pixel_project,
@@ -4183,11 +4188,65 @@ def build_engine(
                 "STATIONARY_CANDIDATE_1_SOURCE", "STATIONARY_CANDIDATE_2_SOURCE"}
             and result.get("recommendedNextTest")
             == "INDEPENDENT_COUNTERPART_PHOTOMETRIC_VARIABILITY_VALIDATION")
+        spatial_continuation = (
+            result.get("classification") == "SECTOR_VARIABLE_MULTI_SOURCE"
+            and result.get("sourceIdentifiable") is True
+            and result.get("sourceAttributionResolved") is False
+            and result.get("physicalMechanismResolved") is False
+            and result.get("recommendedNextTest") == "ADDITIONAL_SOURCE_LOCALIZATION_DATA")
         return StageOutcome(result=result, next_stage=(StageRequest(
             _next_stage_id(request.id, "prepare-offset-source-variability"),
             "openstar.tess.offset-source-variability.prepare", {}, request.id)
-            if candidate_continuation else None), stop=not candidate_continuation,
+            if candidate_continuation else StageRequest(
+            _next_stage_id(request.id, "prepare-time-resolved-residual-phase-localization"),
+            "openstar.tess.time-resolved-residual-phase-localization.prepare", {}, request.id)
+            if spatial_continuation else None),
+            stop=not candidate_continuation and not spatial_continuation,
             final_status="QUIESCENT_AWAITING_DATA",
+            input_hashes={"preparation": sha256_json(preparation), "run": sha256_json(run)},
+            artifacts=(_artifact(path, "application/json"),))
+
+    def time_resolved_residual_phase_prepare_stage(investigation, request):
+        interpretation = _latest_result_for_handler(
+            investigation, "openstar.tess.source-switching-temporal-model.interpret")
+        bridge = _latest_result_for_handler(
+            investigation, "openstar.tess.source-switching-temporal-model.prepare")
+        if interpretation is None or bridge is None:
+            raise RuntimeError("Time-resolved localization requires persisted stages 051 and 053.")
+        result = prepare_time_resolved_residual_phase_localization(
+            temporal_interpretation=interpretation, temporal_preparation=bridge,
+            output_dir=store.directory_for(investigation.id) / "artifacts",
+            investigation_id=investigation.id)
+        return StageOutcome(result=result, next_stage=StageRequest(
+            _next_stage_id(request.id, "run-time-resolved-residual-phase-localization"),
+            "openstar.tess.time-resolved-residual-phase-localization.run", {}, request.id),
+            input_hashes={"stage051": sha256_json(bridge), "stage053": sha256_json(interpretation)},
+            artifacts=(_artifact(Path(result["preparationPath"]), "application/json"),))
+
+    def time_resolved_residual_phase_run_stage(investigation, request):
+        preparation = _latest_result_for_handler(
+            investigation, "openstar.tess.time-resolved-residual-phase-localization.prepare")
+        if preparation is None:
+            raise RuntimeError("Time-resolved localization run requires preparation.")
+        result = run_time_resolved_residual_phase_localization(
+            preparation, sector_inputs=request.parameters.get("sectorInputs"))
+        path = Path(preparation["artifactRoot"]) / "run.json"; _write_json(path, result)
+        return StageOutcome(result=result, next_stage=StageRequest(
+            _next_stage_id(request.id, "interpret-time-resolved-residual-phase-localization"),
+            "openstar.tess.time-resolved-residual-phase-localization.interpret", {}, request.id),
+            input_hashes={"preparation": sha256_json(preparation)},
+            artifacts=(_artifact(path, "application/json"),))
+
+    def time_resolved_residual_phase_interpret_stage(investigation, request):
+        preparation = _latest_result_for_handler(
+            investigation, "openstar.tess.time-resolved-residual-phase-localization.prepare")
+        run = _latest_result_for_handler(
+            investigation, "openstar.tess.time-resolved-residual-phase-localization.run")
+        if preparation is None or run is None:
+            raise RuntimeError("Time-resolved localization interpretation requires prepare and run.")
+        result = interpret_time_resolved_residual_phase_localization(preparation, run)
+        path = Path(preparation["artifactRoot"]) / "interpretation.json"; _write_json(path, result)
+        return StageOutcome(result=result, stop=True, final_status="QUIESCENT_AWAITING_DATA",
             input_hashes={"preparation": sha256_json(preparation), "run": sha256_json(run)},
             artifacts=(_artifact(path, "application/json"),))
 
@@ -8734,6 +8793,18 @@ def build_engine(
     engine.register_handler(
         "openstar.tess.source-switching-temporal-model.interpret",
         source_switching_temporal_interpret_stage,
+    )
+    engine.register_handler(
+        "openstar.tess.time-resolved-residual-phase-localization.prepare",
+        time_resolved_residual_phase_prepare_stage,
+    )
+    engine.register_handler(
+        "openstar.tess.time-resolved-residual-phase-localization.run",
+        time_resolved_residual_phase_run_stage,
+    )
+    engine.register_handler(
+        "openstar.tess.time-resolved-residual-phase-localization.interpret",
+        time_resolved_residual_phase_interpret_stage,
     )
     engine.register_handler(
         "openstar.tess.offset-source-variability.prepare",

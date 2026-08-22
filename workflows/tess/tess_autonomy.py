@@ -981,6 +981,9 @@ def plan_tess_branches(
     source_switching_temporal = _latest_complete(
         investigation, "openstar.tess.source-switching-temporal-model.interpret"
     )
+    time_resolved_localization = _latest_complete(
+        investigation, "openstar.tess.time-resolved-residual-phase-localization.interpret"
+    )
     variability_interpretation = _latest_complete(
         investigation, "openstar.tess.offset-source-variability.interpret"
     )
@@ -1177,6 +1180,25 @@ def plan_tess_branches(
     # before the stage-050 terminal guard so restart recovery remains reachable.
     if source_switching_temporal is not None:
         temporal_result = source_switching_temporal.result or {}
+        localization_started = any(
+            stage.handler_id.startswith("openstar.tess.time-resolved-residual-phase-localization.")
+            and stage.status in {"RUNNING", "COMPLETE"} for stage in investigation.stages)
+        if (time_resolved_localization is None and not localization_started
+                and temporal_result.get("classification") == "SECTOR_VARIABLE_MULTI_SOURCE"
+                and temporal_result.get("sourceIdentifiable") is True
+                and temporal_result.get("sourceAttributionResolved") is False
+                and temporal_result.get("physicalMechanismResolved") is False
+                and temporal_result.get("recommendedNextTest")
+                == "ADDITIONAL_SOURCE_LOCALIZATION_DATA"):
+            return (ScientificBranch(
+                id=f"continue-time-resolved-localization-after-{source_switching_temporal.id}",
+                experiment=StageRequest(
+                    id=_continuation_stage_id(source_switching_temporal,
+                        "prepare-time-resolved-residual-phase-localization"),
+                    handler_id="openstar.tess.time-resolved-residual-phase-localization.prepare",
+                    parameters={}, triggered_by_stage_id=source_switching_temporal.id)),)
+        if time_resolved_localization is not None or localization_started:
+            return ()
         candidate = temporal_result.get("preferredCandidate") or {}
         ids = candidate.get("catalogIDs") or {}
         justified = (candidate.get("raDeg") is not None and candidate.get("decDeg") is not None

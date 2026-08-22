@@ -183,6 +183,41 @@ class TessAutonomyIntegrationTests(unittest.TestCase):
         with_complete = self.store.complete_current_stage(with_running, terminal)
         self.assertEqual((), plan_tess_branches(with_complete, target))
 
+    def test_stage_053_variable_multisource_schedules_time_resolved_once_append_only(self):
+        target = self.source.enumerate_targets()[0]
+        investigation = self.store.create(
+            target.investigation_id, WORKFLOW_ID, WORKFLOW_VERSION,
+            metadata={**target.metadata, "ticID": 277940827})
+        for number in range(1, 51):
+            investigation = self._complete(
+                investigation, f"{number:03d}-persisted-science", "persisted.science",
+                {"stage": number})
+        investigation = self._complete(
+            investigation, "051-prepare-source-switching-temporal-model",
+            "openstar.tess.source-switching-temporal-model.prepare", {})
+        investigation = self._complete(
+            investigation, "052-run-source-switching-temporal-model",
+            "openstar.tess.source-switching-temporal-model.run", {})
+        investigation = self._complete(
+            investigation, "053-interpret-source-switching-temporal-model",
+            "openstar.tess.source-switching-temporal-model.interpret",
+            {"classification": "SECTOR_VARIABLE_MULTI_SOURCE",
+             "sourceIdentifiable": True, "sourceAttributionResolved": False,
+             "physicalMechanismResolved": False,
+             "recommendedNextTest": "ADDITIONAL_SOURCE_LOCALIZATION_DATA"})
+        original = investigation.stages
+        branches = plan_tess_branches(investigation, target)
+        self.assertEqual(1, len(branches))
+        request = branches[0].experiment
+        self.assertEqual("054-prepare-time-resolved-residual-phase-localization", request.id)
+        self.assertEqual("openstar.tess.time-resolved-residual-phase-localization.prepare",
+                         request.handler_id)
+        self.assertEqual(original, investigation.stages)
+        running = InvestigationStage(request.id, request.handler_id, "RUNNING",
+                                     request.triggered_by_stage_id, {})
+        with_running = self.store.append_running_stage(investigation, running)
+        self.assertEqual((), plan_tess_branches(with_running, target))
+
     def test_stage_053_candidate_two_recovery_is_idempotent(self):
         target = self.source.enumerate_targets()[0]
         candidate_1 = {"raDeg": 10.1, "decDeg": -20.1,
