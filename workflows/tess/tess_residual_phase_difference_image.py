@@ -12,14 +12,17 @@ from typing import Any
 
 import numpy as np
 
-from .tess_catalog_guided_localization import (
-    COMPONENT_IDS, HARMONIC_ORDERS, _production_sector_inputs,
-)
+from .tess_catalog_guided_localization import COMPONENT_IDS
+from .tess_multisource_residual import _prewhiten_cube_raw
+from .tess_offset_variability import _skycoord
 from .tess_difference_image import (
     MIN_IMAGE_PEAK_SNR, SOURCE_MARGIN_FLOOR_PIXELS, SOURCE_MATCH_MAX_PIXELS,
     _centroid_from_frames, _extreme_indices, _jackknife_uncertainty, _phase_model,
 )
-from .tess_residual_localization import _time_warp, _write_json
+from .tess_residual_localization import (
+    MAX_CADENCES, _background_subtract_cube, _download_tpf, _time_warp,
+    _uniform_indices, _write_json,
+)
 
 EXPECTED_SECTORS = (94, 95, 102, 103)
 
@@ -38,14 +41,19 @@ def prepare_residual_phase_difference_imaging(
         raise RuntimeError("Residual-phase difference imaging requires an unresolved localization recommendation.")
     if len(candidates) < 2:
         raise RuntimeError("Both persisted catalog candidates are required as spatial hypotheses.")
+    if localization_preparation.get("physicalCycleResolved") is not False:
+        raise RuntimeError("Residual-phase difference imaging requires the unresolved-family bridge.")
     required = {
         "referenceFamilyPeriodDays": localization_preparation.get("referenceFamilyPeriodDays"),
         "residualReferenceFrequency": localization_preparation.get("residualReferenceFrequency"),
         "residualTimeReferenceDays": localization_preparation.get("residualTimeReferenceDays"),
         "fractionalFrequencyDriftPerDay": localization_preparation.get("fractionalFrequencyDriftPerDay"),
+        "subtractedHarmonicOrders": localization_preparation.get("subtractedHarmonicOrders"),
     }
     if any(value is None for value in required.values()):
         raise RuntimeError("The persisted catalog-guided/PRF bridge lacks residual ephemeris values.")
+    if not required["subtractedHarmonicOrders"]:
+        raise RuntimeError("The persisted bridge lacks its harmonic subtraction evidence.")
     sectors = tuple(int(value) for value in localization_preparation.get("sectors") or [])
     root = Path(output_dir) / "residual-phase-difference-imaging"
     root.mkdir(parents=True, exist_ok=True)
@@ -63,7 +71,10 @@ def prepare_residual_phase_difference_imaging(
             {"componentID": "candidate-2", **candidates[1]},
         ],
         "sectors": list(sectors), "referenceFamilyPeriodDays": float(required["referenceFamilyPeriodDays"]),
-        "subtractedHarmonicOrders": list(HARMONIC_ORDERS), "physicalCycleResolved": False,
+        # This is persisted scientific evidence, not a default reconstructed by
+        # the continuation.  Preserve both its values and ordering.
+        "subtractedHarmonicOrders": list(required["subtractedHarmonicOrders"]),
+        "physicalCycleResolved": False,
         "residualReferenceFrequency": float(required["residualReferenceFrequency"]),
         "residualTimeReferenceDays": float(required["residualTimeReferenceDays"]),
         "fractionalFrequencyDriftPerDay": float(required["fractionalFrequencyDriftPerDay"]),
@@ -96,7 +107,7 @@ def run_residual_phase_difference_imaging(
     preparation: dict[str, Any], *, sector_inputs: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Construct high-minus-low residual-phase images and jackknife centroids."""
-    inputs = _production_sector_inputs(preparation) if sector_inputs is None else sector_inputs
+    inputs = _production_difference_image_inputs(preparation) if sector_inputs is None else sector_inputs
     results = []
     for item in inputs:
         times = np.asarray(item["times"], dtype=float)
@@ -122,6 +133,7 @@ def run_residual_phase_difference_imaging(
             "differenceImageUsable": usable, "differenceImage": image,
             "centroidUncertaintyPixels": uncertainty, "jackknifeCentroids": jackknife,
             "distancesPixels": distances, "catalogPixelPositions": centers,
+            "acquisitionProvenance": item.get("acquisitionProvenance"),
             "phaseModel": {"amplitude": phase["amplitude"],
                            "phaseRadians": phase["phaseRadians"],
                            "explainedVariance": phase["explainedVariance"],
@@ -130,6 +142,64 @@ def run_residual_phase_difference_imaging(
     return {"version": "openstar.tess-residual-phase-difference-imaging-run.v1",
             "execution": "coordinator-local-difference-image-centroiding",
             "sectorResults": results, "physicalCycleResolved": False}
+
+
+def _production_difference_image_inputs(preparation: dict[str, Any]) -> list[dict[str, Any]]:
+    """Acquire only the TPF pixels and WCS positions needed by difference imaging.
+
+    In particular, this path deliberately has no official-PRF grid, FITS,
+    interpolation, rendering, calibration, or amplitude-fit dependency.
+    """
+    target = preparation["targetSky"]
+    candidates = list(preparation["catalogCandidates"])
+    coordinates = [
+        _skycoord(float(target["raDeg"]), float(target["decDeg"])),
+        *[_skycoord(float(item["raDeg"]), float(item["decDeg"])) for item in candidates],
+    ]
+    harmonic_orders = tuple(int(value) for value in preparation["subtractedHarmonicOrders"])
+    inputs = []
+    for sector in preparation["sectors"]:
+        tpf, source = _download_tpf(
+            tic_id=int(preparation["ticID"]), sector=int(sector),
+            ra_deg=float(target["raDeg"]), dec_deg=float(target["decDeg"]))
+        times = np.asarray(tpf.time.value, dtype=float)
+        flux = getattr(tpf.flux, "value", tpf.flux)
+        if np.ma.isMaskedArray(flux):
+            flux = np.ma.filled(flux, np.nan)
+        cube = np.asarray(flux, dtype=float)
+        keep = np.isfinite(times) & np.any(np.isfinite(cube.reshape(len(cube), -1)), axis=1)
+        times, cube = times[keep], cube[keep]
+        indices = _uniform_indices(len(times), MAX_CADENCES)
+        times, cube = times[indices], cube[indices]
+        if len(times) < 2 * 80:
+            raise RuntimeError(f"Sector {sector} has too few usable cadences for phase bins.")
+        corrected, background = _background_subtract_cube(cube)
+        residual, valid = _prewhiten_cube_raw(
+            absolute_times=times, cube=corrected,
+            physical_frequency=1.0 / float(preparation["referenceFamilyPeriodDays"]),
+            harmonic_orders=harmonic_orders)
+        centers = []
+        for component_id, coordinate in zip(COMPONENT_IDS, coordinates):
+            x, y = tpf.wcs.world_to_pixel(coordinate)
+            if not (math.isfinite(float(x)) and math.isfinite(float(y))):
+                raise RuntimeError(f"{component_id} has no finite WCS position in sector {sector}.")
+            centers.append({"componentID": component_id, "x": float(x), "y": float(y)})
+        inputs.append({
+            "sector": int(sector), "times": times, "prewhitened": residual,
+            "valid": valid, "componentPixelCenters": centers,
+            "acquisitionProvenance": {
+                "tpf": source, "backgroundSubtraction": background,
+                "componentPixelCenters": centers,
+                "referenceFamilyPeriodDays": preparation["referenceFamilyPeriodDays"],
+                "subtractedHarmonicOrders": list(preparation["subtractedHarmonicOrders"]),
+                "residualEphemeris": {
+                    "frequency": preparation["residualReferenceFrequency"],
+                    "timeReferenceDays": preparation["residualTimeReferenceDays"],
+                    "fractionalFrequencyDriftPerDay": preparation["fractionalFrequencyDriftPerDay"],
+                },
+            },
+        })
+    return inputs
 
 
 def interpret_residual_phase_difference_imaging(preparation: dict[str, Any],
@@ -147,17 +217,28 @@ def interpret_residual_phase_difference_imaging(preparation: dict[str, Any],
         classification = "MULTIPLE_OR_BLENDED"
     else:
         classification = "UNRESOLVED"
+    candidates = list(preparation.get("catalogCandidates") or [])
+    preferred = (candidates[0] if classification == "CANDIDATE_1_SUPPORTED"
+                 else candidates[1] if classification == "CANDIDATE_2_SUPPORTED" else None)
+    recommendations = {
+        "TARGET_SUPPORTED": "TARGET_INTRINSIC_RESIDUAL_MODELING",
+        "CANDIDATE_1_SUPPORTED": "INDEPENDENT_COUNTERPART_PHOTOMETRIC_VARIABILITY_VALIDATION",
+        "CANDIDATE_2_SUPPORTED": "INDEPENDENT_COUNTERPART_PHOTOMETRIC_VARIABILITY_VALIDATION",
+        "SOURCE_SWITCHING_BY_SECTOR": "SOURCE_SWITCHING_TEMPORAL_MODEL",
+        "MULTIPLE_OR_BLENDED": "JOINT_MULTI_SOURCE_VARIABILITY_MODEL",
+        "UNRESOLVED": "ADDITIONAL_SOURCE_LOCALIZATION_DATA",
+    }
     return {
         "version": "openstar.tess-residual-phase-difference-imaging-interpretation.v1",
         "classification": classification, "sectorResults": sectors,
         "sourceAttributionResolved": classification in {
             "TARGET_SUPPORTED", "CANDIDATE_1_SUPPORTED", "CANDIDATE_2_SUPPORTED"},
+        "preferredCandidate": preferred, "catalogCandidates": candidates,
         "physicalCycleResolved": False, "physicalMechanismResolved": False,
         "referenceFamilyPeriodDays": preparation["referenceFamilyPeriodDays"],
         "subtractedHarmonicOrders": preparation["subtractedHarmonicOrders"],
         "residualReferenceFrequency": preparation["residualReferenceFrequency"],
-        "recommendedNextTest": None if classification.endswith("SUPPORTED")
-                               else "ADDITIONAL_SOURCE_LOCALIZATION_DATA",
+        "recommendedNextTest": recommendations[classification],
         "interpretationGuard": (
             "Centroids are uncertainty-discriminated against all three frozen catalog positions. "
             "Fewer than three consistent sector localizations cannot resolve source attribution."),

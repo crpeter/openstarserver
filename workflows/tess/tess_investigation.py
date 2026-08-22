@@ -4111,10 +4111,20 @@ def build_engine(
         result = interpret_residual_phase_difference_imaging(preparation, run)
         path = Path(preparation["artifactRoot"]) / "interpretation.json"
         _write_json(path, result)
+        candidate_continuation = (
+            result.get("classification") in {"CANDIDATE_1_SUPPORTED", "CANDIDATE_2_SUPPORTED"}
+            and result.get("recommendedNextTest")
+            == "INDEPENDENT_COUNTERPART_PHOTOMETRIC_VARIABILITY_VALIDATION")
         return StageOutcome(
-            result=result, stop=not result["sourceAttributionResolved"],
-            final_status=("QUIESCENT_AWAITING_DATA" if not result["sourceAttributionResolved"]
-                          else "COMPLETE"),
+            result=result,
+            next_stage=(StageRequest(
+                _next_stage_id(request.id, "prepare-offset-source-variability"),
+                "openstar.tess.offset-source-variability.prepare", {}, request.id)
+                if candidate_continuation else None),
+            # Target localization is scientifically resolved spatially, but its
+            # physical-model continuation is not implemented on this route.
+            stop=not candidate_continuation,
+            final_status="QUIESCENT_AWAITING_DATA",
             input_hashes={"preparation": sha256_json(preparation), "run": sha256_json(run)},
             artifacts=(_artifact(path, "application/json"),))
 
@@ -4193,7 +4203,9 @@ def build_engine(
         official_prf_prepare = _latest_result_for_handler(
             investigation, "openstar.tess.official-spoc-prf-forward-modeling.prepare")
         multisource = _latest_result_for_handler(investigation, "openstar.tess.multi-source-residual.interpret")
-        catalog_counterpart = (_latest_result_for_handler(
+        residual_phase_localization = _latest_result_for_handler(
+            investigation, "openstar.tess.residual-phase-difference-imaging.interpret")
+        catalog_counterpart = (residual_phase_localization or _latest_result_for_handler(
             investigation, "openstar.tess.catalog-guided-source-localization.interpret")
             or _latest_result_for_handler(
             investigation, "openstar.tess.catalog-counterpart-identification.analyze"
