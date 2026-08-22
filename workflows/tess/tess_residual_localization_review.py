@@ -8,6 +8,8 @@ from typing import Any
 
 import numpy as np
 
+from .tess_sector_archive import TessArchiveTransientError
+
 from .tess_residual_localization import (
     GENERIC_LOMB_SCARGLE_WORKLOAD_ID,
     LOMB_SCARGLE_WORKLOAD_ALIASES,
@@ -327,6 +329,8 @@ def build_residual_mode_localization_review_project(
                         f"      window {window_index}: samples={sample_count}, pixel datasets={prepared_count}",
                         flush=True,
                     )
+        except TessArchiveTransientError:
+            raise
         except Exception as exc:
             errors.append(
                 {

@@ -8,6 +8,12 @@ from typing import Any
 
 import numpy as np
 
+from .tess_sector_archive import (
+    TessArchiveTransientError,
+    _is_transient_transport_error,
+    configure_tess_archive_timeout,
+)
+
 
 OFFICIAL_AUTHORS = ("SPOC", "TESS-SPOC")
 TESScut_SIZE = (11, 11)
@@ -20,6 +26,20 @@ MAX_OFF_TARGET_SKY_SCATTER_ARCSEC = 15.0
 SIGNAL_CLUSTER_FRACTION = 0.20
 MIN_AMPLITUDE_CONTRAST = 1.5
 MIN_CLUSTER_WEIGHT_FRACTION = 0.30
+
+
+def _archive_operation(description: str, operation):
+    # Lightkurve has no timeout parameter on these public methods; its supported
+    # Astroquery/Astropy transports are configured immediately before each call.
+    configure_tess_archive_timeout()
+    try:
+        return operation()
+    except Exception as error:
+        if _is_transient_transport_error(error):
+            raise TessArchiveTransientError(
+                f"Transient MAST transport failure during {description}"
+            ) from error
+        raise
 
 
 def _float(value: Any) -> float | None:
@@ -125,12 +145,17 @@ def _download_tpf(*, tic_id: int, sector: int, ra_deg: float, dec_deg: float):
 
     print(f"      searching official target-pixel products for Sector {sector}...", flush=True)
     try:
-        search = lk.search_targetpixelfile(
-            f"TIC {int(tic_id)}",
-            mission="TESS",
-            sector=int(sector),
+        search = _archive_operation(
+            "official target-pixel search",
+            lambda: lk.search_targetpixelfile(
+                f"TIC {int(tic_id)}",
+                mission="TESS",
+                sector=int(sector),
+            ),
         )
         selected = _select_official_tpf(search, sector)
+    except TessArchiveTransientError:
+        raise
     except Exception as error:
         selected = None
         official_error = f"{type(error).__name__}: {error}"
@@ -145,7 +170,10 @@ def _download_tpf(*, tic_id: int, sector: int, ra_deg: float, dec_deg: float):
             flush=True,
         )
         print("      downloading target pixel file...", flush=True)
-        tpf = result.download(quality_bitmask="default")
+        tpf = _archive_operation(
+            "official target-pixel download",
+            lambda: result.download(quality_bitmask="default"),
+        )
         if tpf is None:
             raise RuntimeError(f"Official TPF download returned no data for Sector {sector}.")
         return tpf, {
@@ -157,11 +185,19 @@ def _download_tpf(*, tic_id: int, sector: int, ra_deg: float, dec_deg: float):
 
     print("      no official TPF selected; falling back to an 11x11 TESScut FFI cutout...", flush=True)
     target = SkyCoord(ra_deg * u.deg, dec_deg * u.deg, frame="icrs")
-    search = lk.search_tesscut(target, sector=int(sector))
+    search = _archive_operation(
+        "TESScut search",
+        lambda: lk.search_tesscut(target, sector=int(sector)),
+    )
     if getattr(search, "table", None) is None or len(search.table) == 0:
         raise RuntimeError(f"No official TPF or TESScut coverage available for Sector {sector}.")
     print("      downloading TESScut pixels...", flush=True)
-    tpf = search[0:1].download(quality_bitmask="default", cutout_size=TESScut_SIZE)
+    tpf = _archive_operation(
+        "TESScut download",
+        lambda: search[0:1].download(
+            quality_bitmask="default", cutout_size=TESScut_SIZE
+        ),
+    )
     if tpf is None:
         raise RuntimeError(f"TESScut download returned no data for Sector {sector}.")
     cadence_seconds = None
@@ -652,6 +688,8 @@ def localize_periodic_source(
                 f"classification={result.get('classification')}",
                 flush=True,
             )
+        except TessArchiveTransientError:
+            raise
         except Exception as error:
             text = f"{type(error).__name__}: {error}"
             errors.append({"sector": sector, "role": role, "error": text})

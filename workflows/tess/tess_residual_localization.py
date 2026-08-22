@@ -15,6 +15,7 @@ from .tess_localization import (
     _download_tpf,
     _pixel_scale_arcsec,
 )
+from .tess_sector_archive import TessArchiveTransientError
 
 
 GENERIC_LOMB_SCARGLE_WORKLOAD_ID = "openstar.lomb-scargle.v1"
@@ -395,6 +396,8 @@ def build_residual_mode_pixel_project(
                 f"pixel datasets={sector_pixel_count}",
                 flush=True,
             )
+        except TessArchiveTransientError:
+            raise
         except Exception as error:
             text = f"{type(error).__name__}: {error}"
             errors.append({"sector": int(sector), "role": role, "error": text})

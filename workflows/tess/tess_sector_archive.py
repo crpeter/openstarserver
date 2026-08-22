@@ -17,10 +17,36 @@ from typing import Any, Protocol, Sequence
 SCHEMA_VERSION = "1"
 SELECTION_ALGORITHM_VERSION = "spoc-cadence-preference-v1"
 PREFERRED_SPOC_CADENCE_SECONDS = 120.0
+TESS_ARCHIVE_TIMEOUT_SECONDS = float(
+    os.environ.get("OPENSTAR_TESS_ARCHIVE_TIMEOUT_SECONDS", "60")
+)
 
 
 class TessArchiveTransientError(RuntimeError):
     """Provider-neutral signal that an archive operation may succeed later."""
+
+
+def configure_tess_archive_timeout() -> None:
+    """Configure the supported Astroquery/Astropy MAST transport deadlines."""
+    if not math.isfinite(TESS_ARCHIVE_TIMEOUT_SECONDS) or TESS_ARCHIVE_TIMEOUT_SECONDS <= 0:
+        raise ValueError("OPENSTAR_TESS_ARCHIVE_TIMEOUT_SECONDS must be finite and positive.")
+    from astroquery import mast
+
+    Observations = mast.Observations
+    mast_conf = getattr(mast, "conf", None)
+    if mast_conf is not None:
+        mast_conf.timeout = TESS_ARCHIVE_TIMEOUT_SECONDS
+    Observations.TIMEOUT = TESS_ARCHIVE_TIMEOUT_SECONDS
+    tesscut = getattr(mast, "Tesscut", None)
+    if tesscut is not None:
+        tesscut.TIMEOUT = TESS_ARCHIVE_TIMEOUT_SECONDS
+    try:
+        from astropy.utils.data import conf as astropy_data_conf
+    except ImportError:
+        # Dependency-light provider tests replace Astroquery with a test double.
+        # A real Lightkurve/Astroquery installation always supplies Astropy.
+        return
+    astropy_data_conf.remote_timeout = TESS_ARCHIVE_TIMEOUT_SECONDS
 
 
 def _exception_chain(error: BaseException):
@@ -217,9 +243,17 @@ class MastTessSectorArchiveProvider:
             from astroquery.mast import Observations
         except ImportError as error:
             raise RuntimeError("astroquery is required for MAST inventory") from error
-        observations = Observations.query_criteria(obs_collection="TESS", sequence_number=sector,
-                                                   dataproduct_type="timeseries")
-        products = Observations.get_product_list(observations)
+        configure_tess_archive_timeout()
+        try:
+            observations = Observations.query_criteria(obs_collection="TESS", sequence_number=sector,
+                                                       dataproduct_type="timeseries")
+            products = Observations.get_product_list(observations)
+        except Exception as error:
+            if _is_transient_transport_error(error):
+                raise TessArchiveTransientError(
+                    f"Transient MAST transport failure inventorying Sector {sector}"
+                ) from error
+            raise
         observation_fields = {}
         for row in observations:
             fields = self._row_fields(row)
@@ -277,6 +311,7 @@ class MastTessSectorArchiveProvider:
         if not uri: raise RuntimeError("Selected MAST product has no data URI.")
         destination.mkdir(parents=True, exist_ok=True)
         path = destination / (product.product_filename or "tess-light-curve.fits")
+        configure_tess_archive_timeout()
         try:
             result = Observations.download_file(uri, local_path=str(path), cache=True)
         except Exception as error:

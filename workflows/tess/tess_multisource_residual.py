@@ -9,6 +9,8 @@ from typing import Any
 
 import numpy as np
 
+from .tess_sector_archive import TessArchiveTransientError
+
 from .tess_residual_localization import (
     GENERIC_LOMB_SCARGLE_WORKLOAD_ID,
     LOMB_SCARGLE_WORKLOAD_ALIASES,
@@ -538,6 +540,8 @@ def build_multisource_residual_project(
                 )
                 combined.setdefault(component_id, []).append((np.asarray(warped, dtype=np.float64), np.asarray(values, dtype=np.float64)))
             print(f"      extracted components: {sorted(component_series)}", flush=True)
+        except TessArchiveTransientError:
+            raise
         except Exception as exc:
             errors.append({"sector": int(sector), "error": f"{type(exc).__name__}: {exc}"})
             print(f"      unavailable: {type(exc).__name__}: {exc}", flush=True)

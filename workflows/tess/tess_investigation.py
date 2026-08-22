@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from functools import wraps
 from pathlib import Path
 from typing import Any
 
@@ -40,6 +41,7 @@ from .tess_identity import collect_identity, transient_required_catalog_failures
 from .tess_morphology import analyze_morphology
 from .tess_physical import analyze_physical_interpretation
 from .tess_localization import localize_periodic_source
+from .tess_sector_archive import TessArchiveTransientError
 from .tess_multimode import (
     MAX_RESIDUAL_ITERATIONS,
     build_residual_search_project,
@@ -285,6 +287,17 @@ def _next_stage_id(current_id: str, label: str) -> str:
     except (TypeError, ValueError):
         raise ValueError(f"Stage id must begin with an integer prefix: {current_id}")
     return f"{number:03d}-{label}"
+
+
+def _retry_transient_tess_archive_failures(handler):
+    """Adapt provider-neutral TESS archive failures at the workflow boundary."""
+    @wraps(handler)
+    def wrapped(investigation, request):
+        try:
+            return handler(investigation, request)
+        except TessArchiveTransientError as error:
+            raise RetryableExecutionError(str(error)) from error
+    return wrapped
 
 
 def broad_independent_continuation(
@@ -9105,4 +9118,10 @@ def build_engine(
         period_semantics_stage,
     )
     engine.register_handler("openstar.tess.finalize", finalize_stage)
+    # All TESS handlers share this provider-to-workflow adapter.  Localization
+    # builders call _download_tpf indirectly, so a centralized boundary also
+    # protects new experiments from persisting MAST outages as NON_RETRYABLE.
+    for handler_id, handler in tuple(engine.handlers.items()):
+        if handler_id.startswith("openstar.tess."):
+            engine.handlers[handler_id] = _retry_transient_tess_archive_failures(handler)
     return engine
