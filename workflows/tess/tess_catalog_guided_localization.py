@@ -398,6 +398,9 @@ def interpret_catalog_guided_localization(preparation: dict[str, Any],
         "sectorResults": sectors, "decisiveSectorCount": len(decisive),
         "classification": "SINGLE_CATALOG_CANDIDATE_ATTRIBUTED" if resolved else "UNRESOLVED",
         "preferredModel": model, "preferredCandidate": preferred,
+        # Preserve the frozen stage-044 hypothesis set in its original order. The losing
+        # candidate remains a required nuisance source in direct variability deblending.
+        "catalogCandidates": candidates,
         "physicalCycleResolved": False, "physicalMechanismResolved": False,
         "sourceAttributionResolved": resolved,
         "recommendedNextTest": (

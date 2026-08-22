@@ -17,6 +17,7 @@ from workflows.tess.tess_catalog_guided_localization import (
 from openstar_investigation import InvestigationStage, InvestigationStore
 from openstar_workflow import StageRequest
 from workflows.tess.tess_investigation import build_engine
+from workflows.tess.tess_offset_variability import _nuisance_catalog_sources
 
 
 class CatalogGuidedLocalizationTests(unittest.TestCase):
@@ -110,16 +111,17 @@ class CatalogGuidedLocalizationTests(unittest.TestCase):
              "catalogIDs": {"ticID": 333}, "frozen": "two"},
         ]
         sector = {
-            "fullDataComparison": {"bestModel": "TARGET_PLUS_CANDIDATE_2",
+            "fullDataComparison": {"bestModel": "TARGET_PLUS_CANDIDATE_1",
                                    "bestModelIdentifiable": True},
             "temporalPredictiveValidation": {
-                "predictiveModel": "TARGET_PLUS_CANDIDATE_2",
+                "predictiveModel": "TARGET_PLUS_CANDIDATE_1",
                 "sourceVectorTemporalCompatibility": {"compatible": True}},
         }
         result = interpret_catalog_guided_localization(
             {"catalogCandidates": candidates}, {"sectorResults": [sector]})
         self.assertTrue(result["sourceAttributionResolved"])
-        self.assertEqual(candidates[1], result["preferredCandidate"])
+        self.assertEqual(candidates[0], result["preferredCandidate"])
+        self.assertEqual(candidates, result["catalogCandidates"])
         self.assertEqual("INDEPENDENT_COUNTERPART_PHOTOMETRIC_VARIABILITY_VALIDATION",
                          result["recommendedNextTest"])
 
@@ -190,6 +192,8 @@ class CatalogGuidedLocalizationTests(unittest.TestCase):
     def test_stage_048_uses_unresolved_family_bridge_without_obsolete_evidence(self):
         candidate = {"raDeg": 10.1, "decDeg": -20.1,
                      "catalogIDs": {"ticID": 111, "gaiaDR3SourceID": 222}}
+        alternate = {"raDeg": 10.2, "decDeg": -20.2,
+                     "catalogIDs": {"ticID": 333, "gaiaDR3SourceID": 444}}
         bridge = {
             "version": "bridge", "preparationPath": "/frozen/045.json",
             "referenceFamilyPeriodDays": 10.30084080080649,
@@ -203,7 +207,8 @@ class CatalogGuidedLocalizationTests(unittest.TestCase):
             "classification": "SINGLE_CATALOG_CANDIDATE_ATTRIBUTED",
             "sourceAttributionResolved": True, "preferredCandidate": candidate,
             "recommendedNextTest": "INDEPENDENT_COUNTERPART_PHOTOMETRIC_VARIABILITY_VALIDATION",
-            "physicalMechanismResolved": False, "catalogCandidates": [candidate],
+            "physicalMechanismResolved": False,
+            "catalogCandidates": [candidate, alternate],
         }
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -270,6 +275,9 @@ class CatalogGuidedLocalizationTests(unittest.TestCase):
             self.assertIsNone(kwargs["nonstationary_summary"])
             self.assertIsNone(kwargs["physical_period_days"])
             self.assertEqual(localized, kwargs["offset_source_identification"])
+            self.assertEqual([alternate], _nuisance_catalog_sources(
+                offset_source_identification=kwargs["offset_source_identification"],
+                best_candidate=kwargs["offset_source_identification"]["preferredCandidate"]))
             self.assertEqual("049-run-offset-source-variability", next_request.id)
             self.assertEqual("COMPLETE", completed.stages[-1].status)
 
