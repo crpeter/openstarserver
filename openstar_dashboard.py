@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import sqlite3
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -15,6 +16,7 @@ from urllib.parse import unquote, urlparse
 from urllib.request import urlopen
 
 from dashboard import build_snapshot, history_snapshot
+from openstar_contributions import DEFAULT_CONTRIBUTION_DB
 from openstar_science_runs import ScienceRunCatalog
 from openstar_sector_sweep_status import sector_sweep_projection
 
@@ -48,6 +50,51 @@ class CoordinatorClient:
             "contributions": contributions,
             "projects": projects,
         }
+
+
+class ContributionActivityReader:
+    """Read latest accepted-work activity without mutating the contribution ledger."""
+
+    def __init__(self, path: str | Path = DEFAULT_CONTRIBUTION_DB):
+        raw = Path(path).expanduser()
+        self.path = (raw if raw.is_absolute() else ROOT / raw).resolve()
+
+    def latest_seen(self) -> dict[str, float]:
+        if not self.path.exists():
+            return {}
+        connection = sqlite3.connect(
+            f"file:{self.path}?mode=ro", uri=True, timeout=1.0
+        )
+        try:
+            rows = connection.execute(
+                "SELECT node_id, MAX(accepted_at) FROM contributions GROUP BY node_id"
+            ).fetchall()
+        finally:
+            connection.close()
+        return {
+            str(node_id).strip().lower(): float(accepted_at)
+            for node_id, accepted_at in rows
+            if node_id is not None and accepted_at is not None
+        }
+
+
+def _overlay_latest_activity(
+    nodes: list[dict[str, Any]], latest_seen: dict[str, float]
+) -> list[dict[str, Any]]:
+    result = copy.deepcopy(nodes)
+    for node in result:
+        node_id = str(node.get("nodeID") or node.get("id") or "").strip().lower()
+        latest = latest_seen.get(node_id)
+        if latest is None:
+            continue
+        try:
+            existing = float(node.get("lastSeenAt"))
+        except (TypeError, ValueError):
+            existing = None
+        if existing is None or latest > existing:
+            node["lastSeenAt"] = latest
+            node["lastSeenSource"] = "accepted_contribution"
+    return result
 
 
 class TelemetryStore:
@@ -130,11 +177,15 @@ class DashboardApplication:
         telemetry: TelemetryStore | None = None,
         observation_cache_seconds: float = 1.5,
         science_run_catalog: ScienceRunCatalog | None = None,
+        contribution_activity_reader: ContributionActivityReader | None = None,
     ):
         self.coordinator = coordinator
         self.telemetry = telemetry or TelemetryStore()
         self.observation_cache_seconds = observation_cache_seconds
         self.science_run_catalog = science_run_catalog or ScienceRunCatalog(create=False)
+        self.contribution_activity_reader = (
+            contribution_activity_reader or ContributionActivityReader()
+        )
         self._observation_lock = threading.Lock()
         self._cached_observation: dict[str, Any] | None = None
         self._cached_until = 0.0
@@ -145,6 +196,16 @@ class DashboardApplication:
             now = time.monotonic()
             if self._cached_observation is None or now >= self._cached_until:
                 observation = self.coordinator.observation()
+                # The currently running coordinator may expose durable node
+                # registration timestamps. Accepted work is also authoritative
+                # evidence that a node was alive, so overlay it read-only.
+                try:
+                    latest_seen = self.contribution_activity_reader.latest_seen()
+                except (OSError, sqlite3.Error, TypeError, ValueError):
+                    latest_seen = {}
+                observation["nodes"] = _overlay_latest_activity(
+                    observation["nodes"], latest_seen
+                )
                 # Science-run observability is optional. A missing/corrupt catalog
                 # must never make the generic fleet dashboard unavailable.
                 try:
