@@ -64,17 +64,24 @@ def local_active_sector_sweeps() -> dict[Path, int]:
 
 
 def discover_sector_inventory_paths(search_roots: Iterable[str | Path]) -> list[Path]:
+    """Find likely science-run roots without walking investigation subtrees."""
     found: set[Path] = set()
+    patterns = (
+        "tess-sector-*-inventory.json",
+        "*/tess-sector-*-inventory.json",
+        "*/*/tess-sector-*-inventory.json",
+    )
     for raw_root in search_roots:
         root = Path(raw_root).expanduser().resolve()
         if not root.exists():
             continue
-        try:
-            for path in root.rglob("tess-sector-*-inventory.json"):
-                if path.is_file():
-                    found.add(path.resolve())
-        except OSError:
-            continue
+        for pattern in patterns:
+            try:
+                for path in root.glob(pattern):
+                    if path.is_file():
+                        found.add(path.resolve())
+            except OSError:
+                continue
     return sorted(found)
 
 
