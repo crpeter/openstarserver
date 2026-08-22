@@ -11,8 +11,11 @@ coordinator's existing `/v1` APIs, so the coordinator and workers operate normal
 dashboard is stopped or absent.
 
 ```bash
-# Terminal 1: existing coordinator
-python coordinator.py --idle --host 127.0.0.1 --port 8080
+# Terminal 1: existing coordinator. To expose an existing persisted sector
+# sweep, point the read-only status projection at its state root. This does not
+# start, restart, or modify the sweep. Repeat the flag for additional roots.
+python coordinator.py --idle --host 127.0.0.1 --port 8080 \
+  --sector-sweep-state-dir /path/to/existing-sector-sweep-state
 
 # Terminal 2: dashboard
 python openstar_dashboard.py --coordinator http://127.0.0.1:8080 --host 127.0.0.1 --port 8081
