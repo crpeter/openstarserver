@@ -18,8 +18,10 @@ investigation/science history.
 
 For science state created before the catalog existed, run the one-time backfill. It discovers
 likely sector-sweep roots under `/tmp` and `data`; if a matching sector-sweep process is actually
-running locally, that run is recorded as running. Other incomplete historical state is kept
-conservatively as discovered/incomplete.
+running locally, the legacy run is labeled `DISCOVERED_ACTIVE` rather than permanently claiming
+a `RUNNING` state that the old process cannot later clear. Other incomplete historical state is
+kept conservatively as discovered/incomplete. Future instrumented runners record exact
+`RUNNING` to terminal transitions automatically.
 
 ```bash
 python backfill_openstar_science_runs.py
