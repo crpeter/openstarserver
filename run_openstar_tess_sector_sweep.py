@@ -129,7 +129,7 @@ def main(argv=None):
             None,
         )
         status = "FAILED" if code else "FINISHED"
-        if projection is not None and projection.get("status") == "COMPLETE":
+        if not code and projection is not None and projection.get("status") == "COMPLETE":
             status = "COMPLETE"
         recorder.finish(
             status=status,
