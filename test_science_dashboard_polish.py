@@ -25,6 +25,27 @@ class DashboardPolishTests(unittest.TestCase):
         self.assertIn("toFixed(2)", source)
         self.assertIn("exactFmt(sweep.complete)", source)
         self.assertIn("exactFmt(sweep.inventory)", source)
+        self.assertIn("exactFmt(sweep.remaining)", source)
+
+    def test_live_poll_updates_stable_sector_nodes_in_place(self):
+        source = Path("dashboard/app.js").read_text(encoding="utf-8")
+        self.assertIn("reconcile($(\"#sectors\")", source)
+        self.assertIn("updateSectorCard", source)
+        self.assertIn("setText(refs.total", source)
+        self.assertIn("refs.barFill.style.width", source)
+        self.assertIn("setInterval(refreshActivity, 2000)", source)
+        self.assertIn("setInterval(refreshFleet, 10000)", source)
+        self.assertNotIn("replace($(\"#sectors\")", source)
+        self.assertNotIn("replace($(\"#stats\")", source)
+        self.assertNotIn("replace($(\"#workers\")", source)
+
+    def test_counts_are_exact_and_compact_notation_is_reserved_for_rates(self):
+        source = Path("dashboard/app.js").read_text(encoding="utf-8")
+        self.assertIn("exactFmt(worker.completedWorkUnits)", source)
+        self.assertIn("exactFmt(project.projectCompletedWorkUnits", source)
+        self.assertIn("exactFmt(contribution.acceptedWorkUnits)", source)
+        self.assertIn("exactFmt(summary.completedWorkUnits)", source)
+        self.assertIn("compactFmt(worker.measuredThroughput)", source)
 
 
 class CanonicalBackfillTests(unittest.TestCase):
