@@ -1176,6 +1176,33 @@ def plan_tess_branches(
         )
 
     catalog_result = (catalog_identification.result or {}) if catalog_identification else {}
+    # A completed stage 056 is authoritative over the stage-053 continuation.
+    # Recreate its direct candidate-validation request after restart, exactly once.
+    if time_resolved_localization is not None:
+        localization_result = time_resolved_localization.result or {}
+        candidate = localization_result.get("preferredCandidate") or {}
+        ids = candidate.get("catalogIDs") or {}
+        justified = (candidate.get("raDeg") is not None and candidate.get("decDeg") is not None
+                     and (ids.get("ticID") is not None or ids.get("gaiaDR3SourceID") is not None))
+        validation_started = any(
+            stage.handler_id == "openstar.tess.offset-source-variability.prepare"
+            and stage.status in {"RUNNING", "COMPLETE"} for stage in investigation.stages)
+        if (not validation_started
+                and localization_result.get("classification") in {
+                    "STABLE_CANDIDATE_1_LOCALIZATION", "STABLE_CANDIDATE_2_LOCALIZATION"}
+                and localization_result.get("sourceAttributionResolved") is True
+                and localization_result.get("physicalMechanismResolved") is False
+                and localization_result.get("recommendedNextTest")
+                == "INDEPENDENT_COUNTERPART_PHOTOMETRIC_VARIABILITY_VALIDATION"
+                and justified):
+            return (ScientificBranch(
+                id=f"continue-counterpart-variability-after-{time_resolved_localization.id}",
+                experiment=StageRequest(
+                    id=_continuation_stage_id(
+                        time_resolved_localization, "prepare-offset-source-variability"),
+                    handler_id="openstar.tess.offset-source-variability.prepare", parameters={},
+                    triggered_by_stage_id=time_resolved_localization.id)),)
+        return ()
     # Stage 053 supersedes stage 050 for a resolved temporal candidate.  Check it
     # before the stage-050 terminal guard so restart recovery remains reachable.
     if source_switching_temporal is not None:
@@ -1197,7 +1224,7 @@ def plan_tess_branches(
                         "prepare-time-resolved-residual-phase-localization"),
                     handler_id="openstar.tess.time-resolved-residual-phase-localization.prepare",
                     parameters={}, triggered_by_stage_id=source_switching_temporal.id)),)
-        if time_resolved_localization is not None or localization_started:
+        if localization_started:
             return ()
         candidate = temporal_result.get("preferredCandidate") or {}
         ids = candidate.get("catalogIDs") or {}

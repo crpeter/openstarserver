@@ -5,6 +5,9 @@ from unittest import mock
 
 import numpy as np
 
+from openstar_investigation import InvestigationStage, InvestigationStore
+from openstar_workflow import StageRequest
+from workflows.tess.tess_investigation import build_engine
 from workflows.tess.tess_time_resolved_residual_phase_localization import (
     interpret_time_resolved_residual_phase_localization,
     prepare_time_resolved_residual_phase_localization,
@@ -17,8 +20,10 @@ class TimeResolvedResidualPhaseLocalizationTests(unittest.TestCase):
         self.preparation = {
             "ticID": 277940827, "sectors": [94, 95, 102, 103],
             "targetSky": {"raDeg": 10., "decDeg": 20.},
-            "catalogCandidates": [{"raDeg": 10.1, "decDeg": 20.1},
-                                  {"raDeg": 10.2, "decDeg": 20.2}],
+            "catalogCandidates": [{"raDeg": 10.1, "decDeg": 20.1,
+                                   "catalogIDs": {"ticID": 111}},
+                                  {"raDeg": 10.2, "decDeg": 20.2,
+                                   "catalogIDs": {"ticID": 222}}],
             "referenceFamilyPeriodDays": 10.30084080080649,
             "subtractedHarmonicOrders": [4, 2], "physicalCycleResolved": False,
             "residualReferenceFrequency": .45, "residualTimeReferenceDays": 2500.,
@@ -55,7 +60,68 @@ class TimeResolvedResidualPhaseLocalizationTests(unittest.TestCase):
     def test_target_in_all_windows_is_stable_target(self):
         result, run = self._classify([["target", "target"]] * 4)
         self.assertEqual("STABLE_TARGET_LOCALIZATION", result["classification"])
+        self.assertIsNone(result["preferredCandidate"])
+        self.assertEqual("TARGET_INTRINSIC_RESIDUAL_MODELING",
+                         result["recommendedNextTest"])
+        self.assertFalse(result["physicalMechanismResolved"])
         self.assertTrue(all(len(s["windowResults"]) == 2 for s in run["sectorResults"]))
+
+    def test_candidate_one_in_all_windows_preserves_candidates_and_validation(self):
+        result, _ = self._classify([["candidate-1", "candidate-1"]] * 4)
+        self.assertEqual("STABLE_CANDIDATE_1_LOCALIZATION", result["classification"])
+        self.assertIs(self.preparation["catalogCandidates"][0], result["preferredCandidate"])
+        self.assertIs(self.preparation["catalogCandidates"], result["catalogCandidates"])
+        self.assertTrue(result["sourceAttributionResolved"])
+        self.assertEqual("INDEPENDENT_COUNTERPART_PHOTOMETRIC_VARIABILITY_VALIDATION",
+                         result["recommendedNextTest"])
+
+    def test_candidate_two_in_all_windows_preserves_candidates_and_validation(self):
+        result, _ = self._classify([["candidate-2", "candidate-2"]] * 4)
+        self.assertEqual("STABLE_CANDIDATE_2_LOCALIZATION", result["classification"])
+        self.assertIs(self.preparation["catalogCandidates"][1], result["preferredCandidate"])
+        self.assertIs(self.preparation["catalogCandidates"], result["catalogCandidates"])
+        self.assertTrue(result["sourceAttributionResolved"])
+        self.assertEqual("INDEPENDENT_COUNTERPART_PHOTOMETRIC_VARIABILITY_VALIDATION",
+                         result["recommendedNextTest"])
+
+    def test_stage_056_routes_candidates_and_quiesces_target(self):
+        for source, expected_next in (("candidate-1", True), ("candidate-2", True),
+                                      ("target", False)):
+            with self.subTest(source=source), tempfile.TemporaryDirectory() as root:
+                root = Path(root); store = InvestigationStore(root / "store")
+                investigation = store.create("tic-277940827", "workflow", "1")
+                preparation = {**self.preparation, "artifactRoot": str(root / "artifacts")}
+                (root / "artifacts").mkdir()
+                run = run_time_resolved_residual_phase_localization(
+                    preparation, sector_inputs=self._inputs([[source, source]] * 4))
+                for stage_id, handler, value in (
+                    ("054-prepare-time-resolved-residual-phase-localization",
+                     "openstar.tess.time-resolved-residual-phase-localization.prepare", preparation),
+                    ("055-run-time-resolved-residual-phase-localization",
+                     "openstar.tess.time-resolved-residual-phase-localization.run", run)):
+                    running = InvestigationStage(stage_id, handler, "RUNNING", None, {})
+                    investigation = store.append_running_stage(investigation, running)
+                    terminal = store.build_terminal_stage(
+                        stage_id=stage_id, handler_id=handler, status="COMPLETE",
+                        triggered_by_stage_id=None, parameters={}, result=value, error=None,
+                        software_id="test", software_version="1", started_at=running.started_at)
+                    investigation = store.complete_current_stage(investigation, terminal)
+                completed, next_stage = build_engine(
+                    store, object(), poll_interval=0, timeout=0).run_stage(
+                        investigation, StageRequest(
+                            "056-interpret-time-resolved-residual-phase-localization",
+                            "openstar.tess.time-resolved-residual-phase-localization.interpret", {},
+                            "055-run-time-resolved-residual-phase-localization"),
+                        software_id="test", software_version="1")
+                if expected_next:
+                    self.assertEqual("057-prepare-offset-source-variability", next_stage.id)
+                    self.assertEqual("openstar.tess.offset-source-variability.prepare",
+                                     next_stage.handler_id)
+                    self.assertFalse(completed.stages[-1].stop)
+                else:
+                    self.assertIsNone(next_stage)
+                    self.assertTrue(completed.stages[-1].stop)
+                    self.assertEqual("QUIESCENT_AWAITING_DATA", completed.status)
 
     def test_target_then_candidate_one_within_sector_switches(self):
         result, _ = self._classify([["target", "candidate-1"]] * 4)

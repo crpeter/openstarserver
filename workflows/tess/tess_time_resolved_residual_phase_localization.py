@@ -201,13 +201,29 @@ def interpret_time_resolved_residual_phase_localization(
         classification = "MULTI_SOURCE_OR_BLENDED"
     else:
         classification = "UNRESOLVED"
+    candidates = preparation["catalogCandidates"]
+    preferred = (candidates[0] if classification == "STABLE_CANDIDATE_1_LOCALIZATION"
+                 else candidates[1] if classification == "STABLE_CANDIDATE_2_LOCALIZATION"
+                 else None)
+    recommendations = {
+        "STABLE_TARGET_LOCALIZATION": "TARGET_INTRINSIC_RESIDUAL_MODELING",
+        "STABLE_CANDIDATE_1_LOCALIZATION":
+            "INDEPENDENT_COUNTERPART_PHOTOMETRIC_VARIABILITY_VALIDATION",
+        "STABLE_CANDIDATE_2_LOCALIZATION":
+            "INDEPENDENT_COUNTERPART_PHOTOMETRIC_VARIABILITY_VALIDATION",
+        "WITHIN_SECTOR_SOURCE_SWITCHING": "SOURCE_SWITCHING_PHYSICAL_MECHANISM_MODELING",
+        "CROSS_SECTOR_SOURCE_SWITCHING": "SOURCE_SWITCHING_PHYSICAL_MECHANISM_MODELING",
+        "MULTI_SOURCE_OR_BLENDED": "JOINT_MULTI_SOURCE_VARIABILITY_MODEL",
+        "TIME_VARIABLE_LOCALIZATION": "TIME_VARIABLE_SOURCE_LOCALIZATION_FOLLOWUP",
+        "UNRESOLVED": "ADDITIONAL_SOURCE_LOCALIZATION_DATA",
+    }
     result = {"version": "openstar.tess-time-resolved-residual-phase-localization-interpretation.v1",
         "classification": classification, "sectorEvidence": sector_evidence,
         "sourceAttributionResolved": classification.startswith("STABLE_"),
         "sourceAttributionResolvedByWindows": classification.startswith("STABLE_"),
+        "preferredCandidate": preferred,
         "physicalCycleResolved": False, "physicalMechanismResolved": False,
-        "recommendedNextTest": None if classification.startswith("STABLE_") else
-                               "ADDITIONAL_SOURCE_LOCALIZATION_DATA",
+        "recommendedNextTest": recommendations[classification],
         "interpretationGuard": "Switching requires multiple high-quality, uncertainty-discriminated source identities; nearest-centroid labels alone are insufficient."}
     result.update({key: preparation[key] for key in _PRESERVED})
     return result
