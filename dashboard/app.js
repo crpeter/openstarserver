@@ -52,6 +52,16 @@ function reconcile(container, items, keyFor, createNode, updateNode) {
   });
   for (const node of existing.values()) node.remove();
 }
+function numericOrNegativeInfinity(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : Number.NEGATIVE_INFINITY;
+}
+function workerLabel(worker) {
+  return worker.name || worker.id || "Unknown worker";
+}
+function workerDeviceType(worker) {
+  return [worker.hardwareModel, worker.platform].filter(Boolean).join(" · ") || "Unknown device";
+}
 
 let workers = [];
 
@@ -81,7 +91,7 @@ function createWorkerRow(worker) {
 }
 function updateWorkerRow(row, worker) {
   const refs = row._refs;
-  setText(refs.name, worker.name || worker.id);
+  setText(refs.name, workerLabel(worker));
   setText(refs.info, [worker.hardwareModel, worker.platform, worker.osVersion].filter(Boolean).join(" · ") || "Telemetry unavailable");
   setClass(refs.badge, `badge ${worker.computeState}`);
   setText(refs.badge, worker.computeState.toUpperCase());
@@ -101,7 +111,12 @@ function updateWorkerRow(row, worker) {
   row.hidden = !!query && !JSON.stringify(worker).toLowerCase().includes(query);
 }
 function renderWorkers() {
-  reconcile($("#workers"), workers, worker => worker.id, createWorkerRow, updateWorkerRow);
+  const rankedWorkers = [...workers].sort((left, right) => {
+    const throughputDifference = numericOrNegativeInfinity(right.measuredThroughput) - numericOrNegativeInfinity(left.measuredThroughput);
+    if (throughputDifference) return throughputDifference;
+    return workerLabel(left).localeCompare(workerLabel(right));
+  });
+  reconcile($("#workers"), rankedWorkers, worker => worker.id, createWorkerRow, updateWorkerRow);
 }
 
 function createStat([label]) {
@@ -240,19 +255,34 @@ function renderProjects(projects) {
 }
 
 function createContributionRow() {
-  const id = element("span");
+  const name = element("b");
+  const device = element("small");
   const units = element("b");
-  const node = element("div", {className: "row"}, [id, units]);
-  node._refs = {id, units};
+  const node = element("div", {className: "row"}, [element("div", {}, [name, device]), units]);
+  node._refs = {name, device, units};
   return node;
 }
 function updateContributionRow(node, contribution) {
-  setText(node._refs.id, contribution.nodeID);
+  const worker = contribution.worker;
+  setText(node._refs.name, worker ? workerLabel(worker) : contribution.nodeID);
+  const deviceType = worker ? workerDeviceType(worker) : "Unknown device";
+  const nodeSuffix = worker && workerLabel(worker) !== contribution.nodeID ? ` · ${contribution.nodeID}` : "";
+  setText(node._refs.device, ` · ${deviceType}${nodeSuffix}`);
   setText(node._refs.units, `${exactFmt(contribution.acceptedWorkUnits)} units`);
 }
 function renderContribution(history) {
   const rows = rowsContainer($("#contribution"));
-  const items = history.contributionByWorker || [];
+  const workerByID = new Map(workers.map(worker => [String(worker.id).toLowerCase(), worker]));
+  const items = (history.contributionByWorker || [])
+    .map(contribution => ({
+      ...contribution,
+      worker: workerByID.get(String(contribution.nodeID).toLowerCase()),
+    }))
+    .sort((left, right) => {
+      const unitsDifference = numericOrNegativeInfinity(right.acceptedWorkUnits) - numericOrNegativeInfinity(left.acceptedWorkUnits);
+      if (unitsDifference) return unitsDifference;
+      return String(left.nodeID).localeCompare(String(right.nodeID));
+    });
   if (!items.length) {
     reconcile(rows, [{nodeID: "__empty__"}], item => item.nodeID, () => element("p", {text: "Contributions will appear after accepted work."}), () => {});
     return;
