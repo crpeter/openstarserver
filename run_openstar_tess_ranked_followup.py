@@ -11,6 +11,7 @@ from openstar_dispatch import InvestigationDispatcher
 from openstar_external_jobs import ExternalJobMonitor, ExternalJobStore, apply_external_job_wakeups
 from openstar_investigation import InvestigationStore
 from openstar_scheduler import InvestigationScheduler
+from openstar_science_runs import ScienceRunRecorder
 from workflows.tess.tess_autonomy import (
     WORKFLOW_ID,
     plan_tess_branches,
@@ -140,12 +141,37 @@ def parse_args(argv=None):
 
 def main(argv=None):
     args = parse_args(argv)
-    try: return run_tess_ranked_followup(args.sector, args.sector_state_dir, args.deep_state_dir,
-        args.coordinator_url, args.promote_top, max_concurrent_investigations=args.max_concurrent_investigations,
-        poll_interval=args.poll_interval, timeout=args.timeout)
-    except KeyboardInterrupt: return 130
+    sector_root = Path(args.sector_state_dir).expanduser().resolve()
+    deep_root = Path(args.deep_state_dir).expanduser().resolve()
+    recorder = ScienceRunRecorder(
+        kind="tess-ranked-followup",
+        display_name=f"TESS Sector {args.sector} Ranked Follow-up",
+        state_root=deep_root,
+        workflow_id=WORKFLOW_ID,
+        metadata={
+            "mission": "TESS",
+            "sector": args.sector,
+            "promoteTop": args.promote_top,
+            "sectorStateRoot": str(sector_root),
+        },
+        identity=str(args.sector),
+    )
+    try:
+        code = run_tess_ranked_followup(args.sector, sector_root, deep_root,
+            args.coordinator_url, args.promote_top, max_concurrent_investigations=args.max_concurrent_investigations,
+            poll_interval=args.poll_interval, timeout=args.timeout)
+        recorder.finish(
+            status="FAILED" if code else "FINISHED",
+            summary={"exitCode": code},
+        )
+        return code
+    except KeyboardInterrupt:
+        recorder.interrupt()
+        return 130
     except Exception as error:
-        print(f"OpenStar ranked TESS follow-up: error={type(error).__name__}: {error}", file=sys.stderr); return 1
+        recorder.fail(error)
+        print(f"OpenStar ranked TESS follow-up: error={type(error).__name__}: {error}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__": raise SystemExit(main())
