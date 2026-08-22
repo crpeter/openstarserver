@@ -145,7 +145,12 @@ class DashboardApplication:
             now = time.monotonic()
             if self._cached_observation is None or now >= self._cached_until:
                 observation = self.coordinator.observation()
-                science_runs = self.science_run_catalog.list_runs()
+                # Science-run observability is optional. A missing/corrupt catalog
+                # must never make the generic fleet dashboard unavailable.
+                try:
+                    science_runs = self.science_run_catalog.list_runs()
+                except Exception:
+                    science_runs = []
                 observation["scienceRuns"] = science_runs
                 observation["sectorSweeps"] = _sector_sweeps_from_science_runs(
                     science_runs
