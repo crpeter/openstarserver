@@ -40,6 +40,7 @@ from .tess_identity import collect_identity, transient_required_catalog_failures
 from .tess_morphology import analyze_morphology
 from .tess_physical import analyze_physical_interpretation
 from .tess_localization import localize_periodic_source
+from .tess_sector_archive import TessArchiveTransientError
 from .tess_multimode import (
     MAX_RESIDUAL_ITERATIONS,
     build_residual_search_project,
@@ -3366,19 +3367,22 @@ def build_engine(
         print(f"   fractional frequency drift/day: {nonstationary.get('fractionalFrequencyDriftPerDay')}")
         print("   downloading TESS pixel stamps, subtracting the established family per pixel")
         print("   each usable pixel becomes one ordinary generic Lomb-Scargle dataset")
-        spec = build_residual_mode_pixel_project(
-            source_project_path=prepared["sourceProjectPath"],
-            source_dataset_entry=prepared["sourceDatasetEntry"],
-            tic_id=int(prepared["ticID"]),
-            identity=identity,
-            primary_sector=prepared.get("sector"),
-            independent_spec=independent_prepare,
-            physical_period_days=physical_period,
-            nonstationary_summary=nonstationary,
-            output_dir=artifact_root,
-            investigation_id=investigation.id,
-            harmonic_orders=harmonic_orders,
-        )
+        try:
+            spec = build_residual_mode_pixel_project(
+                source_project_path=prepared["sourceProjectPath"],
+                source_dataset_entry=prepared["sourceDatasetEntry"],
+                tic_id=int(prepared["ticID"]),
+                identity=identity,
+                primary_sector=prepared.get("sector"),
+                independent_spec=independent_prepare,
+                physical_period_days=physical_period,
+                nonstationary_summary=nonstationary,
+                output_dir=artifact_root,
+                investigation_id=investigation.id,
+                harmonic_orders=harmonic_orders,
+            )
+        except TessArchiveTransientError as error:
+            raise RetryableExecutionError(str(error)) from error
         spec["periodReference"] = {
             "periodDays": physical_period,
             "kind": ("UNRESOLVED_FAMILY_ANALYSIS_REFERENCE" if dynamic_path is not None
