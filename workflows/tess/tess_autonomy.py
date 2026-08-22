@@ -1170,6 +1170,43 @@ def plan_tess_branches(
         )
 
     catalog_result = (catalog_identification.result or {}) if catalog_identification else {}
+    # Once independent residual-phase difference imaging has completed, it is
+    # authoritative over the older unresolved catalog-guided interpretation.
+    # Reproduce the handler's direct continuation after a process restart.
+    if residual_phase_difference_image is not None:
+        spatial_result = residual_phase_difference_image.result or {}
+        candidate = spatial_result.get("preferredCandidate") or {}
+        ids = candidate.get("catalogIDs") or {}
+        justified = (
+            candidate.get("raDeg") is not None
+            and candidate.get("decDeg") is not None
+            and (ids.get("ticID") is not None or ids.get("gaiaDR3SourceID") is not None)
+        )
+        validation_started = any(
+            stage.handler_id == "openstar.tess.offset-source-variability.prepare"
+            and stage.status in {"RUNNING", "COMPLETE"}
+            for stage in investigation.stages
+        )
+        if (
+            not validation_started
+            and spatial_result.get("classification")
+            in {"CANDIDATE_1_SUPPORTED", "CANDIDATE_2_SUPPORTED"}
+            and spatial_result.get("sourceAttributionResolved") is True
+            and spatial_result.get("recommendedNextTest")
+            == "INDEPENDENT_COUNTERPART_PHOTOMETRIC_VARIABILITY_VALIDATION"
+            and justified
+        ):
+            return (ScientificBranch(
+                id=f"continue-counterpart-variability-after-{residual_phase_difference_image.id}",
+                experiment=StageRequest(
+                    id=_continuation_stage_id(
+                        residual_phase_difference_image, "prepare-offset-source-variability"),
+                    handler_id="openstar.tess.offset-source-variability.prepare",
+                    parameters={}, triggered_by_stage_id=residual_phase_difference_image.id),
+            ),)
+        # Other spatial outcomes deliberately remain quiescent until their
+        # recommended scientific continuation is implemented.
+        return ()
     localization_started = any(
         stage.handler_id.startswith("openstar.tess.catalog-guided-source-localization.")
         for stage in investigation.stages
