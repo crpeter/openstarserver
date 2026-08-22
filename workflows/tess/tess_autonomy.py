@@ -972,6 +972,9 @@ def plan_tess_branches(
     catalog_identification = _latest_complete(
         investigation, "openstar.tess.catalog-counterpart-identification.analyze"
     )
+    catalog_guided_localization = _latest_complete(
+        investigation, "openstar.tess.catalog-guided-source-localization.interpret"
+    )
     variability_interpretation = _latest_complete(
         investigation, "openstar.tess.offset-source-variability.interpret"
     )
@@ -1164,6 +1167,28 @@ def plan_tess_branches(
         )
 
     catalog_result = (catalog_identification.result or {}) if catalog_identification else {}
+    localization_started = any(
+        stage.handler_id.startswith("openstar.tess.catalog-guided-source-localization.")
+        for stage in investigation.stages
+    )
+    if (
+        catalog_identification is not None
+        and catalog_guided_localization is None
+        and not localization_started
+        and catalog_result.get("recommendedNextTest") == "CATALOG_GUIDED_SOURCE_LOCALIZATION"
+        and catalog_result.get("physicalMechanismResolved") is False
+        and len(catalog_result.get("plausibleCatalogCandidates") or []) >= 2
+    ):
+        return (ScientificBranch(
+            id=f"continue-catalog-guided-localization-after-{catalog_identification.id}",
+            experiment=StageRequest(
+                id=_continuation_stage_id(
+                    catalog_identification, "prepare-catalog-guided-source-localization"),
+                handler_id="openstar.tess.catalog-guided-source-localization.prepare",
+                parameters={}, triggered_by_stage_id=catalog_identification.id),
+        ),)
+    if catalog_guided_localization is not None:
+        return ()
     preferred = catalog_result.get("preferredCandidate") or {}
     preferred_ids = preferred.get("catalogIDs") or {}
     justified_preferred = (

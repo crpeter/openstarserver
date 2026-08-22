@@ -160,11 +160,17 @@ class CatalogCounterpartTest(unittest.TestCase):
                          request.handler_id)
         ambiguous = dict(self._new_catalog_result(), preferredCandidate=None,
                          classification="AMBIGUOUS_MULTIPLE_CATALOG_COUNTERPARTS")
+        localization = catalog_counterpart_variability_continuation(
+            dict(ambiguous, plausibleCatalogCandidates=[
+                {"raDeg": 1.0, "decDeg": 2.0},
+                {"raDeg": 1.1, "decDeg": 2.1},
+            ], recommendedNextTest="CATALOG_GUIDED_SOURCE_LOCALIZATION"),
+            request_id="044")
         self.assertEqual(
-            "openstar.tess.finalize",
-            catalog_counterpart_variability_continuation(
-                ambiguous, request_id="021").handler_id,
+            "openstar.tess.catalog-guided-source-localization.prepare",
+            localization.handler_id,
         )
+        self.assertEqual("045-prepare-catalog-guided-source-localization", localization.id)
         self.assertEqual(
             self._new_catalog_result()["preferredCandidate"],
             _catalog_candidate(self._new_catalog_result()),
