@@ -48,6 +48,23 @@ class DashboardPolishTests(unittest.TestCase):
         self.assertIn("exactFmt(summary.completedWorkUnits)", source)
         self.assertIn("compactFmt(worker.measuredThroughput)", source)
 
+    def test_fleet_is_ranked_by_measured_throughput_descending(self):
+        source = Path("dashboard/app.js").read_text(encoding="utf-8")
+        self.assertIn("const rankedWorkers = [...workers].sort", source)
+        self.assertIn("right.measuredThroughput", source)
+        self.assertIn("left.measuredThroughput", source)
+        self.assertIn("Number.NEGATIVE_INFINITY", source)
+        self.assertIn("reconcile($(\"#workers\"), rankedWorkers", source)
+
+    def test_contributions_are_ranked_by_units_and_show_device_type(self):
+        source = Path("dashboard/app.js").read_text(encoding="utf-8")
+        self.assertIn("right.acceptedWorkUnits", source)
+        self.assertIn("left.acceptedWorkUnits", source)
+        self.assertIn("workerByID", source)
+        self.assertIn("workerDeviceType(worker)", source)
+        self.assertIn("worker.hardwareModel", source)
+        self.assertIn("worker.platform", source)
+
 
 class CanonicalBackfillTests(unittest.TestCase):
     def write_inventory(self, root: Path, sector: int, count: int) -> None:
