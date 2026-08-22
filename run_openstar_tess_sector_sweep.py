@@ -13,6 +13,8 @@ from openstar_coordinator_client import OpenStarCoordinatorClient
 from openstar_dispatch import InvestigationDispatcher
 from openstar_investigation import InvestigationStore
 from openstar_scheduler import InvestigationScheduler
+from openstar_science_runs import ScienceRunRecorder
+from openstar_sector_sweep_status import sector_sweep_projection
 from workflows.tess.tess_sector_archive import MastTessSectorArchiveProvider, TessSectorInventoryStore
 from workflows.tess.tess_sector_scan import (
     WORKFLOW_ID, TessSectorScanTargetSource, plan_tess_sector_scan,
@@ -108,14 +110,39 @@ def parse_args(argv=None):
 
 def main(argv=None):
     args = parse_args(argv)
+    root = Path(args.state_dir).expanduser().resolve()
+    recorder = ScienceRunRecorder(
+        kind="tess-sector-sweep",
+        display_name=f"TESS Sector {args.sector} Sweep",
+        state_root=root,
+        workflow_id=WORKFLOW_ID,
+        metadata={"mission": "TESS", "sector": args.sector},
+        identity=str(args.sector),
+    )
     try:
-        return run_tess_sector_sweep(args.sector, args.coordinator_url, args.state_dir,
+        code = run_tess_sector_sweep(args.sector, args.coordinator_url, root,
             max_concurrent_investigations=args.max_concurrent_investigations,
             max_targets=args.max_targets, poll_interval=args.poll_interval, timeout=args.timeout,
             frequencies_per_work_unit=args.frequencies_per_work_unit)
-    except KeyboardInterrupt: return 130
+        projection = next(
+            (item for item in sector_sweep_projection(root) if item["sector"] == args.sector),
+            None,
+        )
+        status = "FAILED" if code else "FINISHED"
+        if projection is not None and projection.get("status") == "COMPLETE":
+            status = "COMPLETE"
+        recorder.finish(
+            status=status,
+            summary={"exitCode": code, "sectorSweep": projection or {}},
+        )
+        return code
+    except KeyboardInterrupt:
+        recorder.interrupt()
+        return 130
     except Exception as error:
-        print(f"OpenStar TESS sector sweep: error={type(error).__name__}: {error}", file=sys.stderr); return 1
+        recorder.fail(error)
+        print(f"OpenStar TESS sector sweep: error={type(error).__name__}: {error}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
