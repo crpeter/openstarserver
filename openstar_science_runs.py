@@ -1,7 +1,7 @@
 """Durable operational catalog of OpenStar science runs.
 
 The catalog records which science processes have run and where their authoritative
-state lives.  It is deliberately separate from investigation/scientific history:
+state lives. It is deliberately separate from investigation/scientific history:
 runners may update catalog metadata, but the catalog never owns or rewrites science
 results.
 """
@@ -18,6 +18,7 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_SCIENCE_RUN_CATALOG = ROOT / "data" / "science-runs.sqlite3"
+_TERMINAL_STATUSES = {"COMPLETE", "FINISHED", "FAILED", "INTERRUPTED"}
 
 
 def _utc_now() -> str:
@@ -93,7 +94,9 @@ class ScienceRunCatalog:
 
     @staticmethod
     def _json(value: dict[str, Any] | None) -> str:
-        return json.dumps(value or {}, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        return json.dumps(
+            value or {}, sort_keys=True, separators=(",", ":"), allow_nan=False
+        )
 
     def register(
         self,
@@ -117,7 +120,7 @@ class ScienceRunCatalog:
         resolved_root = (
             str(Path(state_root).expanduser().resolve()) if state_root is not None else None
         )
-        completed_at = timestamp if status in {"COMPLETE", "FINISHED", "FAILED", "INTERRUPTED"} else None
+        completed_at = timestamp if status in _TERMINAL_STATUSES else None
         with self._connect(write=True) as connection:
             connection.execute(
                 """
@@ -170,7 +173,7 @@ class ScienceRunCatalog:
         timestamp = now or _utc_now()
         next_status = status or existing["status"]
         if completed is None:
-            completed = next_status in {"COMPLETE", "FINISHED", "FAILED", "INTERRUPTED"}
+            completed = next_status in _TERMINAL_STATUSES
         completed_at = timestamp if completed else None
         with self._connect(write=True) as connection:
             connection.execute(
@@ -184,7 +187,9 @@ class ScienceRunCatalog:
                     next_status,
                     timestamp,
                     completed_at,
-                    self._json(metadata if metadata is not None else existing["metadata"]),
+                    self._json(
+                        metadata if metadata is not None else existing["metadata"]
+                    ),
                     self._json(summary if summary is not None else existing["summary"]),
                     run_id,
                 ),
@@ -228,3 +233,65 @@ class ScienceRunCatalog:
                 """
             ).fetchall()
         return [self._decode(row) for row in rows]
+
+
+class ScienceRunRecorder:
+    """Best-effort runner hook; catalog failures never block science execution."""
+
+    def __init__(
+        self,
+        *,
+        kind: str,
+        display_name: str,
+        state_root: str | Path | None = None,
+        workflow_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        identity: str | None = None,
+        catalog: ScienceRunCatalog | None = None,
+    ):
+        self.run_id = science_run_id(kind, state_root, identity=identity)
+        self.catalog: ScienceRunCatalog | None = catalog
+        try:
+            self.catalog = self.catalog or ScienceRunCatalog()
+            self.catalog.register(
+                self.run_id,
+                kind=kind,
+                display_name=display_name,
+                status="RUNNING",
+                state_root=state_root,
+                workflow_id=workflow_id,
+                metadata=metadata,
+            )
+        except (OSError, sqlite3.Error, TypeError, ValueError):
+            self.catalog = None
+
+    @property
+    def enabled(self) -> bool:
+        return self.catalog is not None
+
+    def finish(
+        self,
+        *,
+        status: str = "FINISHED",
+        summary: dict[str, Any] | None = None,
+    ) -> None:
+        if self.catalog is None:
+            return
+        try:
+            self.catalog.update(
+                self.run_id,
+                status=status,
+                summary=summary,
+                completed=True,
+            )
+        except (OSError, sqlite3.Error, KeyError, TypeError, ValueError):
+            return
+
+    def fail(self, error: BaseException) -> None:
+        self.finish(
+            status="FAILED",
+            summary={"error": f"{type(error).__name__}: {error}"},
+        )
+
+    def interrupt(self) -> None:
+        self.finish(status="INTERRUPTED")
