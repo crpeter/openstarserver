@@ -86,6 +86,11 @@ from .tess_difference_image import (
     build_difference_image_project,
     interpret_difference_image_project,
 )
+from .tess_residual_phase_difference_image import (
+    prepare_residual_phase_difference_imaging,
+    run_residual_phase_difference_imaging,
+    interpret_residual_phase_difference_imaging,
+)
 from .tess_frequency_localized_pixel import (
     build_frequency_localized_pixel_project,
     interpret_frequency_localized_pixel_project,
@@ -4056,6 +4061,60 @@ def build_engine(
                 if continue_validation else None),
             stop=unresolved,
             final_status="QUIESCENT_AWAITING_DATA" if unresolved else "COMPLETE",
+            input_hashes={"preparation": sha256_json(preparation), "run": sha256_json(run)},
+            artifacts=(_artifact(path, "application/json"),))
+
+    def residual_phase_difference_image_prepare_stage(investigation, request):
+        localization = _latest_result_for_handler(
+            investigation, "openstar.tess.catalog-guided-source-localization.interpret")
+        bridge = _latest_result_for_handler(
+            investigation, "openstar.tess.catalog-guided-source-localization.prepare")
+        if localization is None or bridge is None:
+            raise RuntimeError("Residual-phase difference imaging requires the persisted catalog-guided bridge.")
+        preparation = prepare_residual_phase_difference_imaging(
+            localization_summary=localization, localization_preparation=bridge,
+            output_dir=store.directory_for(investigation.id) / "artifacts",
+            investigation_id=investigation.id)
+        return StageOutcome(
+            result=preparation,
+            next_stage=StageRequest(
+                _next_stage_id(request.id, "run-residual-phase-difference-imaging"),
+                "openstar.tess.residual-phase-difference-imaging.run", {}, request.id),
+            input_hashes={"catalogGuidedPreparation": sha256_json(bridge),
+                          "catalogGuidedInterpretation": sha256_json(localization)},
+            artifacts=(_artifact(Path(preparation["preparationPath"]), "application/json"),))
+
+    def residual_phase_difference_image_run_stage(investigation, request):
+        preparation = _latest_result_for_handler(
+            investigation, "openstar.tess.residual-phase-difference-imaging.prepare")
+        if preparation is None:
+            raise RuntimeError("Residual-phase difference imaging run requires preparation.")
+        result = run_residual_phase_difference_imaging(
+            preparation, sector_inputs=request.parameters.get("sectorInputs"))
+        path = Path(preparation["artifactRoot"]) / "run.json"
+        _write_json(path, result)
+        return StageOutcome(
+            result=result,
+            next_stage=StageRequest(
+                _next_stage_id(request.id, "interpret-residual-phase-difference-imaging"),
+                "openstar.tess.residual-phase-difference-imaging.interpret", {}, request.id),
+            input_hashes={"preparation": sha256_json(preparation)},
+            artifacts=(_artifact(path, "application/json"),))
+
+    def residual_phase_difference_image_interpret_stage(investigation, request):
+        preparation = _latest_result_for_handler(
+            investigation, "openstar.tess.residual-phase-difference-imaging.prepare")
+        run = _latest_result_for_handler(
+            investigation, "openstar.tess.residual-phase-difference-imaging.run")
+        if preparation is None or run is None:
+            raise RuntimeError("Residual-phase difference imaging interpretation requires prepare and run.")
+        result = interpret_residual_phase_difference_imaging(preparation, run)
+        path = Path(preparation["artifactRoot"]) / "interpretation.json"
+        _write_json(path, result)
+        return StageOutcome(
+            result=result, stop=not result["sourceAttributionResolved"],
+            final_status=("QUIESCENT_AWAITING_DATA" if not result["sourceAttributionResolved"]
+                          else "COMPLETE"),
             input_hashes={"preparation": sha256_json(preparation), "run": sha256_json(run)},
             artifacts=(_artifact(path, "application/json"),))
 
@@ -8574,6 +8633,18 @@ def build_engine(
     engine.register_handler(
         "openstar.tess.catalog-guided-source-localization.interpret",
         catalog_guided_localization_interpret_stage,
+    )
+    engine.register_handler(
+        "openstar.tess.residual-phase-difference-imaging.prepare",
+        residual_phase_difference_image_prepare_stage,
+    )
+    engine.register_handler(
+        "openstar.tess.residual-phase-difference-imaging.run",
+        residual_phase_difference_image_run_stage,
+    )
+    engine.register_handler(
+        "openstar.tess.residual-phase-difference-imaging.interpret",
+        residual_phase_difference_image_interpret_stage,
     )
     engine.register_handler(
         "openstar.tess.offset-source-variability.prepare",

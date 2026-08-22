@@ -98,6 +98,33 @@ class TessAutonomyIntegrationTests(unittest.TestCase):
         )
         self.assertEqual("blind-c", branches[0].experiment.parameters["datasetID"])
 
+    def test_tic_277940827_stage_047_schedules_residual_phase_difference_image_append_only(self):
+        target = self.source.enumerate_targets()[0]
+        investigation = self.store.create(target.investigation_id, WORKFLOW_ID, WORKFLOW_VERSION,
+                                          metadata={**target.metadata, "ticID": 277940827})
+        for number in range(1, 47):
+            investigation = self._complete(
+                investigation, f"{number:03d}-persisted-science", "persisted.science", {"stage": number})
+        investigation = self._complete(
+            investigation, "047-interpret-catalog-guided-source-localization",
+            "openstar.tess.catalog-guided-source-localization.interpret",
+            {"recommendedNextTest": "ADDITIONAL_SOURCE_LOCALIZATION_DATA",
+             "classification": "UNRESOLVED", "sourceAttributionResolved": False,
+             "physicalCycleResolved": False})
+        old_stages = investigation.stages
+        branches = plan_tess_branches(investigation, target)
+        request = branches[0].experiment
+        self.assertEqual("048-prepare-residual-phase-difference-imaging", request.id)
+        self.assertEqual("openstar.tess.residual-phase-difference-imaging.prepare",
+                         request.handler_id)
+        engine = WorkflowEngine(self.store)
+        engine.register_handler(request.handler_id, lambda _investigation, _request: StageOutcome(
+            result={"scheduledFrom": "ADDITIONAL_SOURCE_LOCALIZATION_DATA"}, stop=True))
+        completed, _ = engine.run_stage(
+            investigation, request, software_id="test", software_version="stage-048")
+        self.assertEqual(old_stages, completed.stages[:47])
+        self.assertEqual("048-prepare-residual-phase-difference-imaging", completed.stages[47].id)
+
     def test_completed_mode_identification_boundary_is_append_only_and_idempotent(self):
         target = self.source.enumerate_targets()[0]
         investigation = self.store.create(target.investigation_id, WORKFLOW_ID, WORKFLOW_VERSION,

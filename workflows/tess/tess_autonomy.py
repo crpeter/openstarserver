@@ -975,6 +975,9 @@ def plan_tess_branches(
     catalog_guided_localization = _latest_complete(
         investigation, "openstar.tess.catalog-guided-source-localization.interpret"
     )
+    residual_phase_difference_image = _latest_complete(
+        investigation, "openstar.tess.residual-phase-difference-imaging.interpret"
+    )
     variability_interpretation = _latest_complete(
         investigation, "openstar.tess.offset-source-variability.interpret"
     )
@@ -1196,6 +1199,23 @@ def plan_tess_branches(
         validation_started = any(
             stage.handler_id == "openstar.tess.offset-source-variability.prepare"
             for stage in investigation.stages)
+        difference_image_started = any(
+            stage.handler_id.startswith("openstar.tess.residual-phase-difference-imaging.")
+            for stage in investigation.stages)
+        if (residual_phase_difference_image is None and not difference_image_started
+                and localization_result.get("recommendedNextTest")
+                == "ADDITIONAL_SOURCE_LOCALIZATION_DATA"
+                and localization_result.get("classification") == "UNRESOLVED"
+                and localization_result.get("sourceAttributionResolved") is False):
+            return (ScientificBranch(
+                id=f"continue-residual-phase-difference-imaging-after-{catalog_guided_localization.id}",
+                experiment=StageRequest(
+                    id=_continuation_stage_id(
+                        catalog_guided_localization,
+                        "prepare-residual-phase-difference-imaging"),
+                    handler_id="openstar.tess.residual-phase-difference-imaging.prepare",
+                    parameters={}, triggered_by_stage_id=catalog_guided_localization.id),
+            ),)
         if (not validation_started
                 and localization_result.get("sourceAttributionResolved") is True
                 and justified
