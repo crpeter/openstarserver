@@ -76,6 +76,14 @@ def catalog_period_evidence(identity: dict[str, Any], observed_period: float) ->
     return evidence
 
 
+def primary_period_days(primary: dict[str, Any]) -> float | None:
+    """Select the period used for catalog interpretation everywhere."""
+    period = _float(primary.get("preferredPhysicalPeriodDays"))
+    if period is None:
+        period = _float(primary.get("candidatePeriodDays"))
+    return period if period is not None and period > 0 else None
+
+
 def cycle_coverage(period_days: float | None, baseline_days: float | None) -> dict[str, Any]:
     period = _float(period_days)
     baseline = _float(baseline_days)
@@ -189,9 +197,7 @@ def analyze(
     observation_baseline_days: float | None = None,
     primary_minimum_frequency: float | None = None,
 ) -> dict[str, Any]:
-    period = _float(primary.get("preferredPhysicalPeriodDays"))
-    if period is None:
-        period = _float(primary.get("candidatePeriodDays"))
+    period = primary_period_days(primary)
 
     status = str(primary.get("periodStatus") or "").upper()
     confidence = str(primary.get("periodConfidence") or "none").lower()
