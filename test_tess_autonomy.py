@@ -286,6 +286,40 @@ class TessAutonomyIntegrationTests(unittest.TestCase):
         self.assertEqual((), plan_tess_branches(with_running, target))
         self.assertEqual(original, with_running.stages[:56])
 
+    def test_stage_059_candidate_recovery_schedules_stage_060_exactly_once(self):
+        target = self.source.enumerate_targets()[0]
+        for number, catalog_id in ((1,111),(2,222)):
+            candidate={"raDeg":10.+number/10,"decDeg":-20.-number/10,
+                       "catalogIDs":{"ticID":catalog_id}}
+            investigation=self.store.create(f"{target.investigation_id}-stage59-{number}",
+                WORKFLOW_ID,WORKFLOW_VERSION,metadata={**target.metadata,"ticID":277940827})
+            investigation=self._complete(investigation,
+                "056-interpret-time-resolved-residual-phase-localization",
+                "openstar.tess.time-resolved-residual-phase-localization.interpret",
+                {"classification":"TIME_VARIABLE_LOCALIZATION","sourceAttributionResolved":False,
+                 "physicalMechanismResolved":False,
+                 "recommendedNextTest":"TIME_VARIABLE_SOURCE_LOCALIZATION_FOLLOWUP"})
+            investigation=self._complete(investigation,
+                "059-interpret-time-resolved-frequency-localization",
+                "openstar.tess.time-resolved-frequency-localization.interpret",
+                {"classification":f"STABLE_CANDIDATE_{number}_LOCALIZATION",
+                 "sourceAttributionResolved":True,"physicalMechanismResolved":False,
+                 "preferredCandidate":candidate,
+                 "recommendedNextTest":"INDEPENDENT_COUNTERPART_PHOTOMETRIC_VARIABILITY_VALIDATION"})
+            branches=plan_tess_branches(investigation,target)
+            self.assertEqual(1,len(branches)); request=branches[0].experiment
+            self.assertEqual("060-prepare-offset-source-variability",request.id)
+            running=InvestigationStage(request.id,request.handler_id,"RUNNING",
+                                       request.triggered_by_stage_id,{})
+            with_running=self.store.append_running_stage(investigation,running)
+            self.assertEqual((),plan_tess_branches(with_running,target))
+            terminal=self.store.build_terminal_stage(stage_id=request.id,
+                handler_id=request.handler_id,status="COMPLETE",
+                triggered_by_stage_id=request.triggered_by_stage_id,parameters={},result={},
+                error=None,software_id="test",software_version="1",started_at=running.started_at)
+            with_complete=self.store.complete_current_stage(with_running,terminal)
+            self.assertEqual((),plan_tess_branches(with_complete,target))
+
     def test_stage_053_candidate_two_recovery_is_idempotent(self):
         target = self.source.enumerate_targets()[0]
         candidate_1 = {"raDeg": 10.1, "decDeg": -20.1,

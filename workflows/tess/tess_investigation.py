@@ -4405,7 +4405,9 @@ def build_engine(
             investigation, "openstar.tess.source-switching-temporal-model.interpret")
         time_resolved_localization = _latest_result_for_handler(
             investigation, "openstar.tess.time-resolved-residual-phase-localization.interpret")
-        catalog_counterpart = (time_resolved_localization or temporal_source_model
+        time_resolved_frequency = _latest_result_for_handler(
+            investigation, "openstar.tess.time-resolved-frequency-localization.interpret")
+        catalog_counterpart = (time_resolved_frequency or time_resolved_localization or temporal_source_model
             or residual_phase_localization or _latest_result_for_handler(
             investigation, "openstar.tess.catalog-guided-source-localization.interpret")
             or _latest_result_for_handler(

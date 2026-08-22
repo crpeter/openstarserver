@@ -19,7 +19,7 @@ from .tess_frequency_localized_pixel import (
 from .tess_residual_localization import _time_warp, _write_json
 from .tess_residual_phase_difference_image import _production_difference_image_inputs
 
-_PRESERVED = ("referenceFamilyPeriodDays", "subtractedHarmonicOrders",
+_PRESERVED = ("ticID", "referenceFamilyPeriodDays", "subtractedHarmonicOrders",
               "physicalCycleResolved", "residualReferenceFrequency",
               "residualTimeReferenceDays", "fractionalFrequencyDriftPerDay",
               "targetSky", "catalogCandidates", "sectors")
