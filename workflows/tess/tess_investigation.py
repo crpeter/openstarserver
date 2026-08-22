@@ -95,6 +95,11 @@ from .tess_prf_refinement import (
     interpret_prf_deblending,
 )
 from .tess_catalog_counterpart import identify_catalog_counterparts
+from .tess_catalog_guided_localization import (
+    prepare_catalog_guided_localization,
+    run_catalog_guided_localization,
+    interpret_catalog_guided_localization,
+)
 from .tess_external_highres import (
     build_external_high_resolution_project,
     interpret_external_high_resolution_project,
@@ -505,6 +510,12 @@ def catalog_counterpart_variability_continuation(
         and candidate.get("decDeg") is not None
         and (ids.get("ticID") is not None or ids.get("gaiaDR3SourceID") is not None)
     )
+    candidates = summary.get("plausibleCatalogCandidates") or []
+    run_localization = (
+        summary.get("recommendedNextTest") == "CATALOG_GUIDED_SOURCE_LOCALIZATION"
+        and summary.get("physicalMechanismResolved") is False
+        and len(candidates) >= 2
+    )
     run_validation = (
         summary.get("recommendedNextTest")
         == "INDEPENDENT_COUNTERPART_PHOTOMETRIC_VARIABILITY_VALIDATION"
@@ -514,14 +525,16 @@ def catalog_counterpart_variability_continuation(
     return StageRequest(
         id=_next_stage_id(
             request_id,
-            "prepare-offset-source-variability" if run_validation else "finalize",
+            ("prepare-catalog-guided-source-localization" if run_localization else
+             "prepare-offset-source-variability" if run_validation else "finalize"),
         ),
         handler_id=(
-            "openstar.tess.offset-source-variability.prepare"
-            if run_validation
+            ("openstar.tess.catalog-guided-source-localization.prepare" if run_localization else
+             "openstar.tess.offset-source-variability.prepare" if run_validation
             else "openstar.tess.finalize"
+            )
         ),
-        parameters={} if run_validation else {"outputSuffix": "catalog-counterpart"},
+        parameters={} if (run_localization or run_validation) else {"outputSuffix": "catalog-counterpart"},
         triggered_by_stage_id=request_id,
     )
 
@@ -3979,6 +3992,75 @@ def build_engine(
                           "prfSummary": sha256_json(prf_summary)},
             artifacts=(_artifact(path, "application/json"),),
         )
+
+    def catalog_guided_localization_prepare_stage(investigation, request):
+        handlers = {
+            "targetPreparation": "openstar.tess.prepare-target",
+            "decompositionPreparation": "openstar.tess.multi-source-residual.prepare",
+            "prfPreparation": "openstar.tess.official-spoc-prf-forward-modeling.prepare",
+            "prfInterpretation": "openstar.tess.official-spoc-prf-forward-modeling.interpret",
+            "catalogCounterpartIdentification": "openstar.tess.catalog-counterpart-identification.analyze",
+        }
+        evidence = {name: _latest_result_for_handler(investigation, handler)
+                    for name, handler in handlers.items()}
+        if any(value is None for value in evidence.values()):
+            raise RuntimeError("Catalog-guided localization requires persisted stages 038, 041, 043, and 044.")
+        spec = prepare_catalog_guided_localization(
+            evidence=evidence, output_dir=store.directory_for(investigation.id) / "artifacts",
+            investigation_id=investigation.id)
+        return StageOutcome(
+            result=spec,
+            next_stage=StageRequest(_next_stage_id(request.id, "run-catalog-guided-source-localization"),
+                "openstar.tess.catalog-guided-source-localization.run", {}, request.id),
+            input_hashes={name: sha256_json(value) for name, value in evidence.items()},
+            artifacts=(_artifact(Path(spec["preparationPath"]), "application/json"),),
+        )
+
+    def catalog_guided_localization_run_stage(investigation, request):
+        preparation = _latest_result_for_handler(
+            investigation, "openstar.tess.catalog-guided-source-localization.prepare")
+        if preparation is None:
+            raise RuntimeError("Catalog-guided localization run requires completed preparation.")
+        result = run_catalog_guided_localization(preparation)
+        path = Path(preparation["artifactRoot"]) / "run.json"
+        _write_json(path, result)
+        return StageOutcome(result=result,
+            next_stage=StageRequest(_next_stage_id(request.id, "interpret-catalog-guided-source-localization"),
+                "openstar.tess.catalog-guided-source-localization.interpret", {}, request.id),
+            input_hashes={"preparation": sha256_json(preparation)},
+            artifacts=(_artifact(path, "application/json"),))
+
+    def catalog_guided_localization_interpret_stage(investigation, request):
+        preparation = _latest_result_for_handler(
+            investigation, "openstar.tess.catalog-guided-source-localization.prepare")
+        run = _latest_result_for_handler(
+            investigation, "openstar.tess.catalog-guided-source-localization.run")
+        if preparation is None or run is None:
+            raise RuntimeError("Catalog-guided localization interpretation requires prepare + run.")
+        summary = interpret_catalog_guided_localization(preparation, run)
+        path = Path(preparation["artifactRoot"]) / "interpretation.json"
+        _write_json(path, summary)
+        identified = summary.get("preferredCandidate") is not None and summary.get(
+            "recommendedNextTest") == "INDEPENDENT_COUNTERPART_PHOTOMETRIC_VARIABILITY_VALIDATION"
+        next_stage = StageRequest(
+            _next_stage_id(request.id, "prepare-offset-source-variability" if identified else "catalog-guided-unresolved-followup"),
+            "openstar.tess.offset-source-variability.prepare" if identified
+            else "openstar.tess.catalog-guided-unresolved-followup.analyze", {}, request.id)
+        return StageOutcome(result=summary, next_stage=next_stage,
+            input_hashes={"preparation": sha256_json(preparation), "run": sha256_json(run)},
+            artifacts=(_artifact(path, "application/json"),))
+
+    def catalog_guided_unresolved_followup_stage(investigation, request):
+        localization = _latest_result_for_handler(
+            investigation, "openstar.tess.catalog-guided-source-localization.interpret")
+        if localization is None or localization.get("preferredCandidate") is not None:
+            raise RuntimeError("Unresolved follow-up requires an unresolved catalog-guided localization.")
+        result = {"classification": "AWAITING_RECOMMENDED_UNRESOLVED_FOLLOWUP",
+                  "recommendedNextTest": localization.get("recommendedNextTest"),
+                  "physicalMechanismResolved": False, "physicalCycleResolved": False}
+        return StageOutcome(result=result, next_stage=None, stop=True,
+                            final_status="QUIESCENT_AWAITING_DATA",
+                            input_hashes={"localization": sha256_json(localization)})
 
     def offset_source_identification_stage(investigation, request):
         prepared = _latest_result_for_handler(investigation, "openstar.tess.prepare-target")
@@ -8441,6 +8523,22 @@ def build_engine(
     engine.register_handler(
         "openstar.tess.catalog-counterpart-identification.analyze",
         catalog_counterpart_identification_stage,
+    )
+    engine.register_handler(
+        "openstar.tess.catalog-guided-source-localization.prepare",
+        catalog_guided_localization_prepare_stage,
+    )
+    engine.register_handler(
+        "openstar.tess.catalog-guided-source-localization.run",
+        catalog_guided_localization_run_stage,
+    )
+    engine.register_handler(
+        "openstar.tess.catalog-guided-source-localization.interpret",
+        catalog_guided_localization_interpret_stage,
+    )
+    engine.register_handler(
+        "openstar.tess.catalog-guided-unresolved-followup.analyze",
+        catalog_guided_unresolved_followup_stage,
     )
     engine.register_handler(
         "openstar.tess.offset-source-variability.prepare",
