@@ -16,7 +16,12 @@ except ImportError:
     sys.modules["numpy"] = types.ModuleType("numpy")
 
 from workflows.tess.tess_localization import _download_tpf
-from workflows.tess.tess_sector_archive import TessArchiveTransientError
+from workflows.tess.tess_sector_archive import (
+    TESS_ARCHIVE_TIMEOUT_SECONDS,
+    TessArchiveTransientError,
+    _archive_timeout_seconds,
+    configure_tess_archive_timeout,
+)
 
 
 class _Table:
@@ -44,6 +49,55 @@ class _Search:
 
 
 class TessPixelArchiveTimeoutTests(unittest.TestCase):
+    def test_timeout_config_uses_dependency_specific_types(self):
+        class _StrictIntegerConfig:
+            def __init__(self):
+                self._timeout = None
+
+            @property
+            def timeout(self):
+                return self._timeout
+
+            @timeout.setter
+            def timeout(self, value):
+                if type(value) is not int:
+                    raise TypeError(f"{value!r} is not an integer timeout")
+                self._timeout = value
+
+        mast_conf = _StrictIntegerConfig()
+        observations = types.SimpleNamespace(TIMEOUT=None)
+        tesscut = types.SimpleNamespace(TIMEOUT=None)
+        mast = types.ModuleType("astroquery.mast")
+        mast.conf, mast.Observations, mast.Tesscut = mast_conf, observations, tesscut
+        astroquery = types.ModuleType("astroquery")
+        astroquery.mast = mast
+        data_conf = types.SimpleNamespace(remote_timeout=None)
+        data = types.ModuleType("astropy.utils.data")
+        data.conf = data_conf
+        utils = types.ModuleType("astropy.utils")
+        utils.data = data
+        astropy = types.ModuleType("astropy")
+        astropy.utils = utils
+        with mock.patch.dict(sys.modules, {
+            "astroquery": astroquery, "astroquery.mast": mast,
+            "astropy": astropy, "astropy.utils": utils,
+            "astropy.utils.data": data,
+        }):
+            configure_tess_archive_timeout()
+
+        self.assertIs(type(TESS_ARCHIVE_TIMEOUT_SECONDS), int)
+        self.assertEqual(60, mast_conf.timeout)
+        self.assertIs(type(observations.TIMEOUT), int)
+        self.assertIs(type(tesscut.TIMEOUT), int)
+        self.assertIs(type(data_conf.remote_timeout), float)
+
+    def test_timeout_value_rejects_float_syntax_and_nonpositive_values(self):
+        for value in ("60.0", "0", "-1", "nan", ""):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                ValueError, "must be a positive integer"
+            ):
+                _archive_timeout_seconds(value)
+
     def _modules(self, lightkurve):
         class _Degree:
             def __rmul__(self, value):

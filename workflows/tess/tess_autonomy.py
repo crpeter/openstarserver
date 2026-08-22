@@ -572,6 +572,86 @@ def _repair_unresolved_dynamic_localization_review_failure(
     )
 
 
+def _repair_archive_timeout_localization_failure(
+    store: InvestigationStore, investigation: Investigation, control: dict
+) -> Investigation | None:
+    """Retry only a localization spawned by the obsolete stage-022 repair."""
+    if investigation.status != "FAILED" or len(investigation.stages) < 2:
+        return None
+    failed = investigation.stages[-1]
+    review_failure = investigation.stages[-2]
+    if (failed.status != "FAILED"
+            or failed.handler_id != "openstar.tess.residual-mode-localization.prepare"
+            or failed.failure_classification != "NON_RETRYABLE"
+            or failed.error != (
+                "RuntimeError: v20.10 could not prepare any residual-mode pixel datasets."
+            )
+            or failed.triggered_by_stage_id != review_failure.id
+            or review_failure.status != "FAILED"
+            or review_failure.handler_id
+               != "openstar.tess.residual-mode-localization-review.prepare"
+            or review_failure.failure_classification != "NON_RETRYABLE"
+            or review_failure.error not in {
+                "RuntimeError: v20.11 requires the morphology-resolved physical period.",
+                "RuntimeError: v20.11 requires the completed v20.9 nonstationary model.",
+            }):
+        return None
+    if control.get("schedulerAction") not in ("RUN_EXPERIMENT", "INVESTIGATION_FAILED"):
+        return None
+    selected = control.get("selectedExperiment")
+    if not isinstance(selected, dict) or any((
+        selected.get("id") != failed.id,
+        selected.get("handler_id") != failed.handler_id,
+        selected.get("parameters") != failed.parameters,
+        selected.get("triggered_by_stage_id") != failed.triggered_by_stage_id,
+    )):
+        return None
+
+    morphology = _latest_complete(investigation, "openstar.tess.morphology.analyze")
+    dynamic = _latest_complete(investigation, "openstar.tess.dynamic-harmonic.analyze")
+    tf_prepare = _latest_complete(investigation, "openstar.tess.time-frequency.prepare")
+    tf_summary = _latest_complete(investigation, "openstar.tess.time-frequency.summarize")
+    mode = _latest_complete(investigation, "openstar.tess.mode-identification.analyze")
+    localization = _latest_complete(
+        investigation, "openstar.tess.residual-mode-localization.interpret"
+    )
+    family = frozen_residual_localization_family(
+        morphology.result if morphology else None,
+        dynamic.result if dynamic else None,
+        tf_prepare.result if tf_prepare else None,
+        tf_summary.result if tf_summary else None,
+        mode.result if mode else None,
+    )
+    if (family is None or localization is None
+            or (localization.result or {}).get("recommendedNextTest")
+               != "RESIDUAL_MODE_SOURCE_LOCALIZATION_REVIEW"
+            or review_failure.triggered_by_stage_id != localization.id):
+        return None
+    prior_prepare = _latest_complete(
+        investigation, "openstar.tess.residual-mode-localization.prepare"
+    )
+    if (prior_prepare is None
+            or list((prior_prepare.result or {}).get("subtractedHarmonicOrders") or [1, 2])
+               == list(family[1])):
+        return None
+
+    prefixes = [int(stage.id.partition("-")[0]) for stage in investigation.stages
+                if stage.id.partition("-")[0].isdigit()]
+    continuation = StageRequest(
+        id=f"{max(prefixes, default=0) + 1:03d}-prepare-residual-mode-localization",
+        handler_id="openstar.tess.residual-mode-localization.prepare",
+        parameters={}, triggered_by_stage_id=failed.id,
+    )
+    return store.set_control_state(
+        investigation, status="RUNNING",
+        control_state={
+            "branchAssessments": [], "selectedExperiment": asdict(continuation),
+            "schedulerAction": "RUN_EXPERIMENT",
+            "recovery": "TESS_ARCHIVE_TIMEOUT_LOCALIZATION_COMPATIBILITY_RETRY",
+        },
+    )
+
+
 def _repair_unresolved_dynamic_multisource_failure(
     store: InvestigationStore, investigation: Investigation, control: dict
 ) -> Investigation | None:
@@ -748,6 +828,12 @@ def repair_obsolete_terminal_wait(
     control = investigation.metadata.get("controlState")
     if investigation.workflow_id != WORKFLOW_ID or not isinstance(control, dict):
         return investigation
+
+    archive_timeout_repair = _repair_archive_timeout_localization_failure(
+        store, investigation, control
+    )
+    if archive_timeout_repair is not None:
+        return archive_timeout_repair
 
     localization_review_repair = _repair_unresolved_dynamic_localization_review_failure(
         store, investigation, control
