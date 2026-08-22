@@ -11,9 +11,10 @@ from typing import Any
 
 import numpy as np
 
-from .tess_catalog_guided_localization import COMPONENT_IDS
+from .tess_catalog_guided_localization import (
+    COMPONENT_IDS, _fit_shared_astrometric_shift, _production_sector_inputs,
+)
 from .tess_residual_localization import _time_warp, _write_json
-from .tess_residual_phase_difference_image import _production_difference_image_inputs
 
 EXPECTED_SECTORS = (94, 95, 102, 103)
 
@@ -56,26 +57,35 @@ def prepare_source_switching_temporal_model(*, difference_interpretation: dict[s
     return result
 
 
-def _templates(item: dict[str, Any], valid: np.ndarray) -> np.ndarray:
+def _templates(item: dict[str, Any], valid: np.ndarray) -> tuple[np.ndarray | None, dict[str, Any]]:
     supplied = item.get("sourceTemplates")
     if supplied is not None:
         templates = np.asarray(supplied, dtype=float)
         if templates.shape[0] != 3:
             raise RuntimeError("sourceTemplates must contain target and both candidates.")
         templates = templates.reshape(3, -1)[:, valid.ravel()].T
+        calibration = {"available": True, "method": "injected-calibrated-test-templates"}
     else:
-        centers = list(item.get("componentPixelCenters") or
-                       (item.get("acquisitionProvenance") or {}).get("componentPixelCenters") or [])
-        if [x.get("componentID") for x in centers] != list(COMPONENT_IDS):
-            raise RuntimeError("All three frozen component pixel positions are required.")
-        yy, xx = np.indices(valid.shape)
-        templates = np.column_stack([
-            np.exp(-.5 * ((xx[valid] - float(c["x"])) ** 2 +
-                          (yy[valid] - float(c["y"])) ** 2) / .7 ** 2) for c in centers])
+        renderer = item.get("renderTemplates")
+        calibration_image = item.get("calibrationImage")
+        background = item.get("backgroundColumns")
+        if renderer is None or calibration_image is None or background is None:
+            raise RuntimeError(
+                "Production temporal modeling requires calibrated official SPOC PRF inputs; "
+                "synthetic spatial-template fallback is forbidden.")
+        calibrated = _fit_shared_astrometric_shift(
+            calibration_image=np.asarray(calibration_image, float),
+            background_columns=[np.asarray(x, float) for x in background],
+            render_templates=renderer)
+        if not calibrated.get("available"):
+            return None, calibrated
+        templates = np.asarray(calibrated["templates"], float)
+        calibration = {"available": True, "method": "official-spoc-prf-shared-astrometry",
+                       "sharedAstrometricCalibration": calibrated["sharedAstrometricCalibration"]}
     norms = np.sqrt(np.sum(templates * templates, axis=0))
     if np.any(norms <= 0):
         raise RuntimeError("A frozen source template has zero support.")
-    return templates / norms
+    return templates / norms, calibration
 
 
 def _design(times: np.ndarray, templates: np.ndarray, preparation: dict[str, Any]) -> np.ndarray:
@@ -101,7 +111,9 @@ def _fit(x: np.ndarray, y: np.ndarray) -> dict[str, Any]:
 
 def run_source_switching_temporal_model(preparation: dict[str, Any], *,
                                         sector_inputs: list[dict[str, Any]] | None = None) -> dict[str, Any]:
-    inputs = _production_difference_image_inputs(preparation) if sector_inputs is None else sector_inputs
+    # The catalog-guided acquisition path is the authoritative official-PRF path:
+    # it preserves frozen WCS positions and exposes one shared astrometric renderer.
+    inputs = _production_sector_inputs(preparation) if sector_inputs is None else sector_inputs
     sectors = []
     for item in inputs:
         times = np.asarray(item["times"], float)
@@ -109,24 +121,39 @@ def run_source_switching_temporal_model(preparation: dict[str, Any], *,
         valid = np.asarray(item["valid"], bool)
         finite = np.isfinite(times) & np.all(np.isfinite(cube[:, valid]), axis=1)
         times, values = times[finite], cube[finite][:, valid]
-        template = _templates(item, valid)
+        template, calibration = _templates(item, valid)
+        if template is None:
+            sectors.append({"sector": int(item["sector"]), "usable": False,
+                            "calibrationFailure": calibration})
+            continue
         x = _design(times, template, preparation)
         y = values.reshape(-1)
         sectors.append({"sector": int(item["sector"]), "times": times, "x": x, "y": y,
+                        "usable": True, "spatialCalibration": calibration,
                         "templateRank": int(np.linalg.matrix_rank(template)),
                         "templateConditionNumber": float(np.linalg.cond(template))})
     if [x["sector"] for x in sectors] != list(preparation["sectors"]):
         raise RuntimeError("Temporal model inputs do not match the frozen sector ordering.")
 
+    usable_sectors = [sector for sector in sectors if sector.get("usable")]
     source_sets = {"TARGET_STATIONARY": (0,), "CANDIDATE_1_STATIONARY": (1,),
                    "CANDIDATE_2_STATIONARY": (2,),
                    "TARGET_PLUS_CANDIDATE_1_STATIONARY": (0, 1),
+                   "TARGET_PLUS_CANDIDATE_2_STATIONARY": (0, 2),
+                   "CANDIDATE_1_PLUS_CANDIDATE_2_STATIONARY": (1, 2),
                    "ALL_SOURCES_STATIONARY": (0, 1, 2)}
     models: dict[str, Any] = {}
-    all_y = np.concatenate([s["y"] for s in sectors])
+    if not usable_sectors:
+        return {"version": "openstar.tess-source-switching-temporal-run.v1", "models": {},
+                "perSectorSourceCoherentVectors": [], "sectorUsability": sectors,
+                "sourceIdentifiable": False, "physicalCycleResolved": False,
+                "frozenResidualEphemeris": {"frequency": preparation["residualReferenceFrequency"],
+                    "timeReferenceDays": preparation["residualTimeReferenceDays"],
+                    "fractionalFrequencyDriftPerDay": preparation["fractionalFrequencyDriftPerDay"]}}
+    all_y = np.concatenate([s["y"] for s in usable_sectors])
     for name, sources in source_sets.items():
         columns = list(sources) + [3 + j for j in sources]
-        fit = _fit(np.vstack([s["x"][:, columns] for s in sectors]), all_y)
+        fit = _fit(np.vstack([s["x"][:, columns] for s in usable_sectors]), all_y)
         models[name] = {"rss": fit["rss"], "bic": len(all_y) * math.log(fit["rss"] / len(all_y))
                         + fit["k"] * math.log(len(all_y)), "parameterCount": fit["k"],
                         "rank": fit["rank"]}
@@ -135,12 +162,14 @@ def run_source_switching_temporal_model(preparation: dict[str, Any], *,
     varying_rss = 0.0
     varying_k = 0
     identifiable = True
-    for sector in sectors:
+    for sector in usable_sectors:
         fit = _fit(sector["x"], sector["y"])
         varying_rss += fit["rss"]; varying_k += fit["k"]
         identifiable &= fit["rank"] == 6 and sector["templateRank"] == 3
         entry = {"sector": sector["sector"], "templateRank": sector["templateRank"],
-                 "templateConditionNumber": sector["templateConditionNumber"], "sources": {}}
+                 "templateConditionNumber": sector["templateConditionNumber"],
+                 "spatialCalibration": sector["spatialCalibration"],
+                 "jointCoherentVectorCovariance": fit["covariance"].tolist(), "sources": {}}
         for j, component in enumerate(COMPONENT_IDS):
             sin, cos = float(fit["beta"][j]), float(fit["beta"][3 + j])
             cov = fit["covariance"][np.ix_([j, 3 + j], [j, 3 + j])]
@@ -155,31 +184,59 @@ def run_source_switching_temporal_model(preparation: dict[str, Any], *,
     models["SECTOR_VARYING_SOURCE_AMPLITUDES"] = {
         "rss": varying_rss, "bic": len(all_y) * math.log(varying_rss / len(all_y))
         + varying_k * math.log(len(all_y)), "parameterCount": varying_k,
-        "rank": sum(6 for _ in sectors) if identifiable else None}
+        "rank": sum(6 for _ in usable_sectors) if identifiable else None}
 
-    # Frozen-parameter prediction: train on alternating cadences, predict the held-out
-    # cadences. This tests amplitude generalization without frequency refitting.
+    # Frozen-parameter prediction over contiguous time blocks.  Every cadence in a
+    # held-out block is absent from the amplitude/phase fit used to predict it.
     cv = {name: 0.0 for name in models}
+    fold_evidence = []
+    block_count = 4
     for name, sources in {**source_sets, "SECTOR_VARYING_SOURCE_AMPLITUDES": (0, 1, 2)}.items():
         columns = list(sources) + [3 + j for j in sources]
-        if name == "SECTOR_VARYING_SOURCE_AMPLITUDES":
-            for s in sectors:
-                pixels = len(s["y"]) // len(s["times"]); cadence = np.repeat(np.arange(len(s["times"])), pixels)
-                train = cadence % 2 == 0
-                fit = _fit(s["x"][train][:, columns], s["y"][train])
-                cv[name] += float(np.sum((s["y"][~train] - s["x"][~train][:, columns] @ fit["beta"]) ** 2))
-        else:
-            train_x=[]; train_y=[]; test=[]
-            for s in sectors:
-                pixels=len(s["y"])//len(s["times"]); cadence=np.repeat(np.arange(len(s["times"])), pixels)
-                mask=cadence%2==0; train_x.append(s["x"][mask][:, columns]); train_y.append(s["y"][mask])
-                test.append((s["x"][~mask][:, columns], s["y"][~mask]))
-            fit=_fit(np.vstack(train_x), np.concatenate(train_y))
-            cv[name]=sum(float(np.sum((y-x@fit["beta"])**2)) for x,y in test)
+        for fold_index in range(block_count):
+            partitions = []
+            for s in usable_sectors:
+                pixels = len(s["y"]) // len(s["times"])
+                blocks = np.array_split(np.arange(len(s["times"])), block_count)
+                held_cadences = blocks[fold_index]
+                held = np.isin(np.repeat(np.arange(len(s["times"])), pixels), held_cadences)
+                partitions.append((s, ~held, held, held_cadences))
+            records = []
+            if name == "SECTOR_VARYING_SOURCE_AMPLITUDES":
+                fold_rss = 0.0
+                for s, train, held, held_cadences in partitions:
+                    fit = _fit(s["x"][train][:, columns], s["y"][train])
+                    rss = float(np.sum((s["y"][held] -
+                                        s["x"][held][:, columns] @ fit["beta"]) ** 2))
+                    fold_rss += rss
+                    records.append({"sector": s["sector"], "heldOutRSS": rss,
+                                    "heldOutTimeRange": [float(s["times"][held_cadences[0]]),
+                                                         float(s["times"][held_cadences[-1]])]})
+            else:
+                fit = _fit(np.vstack([s["x"][train][:, columns]
+                                      for s, train, _, _ in partitions]),
+                           np.concatenate([s["y"][train]
+                                           for s, train, _, _ in partitions]))
+                fold_rss = 0.0
+                for s, _, held, held_cadences in partitions:
+                    rss = float(np.sum((s["y"][held] -
+                                        s["x"][held][:, columns] @ fit["beta"]) ** 2))
+                    fold_rss += rss
+                    records.append({"sector": s["sector"], "heldOutRSS": rss,
+                                    "heldOutTimeRange": [float(s["times"][held_cadences[0]]),
+                                                         float(s["times"][held_cadences[-1]])]})
+            cv[name] += fold_rss
+            fold_evidence.append({"model": name, "foldIndex": fold_index,
+                                  "heldOutRSS": fold_rss, "sectorEvidence": records})
         models[name]["heldOutRSS"] = cv[name]
     return {"version": "openstar.tess-source-switching-temporal-run.v1",
             "models": models, "perSectorSourceCoherentVectors": vectors,
             "sourceIdentifiable": bool(identifiable), "physicalCycleResolved": False,
+            "sectorUsability": [{key: value for key, value in sector.items()
+                                  if key not in {"times", "x", "y"}} for sector in sectors],
+            "heldOutTemporalValidation": {
+                "method": "four contiguous temporal blocks with frozen amplitude/phase fits",
+                "folds": fold_evidence},
             "frozenResidualEphemeris": {"frequency": preparation["residualReferenceFrequency"],
                 "timeReferenceDays": preparation["residualTimeReferenceDays"],
                 "fractionalFrequencyDriftPerDay": preparation["fractionalFrequencyDriftPerDay"]}}
@@ -188,12 +245,14 @@ def run_source_switching_temporal_model(preparation: dict[str, Any], *,
 def interpret_source_switching_temporal_model(preparation: dict[str, Any],
                                               run: dict[str, Any]) -> dict[str, Any]:
     models = run["models"]
-    bic_winner = min(models, key=lambda name: models[name]["bic"])
-    predictive_winner = min(models, key=lambda name: models[name]["heldOutRSS"])
+    bic_winner = min(models, key=lambda name: models[name]["bic"]) if models else None
+    predictive_winner = min(models, key=lambda name: models[name]["heldOutRSS"]) if models else None
     stationary_labels = {"TARGET_STATIONARY": "STATIONARY_TARGET_SOURCE",
                          "CANDIDATE_1_STATIONARY": "STATIONARY_CANDIDATE_1_SOURCE",
                          "CANDIDATE_2_STATIONARY": "STATIONARY_CANDIDATE_2_SOURCE",
                          "TARGET_PLUS_CANDIDATE_1_STATIONARY": "MULTI_SOURCE_STATIONARY_BLEND",
+                         "TARGET_PLUS_CANDIDATE_2_STATIONARY": "MULTI_SOURCE_STATIONARY_BLEND",
+                         "CANDIDATE_1_PLUS_CANDIDATE_2_STATIONARY": "MULTI_SOURCE_STATIONARY_BLEND",
                          "ALL_SOURCES_STATIONARY": "MULTI_SOURCE_STATIONARY_BLEND"}
     classification = "UNRESOLVED"
     if run.get("sourceIdentifiable"):
@@ -202,20 +261,66 @@ def interpret_source_switching_temporal_model(preparation: dict[str, Any],
         elif bic_winner == predictive_winner == "SECTOR_VARYING_SOURCE_AMPLITUDES":
             dominant = []
             for sector in run["perSectorSourceCoherentVectors"]:
-                dominant.append(max(sector["sources"], key=lambda key:
-                                    sector["sources"][key]["coherentAmplitude"]))
-            classification = ("SOURCE_SWITCHING_CONFIRMED" if len(set(dominant)) > 1
+                sources = sector["sources"]
+                ordered = sorted(sources, key=lambda key: sources[key]["coherentAmplitude"],
+                                 reverse=True)
+                winner = ordered[0]
+                vector = np.array([sources[winner]["sinAmplitude"],
+                                   sources[winner]["cosAmplitude"]])
+                covariance = np.asarray(sources[winner]["covariance"], float)
+                # A two-dimensional coherent vector is conditionally supported by
+                # the conventional 95% chi-square confidence ellipse (2 dof).
+                supported = float(vector @ np.linalg.pinv(covariance) @ vector) > 5.991464547
+                winner_amplitude = sources[winner]["coherentAmplitude"]
+                winner_gradient = vector / winner_amplitude if winner_amplitude else np.zeros(2)
+                joint_covariance = np.asarray(sector["jointCoherentVectorCovariance"], float)
+                winner_index = list(COMPONENT_IDS).index(winner)
+                separated = True
+                for competitor in ordered[1:]:
+                    other = sources[competitor]
+                    other_vector = np.array([other["sinAmplitude"], other["cosAmplitude"]])
+                    other_amplitude = other["coherentAmplitude"]
+                    other_gradient = (other_vector / other_amplitude
+                                      if other_amplitude else np.zeros(2))
+                    competitor_index = list(COMPONENT_IDS).index(competitor)
+                    gradient = np.zeros(6)
+                    gradient[[winner_index, 3 + winner_index]] = winner_gradient
+                    gradient[[competitor_index, 3 + competitor_index]] = -other_gradient
+                    difference_sigma = math.sqrt(max(0., float(
+                        gradient @ joint_covariance @ gradient)))
+                    # A near tie whose confidence intervals overlap is ambiguous.
+                    separated &= winner_amplitude - other_amplitude > 1.959963985 * difference_sigma
+                if supported and separated:
+                    dominant.append({"sector": sector["sector"], "componentID": winner,
+                                     "uncertaintySupported": True})
+            identities = {item["componentID"] for item in dominant}
+            classification = ("SOURCE_SWITCHING_CONFIRMED"
+                              if len(dominant) >= 2 and len(identities) >= 2
                               else "SECTOR_VARIABLE_MULTI_SOURCE")
+    candidates = list(preparation.get("catalogCandidates") or [])
+    preferred = (candidates[0] if classification == "STATIONARY_CANDIDATE_1_SOURCE"
+                 else candidates[1] if classification == "STATIONARY_CANDIDATE_2_SOURCE"
+                 else None)
+    recommendations = {
+        "STATIONARY_TARGET_SOURCE": "TARGET_INTRINSIC_RESIDUAL_MODELING",
+        "STATIONARY_CANDIDATE_1_SOURCE": "INDEPENDENT_COUNTERPART_PHOTOMETRIC_VARIABILITY_VALIDATION",
+        "STATIONARY_CANDIDATE_2_SOURCE": "INDEPENDENT_COUNTERPART_PHOTOMETRIC_VARIABILITY_VALIDATION",
+        "MULTI_SOURCE_STATIONARY_BLEND": "JOINT_MULTI_SOURCE_VARIABILITY_MODEL",
+        "SECTOR_VARIABLE_MULTI_SOURCE": "ADDITIONAL_SOURCE_LOCALIZATION_DATA",
+        "SOURCE_SWITCHING_CONFIRMED": "SOURCE_SWITCHING_PHYSICAL_MECHANISM_MODELING",
+        "UNRESOLVED": "ADDITIONAL_SOURCE_LOCALIZATION_DATA",
+    }
     return {"version": "openstar.tess-source-switching-temporal-interpretation.v1",
             "classification": classification, "bicWinningModel": bic_winner,
             "heldOutWinningModel": predictive_winner, "modelComparisons": models,
             "perSectorSourceCoherentVectors": run["perSectorSourceCoherentVectors"],
             "sourceIdentifiable": run.get("sourceIdentifiable", False),
+            "preferredCandidate": preferred, "catalogCandidates": candidates,
             "sourceAttributionResolved": classification in {
                 "STATIONARY_TARGET_SOURCE", "STATIONARY_CANDIDATE_1_SOURCE",
                 "STATIONARY_CANDIDATE_2_SOURCE"},
             "physicalCycleResolved": False, "physicalMechanismResolved": False,
             "referenceFamilyPeriodDays": preparation["referenceFamilyPeriodDays"],
             "subtractedHarmonicOrders": preparation["subtractedHarmonicOrders"],
-            "recommendedNextTest": None,
+            "recommendedNextTest": recommendations[classification],
             "validationGuard": "A variable-source result requires both BIC and frozen-ephemeris held-out prediction to select it."}

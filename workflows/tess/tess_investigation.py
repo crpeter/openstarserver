@@ -4178,7 +4178,15 @@ def build_engine(
             raise RuntimeError("Temporal source-model interpretation requires prepare and run.")
         result = interpret_source_switching_temporal_model(preparation, run)
         path = Path(preparation["artifactRoot"]) / "interpretation.json"; _write_json(path, result)
-        return StageOutcome(result=result, next_stage=None, stop=True,
+        candidate_continuation = (
+            result.get("classification") in {
+                "STATIONARY_CANDIDATE_1_SOURCE", "STATIONARY_CANDIDATE_2_SOURCE"}
+            and result.get("recommendedNextTest")
+            == "INDEPENDENT_COUNTERPART_PHOTOMETRIC_VARIABILITY_VALIDATION")
+        return StageOutcome(result=result, next_stage=(StageRequest(
+            _next_stage_id(request.id, "prepare-offset-source-variability"),
+            "openstar.tess.offset-source-variability.prepare", {}, request.id)
+            if candidate_continuation else None), stop=not candidate_continuation,
             final_status="QUIESCENT_AWAITING_DATA",
             input_hashes={"preparation": sha256_json(preparation), "run": sha256_json(run)},
             artifacts=(_artifact(path, "application/json"),))
@@ -4260,7 +4268,9 @@ def build_engine(
         multisource = _latest_result_for_handler(investigation, "openstar.tess.multi-source-residual.interpret")
         residual_phase_localization = _latest_result_for_handler(
             investigation, "openstar.tess.residual-phase-difference-imaging.interpret")
-        catalog_counterpart = (residual_phase_localization or _latest_result_for_handler(
+        temporal_source_model = _latest_result_for_handler(
+            investigation, "openstar.tess.source-switching-temporal-model.interpret")
+        catalog_counterpart = (temporal_source_model or residual_phase_localization or _latest_result_for_handler(
             investigation, "openstar.tess.catalog-guided-source-localization.interpret")
             or _latest_result_for_handler(
             investigation, "openstar.tess.catalog-counterpart-identification.analyze"

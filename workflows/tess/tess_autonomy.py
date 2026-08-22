@@ -1245,6 +1245,27 @@ def plan_tess_branches(
         temporal_started = any(
             stage.handler_id.startswith("openstar.tess.source-switching-temporal-model.")
             for stage in investigation.stages)
+        if source_switching_temporal is not None and not validation_started:
+            temporal_result = source_switching_temporal.result or {}
+            candidate = temporal_result.get("preferredCandidate") or {}
+            candidate_ids = candidate.get("catalogIDs") or {}
+            justified_candidate = (
+                candidate.get("raDeg") is not None and candidate.get("decDeg") is not None
+                and (candidate_ids.get("ticID") is not None
+                     or candidate_ids.get("gaiaDR3SourceID") is not None))
+            if (temporal_result.get("classification") in {
+                    "STATIONARY_CANDIDATE_1_SOURCE", "STATIONARY_CANDIDATE_2_SOURCE"}
+                    and temporal_result.get("recommendedNextTest")
+                    == "INDEPENDENT_COUNTERPART_PHOTOMETRIC_VARIABILITY_VALIDATION"
+                    and justified_candidate):
+                return (ScientificBranch(
+                    id=f"continue-counterpart-variability-after-{source_switching_temporal.id}",
+                    experiment=StageRequest(
+                        id=_continuation_stage_id(
+                            source_switching_temporal, "prepare-offset-source-variability"),
+                        handler_id="openstar.tess.offset-source-variability.prepare",
+                        parameters={}, triggered_by_stage_id=source_switching_temporal.id),
+                ),)
         if (residual_phase_difference_image is not None
                 and source_switching_temporal is None and not temporal_started):
             difference_result = residual_phase_difference_image.result or {}
