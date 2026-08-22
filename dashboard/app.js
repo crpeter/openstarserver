@@ -1,5 +1,6 @@
 const $ = selector => document.querySelector(selector);
 const fmt = value => value == null ? "—" : Intl.NumberFormat(undefined, {notation: "compact", maximumFractionDigits: 1}).format(value);
+const exactFmt = value => value == null ? "—" : Intl.NumberFormat().format(value);
 const duration = seconds => seconds == null ? "—" : seconds < 60 ? `${seconds.toFixed(1)} s` : seconds < 3600 ? `${(seconds / 60).toFixed(1)} min` : `${(seconds / 3600).toFixed(1)} h`;
 const relative = timestamp => {
   if (!timestamp) return "Never";
@@ -60,13 +61,14 @@ function renderSectors(sweeps) {
   if (!sweeps.length) { replace($("#sectors"), []); return; }
   replace($("#sectors"), sweeps.map(sweep => {
     const percent = Math.max(0, Math.min(1, sweep.progress || 0));
+    const percentText = `${(percent * 100).toFixed(2)}%`;
     const metrics = [["Remaining", sweep.remaining], ["Runnable", sweep.runnable], ["In flight or recovery", sweep.inFlightOrRecovery], ["Admitted", sweep.admitted], ["Inventory", sweep.inventory]];
     const status = sweep.status === "COMPLETE" ? "COMPLETE" : (sweep.runStatus || sweep.status);
     return element("article", {className: "sector"}, [
       element("div", {className: "sector-heading"}, [element("h3", {text: `TESS Sector ${sweep.sector}`}), element("span", {className: `badge ${status === "COMPLETE" ? "active" : "idle"}`, text: status})]),
-      element("div", {className: "sector-total"}, [element("b", {text: `${fmt(sweep.complete)} / ${fmt(sweep.inventory)}`}), element("span", {text: " targets complete"}), element("strong", {text: `${(percent * 100).toFixed(1)}%`})]),
-      element("div", {className: "sector-bar", title: `${(percent * 100).toFixed(1)}% complete`}, [Object.assign(element("i"), {style: `width:${percent * 100}%`})]),
-      element("div", {className: "sector-metrics"}, metrics.map(([label, value]) => element("div", {}, [element("span", {text: label}), element("b", {text: fmt(value)})])))
+      element("div", {className: "sector-total"}, [element("b", {text: `${exactFmt(sweep.complete)} / ${exactFmt(sweep.inventory)}`}), element("span", {text: " targets complete"}), element("strong", {text: percentText})]),
+      element("div", {className: "sector-bar", title: `${percentText} complete`}, [Object.assign(element("i"), {style: `width:${percent * 100}%`})]),
+      element("div", {className: "sector-metrics"}, metrics.map(([label, value]) => element("div", {}, [element("span", {text: label}), element("b", {text: exactFmt(value)})])))
     ]);
   }));
 }
