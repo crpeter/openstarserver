@@ -1,4 +1,5 @@
 import json
+import shutil
 import tempfile
 import unittest
 from unittest import mock
@@ -14,6 +15,7 @@ from openstar_workflow import StageOutcome, WorkflowEngine
 from openstar_workflow import StageRequest
 from workflows.tess.tess_autonomy import (
     TessInvestigationTargetSource,
+    _repair_official_prf_transport_terminal,
     _repair_resolved_family_multisource_failure,
     plan_tess_branches,
     repair_obsolete_terminal_wait,
@@ -99,6 +101,117 @@ class TessAutonomyIntegrationTests(unittest.TestCase):
             "openstar.tess.prepare-target", branches[0].experiment.handler_id
         )
         self.assertEqual("blind-c", branches[0].experiment.parameters["datasetID"])
+
+    def _historical_blocked_prf(self, errors=None, **interpret_overrides):
+        target = self.source.enumerate_targets()[0]
+        investigation = self.store.create(
+            target.investigation_id, WORKFLOW_ID, WORKFLOW_VERSION,
+            metadata=target.metadata,
+        )
+        evidence = (
+            ("071-prf-prepare", "openstar.tess.official-spoc-prf-forward-modeling.prepare",
+             {"version": "openstar.tess-prf-deblending.v1"}, None),
+            ("072-prf-run", "openstar.tess.official-spoc-prf-forward-modeling.run",
+             {"sectorResults": [], "errors": errors if errors is not None else [
+                 {"sector": 2, "error": "TimeoutError: The read operation timed out"},
+                 {"sector": 29, "error": "URLError: <urlopen error [Errno 60] Operation timed out>"},
+                 {"sector": 68, "error": "URLError: <urlopen error [SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred>"},
+                 {"sector": 69, "error": "URLError: <urlopen error timed out>"},
+             ]}, "071-prf-prepare"),
+            ("073-prf-interpret", "openstar.tess.official-spoc-prf-forward-modeling.interpret",
+             {"classification": "BLOCKED_EXTERNAL_DATA",
+              "recommendedNextTest": "RETRY_PIXEL_RESPONSE_FUNCTION_DEBLENDING",
+              "physicalMechanismResolved": False, **interpret_overrides}, "072-prf-run"),
+            ("074-finalize", "openstar.tess.finalize", {"claim": {}}, "073-prf-interpret"),
+        )
+        for stage_id, handler, result, trigger in evidence:
+            running = InvestigationStage(stage_id, handler, "RUNNING", trigger, {})
+            investigation = self.store.append_running_stage(investigation, running)
+            terminal = self.store.build_terminal_stage(
+                stage_id=stage_id, handler_id=handler, status="COMPLETE",
+                triggered_by_stage_id=trigger, parameters={}, result=result, error=None,
+                software_id="historical", software_version="20.18",
+                started_at=running.started_at, stop=handler == "openstar.tess.finalize",
+            )
+            investigation = self.store.complete_current_stage(investigation, terminal)
+        return self.store.set_control_state(
+            investigation, status="COMPLETE", control_state={
+                "branchAssessments": [], "selectedExperiment": None,
+                "schedulerAction": "INVESTIGATION_COMPLETE",
+            },
+        )
+
+    def test_historical_prf_transport_recovery_is_append_only_and_idempotent(self):
+        investigation = self._historical_blocked_prf()
+        stage_files = {
+            path: path.read_bytes()
+            for path in self.store.directory_for(investigation.id).joinpath("stages").iterdir()
+        }
+        repaired = repair_obsolete_terminal_wait(self.store, investigation)
+        selected = repaired.metadata["controlState"]["selectedExperiment"]
+        self.assertEqual("RUNNING", repaired.status)
+        self.assertEqual("openstar.tess.official-spoc-prf-forward-modeling.run",
+                         selected["handler_id"])
+        self.assertEqual({}, selected["parameters"])
+        self.assertEqual("073-prf-interpret", selected["triggered_by_stage_id"])
+        self.assertEqual(investigation.stages, repaired.stages)
+        self.assertEqual(stage_files, {path: path.read_bytes() for path in stage_files})
+        self.assertEqual(repaired, repair_obsolete_terminal_wait(self.store, repaired))
+
+    def test_historical_prf_recovery_fails_closed(self):
+        cases = (
+            ({"errors": [{"sector": 2, "error": "RuntimeError: invalid PRF grid"}]}, {}),
+            ({"errors": []}, {}),
+            ({}, {"classification": "UNRESOLVED"}),
+            ({}, {"recommendedNextTest": "OTHER"}),
+            ({}, {"physicalMechanismResolved": True}),
+        )
+        for position, (history_kwargs, overrides) in enumerate(cases):
+            with self.subTest(position=position):
+                # Each history needs a distinct durable investigation id.
+                investigation = self._historical_blocked_prf(
+                    **history_kwargs, **overrides
+                )
+                control = investigation.metadata["controlState"]
+                self.assertIsNone(_repair_official_prf_transport_terminal(
+                    self.store, investigation, control
+                ))
+                # Remove this case before creating the next identical test id.
+                shutil.rmtree(self.store.directory_for(investigation.id))
+
+        investigation = self._historical_blocked_prf()
+        control = investigation.metadata["controlState"]
+        run = investigation.stages[1]
+        with_sector_result = replace(
+            investigation,
+            stages=(investigation.stages[0], replace(
+                run, result={**run.result, "sectorResults": [{"sector": 2}]}
+            ), *investigation.stages[2:]),
+        )
+        broken_lineage = replace(
+            investigation,
+            stages=(*investigation.stages[:2], replace(
+                investigation.stages[2], triggered_by_stage_id="unrelated-run"
+            ), investigation.stages[3]),
+        )
+        later_attempt = replace(
+            investigation,
+            stages=investigation.stages + (InvestigationStage(
+                "075-prf-run", "openstar.tess.official-spoc-prf-forward-modeling.run",
+                "COMPLETE", investigation.stages[2].id, {}, result={}
+            ),),
+        )
+        inconsistent_control = {**control, "selectedExperiment": {"id": "other"}}
+        for snapshot, snapshot_control in (
+            (with_sector_result, control),
+            (broken_lineage, control),
+            (later_attempt, control),
+            (replace(investigation, status="RUNNING"), control),
+            (investigation, inconsistent_control),
+        ):
+            self.assertIsNone(_repair_official_prf_transport_terminal(
+                self.store, snapshot, snapshot_control
+            ))
 
     def test_tic_277940827_stage_047_schedules_residual_phase_difference_image_append_only(self):
         target = self.source.enumerate_targets()[0]

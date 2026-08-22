@@ -337,6 +337,118 @@ def _repair_catalog_timeout_terminal(
     )
 
 
+_OFFICIAL_PRF_PREPARE = "openstar.tess.official-spoc-prf-forward-modeling.prepare"
+_OFFICIAL_PRF_RUN = "openstar.tess.official-spoc-prf-forward-modeling.run"
+_OFFICIAL_PRF_INTERPRET = "openstar.tess.official-spoc-prf-forward-modeling.interpret"
+
+
+def _legacy_prf_transport_error(error: object) -> bool:
+    """Recognize only transport text emitted by the obsolete PRF runner."""
+    if not isinstance(error, str):
+        return False
+    return bool(
+        re.fullmatch(
+            r"TimeoutError: (?:The read operation timed out|timed out|read timed out)",
+            error,
+        )
+        or re.fullmatch(
+            r"URLError: <urlopen error (?:timed out|\[Errno 60\] Operation timed out)>",
+            error,
+        )
+        or (
+            error.startswith("URLError: <urlopen error [SSL: UNEXPECTED_EOF_WHILE_READING]")
+            and error.endswith(">")
+        )
+    )
+
+
+def _repair_official_prf_transport_terminal(
+    store: InvestigationStore, investigation: Investigation, control: dict
+) -> Investigation | None:
+    """Select one append-only retry for a legacy transport-only PRF result."""
+    if (
+        investigation.status != "COMPLETE"
+        or control.get("schedulerAction") != "INVESTIGATION_COMPLETE"
+        or control.get("selectedExperiment") not in (None, {})
+        or not _has_terminal_tess_evidence(investigation)
+    ):
+        return None
+
+    stages = investigation.stages
+    interpret_index = next((
+        index for index in range(len(stages) - 1, -1, -1)
+        if stages[index].handler_id == _OFFICIAL_PRF_INTERPRET
+        and stages[index].status == "COMPLETE"
+    ), None)
+    if interpret_index is None:
+        return None
+    interpretation = stages[interpret_index]
+    result = interpretation.result or {}
+    if not (
+        result.get("classification") == "BLOCKED_EXTERNAL_DATA"
+        and result.get("recommendedNextTest")
+        == "RETRY_PIXEL_RESPONSE_FUNCTION_DEBLENDING"
+        and result.get("physicalMechanismResolved") is False
+    ):
+        return None
+
+    by_id = {stage.id: stage for stage in stages}
+    run = by_id.get(interpretation.triggered_by_stage_id)
+    prepare = by_id.get(run.triggered_by_stage_id) if run is not None else None
+    if not (
+        run is not None and run.handler_id == _OFFICIAL_PRF_RUN
+        and run.status == "COMPLETE" and isinstance(run.result, dict)
+        and prepare is not None and prepare.handler_id == _OFFICIAL_PRF_PREPARE
+        and prepare.status == "COMPLETE"
+    ):
+        return None
+    sector_results = run.result.get("sectorResults")
+    errors = run.result.get("errors")
+    if sector_results != [] or not isinstance(errors, list) or not errors:
+        return None
+    if not all(
+        isinstance(item, dict) and _legacy_prf_transport_error(item.get("error"))
+        for item in errors
+    ):
+        return None
+
+    # The completed finalizer must be the current terminal evidence and must
+    # descend directly from this interpretation. Any later PRF stage means a
+    # retry has already been attempted or superseded.
+    terminal = stages[-1]
+    if not (
+        terminal.handler_id == "openstar.tess.finalize"
+        and terminal.status == "COMPLETE"
+        and terminal.triggered_by_stage_id == interpretation.id
+        and all(
+            not stage.handler_id.startswith(
+                "openstar.tess.official-spoc-prf-forward-modeling."
+            )
+            for stage in stages[interpret_index + 1:]
+        )
+    ):
+        return None
+
+    prefixes = [int(stage.id.partition("-")[0]) for stage in stages
+                if stage.id.partition("-")[0].isdigit()]
+    retry = StageRequest(
+        id=f"{max(prefixes, default=0) + 1:03d}-run-official-spoc-prf-forward-modeling",
+        handler_id=_OFFICIAL_PRF_RUN,
+        parameters={},
+        triggered_by_stage_id=interpretation.id,
+    )
+    return store.set_control_state(
+        investigation,
+        status="RUNNING",
+        control_state={
+            "branchAssessments": [],
+            "selectedExperiment": asdict(retry),
+            "schedulerAction": "RUN_EXPERIMENT",
+            "recovery": "TESS_OFFICIAL_PRF_TRANSPORT_COMPATIBILITY_RETRY",
+        },
+    )
+
+
 def _positive_number(value: object) -> bool:
     try:
         number = float(value)
@@ -962,6 +1074,12 @@ def repair_obsolete_terminal_wait(
     control = investigation.metadata.get("controlState")
     if investigation.workflow_id != WORKFLOW_ID or not isinstance(control, dict):
         return investigation
+
+    prf_transport_repair = _repair_official_prf_transport_terminal(
+        store, investigation, control
+    )
+    if prf_transport_repair is not None:
+        return prf_transport_repair
 
     archive_timeout_repair = _repair_archive_timeout_localization_failure(
         store, investigation, control
