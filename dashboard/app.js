@@ -61,7 +61,7 @@ function renderSectors(sweeps) {
   replace($("#sectors"), sweeps.map(sweep => {
     const percent = Math.max(0, Math.min(1, sweep.progress || 0));
     const metrics = [["Remaining", sweep.remaining], ["Runnable", sweep.runnable], ["In flight or recovery", sweep.inFlightOrRecovery], ["Admitted", sweep.admitted], ["Inventory", sweep.inventory]];
-    const status = sweep.runStatus === "RUNNING" ? "RUNNING" : sweep.status;
+    const status = sweep.status === "COMPLETE" ? "COMPLETE" : (sweep.runStatus || sweep.status);
     return element("article", {className: "sector"}, [
       element("div", {className: "sector-heading"}, [element("h3", {text: `TESS Sector ${sweep.sector}`}), element("span", {className: `badge ${status === "COMPLETE" ? "active" : "idle"}`, text: status})]),
       element("div", {className: "sector-total"}, [element("b", {text: `${fmt(sweep.complete)} / ${fmt(sweep.inventory)}`}), element("span", {text: " targets complete"}), element("strong", {text: `${(percent * 100).toFixed(1)}%`})]),
