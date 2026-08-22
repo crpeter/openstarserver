@@ -207,6 +207,13 @@ class ScienceRunCatalog:
             )
         return self.get(run_id) or {}
 
+    def delete(self, run_id: str) -> None:
+        """Delete only catalog metadata for a run; authoritative science state is untouched."""
+        if not self.create:
+            raise RuntimeError("ScienceRunCatalog is read-only.")
+        with self._connection(write=True) as connection:
+            connection.execute("DELETE FROM science_runs WHERE id = ?", (run_id,))
+
     @staticmethod
     def _decode(row: sqlite3.Row) -> dict[str, Any]:
         return {
