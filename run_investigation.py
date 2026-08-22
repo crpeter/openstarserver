@@ -10,6 +10,7 @@ from openstar_investigation import (
     InvestigationStore,
     sha256_file,
 )
+from openstar_science_runs import ScienceRunRecorder
 from openstar_workflow import (
     StageOutcome,
     StageRequest,
@@ -158,54 +159,77 @@ def parse_args():
 
 def main():
     args = parse_args()
-
-    store = InvestigationStore(args.store)
-    investigation = store.create(
-        args.investigation_id,
-        WORKFLOW_ID,
-        WORKFLOW_VERSION,
+    store_root = Path(args.store).expanduser().resolve()
+    recorder = ScienceRunRecorder(
+        kind="investigation",
+        display_name=f"Investigation {args.investigation_id}",
+        state_root=store_root,
+        workflow_id=WORKFLOW_ID,
+        identity=args.investigation_id,
         metadata={
             "projectPath": str(Path(args.project).expanduser().resolve()),
-            "coordinator": args.coordinator,
+            "investigationID": args.investigation_id,
         },
     )
 
-    coordinator = OpenStarCoordinatorClient(args.coordinator)
-    health = coordinator.health()
-    print("⭐ OpenStar Investigation")
-    print(f"Investigation: {investigation.id}")
-    print(f"Workflow: {WORKFLOW_ID}")
-    print(f"Coordinator: {args.coordinator}")
-    print(f"Coordinator build: {health.get('build', 'unknown')}")
+    try:
+        store = InvestigationStore(store_root)
+        investigation = store.create(
+            args.investigation_id,
+            WORKFLOW_ID,
+            WORKFLOW_VERSION,
+            metadata={
+                "projectPath": str(Path(args.project).expanduser().resolve()),
+                "coordinator": args.coordinator,
+            },
+        )
 
-    engine = build_engine(
-        store,
-        coordinator,
-        poll_interval=args.poll_interval,
-        timeout=args.timeout,
-    )
+        coordinator = OpenStarCoordinatorClient(args.coordinator)
+        health = coordinator.health()
+        print("⭐ OpenStar Investigation")
+        print(f"Investigation: {investigation.id}")
+        print(f"Workflow: {WORKFLOW_ID}")
+        print(f"Coordinator: {args.coordinator}")
+        print(f"Coordinator build: {health.get('build', 'unknown')}")
 
-    final = engine.run(
-        investigation,
-        StageRequest(
-            id="001-prepare-project",
-            handler_id="local.project.prepare",
-            parameters={"projectPath": args.project},
-        ),
-        software_id=SOFTWARE_ID,
-        software_version=SOFTWARE_VERSION,
-    )
+        engine = build_engine(
+            store,
+            coordinator,
+            poll_interval=args.poll_interval,
+            timeout=args.timeout,
+        )
 
-    print()
-    print("🏁 Investigation terminal")
-    print(f"status: {final.status}")
-    print(f"stages: {len(final.stages)}")
-    print(f"record: {store.path_for(final.id)}")
+        final = engine.run(
+            investigation,
+            StageRequest(
+                id="001-prepare-project",
+                handler_id="local.project.prepare",
+                parameters={"projectPath": args.project},
+            ),
+            software_id=SOFTWARE_ID,
+            software_version=SOFTWARE_VERSION,
+        )
 
-    last = final.stages[-1]
-    if last.result is not None:
-        print("terminal result:")
-        print(json.dumps(last.result, indent=2, sort_keys=True))
+        print()
+        print("🏁 Investigation terminal")
+        print(f"status: {final.status}")
+        print(f"stages: {len(final.stages)}")
+        print(f"record: {store.path_for(final.id)}")
+
+        last = final.stages[-1]
+        if last.result is not None:
+            print("terminal result:")
+            print(json.dumps(last.result, indent=2, sort_keys=True))
+        recorder.finish(
+            status=final.status,
+            summary={"stageCount": len(final.stages)},
+        )
+    except KeyboardInterrupt:
+        recorder.interrupt()
+        raise
+    except Exception as error:
+        recorder.fail(error)
+        raise
 
 
 if __name__ == "__main__":

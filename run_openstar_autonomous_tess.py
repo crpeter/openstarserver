@@ -19,6 +19,7 @@ from openstar_dispatch import InvestigationDispatcher
 from openstar_investigation import InvestigationStore
 from openstar_lifecycle import InvestigationLifecycleLoop, LifecycleResult
 from openstar_scheduler import InvestigationScheduler
+from openstar_science_runs import ScienceRunRecorder
 from openstar_targets import InvestigationTargetPortfolio, NoEligibleTargetError
 from workflows.tess.tess_autonomy import (
     WORKFLOW_ID,
@@ -207,20 +208,37 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    root = Path(args.state_dir).expanduser().resolve()
+    recorder = ScienceRunRecorder(
+        kind="autonomous-investigation",
+        display_name="Autonomous TESS Investigation",
+        state_root=root,
+        workflow_id=WORKFLOW_ID,
+        metadata={
+            "mission": "TESS",
+            "projects": [str(Path(path).expanduser()) for path in args.project],
+            "multiInvestigation": args.multi_investigation,
+        },
+    )
     try:
-        return run_autonomous_tess(
+        code = run_autonomous_tess(
             args.project,
             args.coordinator_url,
-            args.state_dir,
+            root,
             poll_interval=args.poll_interval,
             timeout=args.timeout,
             multi_investigation=args.multi_investigation,
             max_concurrent_investigations=args.max_concurrent_investigations,
         )
+        status = "ATTENTION_REQUIRED" if code == 2 else ("FAILED" if code else "FINISHED")
+        recorder.finish(status=status, summary={"exitCode": code})
+        return code
     except KeyboardInterrupt:
+        recorder.interrupt()
         print("OpenStar lifecycle: disposition=SHUTDOWN", file=sys.stderr)
         return 130
     except Exception as error:
+        recorder.fail(error)
         print(f"OpenStar lifecycle: disposition=ERROR error={error}", file=sys.stderr)
         return 1
 

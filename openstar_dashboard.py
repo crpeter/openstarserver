@@ -5,17 +5,20 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import sqlite3
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import unquote, urlparse
 from urllib.request import urlopen
 
 from dashboard import build_snapshot, history_snapshot
-from openstar_sector_sweep_status import sector_sweeps_projection
+from openstar_contributions import DEFAULT_CONTRIBUTION_DB
+from openstar_science_runs import ScienceRunCatalog
+from openstar_sector_sweep_status import sector_sweep_projection
 
 ROOT = Path(__file__).resolve().parent
 
@@ -47,6 +50,51 @@ class CoordinatorClient:
             "contributions": contributions,
             "projects": projects,
         }
+
+
+class ContributionActivityReader:
+    """Read latest accepted-work activity without mutating the contribution ledger."""
+
+    def __init__(self, path: str | Path = DEFAULT_CONTRIBUTION_DB):
+        raw = Path(path).expanduser()
+        self.path = (raw if raw.is_absolute() else ROOT / raw).resolve()
+
+    def latest_seen(self) -> dict[str, float]:
+        if not self.path.exists():
+            return {}
+        connection = sqlite3.connect(
+            f"file:{self.path}?mode=ro", uri=True, timeout=1.0
+        )
+        try:
+            rows = connection.execute(
+                "SELECT node_id, MAX(accepted_at) FROM contributions GROUP BY node_id"
+            ).fetchall()
+        finally:
+            connection.close()
+        return {
+            str(node_id).strip().lower(): float(accepted_at)
+            for node_id, accepted_at in rows
+            if node_id is not None and accepted_at is not None
+        }
+
+
+def _overlay_latest_activity(
+    nodes: list[dict[str, Any]], latest_seen: dict[str, float]
+) -> list[dict[str, Any]]:
+    result = copy.deepcopy(nodes)
+    for node in result:
+        node_id = str(node.get("nodeID") or node.get("id") or "").strip().lower()
+        latest = latest_seen.get(node_id)
+        if latest is None:
+            continue
+        try:
+            existing = float(node.get("lastSeenAt"))
+        except (TypeError, ValueError):
+            existing = None
+        if existing is None or latest > existing:
+            node["lastSeenAt"] = latest
+            node["lastSeenSource"] = "accepted_contribution"
+    return result
 
 
 class TelemetryStore:
@@ -82,19 +130,61 @@ class TelemetryStore:
             return json.loads(json.dumps(self._heartbeats))
 
 
+def _sector_sweeps_from_science_runs(
+    science_runs: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    sweeps: list[dict[str, Any]] = []
+    for run in science_runs:
+        if run.get("kind") != "tess-sector-sweep":
+            continue
+        metadata = run.get("metadata") if isinstance(run.get("metadata"), dict) else {}
+        expected_sector = metadata.get("sector")
+        state_root = run.get("stateRoot")
+        projection = []
+        if isinstance(state_root, str) and state_root:
+            projection = sector_sweep_projection(state_root)
+        sweep = next(
+            (
+                item
+                for item in projection
+                if expected_sector is None or item.get("sector") == expected_sector
+            ),
+            None,
+        )
+        if sweep is None:
+            summary = run.get("summary") if isinstance(run.get("summary"), dict) else {}
+            candidate = summary.get("sectorSweep")
+            if isinstance(candidate, dict):
+                sweep = dict(candidate)
+        if sweep is None:
+            continue
+        sweeps.append(
+            {
+                **sweep,
+                "runID": run.get("id"),
+                "runStatus": run.get("status"),
+                "displayName": run.get("displayName"),
+                "updatedAt": run.get("updatedAt"),
+            }
+        )
+    return sweeps
+
+
 class DashboardApplication:
     def __init__(
         self,
         coordinator: CoordinatorClient,
         telemetry: TelemetryStore | None = None,
         observation_cache_seconds: float = 1.5,
-        sector_sweep_state_dirs: Iterable[str | Path] = (),
+        science_run_catalog: ScienceRunCatalog | None = None,
+        contribution_activity_reader: ContributionActivityReader | None = None,
     ):
         self.coordinator = coordinator
         self.telemetry = telemetry or TelemetryStore()
         self.observation_cache_seconds = observation_cache_seconds
-        self.sector_sweep_state_dirs = tuple(
-            Path(path).expanduser().resolve() for path in sector_sweep_state_dirs
+        self.science_run_catalog = science_run_catalog or ScienceRunCatalog(create=False)
+        self.contribution_activity_reader = (
+            contribution_activity_reader or ContributionActivityReader()
         )
         self._observation_lock = threading.Lock()
         self._cached_observation: dict[str, Any] | None = None
@@ -106,8 +196,25 @@ class DashboardApplication:
             now = time.monotonic()
             if self._cached_observation is None or now >= self._cached_until:
                 observation = self.coordinator.observation()
-                observation["sectorSweeps"] = sector_sweeps_projection(
-                    self.sector_sweep_state_dirs
+                # The currently running coordinator may expose durable node
+                # registration timestamps. Accepted work is also authoritative
+                # evidence that a node was alive, so overlay it read-only.
+                try:
+                    latest_seen = self.contribution_activity_reader.latest_seen()
+                except (OSError, sqlite3.Error, TypeError, ValueError):
+                    latest_seen = {}
+                observation["nodes"] = _overlay_latest_activity(
+                    observation["nodes"], latest_seen
+                )
+                # Science-run observability is optional. A missing/corrupt catalog
+                # must never make the generic fleet dashboard unavailable.
+                try:
+                    science_runs = self.science_run_catalog.list_runs()
+                except Exception:
+                    science_runs = []
+                observation["scienceRuns"] = science_runs
+                observation["sectorSweeps"] = _sector_sweeps_from_science_runs(
+                    science_runs
                 )
                 self._cached_observation = observation
                 self._cached_until = time.monotonic() + self.observation_cache_seconds
@@ -131,6 +238,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         return
 
+    def _write_body(self, body: bytes) -> None:
+        """Ignore clients that navigate/refresh after a response has started."""
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            return
+
     def send_json(self, status: int, payload: Any):
         body = json.dumps(payload, separators=(",", ":"), allow_nan=False).encode()
         self.send_response(status)
@@ -138,7 +252,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
-        self.wfile.write(body)
+        self._write_body(body)
 
     def send_asset(self, relative: str, content_type: str):
         body = (ROOT / relative).read_bytes()
@@ -146,7 +260,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        self._write_body(body)
 
     def do_GET(self):
         path = urlparse(self.path).path
@@ -196,6 +310,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     200,
                     {
                         "projects": observation["projects"],
+                        "scienceRuns": observation.get("scienceRuns", []),
                         "sectorSweeps": observation.get("sectorSweeps", []),
                         "health": observation["health"],
                         "updatedAt": time.time(),
@@ -244,20 +359,11 @@ def main():
     parser.add_argument("--coordinator", default="http://127.0.0.1:8080")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8081)
-    parser.add_argument(
-        "--sector-sweep-state-dir",
-        action="append",
-        default=[],
-        help="Durable TESS sector-sweep state root to observe read-only (repeatable).",
-    )
     args = parser.parse_args()
     server = make_server(
         args.host,
         args.port,
-        DashboardApplication(
-            CoordinatorClient(args.coordinator),
-            sector_sweep_state_dirs=args.sector_sweep_state_dir,
-        ),
+        DashboardApplication(CoordinatorClient(args.coordinator)),
     )
     print(f"OpenStar dashboard: http://{args.host}:{args.port}/dashboard/")
     try:

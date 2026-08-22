@@ -8,18 +8,34 @@ source .venv/bin/activate
 
 The optional dashboard is a separate process. It only performs `GET` requests against the
 coordinator's existing `/v1` APIs, so the coordinator and workers operate normally when the
-dashboard is stopped or absent. For sector-level progress, the sidecar may also read explicitly
-configured persisted TESS sweep roots directly; those reads never start, restart, or modify a
-sweep.
+dashboard is stopped or absent.
+
+Science runners register themselves in the durable operational science-run catalog at
+`data/science-runs.sqlite3`. The dashboard reads that catalog automatically, so it can show
+current and historical science without being given TESS sectors, state directories, or other
+science-specific launch arguments. Catalog metadata never replaces or rewrites authoritative
+investigation/science history.
+
+For science state created before the catalog existed, run the one-time backfill. It discovers
+likely sector-sweep roots under `/tmp` and `data`; if a matching sector-sweep process is actually
+running locally, the legacy run is labeled `DISCOVERED_ACTIVE` rather than permanently claiming
+a `RUNNING` state that the old process cannot later clear. Other incomplete historical state is
+kept conservatively as discovered/incomplete. Future instrumented runners record exact
+`RUNNING` to terminal transitions automatically.
+
+```bash
+python backfill_openstar_science_runs.py
+```
+
+Normal dashboard launch:
 
 ```bash
 # Terminal 1: existing coordinator
 python coordinator.py --idle --host 127.0.0.1 --port 8080
 
-# Terminal 2: dashboard. Repeat --sector-sweep-state-dir for additional roots.
+# Terminal 2: dashboard
 python openstar_dashboard.py --coordinator http://127.0.0.1:8080 \
-  --host 127.0.0.1 --port 8081 \
-  --sector-sweep-state-dir /path/to/existing-sector-sweep-state
+  --host 127.0.0.1 --port 8081
 ```
 
 Open <http://127.0.0.1:8081/dashboard/>.
