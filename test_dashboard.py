@@ -1,4 +1,5 @@
 import json
+import tempfile
 import threading
 import time
 import unittest
@@ -204,7 +205,6 @@ class CoordinatorClientTests(unittest.TestCase):
             "/v1/health": {"ok": True},
             "/v1/nodes": [],
             "/v1/contributions/summary": {"allTime": {}, "currentSession": {}},
-            "/v1/science/tess-sector-sweeps": {"sweeps": []},
             "/v1/projects": [
                 {"projectID": "alpha beta", "status": {"projectID": "alpha beta"}}
             ],
@@ -221,7 +221,6 @@ class CoordinatorClientTests(unittest.TestCase):
             "/v1/health": {},
             "/v1/nodes": [],
             "/v1/contributions/summary": {},
-            "/v1/science/tess-sector-sweeps": {"sweeps": []},
             "/v1/projects": [
                 {
                     "projectID": "one",
@@ -238,8 +237,33 @@ class CoordinatorClientTests(unittest.TestCase):
         self.assertEqual(
             ["one", "two"], [item["projectID"] for item in observation["projects"]]
         )
-        self.assertEqual(5, len(calls))
+        self.assertEqual(4, len(calls))
         self.assertFalse(any(path.endswith("/status") for path in calls))
+
+    def test_dashboard_reads_configured_sector_sweep_state_directly(self):
+        with tempfile.TemporaryDirectory() as root:
+            Path(root, "tess-sector-9-inventory.json").write_text(
+                json.dumps({"sector": 9, "entries": []}),
+                encoding="utf-8",
+            )
+            coordinator = FakeCoordinator()
+            application = DashboardApplication(
+                coordinator,
+                sector_sweep_state_dirs=(root,),
+            )
+
+            _, observation = application.snapshot()
+
+            self.assertEqual(1, coordinator.calls)
+            self.assertEqual(9, observation["sectorSweeps"][0]["sector"])
+
+    def test_dashboard_without_configured_sector_state_has_no_sector_sweeps(self):
+        coordinator = FakeCoordinator()
+        application = DashboardApplication(coordinator)
+
+        _, observation = application.snapshot()
+
+        self.assertEqual([], observation["sectorSweeps"])
 
     def test_concurrent_snapshots_share_short_lived_observation(self):
         coordinator = FakeCoordinator()
@@ -276,6 +300,9 @@ class CoordinatorClientTests(unittest.TestCase):
         ):
             source = Path(path).read_text(encoding="utf-8")
             self.assertNotIn("dashboard", source.lower(), path)
+        coordinator_source = Path("coordinator.py").read_text(encoding="utf-8")
+        self.assertNotIn("tess-sector-sweeps", coordinator_source)
+        self.assertNotIn("sector-sweep-state-dir", coordinator_source)
 
 
 class SidecarHTTPTests(unittest.TestCase):
@@ -318,6 +345,9 @@ class SidecarHTTPTests(unittest.TestCase):
         self.assertEqual(
             "project",
             self.request("/api/dashboard/activity")[1]["projects"][0]["projectID"],
+        )
+        self.assertEqual(
+            [], self.request("/api/dashboard/activity")[1]["sectorSweeps"]
         )
         self.assertFalse(self.request("/api/dashboard/history")[1]["available"])
         self.assertIn(b"OpenStar", self.request("/dashboard/")[1])
