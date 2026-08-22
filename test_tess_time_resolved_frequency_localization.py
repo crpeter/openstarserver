@@ -11,7 +11,11 @@ from openstar_investigation import InvestigationStage, InvestigationStore
 from openstar_workflow import StageRequest
 from workflows.tess.tess_investigation import build_engine
 
-from workflows.tess.tess_frequency_localized_pixel import _response_map
+from workflows.tess.tess_frequency_localized_pixel import (
+    MIN_PEAK_POWER,
+    MIN_PHASE_CONCENTRATION,
+    _response_map,
+)
 from workflows.tess.tess_time_resolved_frequency_localization import (
     interpret_time_resolved_frequency_localization,
     prepare_time_resolved_frequency_localization,
@@ -136,12 +140,15 @@ class TimeResolvedFrequencyLocalizationTests(unittest.TestCase):
         self.assertEqual("TIME_VARIABLE_LOCALIZATION_CONFIRMED",result["classification"])
 
     def test_strong_power_poor_phase_concentration_fails_quality(self):
-        t=np.linspace(0,12,500); rng=np.random.default_rng(9); cube=np.empty((500,4,4))
-        for y in range(4):
-            for x in range(4): cube[:,y,x]=np.sin(2*np.pi*.45*t+rng.uniform(0,2*np.pi))
+        t=np.linspace(0,12,500); cube=np.empty((500,4,4))
+        # Deliberately spread high-power responses around the unit circle, but
+        # retain a small imbalance so the aperture response remains nonzero.
+        phases=([0.0]*5 + [np.pi/2]*4 + [np.pi]*4 + [3*np.pi/2]*3)
+        for (y,x),phase in zip(np.ndindex(4,4),phases):
+            cube[:,y,x]=np.sin(2*np.pi*.45*t+phase)
         response=_response_map(times=t,residual_cube=cube,valid_pixels=np.ones((4,4),bool),frequency=.45,power_map=np.ones((4,4)))
-        self.assertGreater(response["peakPower"],.05)
-        self.assertLess(response["phaseConcentration"], .35)
+        self.assertGreater(response["peakPower"],MIN_PEAK_POWER)
+        self.assertLess(response["phaseConcentration"],MIN_PHASE_CONCENTRATION)
         self.assertFalse(response["mapUsable"])
 
     def test_overlapping_candidates_do_not_force_switch(self):
