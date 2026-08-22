@@ -117,7 +117,14 @@ class RequestHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-cache" if content_type.startswith("text/html") else "public, max-age=3600")
+        self.send_header(
+            "Cache-Control",
+            (
+                "no-cache"
+                if content_type.startswith("text/html")
+                else "public, max-age=3600"
+            ),
+        )
         self.end_headers()
         try:
             self.wfile.write(body)
@@ -149,17 +156,43 @@ class RequestHandler(BaseHTTPRequestHandler):
 
         if path in {"/api/dashboard/summary", "/api/dashboard/workers"}:
             snapshot = dashboard_snapshot(RUNTIME)
-            self._send_json(200, snapshot if path.endswith("summary") else {"workers": snapshot["workers"], "updatedAt": snapshot["summary"]["updatedAt"]})
+            self._send_json(
+                200,
+                (
+                    snapshot
+                    if path.endswith("summary")
+                    else {
+                        "workers": snapshot["workers"],
+                        "updatedAt": snapshot["summary"]["updatedAt"],
+                    }
+                ),
+            )
             return
         worker_prefix = "/api/dashboard/workers/"
         if path.startswith(worker_prefix):
-            worker_id = unquote(path[len(worker_prefix):]).strip("/")
+            worker_id = unquote(path[len(worker_prefix) :]).strip("/")
             snapshot = dashboard_snapshot(RUNTIME)
-            worker = next((item for item in snapshot["workers"] if item["id"].lower() == worker_id.lower()), None)
+            worker = next(
+                (
+                    item
+                    for item in snapshot["workers"]
+                    if item["id"].lower() == worker_id.lower()
+                ),
+                None,
+            )
             if worker is None:
                 self._send_error_json(404, "Unknown worker.")
             else:
-                worker["recentCompleted"] = [item for item in snapshot["recentCompleted"] if item["nodeID"].lower() == worker_id.lower()][-20:]
+                worker["recentCompleted"] = [
+                    item
+                    for item in snapshot["recentCompleted"]
+                    if item["nodeID"].lower() == worker_id.lower()
+                ][-20:]
+                worker["recentFailures"] = [
+                    item
+                    for item in snapshot["recentFailures"]
+                    if str(item.get("nodeID", "")).lower() == worker_id.lower()
+                ][-20:]
                 self._send_json(200, worker)
             return
         if path == "/api/dashboard/activity":
@@ -316,11 +349,15 @@ class RequestHandler(BaseHTTPRequestHandler):
                 return
 
             max_work_units = payload.get("maxWorkUnits")
+            telemetry = payload.get("telemetry")
+            telemetry = telemetry if isinstance(telemetry, dict) else None
             try:
                 if max_work_units is None:
-                    work_unit = RUNTIME.claim_work(node_id)
+                    work_unit = RUNTIME.claim_work(node_id, telemetry)
                 else:
-                    work_unit = RUNTIME.claim_work_batch(node_id, max_work_units)
+                    work_unit = RUNTIME.claim_work_batch(
+                        node_id, max_work_units, telemetry
+                    )
             except ValueError as error:
                 self._send_error_json(400, str(error))
                 return

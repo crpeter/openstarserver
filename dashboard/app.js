@@ -1,5 +1,72 @@
-const $=s=>document.querySelector(s), fmt=n=>n==null?'—':Intl.NumberFormat(undefined,{notation:'compact',maximumFractionDigits:1}).format(n), duration=s=>s==null?'—':s<60?`${s.toFixed(1)} s`:s<3600?`${(s/60).toFixed(1)} min`:`${(s/3600).toFixed(1)} h`, relative=t=>{if(!t)return'Never';let s=Math.max(0,Date.now()/1000-t);return s<60?'just now':s<3600?`${Math.floor(s/60)}m ago`:s<86400?`${Math.floor(s/3600)}h ago`:`${Math.floor(s/86400)}d ago`};let workers=[];
-function renderWorkers(){let q=$('#filter').value.toLowerCase();$('#workers').innerHTML=workers.filter(w=>JSON.stringify(w).toLowerCase().includes(q)).map((w,i)=>`<tr data-id="${encodeURIComponent(w.id)}"><td class="device"><b>${w.name||w.id}</b><small>${[w.hardwareModel,w.platform,w.osVersion].filter(Boolean).join(' · ')||'Telemetry unavailable'}</small></td><td><span class="badge ${w.computeState}">${w.computeState.toUpperCase()}</span></td><td>${w.currentAssignment?`<b>${w.currentAssignment.workloadID}</b><br><small>${w.currentAssignment.projectID}</small>`:'—'}</td><td>${fmt(w.completedWorkUnits)}</td><td>${duration(w.cumulativeRuntimeSeconds)}</td><td>${w.measuredThroughput==null?'—':`${fmt(w.measuredThroughput)} eval/s`}</td><td title="${w.lastSeenAt?new Date(w.lastSeenAt*1000).toISOString():'Unavailable'}">${relative(w.lastSeenAt)}</td></tr>`).join('');document.querySelectorAll('tbody tr').forEach(r=>r.onclick=()=>openDetail(decodeURIComponent(r.dataset.id)))}
-function openDetail(id){let w=workers.find(x=>x.id===id);let fields={Status:`${w.connectionState} / ${w.computeState}`,Platform:w.platform,'Hardware model':w.hardwareModel,'OS version':w.osVersion,'Worker version':w.workerVersion,GPU:w.gpuName,'CPU cores':w.processorCount,Memory:w.memoryGB&&`${w.memoryGB} GB`,Battery:w.batteryLevel,Power:w.powerState,Thermal:w.thermalState,'Low power':w.lowPowerMode,Network:w.network,Completed:w.completedWorkUnits,Failed:w.failedWorkUnits,'Cumulative runtime':duration(w.cumulativeRuntimeSeconds),'Metal runtime':duration(w.metalSeconds),'Last seen':w.lastSeenAt&&new Date(w.lastSeenAt*1000).toISOString(),'Latest error':w.latestError};$('#detailBody').innerHTML=`<h2>${w.name||w.id}</h2><p>${w.id}</p><h3>Telemetry</h3><div class="detailgrid">${Object.entries(fields).map(([k,v])=>`<div class="row"><span>${k}</span><b>${v??'Unavailable'}</b></div>`).join('')}</div><h3>Current assignment</h3><pre>${w.currentAssignment?JSON.stringify(w.currentAssignment,null,2):'No current assignment'}</pre><h3>Advertised capabilities</h3><pre>${JSON.stringify(w.capabilities,null,2)}</pre>`;$('#detail').showModal()}
-async function refresh(){try{let [s,a,h]=await Promise.all(['/api/dashboard/summary','/api/dashboard/activity','/api/dashboard/history'].map(x=>fetch(x).then(r=>r.json())));workers=s.workers;let cards=[['Known workers',s.summary.knownWorkers],['Connected',s.summary.connectedWorkers],['Computing',s.summary.activeWorkers],['Running units',s.summary.runningWorkUnits],['Completed',s.summary.completedWorkUnits],['Compute time',duration(s.summary.workerComputeSeconds)]];$('#stats').innerHTML=cards.map(x=>`<div class="stat"><span>${x[0]}</span><b>${x[1]}</b></div>`).join('');renderWorkers();$('#updated').textContent=`${s.summary.health.toUpperCase()} · updated ${relative(s.summary.updatedAt)}`;$('#activity').innerHTML=`<div class="rows">${a.projects.map(p=>`<div class="row"><div><b>${p.projectID||'Project'}</b><small> · ${p.workloadID||'No workload'}</small><div class="bar"><i style="width:${100*(p.projectProgress||0)}%"></i></div></div><span>${p.projectCompletedWorkUnits||0} / ${p.projectTotalWorkUnits||0}</span></div>`).join('')||'<p>No active projects</p>'}</div>`;$('#contribution').innerHTML=`<div class="rows">${h.contributionByWorker.slice(0,8).map(n=>`<div class="row"><span>${n.nodeID}</span><b>${fmt(n.acceptedWorkUnits)} units</b></div>`).join('')||'<p>Contributions will appear after accepted work.</p>'}</div>`}catch(e){$('#updated').textContent='CONNECTION LOST'}}
-$('#filter').oninput=renderWorkers;refresh();setInterval(refresh,10000);
+const $ = selector => document.querySelector(selector);
+const fmt = value => value == null ? "—" : Intl.NumberFormat(undefined, {notation: "compact", maximumFractionDigits: 1}).format(value);
+const duration = seconds => seconds == null ? "—" : seconds < 60 ? `${seconds.toFixed(1)} s` : seconds < 3600 ? `${(seconds / 60).toFixed(1)} min` : `${(seconds / 3600).toFixed(1)} h`;
+const relative = timestamp => {
+  if (!timestamp) return "Never";
+  const seconds = Math.max(0, Date.now() / 1000 - timestamp);
+  return seconds < 60 ? "just now" : seconds < 3600 ? `${Math.floor(seconds / 60)}m ago` : seconds < 86400 ? `${Math.floor(seconds / 3600)}h ago` : `${Math.floor(seconds / 86400)}d ago`;
+};
+function element(tag, options = {}, children = []) {
+  const node = document.createElement(tag);
+  if (options.className) node.className = options.className;
+  if (options.text != null) node.textContent = String(options.text);
+  if (options.title) node.title = options.title;
+  for (const child of children) node.append(child);
+  return node;
+}
+function replace(node, children) { node.replaceChildren(...children); }
+let workers = [];
+
+function renderWorkers() {
+  const query = $("#filter").value.toLowerCase();
+  const rows = workers.filter(worker => JSON.stringify(worker).toLowerCase().includes(query)).map(worker => {
+    const identity = element("td", {className: "device"}, [
+      element("b", {text: worker.name || worker.id}),
+      element("small", {text: [worker.hardwareModel, worker.platform, worker.osVersion].filter(Boolean).join(" · ") || "Telemetry unavailable"})
+    ]);
+    const badge = element("span", {className: `badge ${worker.computeState}`, text: worker.computeState.toUpperCase()});
+    const assignment = element("td");
+    if (worker.currentAssignments.length) {
+      assignment.append(element("b", {text: `${worker.currentAssignments.length} × ${worker.currentAssignments[0].workloadID || "work unit"}`}), element("br"), element("small", {text: worker.currentAssignments[0].projectID || "Unknown project"}));
+    } else assignment.textContent = "—";
+    const seen = element("td", {text: relative(worker.lastSeenAt), title: worker.lastSeenAt ? new Date(worker.lastSeenAt * 1000).toISOString() : "Unavailable"});
+    const row = element("tr", {}, [identity, element("td", {}, [badge]), assignment, element("td", {text: fmt(worker.completedWorkUnits)}), element("td", {text: duration(worker.cumulativeRuntimeSeconds)}), element("td", {text: worker.measuredThroughput == null ? "—" : `${fmt(worker.measuredThroughput)} eval/s`}), seen]);
+    row.addEventListener("click", () => openDetail(worker.id));
+    return row;
+  });
+  replace($("#workers"), rows);
+}
+
+function labelledRows(fields) {
+  return Object.entries(fields).map(([label, value]) => element("div", {className: "row"}, [element("span", {text: label}), element("b", {text: value ?? "Unavailable"})]));
+}
+function jsonBlock(value) { return element("pre", {text: JSON.stringify(value, null, 2)}); }
+async function openDetail(id) {
+  const dialog = $("#detail");
+  const body = $("#detailBody");
+  replace(body, [element("p", {text: "Loading worker telemetry…"})]);
+  dialog.showModal();
+  try {
+    const response = await fetch(`/api/dashboard/workers/${encodeURIComponent(id)}`);
+    if (!response.ok) throw new Error(`Worker request failed (${response.status})`);
+    const worker = await response.json();
+    const fields = {Status: `${worker.connectionState} / ${worker.computeState}`, Platform: worker.platform, "Hardware model": worker.hardwareModel, "OS version": worker.osVersion, "Worker version": worker.workerVersion, GPU: worker.gpuName, "CPU cores": worker.processorCount, Memory: worker.memoryGB && `${worker.memoryGB} GB`, Battery: worker.batteryLevel, Power: worker.powerState, Thermal: worker.thermalState, "Low power": worker.lowPowerMode, Network: worker.network, Completed: worker.completedWorkUnits, Failed: worker.failedWorkUnits, "Cumulative runtime": duration(worker.cumulativeRuntimeSeconds), "Metal runtime": duration(worker.metalSeconds), "Last seen": worker.lastSeenAt && new Date(worker.lastSeenAt * 1000).toISOString(), "Latest error": worker.latestError};
+    replace(body, [element("h2", {text: worker.name || worker.id}), element("p", {text: worker.id}), element("h3", {text: "Telemetry"}), element("div", {className: "detailgrid"}, labelledRows(fields)), element("h3", {text: `Current assignments (${worker.currentAssignments.length})`}), jsonBlock(worker.currentAssignments), element("h3", {text: "Recent completed work"}), jsonBlock(worker.recentCompleted.length ? worker.recentCompleted : "No retained completed work"), element("h3", {text: "Recent errors"}), jsonBlock(worker.recentFailures.length ? worker.recentFailures : "No retained errors"), element("h3", {text: "Advertised capabilities"}), jsonBlock(worker.capabilities)]);
+  } catch (error) { replace(body, [element("h2", {text: "Worker unavailable"}), element("p", {text: error.message})]); }
+}
+
+async function refresh() {
+  try {
+    const [snapshot, activity, history] = await Promise.all(["/api/dashboard/summary", "/api/dashboard/activity", "/api/dashboard/history"].map(url => fetch(url).then(response => response.json())));
+    workers = snapshot.workers;
+    const cards = [["Known workers", snapshot.summary.knownWorkers], ["Connected", snapshot.summary.connectedWorkers], ["Computing", snapshot.summary.activeWorkers], ["Running units", snapshot.summary.runningWorkUnits], ["Completed", snapshot.summary.completedWorkUnits], ["Compute time", duration(snapshot.summary.workerComputeSeconds)]];
+    replace($("#stats"), cards.map(([label, value]) => element("div", {className: "stat"}, [element("span", {text: label}), element("b", {text: value})])));
+    renderWorkers();
+    $("#updated").textContent = `${snapshot.summary.health.toUpperCase()} · updated ${relative(snapshot.summary.updatedAt)}`;
+    replace($("#activity"), [element("div", {className: "rows"}, activity.projects.length ? activity.projects.map(project => element("div", {className: "row"}, [element("div", {}, [element("b", {text: project.projectID || "Project"}), element("small", {text: ` · ${project.workloadID || "No workload"}`}), element("div", {className: "bar"}, [Object.assign(element("i"), {style: `width:${100 * (project.projectProgress || 0)}%`})])]), element("span", {text: `${project.projectCompletedWorkUnits || 0} / ${project.projectTotalWorkUnits || 0}`})])) : [element("p", {text: "No active projects"})])]);
+    replace($("#contribution"), [element("div", {className: "rows"}, history.contributionByWorker.length ? history.contributionByWorker.slice(0, 8).map(node => element("div", {className: "row"}, [element("span", {text: node.nodeID}), element("b", {text: `${fmt(node.acceptedWorkUnits)} units`})])) : [element("p", {text: "Contributions will appear after accepted work."})])]);
+  } catch (_) { $("#updated").textContent = "CONNECTION LOST"; }
+}
+$("#filter").addEventListener("input", renderWorkers);
+refresh();
+setInterval(refresh, 10000);
