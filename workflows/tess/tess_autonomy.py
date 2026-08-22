@@ -748,6 +748,101 @@ def _repair_unresolved_dynamic_multisource_failure(
     )
 
 
+def _repair_resolved_family_multisource_failure(
+    store: InvestigationStore, investigation: Investigation, control: dict
+) -> Investigation | None:
+    """Append a retry for the obsolete resolved-without-v20.9 v20.12 gate."""
+    if investigation.status != "FAILED" or not investigation.stages:
+        return None
+    failed = investigation.stages[-1]
+    if (failed.status != "FAILED"
+            or failed.handler_id != "openstar.tess.multi-source-residual.prepare"
+            or failed.failure_classification != "NON_RETRYABLE"
+            or failed.error != (
+                "RuntimeError: v20.12 requires the completed v20.9 nonstationary model."
+            )):
+        return None
+    selected = control.get("selectedExperiment")
+    expected_selected = asdict(StageRequest(
+        failed.id, failed.handler_id, dict(failed.parameters),
+        failed.triggered_by_stage_id,
+    ))
+    if (control.get("schedulerAction") not in ("RUN_EXPERIMENT", "INVESTIGATION_FAILED")
+            or not isinstance(selected, dict)
+            or selected != expected_selected):
+        return None
+
+    morphology = _latest_complete(investigation, "openstar.tess.morphology.analyze")
+    dynamic = _latest_complete(investigation, "openstar.tess.dynamic-harmonic.analyze")
+    tf_prepare = _latest_complete(investigation, "openstar.tess.time-frequency.prepare")
+    tf_summary = _latest_complete(investigation, "openstar.tess.time-frequency.summarize")
+    mode = _latest_complete(investigation, "openstar.tess.mode-identification.analyze")
+    nonstationary = _latest_complete(investigation, "openstar.tess.nonstationary.summarize")
+    localization_prepare = _latest_complete(
+        investigation, "openstar.tess.residual-mode-localization.prepare"
+    )
+    localization_run = _latest_complete(
+        investigation, "openstar.tess.residual-mode-localization.run"
+    )
+    localization = _latest_complete(
+        investigation, "openstar.tess.residual-mode-localization.interpret"
+    )
+    review_prepare = _latest_complete(
+        investigation, "openstar.tess.residual-mode-localization-review.prepare"
+    )
+    review_run = _latest_complete(
+        investigation, "openstar.tess.residual-mode-localization-review.run"
+    )
+    review = _latest_complete(
+        investigation, "openstar.tess.residual-mode-localization-review.interpret"
+    )
+    family = frozen_residual_localization_family(
+        morphology.result if morphology else None,
+        dynamic.result if dynamic else None,
+        tf_prepare.result if tf_prepare else None,
+        tf_summary.result if tf_summary else None,
+        mode.result if mode else None,
+    )
+    review_result = (review.result or {}) if review else {}
+    cross = review_result.get("crossTime") or {}
+    valid_lineage = bool(
+        localization_prepare and localization_run and localization
+        and review_prepare and review_run and review
+        and localization_run.triggered_by_stage_id == localization_prepare.id
+        and localization.triggered_by_stage_id == localization_run.id
+        and review_prepare.triggered_by_stage_id == localization.id
+        and review_run.triggered_by_stage_id == review_prepare.id
+        and review.triggered_by_stage_id == review_run.id
+        and failed.triggered_by_stage_id == review.id
+    )
+    if not (morphology
+            and (morphology.result or {}).get("physicalCycleResolved") is True
+            and nonstationary is None
+            and family is not None
+            and family[3] == "MORPHOLOGY_RESOLVED_PHYSICAL_PERIOD"
+            and valid_lineage
+            and cross.get("classification")
+                == "RESIDUAL_MODE_SOURCE_SWITCHING_OR_BLEND"
+            and cross.get("residualModeOrigin") == "TIME_VARIABLE_OR_BLENDED"
+            and review_result.get("recommendedNextTest")
+                == "MULTI_SOURCE_RESIDUAL_DECOMPOSITION"):
+        return None
+    prefixes = [int(stage.id.partition("-")[0]) for stage in investigation.stages
+                if stage.id.partition("-")[0].isdigit()]
+    retry = StageRequest(
+        id=f"{max(prefixes, default=0) + 1:03d}-prepare-multi-source-residual",
+        handler_id=failed.handler_id,
+        parameters=dict(failed.parameters),
+        triggered_by_stage_id=failed.id,
+    )
+    return store.set_control_state(
+        investigation, status="RUNNING",
+        control_state={"branchAssessments": [], "selectedExperiment": asdict(retry),
+                       "schedulerAction": "RUN_EXPERIMENT",
+                       "recovery": "TESS_RESOLVED_FAMILY_MULTISOURCE_COMPATIBILITY_RETRY"},
+    )
+
+
 def _repair_closed_file_independent_prepare(
     store: InvestigationStore, investigation: Investigation
 ) -> Investigation | None:
@@ -879,6 +974,12 @@ def repair_obsolete_terminal_wait(
     )
     if localization_review_repair is not None:
         return localization_review_repair
+
+    multisource_repair = _repair_resolved_family_multisource_failure(
+        store, investigation, control
+    )
+    if multisource_repair is not None:
+        return multisource_repair
 
     multisource_repair = _repair_unresolved_dynamic_multisource_failure(
         store, investigation, control
