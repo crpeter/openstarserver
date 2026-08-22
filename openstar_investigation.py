@@ -153,7 +153,7 @@ class InvestigationStore:
     def load(self, investigation_id: str) -> Investigation:
         path = self.path_for(investigation_id)
         with path.open("r", encoding="utf-8") as handle:
-            return self._decode(json.load(handle))
+            return self.decode_snapshot(json.load(handle))
 
     def save(self, investigation: Investigation) -> None:
         self._atomic_write_json(
@@ -386,7 +386,7 @@ class InvestigationStore:
         return asdict(investigation)
 
     @staticmethod
-    def _decode(raw: dict[str, Any]) -> Investigation:
+    def decode_snapshot(raw: dict[str, Any]) -> Investigation:
         stages: list[InvestigationStage] = []
         for stage_raw in raw.get("stages", []):
             provenance_raw = stage_raw.get("provenance")

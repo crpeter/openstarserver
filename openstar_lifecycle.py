@@ -44,6 +44,75 @@ class InvestigationPreparation:
     transitions: int = 0
 
 
+def has_persisted_failed_stage_recovery(
+    investigation: Investigation, failed: Any
+) -> bool:
+    """Recognize an explicit durable replacement for the latest failure."""
+    if investigation.status != "RUNNING":
+        return False
+    control = investigation.metadata.get("controlState")
+    if (
+        not isinstance(control, dict)
+        or control.get("schedulerAction") != "RUN_EXPERIMENT"
+    ):
+        return False
+    selected = control.get("selectedExperiment")
+    if not isinstance(selected, dict):
+        return False
+    stage_id = selected.get("id")
+    handler_id = selected.get("handler_id")
+    parameters = selected.get("parameters", {})
+    return (
+        isinstance(stage_id, str)
+        and bool(stage_id)
+        and isinstance(handler_id, str)
+        and bool(handler_id)
+        and isinstance(parameters, dict)
+        and selected.get("triggered_by_stage_id") == failed.id
+        and not any(stage.id == stage_id for stage in investigation.stages)
+    )
+
+
+def persisted_scheduling_state(
+    investigation: Investigation,
+) -> InvestigationSchedulingState | None:
+    """Classify only scheduler decisions already present in durable state.
+
+    Unlike ``prepare``, this helper never plans, synthesizes recovery, or writes.
+    ``None`` means a scheduler round is required before a state is authoritative.
+    """
+    # A persisted RUNNING stage is written before its handler starts. Without
+    # live scheduler evidence it is impossible to distinguish healthy in-flight
+    # execution from an orphan left by a stopped process.
+    if any(stage.status == "RUNNING" for stage in investigation.stages):
+        return None
+    latest_failed = (
+        investigation.stages[-1]
+        if investigation.stages and investigation.stages[-1].status == "FAILED"
+        else None
+    )
+    if latest_failed is not None and not has_persisted_failed_stage_recovery(
+        investigation, latest_failed
+    ):
+        return InvestigationSchedulingState.FAILED
+    control = investigation.metadata.get("controlState")
+    if not isinstance(control, dict):
+        return None
+    action = control.get("schedulerAction")
+    if action == "RUN_EXPERIMENT":
+        return InvestigationSchedulingState.RUNNABLE
+    if action == "WAIT_FOR_PREREQUISITES":
+        return InvestigationSchedulingState.BLOCKED_PREREQUISITES
+    if action == "INVESTIGATION_COMPLETE":
+        return InvestigationSchedulingState.COMPLETE
+    if (
+        action == "ADVANCE_TO_NEXT_TARGET"
+        and investigation.status == "QUIESCENT_AWAITING_DATA"
+    ):
+        return InvestigationSchedulingState.WAITING_EXTERNAL_DATA
+    return None
+
+
 class InvestigationLifecycleDriver:
     """Prepare and execute one explicitly selected durable investigation."""
 
@@ -136,29 +205,7 @@ class InvestigationLifecycleDriver:
         a decision already persisted by a workflow-specific repair or planner,
         while requiring an unambiguous fresh stage identity.
         """
-        if investigation.status != "RUNNING":
-            return False
-        control = investigation.metadata.get("controlState")
-        if (
-            not isinstance(control, dict)
-            or control.get("schedulerAction") != "RUN_EXPERIMENT"
-        ):
-            return False
-        selected = control.get("selectedExperiment")
-        if not isinstance(selected, dict):
-            return False
-        stage_id = selected.get("id")
-        handler_id = selected.get("handler_id")
-        parameters = selected.get("parameters", {})
-        return (
-            isinstance(stage_id, str)
-            and bool(stage_id)
-            and isinstance(handler_id, str)
-            and bool(handler_id)
-            and isinstance(parameters, dict)
-            and selected.get("triggered_by_stage_id") == failed.id
-            and not any(stage.id == stage_id for stage in investigation.stages)
-        )
+        return has_persisted_failed_stage_recovery(investigation, failed)
 
     def prepare(self, target: InvestigationTarget) -> InvestigationPreparation:
         investigation = self.attach(target)
