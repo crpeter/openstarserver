@@ -978,6 +978,9 @@ def plan_tess_branches(
     residual_phase_difference_image = _latest_complete(
         investigation, "openstar.tess.residual-phase-difference-imaging.interpret"
     )
+    source_switching_temporal = _latest_complete(
+        investigation, "openstar.tess.source-switching-temporal-model.interpret"
+    )
     variability_interpretation = _latest_complete(
         investigation, "openstar.tess.offset-source-variability.interpret"
     )
@@ -1239,6 +1242,24 @@ def plan_tess_branches(
         difference_image_started = any(
             stage.handler_id.startswith("openstar.tess.residual-phase-difference-imaging.")
             for stage in investigation.stages)
+        temporal_started = any(
+            stage.handler_id.startswith("openstar.tess.source-switching-temporal-model.")
+            for stage in investigation.stages)
+        if (residual_phase_difference_image is not None
+                and source_switching_temporal is None and not temporal_started):
+            difference_result = residual_phase_difference_image.result or {}
+            if (difference_result.get("classification") == "SOURCE_SWITCHING_BY_SECTOR"
+                    and difference_result.get("recommendedNextTest")
+                    == "SOURCE_SWITCHING_TEMPORAL_MODEL"):
+                return (ScientificBranch(
+                    id=f"continue-source-switching-temporal-after-{residual_phase_difference_image.id}",
+                    experiment=StageRequest(
+                        id=_continuation_stage_id(
+                            residual_phase_difference_image,
+                            "prepare-source-switching-temporal-model"),
+                        handler_id="openstar.tess.source-switching-temporal-model.prepare",
+                        parameters={}, triggered_by_stage_id=residual_phase_difference_image.id),
+                ),)
         if (residual_phase_difference_image is None and not difference_image_started
                 and localization_result.get("recommendedNextTest")
                 == "ADDITIONAL_SOURCE_LOCALIZATION_DATA"

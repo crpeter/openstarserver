@@ -91,6 +91,11 @@ from .tess_residual_phase_difference_image import (
     run_residual_phase_difference_imaging,
     interpret_residual_phase_difference_imaging,
 )
+from .tess_source_switching_temporal import (
+    prepare_source_switching_temporal_model,
+    run_source_switching_temporal_model,
+    interpret_source_switching_temporal_model,
+)
 from .tess_frequency_localized_pixel import (
     build_frequency_localized_pixel_project,
     interpret_frequency_localized_pixel_project,
@@ -4115,15 +4120,65 @@ def build_engine(
             result.get("classification") in {"CANDIDATE_1_SUPPORTED", "CANDIDATE_2_SUPPORTED"}
             and result.get("recommendedNextTest")
             == "INDEPENDENT_COUNTERPART_PHOTOMETRIC_VARIABILITY_VALIDATION")
+        temporal_continuation = (
+            result.get("classification") == "SOURCE_SWITCHING_BY_SECTOR"
+            and result.get("recommendedNextTest") == "SOURCE_SWITCHING_TEMPORAL_MODEL")
         return StageOutcome(
             result=result,
             next_stage=(StageRequest(
+                _next_stage_id(request.id, "prepare-source-switching-temporal-model"),
+                "openstar.tess.source-switching-temporal-model.prepare", {}, request.id)
+                if temporal_continuation else StageRequest(
                 _next_stage_id(request.id, "prepare-offset-source-variability"),
                 "openstar.tess.offset-source-variability.prepare", {}, request.id)
                 if candidate_continuation else None),
             # Target localization is scientifically resolved spatially, but its
             # physical-model continuation is not implemented on this route.
-            stop=not candidate_continuation,
+            stop=not candidate_continuation and not temporal_continuation,
+            final_status="QUIESCENT_AWAITING_DATA",
+            input_hashes={"preparation": sha256_json(preparation), "run": sha256_json(run)},
+            artifacts=(_artifact(path, "application/json"),))
+
+    def source_switching_temporal_prepare_stage(investigation, request):
+        interpretation = _latest_result_for_handler(
+            investigation, "openstar.tess.residual-phase-difference-imaging.interpret")
+        bridge = _latest_result_for_handler(
+            investigation, "openstar.tess.residual-phase-difference-imaging.prepare")
+        if interpretation is None or bridge is None:
+            raise RuntimeError("Temporal source modeling requires persisted stages 048 and 050.")
+        result = prepare_source_switching_temporal_model(
+            difference_interpretation=interpretation, difference_preparation=bridge,
+            output_dir=store.directory_for(investigation.id) / "artifacts",
+            investigation_id=investigation.id)
+        return StageOutcome(result=result, next_stage=StageRequest(
+            _next_stage_id(request.id, "run-source-switching-temporal-model"),
+            "openstar.tess.source-switching-temporal-model.run", {}, request.id),
+            input_hashes={"stage048": sha256_json(bridge), "stage050": sha256_json(interpretation)},
+            artifacts=(_artifact(Path(result["preparationPath"]), "application/json"),))
+
+    def source_switching_temporal_run_stage(investigation, request):
+        preparation = _latest_result_for_handler(
+            investigation, "openstar.tess.source-switching-temporal-model.prepare")
+        if preparation is None:
+            raise RuntimeError("Temporal source-model run requires preparation.")
+        result = run_source_switching_temporal_model(
+            preparation, sector_inputs=request.parameters.get("sectorInputs"))
+        path = Path(preparation["artifactRoot"]) / "run.json"; _write_json(path, result)
+        return StageOutcome(result=result, next_stage=StageRequest(
+            _next_stage_id(request.id, "interpret-source-switching-temporal-model"),
+            "openstar.tess.source-switching-temporal-model.interpret", {}, request.id),
+            input_hashes={"preparation": sha256_json(preparation)},
+            artifacts=(_artifact(path, "application/json"),))
+
+    def source_switching_temporal_interpret_stage(investigation, request):
+        preparation = _latest_result_for_handler(
+            investigation, "openstar.tess.source-switching-temporal-model.prepare")
+        run = _latest_result_for_handler(investigation, "openstar.tess.source-switching-temporal-model.run")
+        if preparation is None or run is None:
+            raise RuntimeError("Temporal source-model interpretation requires prepare and run.")
+        result = interpret_source_switching_temporal_model(preparation, run)
+        path = Path(preparation["artifactRoot"]) / "interpretation.json"; _write_json(path, result)
+        return StageOutcome(result=result, next_stage=None, stop=True,
             final_status="QUIESCENT_AWAITING_DATA",
             input_hashes={"preparation": sha256_json(preparation), "run": sha256_json(run)},
             artifacts=(_artifact(path, "application/json"),))
@@ -8657,6 +8712,18 @@ def build_engine(
     engine.register_handler(
         "openstar.tess.residual-phase-difference-imaging.interpret",
         residual_phase_difference_image_interpret_stage,
+    )
+    engine.register_handler(
+        "openstar.tess.source-switching-temporal-model.prepare",
+        source_switching_temporal_prepare_stage,
+    )
+    engine.register_handler(
+        "openstar.tess.source-switching-temporal-model.run",
+        source_switching_temporal_run_stage,
+    )
+    engine.register_handler(
+        "openstar.tess.source-switching-temporal-model.interpret",
+        source_switching_temporal_interpret_stage,
     )
     engine.register_handler(
         "openstar.tess.offset-source-variability.prepare",

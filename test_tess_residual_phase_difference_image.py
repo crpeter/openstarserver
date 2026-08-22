@@ -119,8 +119,10 @@ class ResidualPhaseDifferenceImageTests(unittest.TestCase):
         investigation = store.create("tic-277940827", "workflow", "1")
         preparation = self._preparation(root)
         candidates = preparation["catalogCandidates"]
-        run = {"sectorResults": [{"sector": sector, "classification": classification}
-                                 for sector in preparation["sectors"]]}
+        labels = (classification if isinstance(classification, list)
+                  else [classification] * len(preparation["sectors"]))
+        run = {"sectorResults": [{"sector": sector, "classification": label}
+                                 for sector, label in zip(preparation["sectors"], labels)]}
         for stage_id, handler, result in (
             ("048-prepare-residual-phase-difference-imaging",
              "openstar.tess.residual-phase-difference-imaging.prepare", preparation),
@@ -170,3 +172,15 @@ class ResidualPhaseDifferenceImageTests(unittest.TestCase):
                              result["recommendedNextTest"])
             self.assertEqual("QUIESCENT_AWAITING_DATA", completed.status)
             self.assertIsNone(next_stage)
+
+    def test_real_stage_050_source_switching_schedules_stage_051_exactly_once(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            completed, next_stage, _ = self._workflow_interpret(
+                Path(temporary), ["UNRESOLVED", "UNRESOLVED", "TARGET_SUPPORTED",
+                                  "CANDIDATE_1_SUPPORTED"])
+            self.assertEqual("SOURCE_SWITCHING_BY_SECTOR",
+                             completed.stages[-1].result["classification"])
+            self.assertEqual("051-prepare-source-switching-temporal-model",
+                             next_stage.id)
+            self.assertEqual("openstar.tess.source-switching-temporal-model.prepare",
+                             next_stage.handler_id)
