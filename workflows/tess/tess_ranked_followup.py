@@ -72,7 +72,7 @@ class TessDeepAdmissionStore:
         sector = self.sector if self.sector is not None else (admissions[0].sector if admissions else None)
         if sector is None: raise ValueError("Cannot save an empty ledger without a sector")
         _atomic_json(self.path, {"schemaVersion": "1", "sector": sector,
-                                "admissions": [asdict(item) for item in admissions]})
+                                "admissions": [_admission_dict(item) for item in admissions]})
 
     def admit(self, ranking: TessSectorRanking, top_n: int):
         if top_n < 1: raise ValueError("top_n must be positive")
@@ -115,6 +115,15 @@ INCOMPLETE = "CATALOG_COVERAGE_INCOMPLETE"
 INVALID = "INVALID_OR_UNSCREENABLE"
 
 
+def _admission_dict(admission: TessDeepAdmission) -> dict[str, Any]:
+    """Serialize without changing the shape of pre-novelty ledger records."""
+    value = asdict(admission)
+    for key in ("admissionBasis", "noveltyScreeningSha256"):
+        if value[key] is None:
+            del value[key]
+    return value
+
+
 class TessNoveltyScreenStore:
     """Durable catalog triage, separate from immutable shallow evidence."""
     schema_version = "1"
@@ -147,7 +156,7 @@ class TessNoveltyScreenStore:
         screens = self._load(); by_key = {}
         for item in screens: by_key[item["screeningKey"]] = item
         novel, incomplete, known, invalid = [], [], [], []
-        queried = 0
+        queried = known_screened = 0
         for entry in ranking.content["rankedEntries"]:
             tic = int(entry["ticID"])
             if tic in already_admitted: continue
@@ -179,15 +188,22 @@ class TessNoveltyScreenStore:
                     "classification": classification}
                 screens.append(screen); by_key[key] = screen; self._save(screens)
             pair = (entry, screen)
-            {NOVEL: novel, KNOWN: known, INCOMPLETE: incomplete, INVALID: invalid}[screen["classification"]].append(pair)
-            if len(novel) >= novel_count and len(known) >= known_quota: break
+            if screen["classification"] == KNOWN:
+                known_screened += 1
+                if len(known) < known_quota:
+                    known.append(pair)
+            else:
+                {NOVEL: novel, INCOMPLETE: incomplete, INVALID: invalid}[screen["classification"]].append(pair)
+            # The known quota is a ceiling on controls encountered while
+            # finding the novel tranche, never a reason to query farther.
+            if len(novel) >= novel_count: break
         chosen = [(e, "NOVEL_PRIORITY", sha256_json(s)) for e, s in novel[:novel_count]]
         if len(chosen) < novel_count:
             chosen += [(e, "CATALOG_COVERAGE_INCOMPLETE", sha256_json(s))
                        for e, s in incomplete[:novel_count - len(chosen)]]
         chosen += [(e, "KNOWN_PERIOD_VALIDATION", sha256_json(s)) for e, s in known[:known_quota]]
         stats = {"novelty_screened_this_run": queried, "novel_candidates_found": len(novel),
-            "known_period_matches_screened": len(known), "catalog_coverage_incomplete": len(incomplete)}
+            "known_period_matches_screened": known_screened, "catalog_coverage_incomplete": len(incomplete)}
         return chosen, stats
 
 

@@ -72,6 +72,28 @@ class NoveltyScreeningTests(unittest.TestCase):
             self.assertEqual("NOVEL_PRIORITY", third[0][1])
             self.assertEqual([1, 1], calls)
 
+    def test_known_quota_never_extends_screening_past_novel_tranche(self):
+        with tempfile.TemporaryDirectory() as root:
+            calls = []
+            selected, _ = TessNoveltyScreenStore(Path(root) / "screens.json", 1).select(
+                ranking(5000), 4, 2, set(),
+                lambda tic: calls.append(tic) or identity(None),
+                lambda entry: {"preferredPhysicalPeriodDays": 10})
+            self.assertEqual([1, 2, 3, 4], calls)
+            self.assertEqual([1, 2, 3, 4], [entry["ticID"] for entry, _, _ in selected])
+
+    def test_only_known_encountered_before_final_novel_is_admitted(self):
+        with tempfile.TemporaryDirectory() as root:
+            calls = []
+            selected, _ = TessNoveltyScreenStore(Path(root) / "screens.json", 1).select(
+                ranking(5000), 3, 2, set(),
+                lambda tic: calls.append(tic) or identity(10 if tic == 2 else None),
+                lambda entry: {"preferredPhysicalPeriodDays": 10})
+            self.assertEqual([1, 2, 3, 4], calls)
+            self.assertEqual([1, 3, 4, 2], [entry["ticID"] for entry, _, _ in selected])
+            self.assertEqual(1, sum(basis == "KNOWN_PERIOD_VALIDATION"
+                                    for _, basis, _ in selected))
+
     def test_incomplete_is_never_novel_and_admitted_tics_are_skipped(self):
         with tempfile.TemporaryDirectory() as root:
             calls = []

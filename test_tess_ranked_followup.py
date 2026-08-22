@@ -160,6 +160,29 @@ class RankedFollowupTests(unittest.TestCase):
             self.assertEqual([2], [item.ticID for item in new])
             self.assertEqual([1, 2], [item.ticID for item in admitted])
 
+    def test_novel_admission_does_not_rewrite_legacy_record_shape(self):
+        with tempfile.TemporaryDirectory() as shallow, tempfile.TemporaryDirectory() as deep:
+            ranking = self._ranking(shallow)
+            ledger = TessDeepAdmissionStore(Path(deep) / "ledger.json", 7)
+            ledger.admit(ranking, 1)
+            original = json.loads(ledger.path.read_text())["admissions"][0]
+            self.assertNotIn("admissionBasis", original)
+            self.assertNotIn("noveltyScreeningSha256", original)
+
+            entry = ranking.content["rankedEntries"][1]
+            admitted, new, excluded = ledger.admit_selected(
+                ranking, ((entry, "NOVEL_PRIORITY", "screen-hash"),))
+            raw = json.loads(ledger.path.read_text())["admissions"]
+            self.assertEqual(original, raw[0])
+            self.assertEqual("NOVEL_PRIORITY", raw[1]["admissionBasis"])
+            self.assertEqual("screen-hash", raw[1]["noveltyScreeningSha256"])
+            self.assertEqual((2, 1, 0), (len(admitted), len(new), len(excluded)))
+
+            admitted, duplicate, excluded = ledger.admit_selected(
+                ranking, ((entry, "NOVEL_PRIORITY", "other-hash"),))
+            self.assertEqual((2, 0, 0), (len(admitted), len(duplicate), len(excluded)))
+            self.assertEqual(raw, json.loads(ledger.path.read_text())["admissions"])
+
     def test_mutated_source_project_is_not_admitted(self):
         with tempfile.TemporaryDirectory() as shallow, tempfile.TemporaryDirectory() as deep:
             ranking = self._ranking(shallow)
