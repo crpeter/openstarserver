@@ -695,10 +695,29 @@ class TessAutonomyIntegrationTests(unittest.TestCase):
             ("010-morphology", "openstar.tess.morphology.analyze",
              {"physicalCycleResolved": False}),
             ("021-dynamic", "openstar.tess.dynamic-harmonic.analyze",
-             {"referenceFamilyPeriodDays": 10.30084080080649,
-              "supportedHarmonicOrders": [1, 2, 3, 4],
-              "classification": "ADDITIONAL_VARIABILITY_REMAINS"}),
-            ("035-review", "openstar.tess.residual-mode-localization-review.interpret",
+             {"classification": "ADDITIONAL_VARIABILITY_REMAINS"}),
+            ("022-time-frequency-prepare", "openstar.tess.time-frequency.prepare",
+             {"absoluteTimeReferenceDays": 2500.0}),
+            ("023-time-frequency-summary", "openstar.tess.time-frequency.summarize",
+             {"residualEvolution": {"classification": "STABLE_RESIDUAL_MODE"}}),
+            ("024-mode", "openstar.tess.mode-identification.analyze", {
+                "independentModeEvidenceSurvived": True,
+                "physicalMechanismResolved": False,
+                "establishedPeriodFamily": {
+                    "referencePeriodDays": 10.30084080080649,
+                    "modeledHarmonicOrders": [1, 2, 3, 4]},
+                "modeCandidate": {
+                    "frequencyCyclesPerDay": 1 / 2.2071724078510457,
+                    "periodDays": 2.2071724078510457,
+                    "supportingSectors": [94, 95, 102, 103]},
+             }),
+            ("024-prepare-localization", "openstar.tess.residual-mode-localization.prepare", {}),
+            ("025-run-localization", "openstar.tess.residual-mode-localization.run", {}),
+            ("026-localization", "openstar.tess.residual-mode-localization.interpret",
+             {"recommendedNextTest": "RESIDUAL_MODE_SOURCE_LOCALIZATION_REVIEW"}),
+            ("027-review-prepare", "openstar.tess.residual-mode-localization-review.prepare", {}),
+            ("028-review-run", "openstar.tess.residual-mode-localization-review.run", {}),
+            ("029-review", "openstar.tess.residual-mode-localization-review.interpret",
              {"residualFrequencyAtReference": 1 / 2.2071724078510457,
               "residualPeriodAtReferenceDays": 2.2071724078510457,
               "fractionalFrequencyDriftPerDay": 0.0,
@@ -714,9 +733,22 @@ class TessAutonomyIntegrationTests(unittest.TestCase):
             investigation = self._complete(
                 investigation, stage_id, handler, result
             )
+        lineage = {
+            "025-run-localization": "024-prepare-localization",
+            "026-localization": "025-run-localization",
+            "027-review-prepare": "026-localization",
+            "028-review-run": "027-review-prepare",
+            "029-review": "028-review-run",
+        }
+        investigation = replace(
+            investigation,
+            stages=tuple(replace(stage, triggered_by_stage_id=lineage.get(stage.id))
+                         for stage in investigation.stages),
+        )
+        self.store.save(investigation)
         request = StageRequest(
-            "036-prepare-multi-source-residual",
-            "openstar.tess.multi-source-residual.prepare", {}, "035-review",
+            "030-prepare-multi-source-residual",
+            "openstar.tess.multi-source-residual.prepare", {}, "029-review",
         )
         investigation = self.store.set_control_state(
             investigation, status="RUNNING",
@@ -726,27 +758,15 @@ class TessAutonomyIntegrationTests(unittest.TestCase):
         engine = WorkflowEngine(self.store)
 
         def obsolete_gate(_investigation, _request):
-            raise RuntimeError("v20.12 requires the morphology-resolved physical period.")
+            raise RuntimeError(
+                "v20.12 requires either a morphology-resolved physical period or "
+                "an established unresolved dynamic harmonic family."
+            )
 
         engine.register_handler(request.handler_id, obsolete_gate)
         with self.assertRaisesRegex(RuntimeError, "morphology-resolved"):
             engine.run_stage(
                 investigation, request, software_id="legacy", software_version="20.11"
-            )
-        failed = self.store.load(investigation.id)
-        repaired_once = repair_obsolete_terminal_wait(self.store, failed)
-        retry_037 = StageRequest(**repaired_once.metadata["controlState"]["selectedExperiment"])
-
-        def obsolete_nonstationary_gate(_investigation, _request):
-            raise RuntimeError(
-                "v20.12 requires the completed v20.9 nonstationary model."
-            )
-
-        engine_037 = WorkflowEngine(self.store)
-        engine_037.register_handler(request.handler_id, obsolete_nonstationary_gate)
-        with self.assertRaisesRegex(RuntimeError, "v20.9 nonstationary"):
-            engine_037.run_stage(
-                repaired_once, retry_037, software_id="legacy", software_version="20.11"
             )
         failed = self.store.load(investigation.id)
         historical_stages = failed.stages
@@ -760,9 +780,9 @@ class TessAutonomyIntegrationTests(unittest.TestCase):
         self.assertEqual("RUNNING", repaired.status)
         self.assertEqual(historical_stages, repaired.stages)
         selected = repaired.metadata["controlState"]["selectedExperiment"]
-        self.assertEqual("038-prepare-multi-source-residual", selected["id"])
+        self.assertEqual("031-prepare-multi-source-residual", selected["id"])
         self.assertEqual(request.handler_id, selected["handler_id"])
-        self.assertEqual(retry_037.id, selected["triggered_by_stage_id"])
+        self.assertEqual(request.id, selected["triggered_by_stage_id"])
         self.assertEqual(
             historical_files,
             {stage.id: self.store.stage_path_for(repaired.id, stage.id).read_bytes()
@@ -773,12 +793,12 @@ class TessAutonomyIntegrationTests(unittest.TestCase):
         def legitimate_new_failure(_investigation, _request):
             raise RuntimeError("v20.12 could not prepare a spatial component dataset.")
 
-        engine_038 = WorkflowEngine(self.store)
-        engine_038.register_handler(request.handler_id, legitimate_new_failure)
-        retry_038 = StageRequest(**selected)
+        engine_031 = WorkflowEngine(self.store)
+        engine_031.register_handler(request.handler_id, legitimate_new_failure)
+        retry_031 = StageRequest(**selected)
         with self.assertRaisesRegex(RuntimeError, "spatial component"):
-            engine_038.run_stage(
-                repaired, retry_038, software_id="current", software_version="20.12"
+            engine_031.run_stage(
+                repaired, retry_031, software_id="current", software_version="20.12"
             )
         new_failure = self.store.load(investigation.id)
         self.assertEqual("NON_RETRYABLE", new_failure.stages[-1].failure_classification)

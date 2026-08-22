@@ -655,7 +655,7 @@ def _repair_archive_timeout_localization_failure(
 def _repair_unresolved_dynamic_multisource_failure(
     store: InvestigationStore, investigation: Investigation, control: dict
 ) -> Investigation | None:
-    """Retry only the two obsolete v20.12 compatibility gates append-only."""
+    """Retry only obsolete v20.12 frozen-family compatibility gates append-only."""
     if investigation.status != "FAILED" or not investigation.stages:
         return None
     failed = investigation.stages[-1]
@@ -665,28 +665,66 @@ def _repair_unresolved_dynamic_multisource_failure(
             or failed.error not in {
                 "RuntimeError: v20.12 requires the morphology-resolved physical period.",
                 "RuntimeError: v20.12 requires the completed v20.9 nonstationary model.",
+                "RuntimeError: v20.12 requires either a morphology-resolved physical "
+                "period or an established unresolved dynamic harmonic family.",
             }):
         return None
     if control.get("schedulerAction") not in ("RUN_EXPERIMENT", "INVESTIGATION_FAILED"):
         return None
     selected = control.get("selectedExperiment")
-    if selected is not None and (not isinstance(selected, dict)
-            or selected.get("id") != failed.id
-            or selected.get("handler_id") != failed.handler_id):
-        return None
+    if selected is not None:
+        if (not isinstance(selected, dict)
+                or selected.get("id") != failed.id
+                or selected.get("handler_id") != failed.handler_id
+                or selected.get("parameters") != failed.parameters
+                or selected.get("triggered_by_stage_id")
+                   != failed.triggered_by_stage_id):
+            return None
     morphology = _latest_complete(investigation, "openstar.tess.morphology.analyze")
     dynamic = _latest_complete(investigation, "openstar.tess.dynamic-harmonic.analyze")
+    tf_prepare = _latest_complete(investigation, "openstar.tess.time-frequency.prepare")
+    tf_summary = _latest_complete(investigation, "openstar.tess.time-frequency.summarize")
+    mode = _latest_complete(investigation, "openstar.tess.mode-identification.analyze")
+    localization = _latest_complete(
+        investigation, "openstar.tess.residual-mode-localization.interpret"
+    )
+    localization_prepare = _latest_complete(
+        investigation, "openstar.tess.residual-mode-localization.prepare"
+    )
+    localization_run = _latest_complete(
+        investigation, "openstar.tess.residual-mode-localization.run"
+    )
+    review_prepare = _latest_complete(
+        investigation, "openstar.tess.residual-mode-localization-review.prepare"
+    )
+    review_run = _latest_complete(
+        investigation, "openstar.tess.residual-mode-localization-review.run"
+    )
     review = _latest_complete(
         investigation, "openstar.tess.residual-mode-localization-review.interpret"
     )
-    dynamic_result = (dynamic.result or {}) if dynamic else {}
     review_result = (review.result or {}) if review else {}
     cross = review_result.get("crossTime") or {}
+    family = frozen_residual_localization_family(
+        morphology.result if morphology else None,
+        dynamic.result if dynamic else None,
+        tf_prepare.result if tf_prepare else None,
+        tf_summary.result if tf_summary else None,
+        mode.result if mode else None,
+    )
+    valid_review_lineage = bool(
+        localization_prepare and localization_run and localization
+        and review_prepare and review_run and review
+        and localization_run.triggered_by_stage_id == localization_prepare.id
+        and localization.triggered_by_stage_id == localization_run.id
+        and review_prepare.triggered_by_stage_id == localization.id
+        and review_run.triggered_by_stage_id == review_prepare.id
+        and review.triggered_by_stage_id == review_run.id
+    )
     if not (morphology and (morphology.result or {}).get("physicalCycleResolved") is False
-            and dynamic
-            and dynamic_result.get("referenceFamilyPeriodDays")
-            and dynamic_result.get("supportedHarmonicOrders")
+            and family is not None
             and review
+            and valid_review_lineage
             and cross.get("classification")
                 == "RESIDUAL_MODE_SOURCE_SWITCHING_OR_BLEND"
             and cross.get("residualModeOrigin") == "TIME_VARIABLE_OR_BLENDED"

@@ -3708,13 +3708,38 @@ def build_engine(
         prepared = _latest_result_for_handler(investigation, "openstar.tess.prepare-target")
         identity = _latest_result_for_handler(investigation, "openstar.tess.catalog-identity")
         independent_prepare = _latest_result_for_handler(investigation, "openstar.tess.independent.prepare")
-        morphology = _latest_result_for_handler(investigation, "openstar.tess.morphology.analyze")
+        morphology_stage = next((
+            stage for stage in reversed(investigation.stages)
+            if stage.status == "COMPLETE"
+            and stage.handler_id == "openstar.tess.morphology.analyze"
+        ), None)
+        morphology = (morphology_stage.result or {}) if morphology_stage else None
         dynamic_stage = next((
             stage for stage in reversed(investigation.stages)
             if stage.status == "COMPLETE"
             and stage.handler_id == "openstar.tess.dynamic-harmonic.analyze"
         ), None)
         dynamic = (dynamic_stage.result or {}) if dynamic_stage is not None else None
+        time_frequency_prepare_stage = next((
+            stage for stage in reversed(investigation.stages)
+            if stage.status == "COMPLETE"
+            and stage.handler_id == "openstar.tess.time-frequency.prepare"
+        ), None)
+        time_frequency_prepare = ((time_frequency_prepare_stage.result or {})
+                                  if time_frequency_prepare_stage else None)
+        time_frequency_stage = next((
+            stage for stage in reversed(investigation.stages)
+            if stage.status == "COMPLETE"
+            and stage.handler_id == "openstar.tess.time-frequency.summarize"
+        ), None)
+        time_frequency = ((time_frequency_stage.result or {})
+                          if time_frequency_stage else None)
+        mode_stage = next((
+            stage for stage in reversed(investigation.stages)
+            if stage.status == "COMPLETE"
+            and stage.handler_id == "openstar.tess.mode-identification.analyze"
+        ), None)
+        mode = (mode_stage.result or {}) if mode_stage else None
         nonstationary_stage = next((
             stage for stage in reversed(investigation.stages)
             if stage.status == "COMPLETE"
@@ -3737,19 +3762,18 @@ def build_engine(
             raise RuntimeError("v20.12 requires frozen independent-sector metadata.")
         resolved_period = (morphology or {}).get("resolvedPhysicalPeriodDays")
         harmonic_orders = (1, 2)
-        family_stage = None
+        family_context = None
         physical_cycle_resolved = bool((morphology or {}).get("physicalCycleResolved"))
         if not physical_cycle_resolved:
-            dynamic_period = (dynamic or {}).get("referenceFamilyPeriodDays")
-            dynamic_orders = tuple((dynamic or {}).get("supportedHarmonicOrders") or ())
-            if dynamic_period is None or not dynamic_orders:
+            family_context = frozen_residual_localization_family(
+                morphology, dynamic, time_frequency_prepare, time_frequency, mode,
+            )
+            if family_context is None:
                 raise RuntimeError(
                     "v20.12 requires either a morphology-resolved physical period or "
                     "an established unresolved dynamic harmonic family."
                 )
-            resolved_period = dynamic_period
-            harmonic_orders = dynamic_orders
-            family_stage = dynamic_stage
+            resolved_period, harmonic_orders, residual_model, reference_kind = family_context
         if resolved_period is None:
             raise RuntimeError("v20.12 harmonic-family reference period is unavailable.")
         if review is None:
@@ -3762,43 +3786,53 @@ def build_engine(
         # quantities after combining the dynamic-harmonic, time-frequency and
         # mode-identification evidence.  Adapt that durable evidence to the
         # historical shape consumed by the v20.12 project builder.
-        if nonstationary is not None:
+        if not physical_cycle_resolved:
+            evidence_stages = (
+                stage for stage in (
+                    morphology_stage, dynamic_stage, time_frequency_prepare_stage,
+                    time_frequency_stage, mode_stage,
+                ) if stage is not None
+            )
+            residual_model = dict(residual_model)
+            residual_model_evidence = {
+                "sources": [
+                    {"stageID": stage.id, "handlerID": stage.handler_id,
+                     "resultHash": sha256_json(stage.result or {})}
+                    for stage in evidence_stages
+                ],
+                "adapter": "frozen_residual_localization_family",
+            }
+        elif nonstationary is not None:
             residual_model = dict(nonstationary)
             residual_model_evidence = {
                 "stageID": nonstationary_stage.id,
                 "handlerID": nonstationary_stage.handler_id,
                 "resultHash": sha256_json(nonstationary),
             }
-        elif not physical_cycle_resolved:
-            residual_model = {
-                "preferredFrequencyAtReference": review.get(
-                    "residualFrequencyAtReference"
-                ),
-                "preferredPeriodAtReferenceDays": review.get(
-                    "residualPeriodAtReferenceDays"
-                ),
-                "fractionalFrequencyDriftPerDay": review.get(
-                    "fractionalFrequencyDriftPerDay"
-                ),
-                "timeReferenceDays": review.get("timeReferenceDays"),
-                "preferredModel": {"signalSectors": review.get("signalSectors") or []},
-            }
-            residual_model_evidence = {
-                "stageID": review_stage.id,
-                "handlerID": review_stage.handler_id,
-                "resultHash": sha256_json(review),
-            }
         else:
             raise RuntimeError("v20.12 requires the completed v20.9 nonstationary model.")
         residual_model["sourceEvidence"] = residual_model_evidence
 
         physical_period = float(resolved_period)
-        family_evidence = {
-            "stageID": family_stage.id if family_stage is not None else None,
-            "handlerID": (family_stage.handler_id if family_stage is not None
-                          else "openstar.tess.morphology.analyze"),
-            "resultHash": sha256_json(dynamic if family_stage is not None else morphology),
-        }
+        if physical_cycle_resolved:
+            family_evidence = {
+                "stageID": None,
+                "handlerID": "openstar.tess.morphology.analyze",
+                "resultHash": sha256_json(morphology),
+            }
+        else:
+            family_sources = [
+                {"stageID": stage.id, "handlerID": stage.handler_id,
+                 "resultHash": sha256_json(stage.result or {})}
+                for stage in (morphology_stage, dynamic_stage, time_frequency_prepare_stage,
+                              time_frequency_stage, mode_stage)
+                if stage is not None
+            ]
+            family_evidence = {
+                "sources": family_sources,
+                "adapter": "frozen_residual_localization_family",
+                "referenceKind": reference_kind,
+            }
         artifact_root = store.directory_for(investigation.id) / "artifacts"
         print("🧩 Preparing multi-source residual decomposition")
         print(f"   TIC: {prepared.get('ticID')}")
@@ -3850,8 +3884,8 @@ def build_engine(
                 "identity": sha256_json(identity),
                 "independentPreparation": sha256_json(independent_prepare),
                 "morphology": sha256_json(morphology),
-                "harmonicFamilyEvidence": family_evidence["resultHash"],
-                "residualFrequencyDriftModel": residual_model_evidence["resultHash"],
+                "harmonicFamilyEvidence": sha256_json(family_evidence),
+                "residualFrequencyDriftModel": sha256_json(residual_model_evidence),
                 "localizationReview": sha256_json(review),
             },
             artifacts=tuple(artifacts),
