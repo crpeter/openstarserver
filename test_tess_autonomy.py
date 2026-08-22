@@ -261,6 +261,31 @@ class TessAutonomyIntegrationTests(unittest.TestCase):
                 with_complete = self.store.complete_current_stage(with_running, terminal)
                 self.assertEqual((), plan_tess_branches(with_complete, target))
 
+    def test_real_stage_056_time_variable_result_schedules_independent_followup_once(self):
+        target = self.source.enumerate_targets()[0]
+        investigation = self.store.create(target.investigation_id, WORKFLOW_ID,
+            WORKFLOW_VERSION, metadata={**target.metadata, "ticID": 277940827})
+        for number in range(1, 57):
+            result = ({"classification": "TIME_VARIABLE_LOCALIZATION",
+                "sourceAttributionResolved": False, "physicalMechanismResolved": False,
+                "recommendedNextTest": "TIME_VARIABLE_SOURCE_LOCALIZATION_FOLLOWUP"}
+                if number == 56 else {"persistedStage": number})
+            handler = ("openstar.tess.time-resolved-residual-phase-localization.interpret"
+                if number == 56 else "persisted.science")
+            investigation = self._complete(investigation, f"{number:03d}-persisted", handler, result)
+        original = investigation.stages
+        branches = plan_tess_branches(investigation, target)
+        self.assertEqual(1, len(branches))
+        request = branches[0].experiment
+        self.assertEqual("057-prepare-time-resolved-frequency-localization", request.id)
+        self.assertEqual("openstar.tess.time-resolved-frequency-localization.prepare", request.handler_id)
+        self.assertEqual(original, investigation.stages)
+        running = InvestigationStage(request.id, request.handler_id, "RUNNING",
+                                     request.triggered_by_stage_id, {})
+        with_running = self.store.append_running_stage(investigation, running)
+        self.assertEqual((), plan_tess_branches(with_running, target))
+        self.assertEqual(original, with_running.stages[:56])
+
     def test_stage_053_candidate_two_recovery_is_idempotent(self):
         target = self.source.enumerate_targets()[0]
         candidate_1 = {"raDeg": 10.1, "decDeg": -20.1,

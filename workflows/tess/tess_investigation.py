@@ -101,6 +101,11 @@ from .tess_time_resolved_residual_phase_localization import (
     run_time_resolved_residual_phase_localization,
     interpret_time_resolved_residual_phase_localization,
 )
+from .tess_time_resolved_frequency_localization import (
+    prepare_time_resolved_frequency_localization,
+    run_time_resolved_frequency_localization,
+    interpret_time_resolved_frequency_localization,
+)
 from .tess_frequency_localized_pixel import (
     build_frequency_localized_pixel_project,
     interpret_frequency_localized_pixel_project,
@@ -4246,18 +4251,76 @@ def build_engine(
             raise RuntimeError("Time-resolved localization interpretation requires prepare and run.")
         result = interpret_time_resolved_residual_phase_localization(preparation, run)
         path = Path(preparation["artifactRoot"]) / "interpretation.json"; _write_json(path, result)
-        candidate_continuation = (
-            result.get("classification") in {"STABLE_CANDIDATE_1_LOCALIZATION",
-                                             "STABLE_CANDIDATE_2_LOCALIZATION"}
-            and result.get("sourceAttributionResolved") is True
+        frequency_continuation = (
+            result.get("classification") == "TIME_VARIABLE_LOCALIZATION"
+            and result.get("sourceAttributionResolved") is False
+            and result.get("physicalMechanismResolved") is False
             and result.get("recommendedNextTest")
-            == "INDEPENDENT_COUNTERPART_PHOTOMETRIC_VARIABILITY_VALIDATION")
+            == "TIME_VARIABLE_SOURCE_LOCALIZATION_FOLLOWUP")
+        legacy_candidate = (result.get("classification") in {
+            "STABLE_CANDIDATE_1_LOCALIZATION", "STABLE_CANDIDATE_2_LOCALIZATION"}
+            and result.get("sourceAttributionResolved") is True
+            and result.get("recommendedNextTest") ==
+            "INDEPENDENT_COUNTERPART_PHOTOMETRIC_VARIABILITY_VALIDATION")
         next_stage = (StageRequest(
+            _next_stage_id(request.id, "prepare-time-resolved-frequency-localization"),
+            "openstar.tess.time-resolved-frequency-localization.prepare", {}, request.id)
+            if frequency_continuation else StageRequest(
             _next_stage_id(request.id, "prepare-offset-source-variability"),
             "openstar.tess.offset-source-variability.prepare", {}, request.id)
-            if candidate_continuation else None)
+            if legacy_candidate else None)
         return StageOutcome(result=result, next_stage=next_stage,
-            stop=not candidate_continuation, final_status="QUIESCENT_AWAITING_DATA",
+            stop=not frequency_continuation and not legacy_candidate, final_status="QUIESCENT_AWAITING_DATA",
+            input_hashes={"preparation": sha256_json(preparation), "run": sha256_json(run)},
+            artifacts=(_artifact(path, "application/json"),))
+
+    def time_resolved_frequency_prepare_stage(investigation, request):
+        stage054 = _latest_result_for_handler(investigation,
+            "openstar.tess.time-resolved-residual-phase-localization.prepare")
+        stage055 = _latest_result_for_handler(investigation,
+            "openstar.tess.time-resolved-residual-phase-localization.run")
+        stage056 = _latest_result_for_handler(investigation,
+            "openstar.tess.time-resolved-residual-phase-localization.interpret")
+        if stage054 is None or stage055 is None or stage056 is None:
+            raise RuntimeError("Frequency localization requires persisted stages 054-056.")
+        result = prepare_time_resolved_frequency_localization(stage054=stage054,
+            stage055=stage055, stage056=stage056,
+            output_dir=store.directory_for(investigation.id) / "artifacts",
+            investigation_id=investigation.id)
+        return StageOutcome(result=result, next_stage=StageRequest(
+            _next_stage_id(request.id, "run-time-resolved-frequency-localization"),
+            "openstar.tess.time-resolved-frequency-localization.run", {}, request.id),
+            input_hashes={"stage054": sha256_json(stage054), "stage055": sha256_json(stage055),
+                          "stage056": sha256_json(stage056)},
+            artifacts=(_artifact(Path(result["preparationPath"]), "application/json"),))
+
+    def time_resolved_frequency_run_stage(investigation, request):
+        preparation = _latest_result_for_handler(investigation,
+            "openstar.tess.time-resolved-frequency-localization.prepare")
+        if preparation is None: raise RuntimeError("Frequency localization run requires preparation.")
+        result = run_time_resolved_frequency_localization(
+            preparation, sector_inputs=request.parameters.get("sectorInputs"))
+        path = Path(preparation["artifactRoot"]) / "run.json"; _write_json(path, result)
+        return StageOutcome(result=result, next_stage=StageRequest(
+            _next_stage_id(request.id, "interpret-time-resolved-frequency-localization"),
+            "openstar.tess.time-resolved-frequency-localization.interpret", {}, request.id),
+            input_hashes={"preparation": sha256_json(preparation)},
+            artifacts=(_artifact(path, "application/json"),))
+
+    def time_resolved_frequency_interpret_stage(investigation, request):
+        preparation = _latest_result_for_handler(investigation,
+            "openstar.tess.time-resolved-frequency-localization.prepare")
+        run = _latest_result_for_handler(investigation,
+            "openstar.tess.time-resolved-frequency-localization.run")
+        if preparation is None or run is None: raise RuntimeError("Frequency localization interpretation requires prepare and run.")
+        result = interpret_time_resolved_frequency_localization(preparation, run)
+        path = Path(preparation["artifactRoot"]) / "interpretation.json"; _write_json(path, result)
+        candidate = (result.get("classification") in {"STABLE_CANDIDATE_1_LOCALIZATION", "STABLE_CANDIDATE_2_LOCALIZATION"}
+            and result.get("recommendedNextTest") == "INDEPENDENT_COUNTERPART_PHOTOMETRIC_VARIABILITY_VALIDATION")
+        return StageOutcome(result=result, next_stage=StageRequest(
+            _next_stage_id(request.id, "prepare-offset-source-variability"),
+            "openstar.tess.offset-source-variability.prepare", {}, request.id) if candidate else None,
+            stop=not candidate, final_status="QUIESCENT_AWAITING_DATA",
             input_hashes={"preparation": sha256_json(preparation), "run": sha256_json(run)},
             artifacts=(_artifact(path, "application/json"),))
 
@@ -8819,6 +8882,18 @@ def build_engine(
     engine.register_handler(
         "openstar.tess.time-resolved-residual-phase-localization.interpret",
         time_resolved_residual_phase_interpret_stage,
+    )
+    engine.register_handler(
+        "openstar.tess.time-resolved-frequency-localization.prepare",
+        time_resolved_frequency_prepare_stage,
+    )
+    engine.register_handler(
+        "openstar.tess.time-resolved-frequency-localization.run",
+        time_resolved_frequency_run_stage,
+    )
+    engine.register_handler(
+        "openstar.tess.time-resolved-frequency-localization.interpret",
+        time_resolved_frequency_interpret_stage,
     )
     engine.register_handler(
         "openstar.tess.offset-source-variability.prepare",
