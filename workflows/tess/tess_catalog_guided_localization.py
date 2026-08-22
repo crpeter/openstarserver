@@ -18,7 +18,15 @@ from .tess_prf_refinement import (
     _prewhitened_coherent_basis,
     _weighted_hypothesis,
 )
-from .tess_residual_localization import _write_json
+from .tess_multisource_residual import _prewhiten_cube_raw
+from .tess_offset_variability import _skycoord
+from .tess_residual_localization import (
+    MAX_CADENCES, _background_subtract_cube, _download_tpf, _uniform_indices, _write_json,
+)
+from .tess_spoc_prf import (
+    _list_official_prf_grid, _official_prf_at_detector_position,
+    _render_prf_template, _tpf_detector_geometry,
+)
 
 
 HARMONIC_ORDERS = (1, 2, 3, 4)
@@ -227,16 +235,84 @@ def analyze_catalog_guided_sector(*, sector: int, times: np.ndarray,
     }
 
 
+def _production_sector_inputs(preparation: dict[str, Any]) -> list[dict[str, Any]]:
+    """Acquire TPF/WCS and official PRFs from the persisted scientific evidence."""
+    target_sky = preparation["targetSky"]
+    candidates = preparation["catalogCandidates"]
+    coordinates = [
+        _skycoord(float(target_sky["raDeg"]), float(target_sky["decDeg"])),
+        *[_skycoord(float(item["raDeg"]), float(item["decDeg"])) for item in candidates],
+    ]
+    inputs = []
+    cache_root = Path(preparation["artifactRoot"]) / "official-prf-cache"
+    for sector in preparation["sectors"]:
+        tpf, source = _download_tpf(
+            tic_id=int(preparation["ticID"]), sector=int(sector),
+            ra_deg=float(target_sky["raDeg"]), dec_deg=float(target_sky["decDeg"]))
+        times = np.asarray(tpf.time.value, dtype=float)
+        cube = np.asarray(getattr(tpf.flux, "value", tpf.flux), dtype=float)
+        keep = np.isfinite(times) & np.any(np.isfinite(cube.reshape(len(cube), -1)), axis=1)
+        times, cube = times[keep], cube[keep]
+        indices = _uniform_indices(len(times), MAX_CADENCES)
+        times, cube = times[indices], cube[indices]
+        if len(times) < 100:
+            raise RuntimeError(f"Sector {sector} has only {len(times)} usable cadences.")
+        corrected, background = _background_subtract_cube(cube)
+        residual, valid = _prewhiten_cube_raw(
+            absolute_times=times, cube=corrected,
+            physical_frequency=1.0 / float(preparation["referenceFamilyPeriodDays"]),
+            harmonic_orders=HARMONIC_ORDERS)
+        rows, cols = valid.shape
+        centers = []
+        for component_id, coordinate in zip(COMPONENT_IDS, coordinates):
+            x, y = tpf.wcs.world_to_pixel(coordinate)
+            if not (math.isfinite(float(x)) and math.isfinite(float(y))):
+                raise RuntimeError(f"{component_id} has no finite WCS position in sector {sector}.")
+            centers.append({"componentID": component_id, "x": float(x), "y": float(y)})
+        camera, ccd, tpf_col, tpf_row = _tpf_detector_geometry(tpf)
+        grid = _list_official_prf_grid(sector=int(sector), camera=camera, ccd=ccd)
+        models = []
+        for center in centers:
+            image, header, files = _official_prf_at_detector_position(
+                sector=int(sector), camera=camera, ccd=ccd,
+                detector_row=tpf_row + center["y"], detector_col=tpf_col + center["x"],
+                archive_cache=cache_root / f"sector-{int(sector):04d}", grid_entries=grid)
+            models.append({**center, "image": image, "header": header, "modelFiles": files})
+        valid_flat = valid.reshape(-1)
+
+        def render(dx: float, dy: float, *, source_models=models,
+                   mask=valid, selection=valid_flat) -> np.ndarray:
+            return np.column_stack([
+                _render_prf_template(
+                    image=model["image"], header=model["header"],
+                    source_x=model["x"] + dx, source_y=model["y"] + dy,
+                    rows=mask.shape[0], cols=mask.shape[1], valid_pixels=mask)
+                for model in source_models
+            ])[selection]
+
+        inputs.append({
+            "sector": int(sector), "times": times, "prewhitened": residual,
+            "valid": valid, "renderTemplates": render,
+            "physicalFrequency": 1.0 / float(preparation["referenceFamilyPeriodDays"]),
+            "acquisitionProvenance": {"tpf": source, "backgroundSubtraction": background,
+                                      "componentPixelCenters": centers,
+                                      "officialPRFModels": [item["modelFiles"] for item in models]},
+        })
+    return inputs
+
+
 def run_catalog_guided_localization(
-    preparation: dict[str, Any], *, sector_inputs: list[dict[str, Any]]
+    preparation: dict[str, Any], *, sector_inputs: list[dict[str, Any]] | None = None
 ) -> dict[str, Any]:
-    """Execute supplied calibrated sector inputs locally (never through workers)."""
+    """Acquire and execute calibrated sector inputs locally (never through workers)."""
+    if sector_inputs is None:
+        sector_inputs = _production_sector_inputs(preparation)
     results = []
     for item in sector_inputs:
         renderer = item.get("renderTemplates")
         if not callable(renderer):
             raise RuntimeError("Each sector input requires an official-SPOC PRF renderer.")
-        results.append(analyze_catalog_guided_sector(
+        result = analyze_catalog_guided_sector(
             sector=int(item["sector"]), times=item["times"],
             prewhitened=item["prewhitened"], valid=item["valid"],
             render_templates=renderer,
@@ -244,7 +320,9 @@ def run_catalog_guided_localization(
             time_reference=float(preparation["residualTimeReferenceDays"]),
             drift=float(preparation["fractionalFrequencyDriftPerDay"]),
             physical_frequency=float(item["physicalFrequency"]),
-            block_count=int(item.get("blockCount", 4))))
+            block_count=int(item.get("blockCount", 4)))
+        result["acquisitionProvenance"] = item.get("acquisitionProvenance")
+        results.append(result)
     return {"version": "openstar.tess-catalog-guided-source-localization-run.v1",
             "execution": "coordinator-local-small-coupled-spatial-fit",
             "sectorResults": results, "physicalCycleResolved": False}
@@ -270,6 +348,11 @@ def prepare_catalog_guided_localization(*, catalog_summary: dict[str, Any],
         "modelHypotheses": list(MODEL_COMPONENTS),
         "subtractedHarmonicOrders": list(HARMONIC_ORDERS),
         "physicalCycleResolved": False,
+        "ticID": prf_preparation.get("ticID"),
+        "targetSky": prf_preparation.get("targetSky"),
+        "sectors": list(prf_preparation.get("sectors") or []),
+        "referenceFamilyPeriodDays": prf_preparation.get(
+            "referenceFamilyPeriodDays", prf_preparation.get("physicalPeriodDays")),
         "residualReferenceFrequency": prf_preparation.get("residualReferenceFrequency"),
         "residualTimeReferenceDays": prf_preparation.get("residualTimeReferenceDays"),
         "fractionalFrequencyDriftPerDay": prf_preparation.get("fractionalFrequencyDriftPerDay"),
@@ -299,14 +382,26 @@ def interpret_catalog_guided_localization(preparation: dict[str, Any],
         if is_decisive:
             decisive.append(sector)
     attributions = {item["fullDataComparison"]["bestModel"] for item in decisive}
-    resolved = bool(decisive and len(decisive) == len(sectors) and len(attributions) == 1)
+    consistent = bool(decisive and len(decisive) == len(sectors) and len(attributions) == 1)
+    preferred_by_model = {
+        "CANDIDATE_1_ONLY": 0, "TARGET_PLUS_CANDIDATE_1": 0,
+        "CANDIDATE_2_ONLY": 1, "TARGET_PLUS_CANDIDATE_2": 1,
+    }
+    model = next(iter(attributions)) if consistent else None
+    candidate_index = preferred_by_model.get(model)
+    candidates = preparation.get("catalogCandidates") or []
+    preferred = (dict(candidates[candidate_index])
+                 if candidate_index is not None and candidate_index < len(candidates) else None)
+    resolved = preferred is not None
     return {
         "version": "openstar.tess-catalog-guided-source-localization-interpretation.v1",
         "sectorResults": sectors, "decisiveSectorCount": len(decisive),
-        "classification": "CONSISTENT_SOURCE_ATTRIBUTION" if resolved else "UNRESOLVED",
-        "preferredModel": next(iter(attributions)) if resolved else None,
+        "classification": "SINGLE_CATALOG_CANDIDATE_ATTRIBUTED" if resolved else "UNRESOLVED",
+        "preferredModel": model, "preferredCandidate": preferred,
         "physicalCycleResolved": False, "sourceAttributionResolved": resolved,
-        "recommendedNextTest": None if resolved else "ADDITIONAL_SOURCE_LOCALIZATION_DATA",
+        "recommendedNextTest": (
+            "INDEPENDENT_COUNTERPART_PHOTOMETRIC_VARIABILITY_VALIDATION" if resolved
+            else "ADDITIONAL_SOURCE_LOCALIZATION_DATA"),
         "claimLevelChanged": resolved,
         "interpretationGuard": "Unresolved aggregate predictive evidence must not finalize attribution.",
     }

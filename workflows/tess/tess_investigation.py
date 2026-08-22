@@ -4016,12 +4016,10 @@ def build_engine(
             investigation, "openstar.tess.catalog-guided-source-localization.prepare")
         if preparation is None:
             raise RuntimeError("Catalog-guided localization run requires completed preparation.")
-        # Acquisition/rendering is a coordinator-local boundary.  Tests and replay adapters
-        # may inject already calibrated arrays; no generic worker receives catalog semantics.
-        sector_inputs = request.parameters.get("sectorInputs")
-        if sector_inputs is None:
-            raise RuntimeError("Coordinator-local calibrated sector inputs are unavailable.")
-        result = run_catalog_guided_localization(preparation, sector_inputs=sector_inputs)
+        # Acquisition/rendering remains coordinator-local; catalog semantics never enter a
+        # generic worker request. Frozen arrays are an optional deterministic test boundary.
+        result = run_catalog_guided_localization(
+            preparation, sector_inputs=request.parameters.get("sectorInputs"))
         path = Path(preparation["artifactRoot"]) / "run.json"
         _write_json(path, result)
         return StageOutcome(
@@ -4041,9 +4039,22 @@ def build_engine(
         result = interpret_catalog_guided_localization(preparation, run)
         path = Path(preparation["artifactRoot"]) / "interpretation.json"
         _write_json(path, result)
-        unresolved = not result["sourceAttributionResolved"]
+        candidate = result.get("preferredCandidate") or {}
+        ids = candidate.get("catalogIDs") or {}
+        justified = (candidate.get("raDeg") is not None and candidate.get("decDeg") is not None
+                     and (ids.get("ticID") is not None or ids.get("gaiaDR3SourceID") is not None))
+        continue_validation = (
+            result.get("sourceAttributionResolved") is True and justified
+            and result.get("recommendedNextTest")
+            == "INDEPENDENT_COUNTERPART_PHOTOMETRIC_VARIABILITY_VALIDATION")
+        unresolved = not continue_validation
         return StageOutcome(
-            result=result, next_stage=None, stop=unresolved,
+            result=result,
+            next_stage=(StageRequest(
+                _next_stage_id(request.id, "prepare-offset-source-variability"),
+                "openstar.tess.offset-source-variability.prepare", {}, request.id)
+                if continue_validation else None),
+            stop=unresolved,
             final_status="QUIESCENT_AWAITING_DATA" if unresolved else "COMPLETE",
             input_hashes={"preparation": sha256_json(preparation), "run": sha256_json(run)},
             artifacts=(_artifact(path, "application/json"),))
@@ -4120,9 +4131,11 @@ def build_engine(
         nonstationary = _latest_result_for_handler(investigation, "openstar.tess.nonstationary.summarize")
         independent_prepare = _latest_result_for_handler(investigation, "openstar.tess.independent.prepare")
         multisource = _latest_result_for_handler(investigation, "openstar.tess.multi-source-residual.interpret")
-        catalog_counterpart = _latest_result_for_handler(
+        catalog_counterpart = (_latest_result_for_handler(
+            investigation, "openstar.tess.catalog-guided-source-localization.interpret")
+            or _latest_result_for_handler(
             investigation, "openstar.tess.catalog-counterpart-identification.analyze"
-        )
+        ))
         offset_source = catalog_counterpart or _latest_result_for_handler(
             investigation, "openstar.tess.offset-source-identification.analyze")
         if prepared is None or identity is None or independent_prepare is None:

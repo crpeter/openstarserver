@@ -1188,6 +1188,27 @@ def plan_tess_branches(
                 parameters={}, triggered_by_stage_id=catalog_identification.id),
         ),)
     if catalog_guided_localization is not None:
+        localization_result = catalog_guided_localization.result or {}
+        candidate = localization_result.get("preferredCandidate") or {}
+        ids = candidate.get("catalogIDs") or {}
+        justified = (candidate.get("raDeg") is not None and candidate.get("decDeg") is not None
+                     and (ids.get("ticID") is not None or ids.get("gaiaDR3SourceID") is not None))
+        validation_started = any(
+            stage.handler_id == "openstar.tess.offset-source-variability.prepare"
+            for stage in investigation.stages)
+        if (not validation_started
+                and localization_result.get("sourceAttributionResolved") is True
+                and justified
+                and localization_result.get("recommendedNextTest")
+                == "INDEPENDENT_COUNTERPART_PHOTOMETRIC_VARIABILITY_VALIDATION"):
+            return (ScientificBranch(
+                id=f"continue-counterpart-variability-after-{catalog_guided_localization.id}",
+                experiment=StageRequest(
+                    id=_continuation_stage_id(
+                        catalog_guided_localization, "prepare-offset-source-variability"),
+                    handler_id="openstar.tess.offset-source-variability.prepare",
+                    parameters={}, triggered_by_stage_id=catalog_guided_localization.id),
+            ),)
         return ()
     preferred = catalog_result.get("preferredCandidate") or {}
     preferred_ids = preferred.get("catalogIDs") or {}

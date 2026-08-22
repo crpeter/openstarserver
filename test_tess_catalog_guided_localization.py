@@ -1,6 +1,9 @@
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 
@@ -8,8 +11,12 @@ from workflows.tess.tess_catalog_guided_localization import (
     COMPONENT_IDS,
     _fit_shared_astrometric_shift,
     _temporal_predictive_validation,
+    interpret_catalog_guided_localization,
     prepare_catalog_guided_localization,
 )
+from openstar_investigation import InvestigationStage, InvestigationStore
+from openstar_workflow import StageRequest
+from workflows.tess.tess_investigation import build_engine
 
 
 class CatalogGuidedLocalizationTests(unittest.TestCase):
@@ -94,6 +101,91 @@ class CatalogGuidedLocalizationTests(unittest.TestCase):
         self.assertIsNone(result["preferredCandidate"])
         self.assertEqual([1, 2, 3, 4], result["subtractedHarmonicOrders"])
         self.assertFalse(result["physicalCycleResolved"])
+
+    def test_interpretation_preserves_verbatim_justified_candidate(self):
+        candidates = [
+            {"raDeg": 10.1, "decDeg": -20.1,
+             "catalogIDs": {"ticID": 111, "gaiaDR3SourceID": 222}, "frozen": "one"},
+            {"raDeg": 10.2, "decDeg": -20.2,
+             "catalogIDs": {"ticID": 333}, "frozen": "two"},
+        ]
+        sector = {
+            "fullDataComparison": {"bestModel": "TARGET_PLUS_CANDIDATE_2",
+                                   "bestModelIdentifiable": True},
+            "temporalPredictiveValidation": {
+                "predictiveModel": "TARGET_PLUS_CANDIDATE_2",
+                "sourceVectorTemporalCompatibility": {"compatible": True}},
+        }
+        result = interpret_catalog_guided_localization(
+            {"catalogCandidates": candidates}, {"sectorResults": [sector]})
+        self.assertTrue(result["sourceAttributionResolved"])
+        self.assertEqual(candidates[1], result["preferredCandidate"])
+        self.assertEqual("INDEPENDENT_COUNTERPART_PHOTOMETRIC_VARIABILITY_VALIDATION",
+                         result["recommendedNextTest"])
+
+    def test_workflow_045_through_047_needs_no_injected_sector_inputs(self):
+        catalog = {
+            "recommendedNextTest": "CATALOG_GUIDED_SOURCE_LOCALIZATION",
+            "physicalMechanismResolved": False,
+            "plausibleCatalogCandidates": [
+                {"raDeg": 10.1, "decDeg": -20.1, "catalogIDs": {"ticID": 111}},
+                {"raDeg": 10.2, "decDeg": -20.2, "catalogIDs": {"ticID": 222}},
+            ],
+        }
+        prf_prepare = {
+            "ticID": 277940827, "target": {"componentID": "target"},
+            "targetSky": {"raDeg": 10.0, "decDeg": -20.0}, "sectors": [1],
+            "referenceFamilyPeriodDays": 13.72, "residualReferenceFrequency": 0.37,
+            "residualTimeReferenceDays": 100.0, "fractionalFrequencyDriftPerDay": 0.0,
+        }
+        unresolved = {
+            "sectorResults": [{
+                "fullDataComparison": {"bestModel": "TARGET_ONLY",
+                                       "bestModelIdentifiable": True},
+                "temporalPredictiveValidation": {
+                    "predictiveModel": "TARGET_ONLY",
+                    "sourceVectorTemporalCompatibility": {"compatible": True}},
+            }], "physicalCycleResolved": False,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            store = InvestigationStore(Path(directory))
+            investigation = store.create("tic-277940827", "test", "1")
+            investigation = replace(investigation, stages=(
+                InvestigationStage("038-family", "openstar.tess.dynamic-harmonic.analyze",
+                                   "COMPLETE", None, {}, result={"physicalCycleResolved": False}),
+                InvestigationStage("041-prf-prepare",
+                                   "openstar.tess.official-spoc-prf-forward-modeling.prepare",
+                                   "COMPLETE", None, {}, result=prf_prepare),
+                InvestigationStage("043-prf-interpret",
+                                   "openstar.tess.official-spoc-prf-forward-modeling.interpret",
+                                   "COMPLETE", None, {}, result={"physicalMechanismResolved": False}),
+                InvestigationStage("044-catalog",
+                                   "openstar.tess.catalog-counterpart-identification.analyze",
+                                   "COMPLETE", None, {}, result=catalog),
+            ))
+            store.save(investigation)
+            engine = build_engine(store, SimpleNamespace(), poll_interval=0.0, timeout=None)
+            engine.chain_stages = False
+            investigation, run_request = engine.run_stage(
+                investigation, StageRequest(
+                    "045-prepare-catalog-guided-source-localization",
+                    "openstar.tess.catalog-guided-source-localization.prepare", {}),
+                software_id="test", software_version="1")
+            self.assertEqual({}, run_request.parameters)
+            with mock.patch(
+                "workflows.tess.tess_investigation.run_catalog_guided_localization",
+                autospec=True, return_value=unresolved) as production_run:
+                investigation, interpret_request = engine.run_stage(
+                    investigation, run_request,
+                    software_id="test", software_version="1")
+            self.assertIsNone(production_run.call_args.kwargs["sector_inputs"])
+            self.assertEqual("047-interpret-catalog-guided-source-localization",
+                             interpret_request.id)
+            investigation, next_stage = engine.run_stage(
+                investigation, interpret_request, software_id="test", software_version="1")
+            self.assertIsNone(next_stage)
+            self.assertEqual("UNRESOLVED", investigation.stages[-1].result["classification"])
+            self.assertEqual("QUIESCENT_AWAITING_DATA", investigation.status)
 
 
 if __name__ == "__main__":
