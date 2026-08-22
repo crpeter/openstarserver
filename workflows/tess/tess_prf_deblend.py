@@ -7,6 +7,8 @@ from typing import Any
 
 import numpy as np
 
+from .tess_sector_archive import TessArchiveTransientError
+
 from .tess_multisource_residual import MIN_COMPONENT_SAMPLES, _prewhiten_cube_raw
 from .tess_offset_variability import (
     DOMINANCE_POWER_RATIO,
@@ -588,6 +590,8 @@ def build_calibrated_prf_deblending_project(
                 f"extracted target-control + {_candidate_label(candidate)}",
                 flush=True,
             )
+        except TessArchiveTransientError:
+            raise
         except Exception as exc:
             errors.append({"sector": int(sector), "error": f"{type(exc).__name__}: {exc}"})
             print(f"      unavailable: {type(exc).__name__}: {exc}", flush=True)

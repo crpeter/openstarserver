@@ -14,6 +14,8 @@ from typing import Any
 
 import numpy as np
 
+from .tess_sector_archive import TessArchiveTransientError
+
 from .tess_multisource_residual import _design_matrix as _physical_design_matrix, _prewhiten_cube_raw
 from .tess_residual_localization import (
     _background_subtract_cube, _download_tpf, _uniform_indices, MAX_CADENCES,
@@ -865,6 +867,8 @@ def run_prf_deblending(preparation: dict[str, Any]) -> dict[str, Any]:
                     )
                 ),
             })
+        except TessArchiveTransientError:
+            raise
         except Exception as exc:
             errors.append({"sector": sector, "error": f"{type(exc).__name__}: {exc}"})
     return {"version": "openstar.tess-prf-deblending-run.v1", "sectorResults": sector_results,

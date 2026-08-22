@@ -688,6 +688,8 @@ def localize_periodic_source(
                 f"classification={result.get('classification')}",
                 flush=True,
             )
+        except TessArchiveTransientError:
+            raise
         except Exception as error:
             text = f"{type(error).__name__}: {error}"
             errors.append({"sector": sector, "role": role, "error": text})

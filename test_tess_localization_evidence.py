@@ -19,6 +19,10 @@ from workflows.tess.tess_investigation import build_engine
 from workflows.tess.tess_localization_evidence import (
     frozen_residual_localization_family,
 )
+from workflows.tess.tess_residual_localization import build_residual_mode_pixel_project
+from workflows.tess.tess_residual_localization_review import (
+    build_residual_mode_localization_review_project,
+)
 from workflows.tess.tess_sector_archive import TessArchiveTransientError
 
 
@@ -126,16 +130,20 @@ class FrozenResidualLocalizationFamilyTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         store = InvestigationStore(Path(temporary.name) / "investigations")
         investigation = store.create("archive-timeout", "workflow", "1")
+        source_project = Path(temporary.name) / "source.json"
+        source_project.write_text("{}", encoding="utf-8")
         morphology, tf_prepare, tf_summary, mode = self._evidence()
         mode["recommendedNextTest"] = "RESIDUAL_MODE_PIXEL_LOCALIZATION"
         stages = [
             InvestigationStage(
                 "001-prepare-target", "openstar.tess.prepare-target", "COMPLETE",
-                None, {}, result={"sourceProjectPath": "source.json",
-                                  "sourceDatasetEntry": {}, "ticID": 42, "sector": 1},
+                None, {}, result={"sourceProjectPath": str(source_project),
+                                  "sourceDatasetEntry": {}, "ticID": 42, "sector": 28},
             ),
             InvestigationStage("002-identity", "openstar.tess.catalog-identity",
-                               "COMPLETE", "001-prepare-target", {}, result={}),
+                               "COMPLETE", "001-prepare-target", {}, result={
+                                   "tic": {"metadata": {"raDeg": 1.0, "decDeg": 2.0}}
+                               }),
             InvestigationStage("003-independent", "openstar.tess.independent.prepare",
                                "COMPLETE", "002-identity", {}, result={}),
             InvestigationStage("010-morphology", "openstar.tess.morphology.analyze",
@@ -171,13 +179,68 @@ class FrozenResidualLocalizationFamilyTests(unittest.TestCase):
     def _assert_actual_prepare_timeout_is_retryable(self, *, review):
         store, investigation, request = self._archive_failure_investigation(review=review)
         engine = build_engine(store, mock.Mock(), poll_interval=0.0, timeout=1.0)
-        builder = ("build_residual_mode_localization_review_project" if review
-                   else "build_residual_mode_pixel_project")
-        with mock.patch(
-            f"workflows.tess.tess_investigation.{builder}",
+        download_module = ("tess_residual_localization_review" if review
+                           else "tess_residual_localization")
+        class _Degree:
+            def __rmul__(self, value):
+                return value
+        coordinates = types.ModuleType("astropy.coordinates")
+        coordinates.SkyCoord = lambda *args, **kwargs: object()
+        units = types.ModuleType("astropy.units")
+        units.deg = _Degree()
+        astropy = types.ModuleType("astropy")
+        astropy.coordinates, astropy.units = coordinates, units
+        with mock.patch.dict(sys.modules, {
+            "astropy": astropy, "astropy.coordinates": coordinates,
+            "astropy.units": units,
+        }), mock.patch(
+            f"workflows.tess.{download_module}._download_tpf",
             side_effect=TessArchiveTransientError("MAST read timed out"),
-        ), self.assertRaises(RetryableExecutionError):
-            engine.run_stage(investigation, request, software_id="test", software_version="1")
+        ) as download_tpf, mock.patch(
+            "workflows.tess.tess_residual_localization._target_coordinate",
+            return_value=object(),
+        ):
+            prepared = investigation.stages[0].result
+            identity = investigation.stages[1].result
+            nonstationary = {
+                "preferredFrequencyAtReference": 0.27101611598985065,
+                "fractionalFrequencyDriftPerDay": 0.0,
+                "timeReferenceDays": 0.0,
+                "preferredModel": {"signalSectors": [1]},
+            }
+            kwargs = dict(
+                source_project_path=prepared["sourceProjectPath"],
+                source_dataset_entry=prepared["sourceDatasetEntry"], tic_id=42,
+                identity=identity, primary_sector=1, independent_spec={},
+                physical_period_days=10.510316195053623,
+                nonstationary_summary=nonstationary,
+                output_dir=store.directory_for(investigation.id) / "direct-builder",
+                investigation_id=investigation.id,
+            )
+            if review:
+                builder = build_residual_mode_localization_review_project
+                kwargs["residual_localization_summary"] = {
+                    "recommendedNextTest":
+                    "RESIDUAL_MODE_SOURCE_LOCALIZATION_REVIEW",
+                    "sectorResults": [],
+                }
+            else:
+                builder = build_residual_mode_pixel_project
+            with self.assertRaises(TessArchiveTransientError):
+                builder(**kwargs)
+            if not review:
+                download_tpf.side_effect = RuntimeError("genuine unusable pixels")
+                with self.assertRaisesRegex(
+                    RuntimeError, "could not prepare any residual-mode pixel datasets"
+                ):
+                    builder(**kwargs)
+                download_tpf.side_effect = TessArchiveTransientError(
+                    "MAST read timed out"
+                )
+            with self.assertRaises(RetryableExecutionError):
+                engine.run_stage(
+                    investigation, request, software_id="test", software_version="1"
+                )
 
         failed = store.load(investigation.id)
         self.assertEqual("FAILED", failed.status)
