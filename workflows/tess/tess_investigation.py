@@ -3764,7 +3764,11 @@ def build_engine(
         harmonic_orders = (1, 2)
         family_context = None
         physical_cycle_resolved = bool((morphology or {}).get("physicalCycleResolved"))
-        if not physical_cycle_resolved:
+        adapter_backed_family = not physical_cycle_resolved
+        # Preserve the historical resolved + v20.9 route byte-for-byte at the
+        # evidence/hash boundary.  Older durable investigations may instead
+        # have reached v20.11 through its shared frozen-family adapter.
+        if not physical_cycle_resolved or nonstationary is None:
             family_context = frozen_residual_localization_family(
                 morphology, dynamic, time_frequency_prepare, time_frequency, mode,
             )
@@ -3774,6 +3778,12 @@ def build_engine(
                     "an established unresolved dynamic harmonic family."
                 )
             resolved_period, harmonic_orders, residual_model, reference_kind = family_context
+            if (physical_cycle_resolved
+                    and reference_kind != "MORPHOLOGY_RESOLVED_PHYSICAL_PERIOD"):
+                raise RuntimeError(
+                    "v20.12 resolved frozen-family evidence has incompatible reference semantics."
+                )
+            adapter_backed_family = True
         if resolved_period is None:
             raise RuntimeError("v20.12 harmonic-family reference period is unavailable.")
         if review is None:
@@ -3786,7 +3796,7 @@ def build_engine(
         # quantities after combining the dynamic-harmonic, time-frequency and
         # mode-identification evidence.  Adapt that durable evidence to the
         # historical shape consumed by the v20.12 project builder.
-        if not physical_cycle_resolved:
+        if adapter_backed_family:
             evidence_stages = (
                 stage for stage in (
                     morphology_stage, dynamic_stage, time_frequency_prepare_stage,
@@ -3814,7 +3824,7 @@ def build_engine(
         residual_model["sourceEvidence"] = residual_model_evidence
 
         physical_period = float(resolved_period)
-        if physical_cycle_resolved:
+        if physical_cycle_resolved and not adapter_backed_family:
             family_evidence = {
                 "stageID": None,
                 "handlerID": "openstar.tess.morphology.analyze",
@@ -3833,7 +3843,7 @@ def build_engine(
                 "adapter": "frozen_residual_localization_family",
                 "referenceKind": reference_kind,
             }
-        if physical_cycle_resolved:
+        if physical_cycle_resolved and not adapter_backed_family:
             harmonic_family_input_hash = family_evidence["resultHash"]
             residual_model_input_hash = residual_model_evidence["resultHash"]
         else:
