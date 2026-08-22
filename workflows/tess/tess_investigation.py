@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from functools import wraps
 from pathlib import Path
 from typing import Any
 
@@ -286,6 +287,17 @@ def _next_stage_id(current_id: str, label: str) -> str:
     except (TypeError, ValueError):
         raise ValueError(f"Stage id must begin with an integer prefix: {current_id}")
     return f"{number:03d}-{label}"
+
+
+def _retry_transient_tess_archive_failures(handler):
+    """Adapt provider-neutral TESS archive failures at the workflow boundary."""
+    @wraps(handler)
+    def wrapped(investigation, request):
+        try:
+            return handler(investigation, request)
+        except TessArchiveTransientError as error:
+            raise RetryableExecutionError(str(error)) from error
+    return wrapped
 
 
 def broad_independent_continuation(
@@ -3367,22 +3379,19 @@ def build_engine(
         print(f"   fractional frequency drift/day: {nonstationary.get('fractionalFrequencyDriftPerDay')}")
         print("   downloading TESS pixel stamps, subtracting the established family per pixel")
         print("   each usable pixel becomes one ordinary generic Lomb-Scargle dataset")
-        try:
-            spec = build_residual_mode_pixel_project(
-                source_project_path=prepared["sourceProjectPath"],
-                source_dataset_entry=prepared["sourceDatasetEntry"],
-                tic_id=int(prepared["ticID"]),
-                identity=identity,
-                primary_sector=prepared.get("sector"),
-                independent_spec=independent_prepare,
-                physical_period_days=physical_period,
-                nonstationary_summary=nonstationary,
-                output_dir=artifact_root,
-                investigation_id=investigation.id,
-                harmonic_orders=harmonic_orders,
-            )
-        except TessArchiveTransientError as error:
-            raise RetryableExecutionError(str(error)) from error
+        spec = build_residual_mode_pixel_project(
+            source_project_path=prepared["sourceProjectPath"],
+            source_dataset_entry=prepared["sourceDatasetEntry"],
+            tic_id=int(prepared["ticID"]),
+            identity=identity,
+            primary_sector=prepared.get("sector"),
+            independent_spec=independent_prepare,
+            physical_period_days=physical_period,
+            nonstationary_summary=nonstationary,
+            output_dir=artifact_root,
+            investigation_id=investigation.id,
+            harmonic_orders=harmonic_orders,
+        )
         spec["periodReference"] = {
             "periodDays": physical_period,
             "kind": ("UNRESOLVED_FAMILY_ANALYSIS_REFERENCE" if dynamic_path is not None
@@ -9109,4 +9118,10 @@ def build_engine(
         period_semantics_stage,
     )
     engine.register_handler("openstar.tess.finalize", finalize_stage)
+    # All TESS handlers share this provider-to-workflow adapter.  Localization
+    # builders call _download_tpf indirectly, so a centralized boundary also
+    # protects new experiments from persisting MAST outages as NON_RETRYABLE.
+    for handler_id, handler in tuple(engine.handlers.items()):
+        if handler_id.startswith("openstar.tess."):
+            engine.handlers[handler_id] = _retry_transient_tess_archive_failures(handler)
     return engine

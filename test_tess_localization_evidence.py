@@ -1,15 +1,25 @@
 import tempfile
 import unittest
+import sys
+import types
 from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
+try:
+    import numpy  # noqa: F401
+except ImportError:
+    sys.modules["numpy"] = types.ModuleType("numpy")
+
 from openstar_investigation import InvestigationStage, InvestigationStore
-from openstar_workflow import StageRequest
+from openstar_lifecycle import InvestigationLifecycleDriver
+from openstar_targets import InvestigationTarget
+from openstar_workflow import RetryableExecutionError, StageRequest
 from workflows.tess.tess_investigation import build_engine
 from workflows.tess.tess_localization_evidence import (
     frozen_residual_localization_family,
 )
+from workflows.tess.tess_sector_archive import TessArchiveTransientError
 
 
 class FrozenResidualLocalizationFamilyTests(unittest.TestCase):
@@ -110,6 +120,91 @@ class FrozenResidualLocalizationFamilyTests(unittest.TestCase):
                     investigation, request, software_id="test", software_version="current"
                 )
         build_project.assert_not_called()
+
+    def _archive_failure_investigation(self, *, review):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        store = InvestigationStore(Path(temporary.name) / "investigations")
+        investigation = store.create("archive-timeout", "workflow", "1")
+        morphology, tf_prepare, tf_summary, mode = self._evidence()
+        mode["recommendedNextTest"] = "RESIDUAL_MODE_PIXEL_LOCALIZATION"
+        stages = [
+            InvestigationStage(
+                "001-prepare-target", "openstar.tess.prepare-target", "COMPLETE",
+                None, {}, result={"sourceProjectPath": "source.json",
+                                  "sourceDatasetEntry": {}, "ticID": 42, "sector": 1},
+            ),
+            InvestigationStage("002-identity", "openstar.tess.catalog-identity",
+                               "COMPLETE", "001-prepare-target", {}, result={}),
+            InvestigationStage("003-independent", "openstar.tess.independent.prepare",
+                               "COMPLETE", "002-identity", {}, result={}),
+            InvestigationStage("010-morphology", "openstar.tess.morphology.analyze",
+                               "COMPLETE", "003-independent", {}, result=morphology),
+            InvestigationStage("012-time-frequency-prepare",
+                               "openstar.tess.time-frequency.prepare", "COMPLETE",
+                               "010-morphology", {}, result=tf_prepare),
+            InvestigationStage("013-time-frequency-summary",
+                               "openstar.tess.time-frequency.summarize", "COMPLETE",
+                               "012-time-frequency-prepare", {}, result=tf_summary),
+            InvestigationStage("018-mode-identification",
+                               "openstar.tess.mode-identification.analyze", "COMPLETE",
+                               "013-time-frequency-summary", {}, result=mode),
+        ]
+        if review:
+            stages.append(InvestigationStage(
+                "021-interpret-residual-mode-localization",
+                "openstar.tess.residual-mode-localization.interpret", "COMPLETE",
+                "018-mode-identification", {}, result={
+                    "recommendedNextTest": "RESIDUAL_MODE_SOURCE_LOCALIZATION_REVIEW"
+                },
+            ))
+        investigation = replace(investigation, status="RUNNING", stages=tuple(stages))
+        store.save(investigation)
+        label = ("prepare-residual-mode-localization-review" if review
+                 else "prepare-residual-mode-localization")
+        request = StageRequest(
+            f"022-{label}", f"openstar.tess.{label.replace('prepare-', '')}.prepare",
+            {}, stages[-1].id,
+        )
+        return store, investigation, request
+
+    def _assert_actual_prepare_timeout_is_retryable(self, *, review):
+        store, investigation, request = self._archive_failure_investigation(review=review)
+        engine = build_engine(store, mock.Mock(), poll_interval=0.0, timeout=1.0)
+        builder = ("build_residual_mode_localization_review_project" if review
+                   else "build_residual_mode_pixel_project")
+        with mock.patch(
+            f"workflows.tess.tess_investigation.{builder}",
+            side_effect=TessArchiveTransientError("MAST read timed out"),
+        ), self.assertRaises(RetryableExecutionError):
+            engine.run_stage(investigation, request, software_id="test", software_version="1")
+
+        failed = store.load(investigation.id)
+        self.assertEqual("FAILED", failed.status)
+        self.assertEqual("FAILED", failed.stages[-1].status)
+        self.assertEqual("TRANSIENT_INFRASTRUCTURE",
+                         failed.stages[-1].failure_classification)
+        historical_bytes = store.stage_path_for(failed.id, request.id).read_bytes()
+
+        target = InvestigationTarget("42", failed.id, "workflow", "1")
+        driver = InvestigationLifecycleDriver(
+            store, mock.Mock(), {}, software_id="test", software_version="1"
+        )
+        first = driver.prepare(target).investigation
+        selected = first.metadata["controlState"]["selectedExperiment"]
+        self.assertNotEqual(request.id, selected["id"])
+        self.assertEqual(request.id, selected["triggered_by_stage_id"])
+        second = driver.prepare(target).investigation
+        self.assertEqual(selected, second.metadata["controlState"]["selectedExperiment"])
+        self.assertEqual(historical_bytes,
+                         store.stage_path_for(failed.id, request.id).read_bytes())
+        self.assertEqual(failed.stages, second.stages)
+
+    def test_actual_residual_prepare_timeout_is_retryable_and_restarted_once(self):
+        self._assert_actual_prepare_timeout_is_retryable(review=False)
+
+    def test_actual_review_prepare_timeout_is_retryable_and_restarted_once(self):
+        self._assert_actual_prepare_timeout_is_retryable(review=True)
 
 
 if __name__ == "__main__":
