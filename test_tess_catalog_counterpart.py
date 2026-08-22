@@ -233,8 +233,35 @@ class CatalogCounterpartTest(unittest.TestCase):
                     offset_source_identification=self._new_catalog_result(),
                     output_dir=root, investigation_id="test",
                 )
+                historical_prewhiten = patched["_prewhiten_cube_raw"].call_args_list[0]
+                unresolved_spec = build_offset_source_variability_project(
+                    source_project_path=source_project,
+                    source_dataset_entry={"id": "blind-c", "targetName": "Blind C"},
+                    target_tic_id=1,
+                    identity={"tic": {"metadata": {"raDeg": 100.0, "decDeg": -30.0}}},
+                    primary_sector=None, independent_spec={"preparedSectors": []},
+                    multisource_summary={"bestOffsetComponentID": "offset-2",
+                        "componentSummaries": [{"componentID": "offset-2"}]},
+                    offset_source_identification=self._new_catalog_result(),
+                    output_dir=root, investigation_id="unresolved",
+                    reference_family_period_days=10.30084080080649,
+                    harmonic_orders=[1, 2, 3, 4], physical_cycle_resolved=False,
+                    residual_reference_frequency=0.3,
+                    residual_time_reference_days=1000.0,
+                    fractional_frequency_drift_per_day=0.001,
+                    frozen_sectors=[1, 2],
+                    family_residual_provenance={"bridge": "stage-045"},
+                )
 
             self.assertEqual("openstar.lomb-scargle.v1", spec["workloadID"])
+            self.assertEqual((1, 2), historical_prewhiten.kwargs["harmonic_orders"])
+            self.assertTrue(spec["physicalCycleResolved"])
+            self.assertEqual(10.30084080080649,
+                             unresolved_spec["referenceFamilyPeriodDays"])
+            self.assertEqual([1, 2, 3, 4], unresolved_spec["subtractedHarmonicOrders"])
+            self.assertFalse(unresolved_spec["physicalCycleResolved"])
+            self.assertEqual([1, 2, 3, 4],
+                             list(patched["_prewhiten_cube_raw"].call_args.kwargs["harmonic_orders"]))
             self.assertEqual(736900598, spec["catalogCounterpart"]["ticID"])
             self.assertEqual(5284296077579591040,
                              spec["catalogCounterpart"]["gaiaDR3SourceID"])

@@ -187,6 +187,92 @@ class CatalogGuidedLocalizationTests(unittest.TestCase):
             self.assertEqual("UNRESOLVED", investigation.stages[-1].result["classification"])
             self.assertEqual("QUIESCENT_AWAITING_DATA", investigation.status)
 
+    def test_stage_048_uses_unresolved_family_bridge_without_obsolete_evidence(self):
+        candidate = {"raDeg": 10.1, "decDeg": -20.1,
+                     "catalogIDs": {"ticID": 111, "gaiaDR3SourceID": 222}}
+        bridge = {
+            "version": "bridge", "preparationPath": "/frozen/045.json",
+            "referenceFamilyPeriodDays": 10.30084080080649,
+            "subtractedHarmonicOrders": [1, 2, 3, 4],
+            "physicalCycleResolved": False, "residualReferenceFrequency": 0.37,
+            "residualTimeReferenceDays": 100.0,
+            "fractionalFrequencyDriftPerDay": 0.002, "sectors": [1, 27],
+            "priorEvidence": {"stage038": "frozen", "stage041": "frozen"},
+        }
+        localized = {
+            "classification": "SINGLE_CATALOG_CANDIDATE_ATTRIBUTED",
+            "sourceAttributionResolved": True, "preferredCandidate": candidate,
+            "recommendedNextTest": "INDEPENDENT_COUNTERPART_PHOTOMETRIC_VARIABILITY_VALIDATION",
+            "physicalMechanismResolved": False, "catalogCandidates": [candidate],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_project = root / "source.json"
+            source_project.write_text('{"id":"source","workloadID":"openstar.lomb-scargle.v1"}')
+            project = root / "prepared.json"
+            project.write_text("{}")
+            store = InvestigationStore(root / "store")
+            investigation = store.create("tic-277940827-stage-048", "test", "1")
+            stages = (
+                InvestigationStage("001-target", "openstar.tess.prepare-target", "COMPLETE",
+                    None, {}, result={"ticID": 277940827, "sourceProjectPath": str(source_project),
+                                      "sourceDatasetEntry": {"id": "tic"}, "sector": 1}),
+                InvestigationStage("002-identity", "openstar.tess.catalog-identity", "COMPLETE",
+                    None, {}, result={"tic": {"metadata": {"raDeg": 10.0, "decDeg": -20.0}}}),
+                InvestigationStage("003-independent", "openstar.tess.independent.prepare", "COMPLETE",
+                    None, {}, result={"preparedSectors": [{"sector": 1}, {"sector": 27}]}),
+                InvestigationStage("038-family", "openstar.tess.dynamic-harmonic.analyze", "COMPLETE",
+                    None, {}, result={"physicalCycleResolved": False}),
+                InvestigationStage("040-multisource", "openstar.tess.multi-source-residual.interpret",
+                    "COMPLETE", None, {}, result={"bestOffsetComponentID": "offset-1",
+                        "componentSummaries": [{"componentID": "offset-1"}]}),
+                InvestigationStage("041-prf", "openstar.tess.official-spoc-prf-forward-modeling.prepare",
+                    "COMPLETE", None, {}, result=bridge),
+                InvestigationStage("043-prf-interpret",
+                    "openstar.tess.official-spoc-prf-forward-modeling.interpret", "COMPLETE",
+                    None, {}, result={"physicalMechanismResolved": False}),
+                InvestigationStage("044-catalog",
+                    "openstar.tess.catalog-counterpart-identification.analyze", "COMPLETE",
+                    None, {}, result={"preferredCandidate": None}),
+                InvestigationStage("045-localize-prepare",
+                    "openstar.tess.catalog-guided-source-localization.prepare", "COMPLETE",
+                    None, {}, result=bridge),
+                InvestigationStage("046-localize-run",
+                    "openstar.tess.catalog-guided-source-localization.run", "COMPLETE",
+                    None, {}, result={}),
+                InvestigationStage("047-localize-interpret",
+                    "openstar.tess.catalog-guided-source-localization.interpret", "COMPLETE",
+                    None, {}, result=localized),
+            )
+            investigation = replace(investigation, stages=stages)
+            store.save(investigation)
+            engine = build_engine(store, SimpleNamespace(), poll_interval=0.0, timeout=None)
+            engine.chain_stages = False
+            returned = {"projectPath": str(project), "preparedSeries": [],
+                        "workloadID": "openstar.lomb-scargle.v1", "referencePeriodDays": 1 / 0.37,
+                        "totalWorkUnits": 0}
+            with mock.patch(
+                "workflows.tess.tess_investigation.build_offset_source_variability_project",
+                autospec=True, return_value=returned) as builder:
+                completed, next_request = engine.run_stage(
+                    investigation, StageRequest(
+                        "048-prepare-offset-source-variability",
+                        "openstar.tess.offset-source-variability.prepare", {}),
+                    software_id="test", software_version="1")
+            kwargs = builder.call_args.kwargs
+            self.assertEqual(10.30084080080649, kwargs["reference_family_period_days"])
+            self.assertEqual([1, 2, 3, 4], kwargs["harmonic_orders"])
+            self.assertFalse(kwargs["physical_cycle_resolved"])
+            self.assertEqual((0.37, 100.0, 0.002), (
+                kwargs["residual_reference_frequency"], kwargs["residual_time_reference_days"],
+                kwargs["fractional_frequency_drift_per_day"]))
+            self.assertEqual([1, 27], kwargs["frozen_sectors"])
+            self.assertIsNone(kwargs["nonstationary_summary"])
+            self.assertIsNone(kwargs["physical_period_days"])
+            self.assertEqual(localized, kwargs["offset_source_identification"])
+            self.assertEqual("049-run-offset-source-variability", next_request.id)
+            self.assertEqual("COMPLETE", completed.stages[-1].status)
+
 
 if __name__ == "__main__":
     unittest.main()

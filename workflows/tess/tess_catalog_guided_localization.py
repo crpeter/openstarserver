@@ -398,7 +398,8 @@ def interpret_catalog_guided_localization(preparation: dict[str, Any],
         "sectorResults": sectors, "decisiveSectorCount": len(decisive),
         "classification": "SINGLE_CATALOG_CANDIDATE_ATTRIBUTED" if resolved else "UNRESOLVED",
         "preferredModel": model, "preferredCandidate": preferred,
-        "physicalCycleResolved": False, "sourceAttributionResolved": resolved,
+        "physicalCycleResolved": False, "physicalMechanismResolved": False,
+        "sourceAttributionResolved": resolved,
         "recommendedNextTest": (
             "INDEPENDENT_COUNTERPART_PHOTOMETRIC_VARIABILITY_VALIDATION" if resolved
             else "ADDITIONAL_SOURCE_LOCALIZATION_DATA"),
