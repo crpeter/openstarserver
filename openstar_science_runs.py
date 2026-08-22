@@ -12,9 +12,10 @@ import hashlib
 import json
 import os
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_SCIENCE_RUN_CATALOG = ROOT / "data" / "science-runs.sqlite3"
@@ -67,8 +68,18 @@ class ScienceRunCatalog:
         connection.row_factory = sqlite3.Row
         return connection
 
+    @contextmanager
+    def _connection(self, *, write: bool = False) -> Iterator[sqlite3.Connection]:
+        """Yield a connection and always close it after commit/rollback handling."""
+        connection = self._connect(write=write)
+        try:
+            with connection:
+                yield connection
+        finally:
+            connection.close()
+
     def _initialize(self) -> None:
-        with self._connect(write=True) as connection:
+        with self._connection(write=True) as connection:
             connection.execute("PRAGMA journal_mode=WAL")
             connection.execute(
                 """
@@ -121,7 +132,7 @@ class ScienceRunCatalog:
             str(Path(state_root).expanduser().resolve()) if state_root is not None else None
         )
         completed_at = timestamp if status in _TERMINAL_STATUSES else None
-        with self._connect(write=True) as connection:
+        with self._connection(write=True) as connection:
             connection.execute(
                 """
                 INSERT INTO science_runs (
@@ -175,7 +186,7 @@ class ScienceRunCatalog:
         if completed is None:
             completed = next_status in _TERMINAL_STATUSES
         completed_at = timestamp if completed else None
-        with self._connect(write=True) as connection:
+        with self._connection(write=True) as connection:
             connection.execute(
                 """
                 UPDATE science_runs
@@ -215,7 +226,7 @@ class ScienceRunCatalog:
     def get(self, run_id: str) -> dict[str, Any] | None:
         if not self.path.exists():
             return None
-        with self._connect() as connection:
+        with self._connection() as connection:
             row = connection.execute(
                 "SELECT * FROM science_runs WHERE id = ?", (run_id,)
             ).fetchone()
@@ -224,7 +235,7 @@ class ScienceRunCatalog:
     def list_runs(self) -> list[dict[str, Any]]:
         if not self.path.exists():
             return []
-        with self._connect() as connection:
+        with self._connection() as connection:
             rows = connection.execute(
                 """
                 SELECT * FROM science_runs
