@@ -20,10 +20,13 @@ from .tess_prf_refinement import (
 )
 from .tess_multisource_residual import _prewhiten_cube_raw
 from .tess_offset_variability import _skycoord
+from .tess_prf_deblend import _background_columns
 from .tess_residual_localization import (
     MAX_CADENCES, _background_subtract_cube, _download_tpf, _uniform_indices, _write_json,
 )
 from .tess_spoc_prf import (
+    MIN_OFFICIAL_PRF_EXPLAINED_VARIANCE, SHARED_ASTROMETRIC_SHIFT_GRID,
+    _fit_static_image,
     _list_official_prf_grid, _official_prf_at_detector_position,
     _render_prf_template, _tpf_detector_geometry,
 )
@@ -57,11 +60,22 @@ def _compare_hypotheses(coefficients: np.ndarray, covariances: np.ndarray,
     for model_id, model in models.items():
         model["deltaBIC"] = float(model["bic"] - models[winner]["bic"])
     selected = models[winner]
-    identifiable = bool(selected["fullRank"] and all(
-        source["individuallyIdentifiable"] for source in selected["sourceEstimates"]
-    ))
+    selected_indices = set(MODEL_COMPONENTS[winner])
+    conditional = models["TARGET_PLUS_BOTH"]
+    conditional_sources = {
+        item["componentID"]: item for item in conditional["sourceEstimates"]}
+    # Attribution is conditional on every plausible source. A source that is
+    # significant only after its close competitor is omitted is not localized.
+    identifiable = bool(
+        selected["fullRank"] and conditional["fullRank"]
+        and all(source["individuallyIdentifiable"] for source in selected["sourceEstimates"])
+        and all(conditional_sources[COMPONENT_IDS[index]]["individuallyIdentifiable"]
+                for index in selected_indices)
+        and all(not conditional_sources[COMPONENT_IDS[index]]["individuallyIdentifiable"]
+                for index in set(range(3)) - selected_indices))
     return {"models": models, "bestModel": winner,
-            "bestModelIdentifiable": identifiable}
+            "bestModelIdentifiable": identifiable,
+            "conditionalIdentifiabilityModel": "TARGET_PLUS_BOTH"}
 
 
 def _source_vector_compatibility(folds: list[dict[str, Any]], model_id: str) -> dict[str, Any]:
@@ -181,27 +195,48 @@ def _temporal_predictive_validation(*, times: np.ndarray, prewhitened: np.ndarra
     }
 
 
-def _fit_shared_astrometric_shift(*, observations: np.ndarray, covariances: np.ndarray,
+def _fit_shared_astrometric_shift(*, calibration_image: np.ndarray,
+                                  background_columns: list[np.ndarray],
                                   render_templates: Callable[[float, float], np.ndarray],
-                                  shift_grid: tuple[float, ...] = (-0.2, 0.0, 0.2)) -> dict[str, Any]:
-    """Calibrate exactly one detector dx/dy shared by all three catalog sources."""
+                                  shift_grid: tuple[float, ...] = SHARED_ASTROMETRIC_SHIFT_GRID
+                                  ) -> dict[str, Any]:
+    """Calibrate one shared dx/dy from the static sector image, independently of attribution."""
     trials = []
     for dx in shift_grid:
         for dy in shift_grid:
             templates = np.asarray(render_templates(float(dx), float(dy)), dtype=float)
             if templates.ndim != 2 or templates.shape[1] != 3:
                 raise ValueError("PRF renderer must return target + two candidate templates.")
-            comparison = _compare_hypotheses(observations, covariances, templates)
-            trials.append((comparison["models"]["TARGET_PLUS_BOTH"]["chiSquare"], dx, dy,
-                           templates, comparison))
-    _, dx, dy, templates, comparison = min(trials, key=lambda item: item[0])
-    return {"sharedAstrometricCalibration": {"dxPixels": float(dx), "dyPixels": float(dy),
-            "appliedToComponents": list(COMPONENT_IDS), "independentSourceMotion": False},
-            "templates": templates, "comparison": comparison}
+            design = np.column_stack([templates, *background_columns])
+            objective, coefficients, explained = _fit_static_image(
+                design, np.asarray(calibration_image, dtype=float), len(COMPONENT_IDS))
+            trials.append((objective, dx, dy, templates, coefficients, explained))
+    finite = [item for item in trials if math.isfinite(float(item[0]))]
+    if not finite:
+        return {"available": False, "reason": "no finite static-image calibration objective"}
+    minimum = min(float(item[0]) for item in finite)
+    minima = [item for item in finite if np.isclose(float(item[0]), minimum)]
+    if len(minima) != 1:
+        return {"available": False, "reason": "shared astrometric objective has no unique minimum",
+                "minimumObjective": minimum, "tiedMinimumCount": len(minima)}
+    _, dx, dy, templates, coefficients, explained = minima[0]
+    if float(explained) < MIN_OFFICIAL_PRF_EXPLAINED_VARIANCE:
+        return {"available": False, "reason": "official PRF static-image calibration inadequate",
+                "explainedVariance": float(explained),
+                "minimumExplainedVariance": MIN_OFFICIAL_PRF_EXPLAINED_VARIANCE}
+    return {"available": True,
+            "sharedAstrometricCalibration": {"dxPixels": float(dx), "dyPixels": float(dy),
+            "appliedToComponents": list(COMPONENT_IDS), "independentSourceMotion": False,
+            "objective": minimum, "explainedVariance": float(explained),
+            "minimumExplainedVariance": MIN_OFFICIAL_PRF_EXPLAINED_VARIANCE,
+            "sourceFluxCoefficients": coefficients[:3].tolist()},
+            "templates": templates}
 
 
 def analyze_catalog_guided_sector(*, sector: int, times: np.ndarray,
                                   prewhitened: np.ndarray, valid: np.ndarray,
+                                  calibration_image: np.ndarray,
+                                  background_columns: list[np.ndarray],
                                   render_templates: Callable[[float, float], np.ndarray],
                                   residual_frequency: float, time_reference: float,
                                   drift: float, physical_frequency: float,
@@ -218,8 +253,19 @@ def analyze_catalog_guided_sector(*, sector: int, times: np.ndarray,
         frequency=float(residual_frequency), time_reference=float(time_reference),
         drift=float(drift), coherent_basis=coherent_basis)
     calibrated = _fit_shared_astrometric_shift(
-        observations=fit["coefficients"], covariances=fit["covariances"],
+        calibration_image=calibration_image, background_columns=background_columns,
         render_templates=render_templates)
+    if not calibrated.get("available"):
+        return {"sector": int(sector), "calibrationResolved": False,
+                "calibrationFailure": calibrated,
+                "fullDataComparison": {"bestModel": None, "bestModelIdentifiable": False},
+                "temporalPredictiveValidation": {
+                    "predictiveModel": None,
+                    "sourceVectorTemporalCompatibility": {"compatible": False}},
+                "subtractedHarmonicOrders": list(HARMONIC_ORDERS),
+                "physicalCycleResolved": False}
+    comparison = _compare_hypotheses(
+        fit["coefficients"], fit["covariances"], calibrated["templates"])
     temporal = _temporal_predictive_validation(
         times=times, prewhitened=np.asarray(prewhitened, dtype=float), valid=valid,
         templates=calibrated["templates"], residual_frequency=float(residual_frequency),
@@ -228,7 +274,7 @@ def analyze_catalog_guided_sector(*, sector: int, times: np.ndarray,
     return {
         "sector": int(sector),
         "sharedAstrometricCalibration": calibrated["sharedAstrometricCalibration"],
-        "fullDataComparison": calibrated["comparison"],
+        "calibrationResolved": True, "fullDataComparison": comparison,
         "temporalPredictiveValidation": temporal,
         "subtractedHarmonicOrders": list(HARMONIC_ORDERS),
         "physicalCycleResolved": False,
@@ -279,6 +325,9 @@ def _production_sector_inputs(preparation: dict[str, Any]) -> list[dict[str, Any
                 archive_cache=cache_root / f"sector-{int(sector):04d}", grid_entries=grid)
             models.append({**center, "image": image, "header": header, "modelFiles": files})
         valid_flat = valid.reshape(-1)
+        median_image = np.nanmedian(corrected, axis=0).reshape(-1)[valid_flat]
+        static_background = [column[valid_flat]
+                             for column in _background_columns(rows, cols, valid)]
 
         def render(dx: float, dy: float, *, source_models=models,
                    mask=valid, selection=valid_flat) -> np.ndarray:
@@ -293,6 +342,7 @@ def _production_sector_inputs(preparation: dict[str, Any]) -> list[dict[str, Any
         inputs.append({
             "sector": int(sector), "times": times, "prewhitened": residual,
             "valid": valid, "renderTemplates": render,
+            "calibrationImage": median_image, "backgroundColumns": static_background,
             "physicalFrequency": 1.0 / float(preparation["referenceFamilyPeriodDays"]),
             "acquisitionProvenance": {"tpf": source, "backgroundSubtraction": background,
                                       "componentPixelCenters": centers,
@@ -315,6 +365,8 @@ def run_catalog_guided_localization(
         result = analyze_catalog_guided_sector(
             sector=int(item["sector"]), times=item["times"],
             prewhitened=item["prewhitened"], valid=item["valid"],
+            calibration_image=item["calibrationImage"],
+            background_columns=item["backgroundColumns"],
             render_templates=renderer,
             residual_frequency=float(preparation["residualReferenceFrequency"]),
             time_reference=float(preparation["residualTimeReferenceDays"]),

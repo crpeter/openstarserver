@@ -9,6 +9,7 @@ import numpy as np
 
 from workflows.tess.tess_catalog_guided_localization import (
     COMPONENT_IDS,
+    _compare_hypotheses,
     _fit_shared_astrometric_shift,
     _temporal_predictive_validation,
     interpret_catalog_guided_localization,
@@ -68,25 +69,70 @@ class CatalogGuidedLocalizationTests(unittest.TestCase):
         vectors = [[(0, 0), (1.2, -0.45), (0, 0)] for _ in range(4)]
         result = self._validate(vectors)
         self.assertEqual("CANDIDATE_1_ONLY", result["predictiveModel"])
+        coefficients = self.templates[:, 1, None] * np.asarray([[1.2, -0.45]])
+        comparison = _compare_hypotheses(
+            coefficients, np.repeat(np.eye(2)[None] * 1e-4, len(self.templates), axis=0),
+            self.templates)
+        self.assertEqual("CANDIDATE_1_ONLY", comparison["bestModel"])
+        self.assertTrue(comparison["bestModelIdentifiable"])
+
+    def test_overlapping_candidates_fail_conditional_identifiability(self):
+        templates = self.templates.copy()
+        templates[:, 2] = templates[:, 1]
+        coefficients = templates[:, 1, None] * np.asarray([[1.2, -0.45]])
+        comparison = _compare_hypotheses(
+            coefficients, np.repeat(np.eye(2)[None] * 1e-4, len(templates), axis=0),
+            templates)
+        self.assertEqual("CANDIDATE_1_ONLY", comparison["bestModel"])
+        self.assertFalse(comparison["bestModelIdentifiable"])
 
     def test_one_shared_astrometric_shift_applies_to_all_sources(self):
         expected = (0.2, -0.2)
-        base = self.templates
+        yy, xx = np.mgrid[0:4, 0:4]
+        centers = [(0.8, 0.9), (2.0, 1.5), (2.8, 2.7)]
         def render(dx, dy):
-            penalty = (dx - expected[0]) ** 2 + (dy - expected[1]) ** 2
-            return base + penalty * np.asarray([1, -1, 1, -1, 1])[:, None]
-        truth = render(*expected)
-        observations = truth * np.asarray([1.0, 0.5, -0.3])[None, :]
-        observations = np.column_stack((observations.sum(axis=1),
-                                        0.3 * observations.sum(axis=1)))
+            columns = []
+            for cx, cy in centers:
+                value = np.exp(-0.5 * (((xx - cx - dx) / 0.55) ** 2
+                                       + ((yy - cy - dy) / 0.55) ** 2)).reshape(-1)
+                columns.append(value / value.sum())
+            return np.column_stack(columns)
+        background = [np.ones(16), np.tile(np.linspace(-1, 1, 4), 4),
+                      np.repeat(np.linspace(-1, 1, 4), 4)]
+        calibration_image = np.column_stack(
+            [render(*expected), *background]) @ np.asarray([8, 5, 3, 2, .2, -.1])
         result = _fit_shared_astrometric_shift(
-            observations=observations,
-            covariances=np.repeat(np.eye(2)[None, :, :] * 1e-3, len(base), axis=0),
+            calibration_image=calibration_image, background_columns=background,
             render_templates=render)
+        self.assertTrue(result["available"])
         calibration = result["sharedAstrometricCalibration"]
         self.assertEqual(expected, (calibration["dxPixels"], calibration["dyPixels"]))
         self.assertEqual(list(COMPONENT_IDS), calibration["appliedToComponents"])
         self.assertFalse(calibration["independentSourceMotion"])
+
+    def test_flat_astrometric_objective_is_rejected(self):
+        with mock.patch(
+            "workflows.tess.tess_catalog_guided_localization._fit_static_image",
+            return_value=(1.0, np.ones(6), 0.9)):
+            result = _fit_shared_astrometric_shift(
+                calibration_image=np.ones(16), background_columns=[np.ones(16)] * 3,
+                render_templates=lambda _dx, _dy: np.ones((16, 3)))
+        self.assertFalse(result["available"])
+        self.assertIn("unique minimum", result["reason"])
+
+    def test_inadequate_astrometric_explained_variance_is_rejected(self):
+        calls = iter(range(9))
+        def inadequate(*_args):
+            index = next(calls)
+            return (float(index), np.ones(6), 0.1)
+        with mock.patch(
+            "workflows.tess.tess_catalog_guided_localization._fit_static_image",
+            side_effect=inadequate):
+            result = _fit_shared_astrometric_shift(
+                calibration_image=np.ones(16), background_columns=[np.ones(16)] * 3,
+                render_templates=lambda _dx, _dy: np.ones((16, 3)))
+        self.assertFalse(result["available"])
+        self.assertIn("inadequate", result["reason"])
 
     def test_tic_path_preserves_ambiguous_preparation_contract(self):
         catalog = {"recommendedNextTest": "CATALOG_GUIDED_SOURCE_LOCALIZATION",
