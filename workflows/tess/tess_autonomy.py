@@ -495,24 +495,44 @@ def _repair_unresolved_dynamic_localization_review_failure(
     failed = investigation.stages[-1]
     if (failed.status != "FAILED"
             or failed.handler_id != "openstar.tess.residual-mode-localization-review.prepare"
-            or not any(text in str(failed.error or "") for text in (
-                "requires the morphology-resolved physical period",
-                "requires the completed v20.9 nonstationary model",
-            ))):
+            or failed.failure_classification != "NON_RETRYABLE"
+            or failed.error not in {
+                "RuntimeError: v20.11 requires the morphology-resolved physical period.",
+                "RuntimeError: v20.11 requires the completed v20.9 nonstationary model.",
+            }):
         return None
     scheduler_action = control.get("schedulerAction")
     if scheduler_action not in ("RUN_EXPERIMENT", "INVESTIGATION_FAILED"):
         return None
     selected = control.get("selectedExperiment")
-    if selected is not None and (
-        not isinstance(selected, dict)
-        or selected.get("id") != failed.id
-        or selected.get("handler_id") != failed.handler_id
-        or not isinstance(selected.get("parameters"), dict)
-        or selected.get("parameters") != failed.parameters
-        or selected.get("triggered_by_stage_id") != failed.triggered_by_stage_id
-    ):
-        return None
+    if selected is not None:
+        if not isinstance(selected, dict):
+            return None
+        # A scheduler decision dispatches a whole linked StageOutcome chain.
+        # Consequently selectedExperiment normally still describes the first
+        # stage in that chain when a later stage fails.  Accept that real
+        # persisted shape, but only when the selected request exactly matches
+        # an immutable historical stage and the failure descends from it.
+        selected_stage = next(
+            (stage for stage in investigation.stages if stage.id == selected.get("id")),
+            None,
+        )
+        if selected_stage is None or (
+            selected.get("handler_id") != selected_stage.handler_id
+            or not isinstance(selected.get("parameters"), dict)
+            or selected.get("parameters") != selected_stage.parameters
+            or selected.get("triggered_by_stage_id")
+            != selected_stage.triggered_by_stage_id
+        ):
+            return None
+        ancestors = {failed.id}
+        cursor = failed
+        stages_by_id = {stage.id: stage for stage in investigation.stages}
+        while cursor.triggered_by_stage_id in stages_by_id:
+            cursor = stages_by_id[cursor.triggered_by_stage_id]
+            ancestors.add(cursor.id)
+        if selected_stage.id not in ancestors:
+            return None
     morphology = _latest_complete(investigation, "openstar.tess.morphology.analyze")
     dynamic = _latest_complete(investigation, "openstar.tess.dynamic-harmonic.analyze")
     tf_prepare = _latest_complete(investigation, "openstar.tess.time-frequency.prepare")
