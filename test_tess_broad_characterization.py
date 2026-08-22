@@ -72,9 +72,17 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
             ("021-dynamic", "openstar.tess.dynamic-harmonic.analyze",
              {"referenceFamilyPeriodDays": 10.30084080080649,
               "supportedHarmonicOrders": [1, 2, 3, 4]}),
-            ("030-nonstationary", "openstar.tess.nonstationary.summarize", {}),
             ("035-review", "openstar.tess.residual-mode-localization-review.interpret",
-             {"recommendedNextTest": "MULTI_SOURCE_RESIDUAL_DECOMPOSITION"}),
+             {"residualFrequencyAtReference": 1 / 2.2071724078510457,
+              "residualPeriodAtReferenceDays": 2.2071724078510457,
+              "fractionalFrequencyDriftPerDay": 0.0,
+              "timeReferenceDays": 2500.0,
+              "signalSectors": [94, 95, 102, 103],
+              "crossTime": {
+                  "classification": "RESIDUAL_MODE_SOURCE_SWITCHING_OR_BLEND",
+                  "residualModeOrigin": "TIME_VARIABLE_OR_BLENDED",
+              },
+              "recommendedNextTest": "MULTI_SOURCE_RESIDUAL_DECOMPOSITION"}),
         )
         for stage_id, handler, result in evidence:
             investigation = self._complete(store, investigation, stage_id, handler, result)
@@ -100,6 +108,13 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
         self.assertEqual(10.30084080080649, captured["physical_period_days"])
         self.assertFalse(captured["physical_cycle_resolved"])
         self.assertEqual("021-dynamic", captured["family_evidence"]["stageID"])
+        residual = captured["nonstationary_summary"]
+        self.assertAlmostEqual(1 / 2.2071724078510457,
+                               residual["preferredFrequencyAtReference"])
+        self.assertEqual([94, 95, 102, 103], residual["preferredModel"]["signalSectors"])
+        self.assertEqual("035-review", residual["sourceEvidence"]["stageID"])
+        self.assertEqual("openstar.tess.residual-mode-localization-review.interpret",
+                         residual["sourceEvidence"]["handlerID"])
         self.assertEqual("openstar.tess.multi-source-residual.run", next_request.handler_id)
         self.assertEqual("openstar.lomb-scargle.v1", result["workloadID"])
 
