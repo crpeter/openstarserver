@@ -6,6 +6,7 @@ const relative = timestamp => {
   const seconds = Math.max(0, Date.now() / 1000 - timestamp);
   return seconds < 60 ? "just now" : seconds < 3600 ? `${Math.floor(seconds / 60)}m ago` : seconds < 86400 ? `${Math.floor(seconds / 3600)}h ago` : `${Math.floor(seconds / 86400)}d ago`;
 };
+const relativeISO = value => value && !Number.isNaN(Date.parse(value)) ? relative(Date.parse(value) / 1000) : "Never";
 function element(tag, options = {}, children = []) {
   const node = document.createElement(tag);
   if (options.className) node.className = options.className;
@@ -41,6 +42,18 @@ function labelledRows(fields) {
   return Object.entries(fields).map(([label, value]) => element("div", {className: "row"}, [element("span", {text: label}), element("b", {text: value ?? "Unavailable"})]));
 }
 function jsonBlock(value) { return element("pre", {text: JSON.stringify(value, null, 2)}); }
+function renderScienceRuns(runs) {
+  const panel = $("#scienceRunsPanel");
+  panel.hidden = !runs.length;
+  if (!runs.length) { replace($("#scienceRuns"), []); return; }
+  replace($("#scienceRuns"), [element("div", {className: "rows"}, runs.map(run => {
+    const badgeClass = run.status === "RUNNING" ? "active" : run.status === "FAILED" ? "error" : "idle";
+    return element("div", {className: "row"}, [
+      element("div", {}, [element("b", {text: run.displayName || run.id}), element("small", {text: ` · ${run.kind || "science"}`})]),
+      element("div", {}, [element("span", {className: `badge ${badgeClass}`, text: run.status || "UNKNOWN"}), element("small", {text: ` · ${relativeISO(run.updatedAt)}`})])
+    ]);
+  }))]);
+}
 function renderSectors(sweeps) {
   const panel = $("#sectorPanel");
   panel.hidden = !sweeps.length;
@@ -48,8 +61,9 @@ function renderSectors(sweeps) {
   replace($("#sectors"), sweeps.map(sweep => {
     const percent = Math.max(0, Math.min(1, sweep.progress || 0));
     const metrics = [["Remaining", sweep.remaining], ["Runnable", sweep.runnable], ["In flight or recovery", sweep.inFlightOrRecovery], ["Admitted", sweep.admitted], ["Inventory", sweep.inventory]];
+    const status = sweep.runStatus === "RUNNING" ? "RUNNING" : sweep.status;
     return element("article", {className: "sector"}, [
-      element("div", {className: "sector-heading"}, [element("h3", {text: `TESS Sector ${sweep.sector}`}), element("span", {className: `badge ${sweep.status === "COMPLETE" ? "active" : "idle"}`, text: sweep.status})]),
+      element("div", {className: "sector-heading"}, [element("h3", {text: `TESS Sector ${sweep.sector}`}), element("span", {className: `badge ${status === "COMPLETE" ? "active" : "idle"}`, text: status})]),
       element("div", {className: "sector-total"}, [element("b", {text: `${fmt(sweep.complete)} / ${fmt(sweep.inventory)}`}), element("span", {text: " targets complete"}), element("strong", {text: `${(percent * 100).toFixed(1)}%`})]),
       element("div", {className: "sector-bar", title: `${(percent * 100).toFixed(1)}% complete`}, [Object.assign(element("i"), {style: `width:${percent * 100}%`})]),
       element("div", {className: "sector-metrics"}, metrics.map(([label, value]) => element("div", {}, [element("span", {text: label}), element("b", {text: fmt(value)})])))
@@ -77,6 +91,7 @@ async function refresh() {
     const cards = [["Known workers", snapshot.summary.knownWorkers], ["Connected", snapshot.summary.connectedWorkers], ["Computing", snapshot.summary.activeWorkers], ["Running units", snapshot.summary.runningWorkUnits], ["Completed", snapshot.summary.completedWorkUnits], ["Compute time", duration(snapshot.summary.workerComputeSeconds)]];
     replace($("#stats"), cards.map(([label, value]) => element("div", {className: "stat"}, [element("span", {text: label}), element("b", {text: value})])));
     renderWorkers();
+    renderScienceRuns(activity.scienceRuns || []);
     renderSectors(activity.sectorSweeps || []);
     $("#updated").textContent = `${snapshot.summary.health.toUpperCase()} · updated ${relative(snapshot.summary.updatedAt)}`;
     replace($("#activity"), [element("div", {className: "rows"}, activity.projects.length ? activity.projects.map(project => element("div", {className: "row"}, [element("div", {}, [element("b", {text: project.projectID || "Project"}), element("small", {text: ` · ${project.workloadID || "No workload"}`}), element("div", {className: "bar"}, [Object.assign(element("i"), {style: `width:${100 * (project.projectProgress || 0)}%`})])]), element("span", {text: `${project.projectCompletedWorkUnits || 0} / ${project.projectTotalWorkUnits || 0}`})])) : [element("p", {text: "No active projects"})])]);
