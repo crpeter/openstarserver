@@ -177,6 +177,7 @@ from .tess_atlas_fixed_windows import (
 from .tess_observation_planning import (
     build_targeted_observation_plan,
 )
+from .tess_source_pair_lineage import frozen_source_pair_evidence
 from .tess_multisector import (
     TessArchiveInfrastructureError,
     build_broad_independent_sector_project,
@@ -7189,14 +7190,13 @@ def build_engine(
         ), None)
         atlas_forced = atlas_forced_stage.result if atlas_forced_stage is not None else None
 
-        if prepared is None or external is None or (
-            atlas_fixed is None and atlas_forced is None
-        ):
+        if prepared is None or (atlas_fixed is None and atlas_forced is None):
             raise RuntimeError(
-                "v20.28 requires the frozen target, completed v20.19 evidence, and a supported ATLAS result."
+                "v20.28 requires the frozen target and a supported ATLAS result."
             )
 
         direct_atlas = atlas_fixed is None
+        frozen_pair_evidence = None
         if direct_atlas:
             assert atlas_forced_stage is not None and atlas_forced is not None
             position = investigation.stages.index(atlas_forced_stage)
@@ -7229,6 +7229,9 @@ def build_engine(
                 and item.id != request.id
                 for item in investigation.stages
             )
+            frozen_pair_evidence = frozen_source_pair_evidence(
+                investigation, atlas_forced_stage
+            )
             if not (
                 valid_lineage
                 and not superseded
@@ -7240,13 +7243,15 @@ def build_engine(
                 and atlas_forced.get("recommendedNextTest")
                 == "TARGETED_HIGH_RESOLUTION_TIME_SERIES_PHOTOMETRY"
                 and atlas_forced.get("physicalMechanismResolved") is False
-                and isinstance(atlas_forced.get("sourcePair"), dict)
-                and atlas_forced.get("sourcePair")
-                == external.get("sourcePair")
+                and frozen_pair_evidence is not None
             ):
                 raise RuntimeError(
                     "Direct v20.24 targeted-observation planning evidence is incomplete, ambiguous, or superseded."
                 )
+        elif external is None:
+            raise RuntimeError(
+                "v20.28 fixed-window planning requires completed v20.19 evidence."
+            )
         elif atlas_fixed.get("recommendedNextTest") != (
             "TARGETED_HIGH_RESOLUTION_TIME_SERIES_PHOTOMETRY"
         ):
@@ -7271,7 +7276,9 @@ def build_engine(
             source_project_id=str(prepared["sourceProjectID"]),
             source_dataset_id=str(prepared["datasetID"]),
             investigation_id=investigation.id,
-            external_high_resolution_summary=external,
+            external_high_resolution_summary=(
+                frozen_pair_evidence if direct_atlas else external
+            ),
             output_dir=artifact_root,
             atlas_fixed_window_summary=atlas_fixed,
             atlas_forced_photometry_summary=(atlas_forced if direct_atlas else None),
@@ -7321,8 +7328,12 @@ def build_engine(
                 triggered_by_stage_id=request.id,
             ),
             input_hashes={
-                "externalHighResolutionValidation": sha256_json(
-                    external
+                (
+                    "frozenSourcePairEvidence"
+                    if direct_atlas
+                    else "externalHighResolutionValidation"
+                ): sha256_json(
+                    frozen_pair_evidence if direct_atlas else external
                 ),
                 (
                     "atlasForcedPhotometry"

@@ -24,7 +24,12 @@ except ModuleNotFoundError:
 else:
     _installed_numpy_stub = False
 
-from openstar_investigation import Investigation, InvestigationStage, InvestigationStore
+from openstar_investigation import (
+    Investigation,
+    InvestigationStage,
+    InvestigationStore,
+    sha256_json,
+)
 from openstar_lifecycle import InvestigationLifecycleLoop
 from openstar_external_jobs import (ExternalJob, ExternalJobPollUnavailable,
                                     ExternalDependency, ExternalJobStore,
@@ -32,7 +37,11 @@ from openstar_external_jobs import (ExternalJob, ExternalJobPollUnavailable,
 from openstar_targets import InvestigationTarget
 from openstar_workflow import RetryableExecutionError, StageRequest
 from workflows.tess import tess_atlas_forced_photometry as atlas
-from workflows.tess.tess_autonomy import plan_tess_branches, repair_obsolete_terminal_wait
+from workflows.tess.tess_autonomy import (
+    _awaiting_post_atlas_targeted_observation_adapter,
+    plan_tess_branches,
+    repair_obsolete_terminal_wait,
+)
 
 if _installed_numpy_stub:
     sys.modules.pop("numpy", None)
@@ -420,14 +429,34 @@ class CurrentATLASForcedPhotometryTests(unittest.TestCase):
             InvestigationStage("001-prepare-target", "openstar.tess.prepare-target",
                 "COMPLETE", None, {}, result={"sourceProjectID": "p",
                                                 "datasetID": "d", "ticID": 1}),
-            InvestigationStage("019-external", "openstar.tess.external-high-resolution-variability-validation.interpret",
+            InvestigationStage("050-prepare-noirlab-image-level-forced-photometry",
+                "openstar.tess.noirlab-image-forced-photometry.prepare",
                 "COMPLETE", "001-prepare-target", {}, result={"sourcePair": self.pair}),
-            InvestigationStage("052-run-atlas-forced-photometry",
+            InvestigationStage("051-interpret-noirlab-image-forced-photometry",
+                "openstar.tess.noirlab-image-forced-photometry.interpret",
+                "COMPLETE", "050-prepare-noirlab-image-level-forced-photometry", {},
+                result={"sourcePair": self.pair, "archiveStage": "noirlab"}),
+            InvestigationStage("052-prepare-des-dr2-single-epoch-local-forced-photometry",
+                "openstar.tess.des-dr2-se-local-forced-photometry.prepare",
+                "COMPLETE", "051-interpret-noirlab-image-forced-photometry", {},
+                result={"sourcePair": self.pair}),
+            InvestigationStage("053-interpret-des-dr2-se-local-forced-photometry",
+                "openstar.tess.des-dr2-se-local-forced-photometry.interpret",
+                "COMPLETE", "052-prepare-des-dr2-single-epoch-local-forced-photometry", {},
+                result={"sourcePair": self.pair, "archiveStage": "des"}),
+            InvestigationStage("054-prepare-atlas-forced-photometry",
+                "openstar.tess.atlas-forced-photometry.prepare", "COMPLETE",
+                "053-interpret-des-dr2-se-local-forced-photometry", {},
+                result={"sourcePair": self.pair}),
+            InvestigationStage("055-collect-atlas-forced-photometry",
+                "openstar.tess.atlas-forced-photometry.collect", "COMPLETE",
+                "054-prepare-atlas-forced-photometry", {}, result={"sourcePair": self.pair}),
+            InvestigationStage("056-run-atlas-forced-photometry",
                 "openstar.tess.atlas-forced-photometry.run", "COMPLETE",
-                "051-prepare-atlas-forced-photometry", {}, result={}),
-            InvestigationStage("053-interpret-atlas-forced-photometry",
+                "055-collect-atlas-forced-photometry", {}, result={}),
+            InvestigationStage("057-interpret-atlas-forced-photometry",
                 "openstar.tess.atlas-forced-photometry.interpret", "COMPLETE",
-                "052-run-atlas-forced-photometry", {}, result={
+                "056-run-atlas-forced-photometry", {}, result={
                     "classification": "ATLAS_SOURCE_ATTRIBUTION_UNRESOLVED",
                     "residualModeOrigin": "ARCHIVAL_ATLAS_SOURCE_ATTRIBUTION_UNRESOLVED",
                     "recommendedNextTest": atlas.HISTORICAL_TRIGGER,
@@ -444,7 +473,7 @@ class CurrentATLASForcedPhotometryTests(unittest.TestCase):
         self.assertEqual((), branch.required_stage_ids)
         store = InvestigationStore(self.root / "targeted"); store.save(inv)
         atlas_stage_path = store.stage_path_for(
-            inv.id, "053-interpret-atlas-forced-photometry")
+            inv.id, "057-interpret-atlas-forced-photometry")
         atlas_stage_path.parent.mkdir(parents=True, exist_ok=True)
         atlas_stage_path.write_bytes(b"immutable persisted v20.24 terminal evidence\n")
         historical_bytes = atlas_stage_path.read_bytes()
@@ -452,7 +481,7 @@ class CurrentATLASForcedPhotometryTests(unittest.TestCase):
         self.assertEqual("RUNNING", repaired.status)
         self.assertEqual("RUN_EXPERIMENT",
                          repaired.metadata["controlState"]["schedulerAction"])
-        self.assertEqual("054-generate-targeted-observation-plan",
+        self.assertEqual("058-generate-targeted-observation-plan",
             repaired.metadata["controlState"]["selectedExperiment"]["id"])
         self.assertEqual(historical_bytes, atlas_stage_path.read_bytes())
         self.assertEqual(repaired, repair_obsolete_terminal_wait(store, repaired))
@@ -465,6 +494,13 @@ class CurrentATLASForcedPhotometryTests(unittest.TestCase):
         self.assertEqual("v20.24 ATLAS forced-photometry interpretation",
                          planned.result["provenance"]["priorStage"])
         self.assertIn("atlasForcedPhotometry", planned.provenance.input_hashes)
+        self.assertIn("frozenSourcePairEvidence", planned.provenance.input_hashes)
+        self.assertEqual(
+            sha256_json({"sourcePair": self.pair, "archiveStage": "des"}),
+            planned.provenance.input_hashes["frozenSourcePairEvidence"],
+        )
+        self.assertNotIn("externalHighResolutionValidation",
+                         planned.provenance.input_hashes)
         self.assertNotIn("atlasFixedWindowRecurrence", planned.provenance.input_hashes)
         self.assertEqual("COLLECT_TARGETED_TIME_SERIES_PHOTOMETRY",
                          planned.result["recommendedNextTest"])
@@ -473,6 +509,127 @@ class CurrentATLASForcedPhotometryTests(unittest.TestCase):
                              or "time-resolved" in item.handler_id
                              or "fixed-window" in item.handler_id
                              for item in completed.stages))
+        self.assertFalse(any(
+            item.handler_id
+            == "openstar.tess.external-high-resolution-variability-validation.interpret"
+            for item in completed.stages))
+
+    def _minimal_direct_atlas_boundary(self, *, status="BLOCKED", valid_pair=True):
+        search = {"minimumFrequency": 0.2, "maximumFrequency": 4.0}
+        pair = self.pair if valid_pair else {
+            **self.pair,
+            "counterpart": {**self.pair["counterpart"], "raDeg": float("nan")},
+        }
+        stages = (
+            InvestigationStage("001-noirlab",
+                "openstar.tess.noirlab-image-forced-photometry.interpret",
+                "COMPLETE", None, {}, result={"sourcePair": pair}),
+            InvestigationStage("002-run-atlas",
+                "openstar.tess.atlas-forced-photometry.run",
+                "COMPLETE", "001-noirlab", {}, result={}),
+            InvestigationStage("003-interpret-atlas",
+                "openstar.tess.atlas-forced-photometry.interpret",
+                "COMPLETE", "002-run-atlas", {}, result={
+                    "classification": "ATLAS_SOURCE_ATTRIBUTION_UNRESOLVED",
+                    "residualModeOrigin": "ARCHIVAL_ATLAS_SOURCE_ATTRIBUTION_UNRESOLVED",
+                    "recommendedNextTest": atlas.HISTORICAL_TRIGGER,
+                    "physicalMechanismResolved": False,
+                    "sourcePair": pair,
+                    "frequencySearch": search,
+                }, stop=True),
+        )
+        action = "INVESTIGATION_COMPLETE" if status == "COMPLETE" else "WAIT_FOR_PREREQUISITES"
+        return Investigation("compat", "openstar.workflow.tess-investigation.v1", "20.2",
+            status, "now", "now", {"datasetID": "compat", "controlState": {
+                "schedulerAction": action, "selectedExperiment": None}}, stages)
+
+    def test_prematurely_completed_direct_atlas_boundary_reopens_append_only(self):
+        inv = self._minimal_direct_atlas_boundary(status="COMPLETE")
+        store = InvestigationStore(self.root / "premature-complete")
+        store.save(inv)
+        repaired = repair_obsolete_terminal_wait(store, inv)
+        self.assertEqual("RUNNING", repaired.status)
+        self.assertEqual("RUN_EXPERIMENT",
+                         repaired.metadata["controlState"]["schedulerAction"])
+        self.assertEqual("004-generate-targeted-observation-plan",
+                         repaired.metadata["controlState"]["selectedExperiment"]["id"])
+        self.assertEqual(inv.stages, repaired.stages)
+        self.assertEqual(repaired, repair_obsolete_terminal_wait(store, repaired))
+
+    def test_unresolved_atlas_with_invalid_pair_fails_closed(self):
+        inv = self._minimal_direct_atlas_boundary(valid_pair=False)
+        store = InvestigationStore(self.root / "invalid-pair")
+        store.save(inv)
+        repaired = repair_obsolete_terminal_wait(store, inv)
+        self.assertEqual("BLOCKED", repaired.status)
+        self.assertEqual("WAIT_FOR_PREREQUISITES",
+                         repaired.metadata["controlState"]["schedulerAction"])
+        self.assertEqual(inv.stages, repaired.stages)
+
+    def test_contradictory_latest_interpretation_does_not_fall_back(self):
+        pair_b = {
+            **self.pair,
+            "counterpart": {
+                **self.pair["counterpart"],
+                "gaiaDR3SourceID": 303,
+                "raDeg": 10.02,
+            },
+        }
+        inv = self._minimal_direct_atlas_boundary()
+        stages = (
+            inv.stages[0],
+            InvestigationStage(
+                "002-des",
+                "openstar.tess.des-dr2-se-local-forced-photometry.interpret",
+                "COMPLETE", "001-noirlab", {}, result={"sourcePair": pair_b},
+            ),
+            replace(inv.stages[1], id="003-run-atlas", triggered_by_stage_id="002-des"),
+            replace(inv.stages[2], id="004-interpret-atlas",
+                    triggered_by_stage_id="003-run-atlas"),
+        )
+        inv = replace(inv, stages=stages)
+        self.assertFalse(_awaiting_post_atlas_targeted_observation_adapter(inv))
+        target = InvestigationTarget("compat", "compat", inv.workflow_id,
+                                     inv.workflow_version)
+        self.assertEqual((), plan_tess_branches(inv, target))
+        store = InvestigationStore(self.root / "contradictory-pair")
+        store.save(inv)
+        repaired = repair_obsolete_terminal_wait(store, inv)
+        self.assertEqual("BLOCKED", repaired.status)
+        self.assertEqual("WAIT_FOR_PREREQUISITES",
+                         repaired.metadata["controlState"]["schedulerAction"])
+        self.assertNotEqual("INVESTIGATION_COMPLETE",
+                            repaired.metadata["controlState"]["schedulerAction"])
+        self.assertEqual(inv.stages, repaired.stages)
+
+    def test_invalid_current_source_pair_roles_fail_closed(self):
+        for target_role, counterpart_role in (
+            ("catalog-counterpart", "target-control"),
+            ("invalid", "catalog-counterpart"),
+        ):
+            pair = {
+                **self.pair,
+                "target": {**self.pair["target"], "sourceRole": target_role},
+                "counterpart": {
+                    **self.pair["counterpart"], "sourceRole": counterpart_role,
+                },
+            }
+            inv = self._minimal_direct_atlas_boundary()
+            stages = tuple(
+                replace(stage, result={**stage.result, "sourcePair": pair})
+                if isinstance(stage.result, dict) and "sourcePair" in stage.result
+                else stage
+                for stage in inv.stages
+            )
+            invalid = replace(inv, stages=stages)
+            with self.subTest(target_role=target_role,
+                              counterpart_role=counterpart_role):
+                self.assertFalse(
+                    _awaiting_post_atlas_targeted_observation_adapter(invalid)
+                )
+                self.assertEqual((), plan_tess_branches(invalid,
+                    InvestigationTarget("compat", "compat", invalid.workflow_id,
+                                        invalid.workflow_version)))
 
     def _handler_evidence(self, investigation_id):
         return Investigation(investigation_id,
