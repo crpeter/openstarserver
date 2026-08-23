@@ -5,6 +5,7 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+import sqlite3
 from pathlib import Path
 
 from dashboard import build_snapshot, history_snapshot
@@ -13,6 +14,7 @@ from openstar_dashboard import (
     CoordinatorClient,
     TelemetryStore,
     make_server,
+    latest_contribution_activity,
 )
 
 
@@ -174,6 +176,45 @@ class ProjectionTests(unittest.TestCase):
         self.assertEqual(990, mac["lastSeenAt"])
         self.assertEqual("coordinator_registration", mac["lastSeenSource"])
         self.assertEqual("Telemetry still joins", mac["name"])
+
+    def test_recent_accepted_contribution_keeps_worker_online(self):
+        coordinator = FakeCoordinator()
+        snapshot = build_snapshot(coordinator.observed["nodes"],
+            coordinator.observed["contributions"], coordinator.observed["projects"], {},
+            now=1000, contribution_activity={"phone-1": 995})
+        phone = next(worker for worker in snapshot["workers"] if worker["id"] == "phone-1")
+        self.assertEqual("connected", phone["connectionState"])
+        self.assertEqual(995, phone["lastSeenAt"])
+        self.assertEqual("accepted_contribution", phone["lastSeenSource"])
+
+    def test_older_contribution_does_not_override_newer_presence(self):
+        coordinator = FakeCoordinator()
+        coordinator.observed["nodes"][0]["lastSeenAt"] = 990
+        store = TelemetryStore(); store.update({"nodeID": "mac-1"}, now=995)
+        snapshot = build_snapshot(coordinator.observed["nodes"],
+            coordinator.observed["contributions"], coordinator.observed["projects"],
+            store.snapshot(), now=1000, contribution_activity={"mac-1": 900})
+        mac = next(worker for worker in snapshot["workers"] if worker["id"] == "mac-1")
+        self.assertEqual(995, mac["lastSeenAt"])
+        self.assertEqual("dashboard_heartbeat", mac["lastSeenSource"])
+
+    def test_contribution_ledger_read_is_read_only_and_failure_safe(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            missing = Path(temporary) / "missing.sqlite3"
+            self.assertEqual({}, latest_contribution_activity(missing))
+            self.assertFalse(missing.exists())
+            corrupt = Path(temporary) / "corrupt.sqlite3"; corrupt.write_text("not sqlite")
+            self.assertEqual({}, latest_contribution_activity(corrupt))
+            ledger = Path(temporary) / "ledger.sqlite3"
+            connection = sqlite3.connect(ledger)
+            connection.execute("CREATE TABLE contributions(node_id TEXT, accepted_at REAL)")
+            connection.executemany("INSERT INTO contributions VALUES(?,?)",
+                (("Mac-1", 10), ("Mac-1", 25), ("phone-1", 20)))
+            connection.commit(); connection.close()
+            before = ledger.read_bytes()
+            self.assertEqual({"mac-1": 25.0, "phone-1": 20.0},
+                             latest_contribution_activity(ledger))
+            self.assertEqual(before, ledger.read_bytes())
 
     def test_telemetry_store_is_ephemeral_copy_and_validates(self):
         store = TelemetryStore()

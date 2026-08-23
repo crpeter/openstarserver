@@ -41,6 +41,7 @@ def build_snapshot(
     telemetry_by_node: dict[str, dict[str, Any]],
     *,
     now: float | None = None,
+    contribution_activity: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     """Join coordinator observations and optional sidecar telemetry by node ID."""
     now = time.time() if now is None else now
@@ -64,6 +65,7 @@ def build_snapshot(
         for project in projects
     )
     workers = []
+    contribution_activity = contribution_activity or {}
     for node in nodes:
         node_id = str(node.get("nodeID") or node.get("id") or "")
         heartbeat = telemetry_by_node.get(node_id.lower(), {})
@@ -76,9 +78,10 @@ def build_snapshot(
         coordinator_seen = _timestamp(node.get("lastSeenAt"))
         if coordinator_seen is None:
             coordinator_seen = _timestamp(node.get("registeredAt"))
+        accepted_at = _timestamp(contribution_activity.get(node_id.lower()))
         valid_timestamps = [
             timestamp
-            for timestamp in (heartbeat_at, coordinator_seen)
+            for timestamp in (heartbeat_at, coordinator_seen, accepted_at)
             if timestamp is not None
         ]
         last_seen = max(valid_timestamps) if valid_timestamps else None
@@ -122,6 +125,8 @@ def build_snapshot(
                 "lastSeenSource": (
                     "dashboard_heartbeat"
                     if heartbeat_at is not None and heartbeat_at == last_seen
+                    else "accepted_contribution"
+                    if accepted_at is not None and accepted_at == last_seen
                     else "coordinator_registration"
                 ),
                 "currentAssignments": copy.deepcopy(

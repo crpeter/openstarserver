@@ -55,6 +55,14 @@ class ScienceRunCatalog:
         connection = sqlite3.connect(self.path, timeout=5.0)
         connection.execute("PRAGMA busy_timeout=5000")
         connection.execute("PRAGMA journal_mode=WAL")
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(science_runs)")}
+        if columns and "run_id" not in columns:
+            try:
+                self._migrate_legacy(connection, columns)
+            except Exception:
+                connection.rollback()
+                connection.close()
+                raise
         connection.execute(
             """CREATE TABLE IF NOT EXISTS science_runs (
                run_id TEXT PRIMARY KEY, kind TEXT NOT NULL, state_root TEXT NOT NULL,
@@ -62,6 +70,57 @@ class ScienceRunCatalog:
                metadata_json TEXT NOT NULL)"""
         )
         return connection
+
+    @staticmethod
+    def _migrate_legacy(connection: sqlite3.Connection, columns: set[str]) -> None:
+        """Idempotently preserve the catalog used by the #72 observability branch."""
+        required = {"id", "kind", "state_root", "status", "started_at",
+                    "updated_at", "metadata_json"}
+        if not required.issubset(columns):
+            raise sqlite3.DatabaseError("Unsupported science_runs catalog schema")
+        connection.execute("BEGIN IMMEDIATE")
+        # Another process may have completed the migration while this process
+        # waited for the write lock.
+        current = {row[1] for row in connection.execute("PRAGMA table_info(science_runs)")}
+        if "run_id" in current:
+            connection.commit()
+            return
+        rows = connection.execute("SELECT * FROM science_runs").fetchall()
+        names = [item[0] for item in connection.execute("SELECT * FROM science_runs LIMIT 0").description]
+        connection.execute("ALTER TABLE science_runs RENAME TO science_runs_legacy_72")
+        connection.execute(
+            """CREATE TABLE science_runs (
+               run_id TEXT PRIMARY KEY, kind TEXT NOT NULL, state_root TEXT NOT NULL,
+               status TEXT NOT NULL, created_at REAL NOT NULL, updated_at REAL NOT NULL,
+               metadata_json TEXT NOT NULL)"""
+        )
+        for values in rows:
+            old = dict(zip(names, values))
+            try:
+                metadata = json.loads(old.get("metadata_json") or "{}")
+            except (TypeError, json.JSONDecodeError):
+                metadata = {}
+            if not isinstance(metadata, dict):
+                metadata = {}
+            legacy = {name: old.get(name) for name in
+                      ("display_name", "workflow_id", "completed_at") if old.get(name) is not None}
+            summary = old.get("summary_json")
+            if summary:
+                try:
+                    legacy["summary"] = json.loads(summary)
+                except (TypeError, json.JSONDecodeError):
+                    legacy["summary"] = summary
+            if legacy:
+                metadata.setdefault("legacy72", {}).update(legacy)
+            connection.execute(
+                "INSERT INTO science_runs VALUES(?,?,?,?,?,?,?)",
+                (str(old["id"]), str(old["kind"]), str(old["state_root"]),
+                 str(old["status"]), float(old.get("started_at") or old.get("updated_at") or time.time()),
+                 float(old.get("updated_at") or old.get("started_at") or time.time()),
+                 json.dumps(metadata, sort_keys=True, separators=(",", ":"), default=str)),
+            )
+        connection.execute("DROP TABLE science_runs_legacy_72")
+        connection.commit()
 
     def record(self, kind: str, state_root: str | Path, *, status: str = "RUNNING",
                logical_identity: Any = None,
@@ -253,6 +312,23 @@ def backfill_science_runs(roots: Iterable[str | Path], path: str | Path | None =
                     for name in ("inventoryCount", "completedCount", "remainingCount", "rankingComplete"):
                         if name in payload:
                             metadata[name] = payload[name]
+                    if not inventory_backed:
+                        inventory_count = _nonnegative_int(payload.get("inventoryCount"))
+                        completed_count = _nonnegative_int(payload.get("completedCount"))
+                        remaining_count = _nonnegative_int(payload.get("remainingCount"))
+                        if inventory_count is not None and completed_count is not None:
+                            remaining_count = (max(0, inventory_count - completed_count)
+                                               if remaining_count is None else remaining_count)
+                            metadata["sectorSweep"] = {
+                                "sector": sector,
+                                "inventory": inventory_count,
+                                "complete": completed_count,
+                                "remaining": remaining_count,
+                                "progress": completed_count / inventory_count if inventory_count else 0.0,
+                                "status": "COMPLETE" if remaining_count == 0 else "HISTORICAL",
+                                "historical": True,
+                                "rankingComplete": bool(payload.get("rankingComplete")),
+                            }
                     score = (int(active), int(inventory_backed), artifact.stat().st_mtime)
                     if sector not in candidates or score > candidates[sector][0]:
                         candidates[sector] = (score, candidate_root, metadata)
@@ -281,3 +357,11 @@ def _root_has_live_pid(root: Path) -> bool:
         except (OSError, ValueError):
             continue
     return False
+
+
+def _nonnegative_int(value: Any) -> int | None:
+    try:
+        result = int(value)
+    except (TypeError, ValueError):
+        return None
+    return result if result >= 0 else None

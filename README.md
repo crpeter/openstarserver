@@ -41,6 +41,12 @@ python backfill_science_run_catalog.py
 python backfill_science_run_catalog.py --root /science/archive --limit 100
 ```
 
+Opening a catalog created by the earlier #72 observability implementation
+migrates that SQLite catalog in place while preserving its records; no science
+root is touched. The dashboard also reads the contribution ledger in SQLite
+read-only mode and treats a newer accepted-work timestamp as worker-presence
+evidence. Use `--contribution-ledger` to select that optional ledger.
+
 New workers may optionally send generic operational telemetry directly to the sidecar. This
 in-memory heartbeat is not required for contribution and never enters scheduling, accounting,
 or scientific result state:

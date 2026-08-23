@@ -1,5 +1,6 @@
 import json
 import os
+import sqlite3
 import tempfile
 import threading
 import unittest
@@ -83,6 +84,35 @@ class ScienceRunCatalogTests(unittest.TestCase):
             for thread in threads: thread.join()
             self.assertEqual(1, len(catalog.list_runs()))
 
+    def test_legacy_72_catalog_is_migrated_and_remains_writable(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "catalog.sqlite3"
+            connection = sqlite3.connect(path)
+            connection.execute("""CREATE TABLE science_runs (
+                id TEXT PRIMARY KEY, kind TEXT, display_name TEXT, workflow_id TEXT,
+                status TEXT, state_root TEXT, started_at REAL, updated_at REAL,
+                completed_at REAL, metadata_json TEXT, summary_json TEXT)""")
+            connection.execute("INSERT INTO science_runs VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                ("legacy-id", "generic-investigation", "Legacy", "workflow.v1", "COMPLETE",
+                 temporary, 10, 20, 20, '{"target":"old"}', '{"complete":true}'))
+            connection.commit(); connection.close()
+            catalog = ScienceRunCatalog(path)
+            legacy = catalog.list_runs()[0]
+            self.assertEqual("legacy-id", legacy.run_id)
+            self.assertEqual("Legacy", legacy.metadata["legacy72"]["display_name"])
+            new_id = catalog.record("generic-investigation", temporary,
+                                    logical_identity="new-investigation")
+            self.assertEqual(2, len(catalog.list_runs()))
+            self.assertIn(new_id, {item.run_id for item in catalog.list_runs()})
+            self.assertEqual(2, len(discover_science_runs(path)))
+            connection = sqlite3.connect(path)
+            try:
+                columns = {row[1] for row in connection.execute(
+                    "PRAGMA table_info(science_runs)")}
+            finally:
+                connection.close()
+            self.assertIn("run_id", columns)
+
     def test_recorder_failure_is_isolated(self):
         broken = Mock()
         broken.record.side_effect = OSError("disk full")
@@ -142,10 +172,24 @@ class ScienceRunCatalogTests(unittest.TestCase):
             runs = {run.metadata["sector"]: run for run in ScienceRunCatalog(path).list_runs()}
             self.assertEqual(str(ranking_root), runs[1].state_root)
             self.assertEqual(100, runs[1].metadata["inventoryCount"])
+            self.assertEqual({"sector": 1, "inventory": 100, "complete": 80,
+                "remaining": 20, "progress": 0.8, "status": "HISTORICAL",
+                "historical": True, "rankingComplete": False},
+                runs[1].metadata["sectorSweep"])
             self.assertEqual(str(active), runs[2].state_root)
             self.assertEqual("RUNNING", runs[2].status)
             self.assertEqual(2, backfill_science_runs([scan], path))
             self.assertEqual(before, {source: source.read_bytes() for source in before})
+
+            coordinator = Mock()
+            coordinator.observation.return_value = {"health": {}, "nodes": [],
+                "contributions": {}, "projects": []}
+            _, observation = DashboardApplication(coordinator, science_run_catalog=path,
+                                                   contribution_ledger=None).snapshot()
+            sector_one = next(item for item in observation["sectorSweeps"] if item["sector"] == 1)
+            self.assertEqual((100, 80, 20, 0.8), (sector_one["inventory"],
+                sector_one["complete"], sector_one["remaining"], sector_one["progress"]))
+            self.assertEqual(before[ranking], ranking.read_bytes())
 
     def test_dashboard_discovers_cataloged_sweep_without_manual_root(self):
         with tempfile.TemporaryDirectory() as temporary:
