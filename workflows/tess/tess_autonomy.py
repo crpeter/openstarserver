@@ -116,6 +116,21 @@ def _has_terminal_tess_evidence(investigation: Investigation) -> bool:
     )
 
 
+def _intrinsic_target_boundary(investigation: Investigation):
+    """Return only the unconsumed exact v20.12 target-dominant boundary."""
+    stage = _latest_complete(investigation, "openstar.tess.multi-source-residual.interpret")
+    result = (stage.result or {}) if stage is not None else {}
+    attempted = any(item.handler_id == "openstar.tess.intrinsic-nonstationary.analyze"
+                    for item in investigation.stages)
+    if (stage is not None and not attempted
+            and result.get("recommendedNextTest") == "INTRINSIC_NONSTATIONARY_VARIABILITY_CLASSIFICATION"
+            and result.get("classification") == "TARGET_RESIDUAL_COMPONENT_DOMINANT"
+            and result.get("residualModeOrigin") == "TARGET_DOMINANT"
+            and result.get("physicalMechanismResolved") is False):
+        return stage
+    return None
+
+
 def _awaiting_nsc_adapter(investigation: Investigation) -> bool:
     """Identify only the incremental SkyMapper-to-NSC implementation boundary."""
     stage = _latest_complete(
@@ -1180,6 +1195,21 @@ def repair_obsolete_terminal_wait(
     if investigation.workflow_id != WORKFLOW_ID or not isinstance(control, dict):
         return investigation
 
+    intrinsic = _intrinsic_target_boundary(investigation)
+    if (intrinsic is not None and investigation.status == "COMPLETE"
+            and control.get("schedulerAction") == "INVESTIGATION_COMPLETE"):
+        request = StageRequest(
+            id=_continuation_stage_id(intrinsic, "classify-intrinsic-target-residual"),
+            handler_id="openstar.tess.intrinsic-nonstationary.analyze",
+            parameters={}, triggered_by_stage_id=intrinsic.id,
+        )
+        return store.set_control_state(
+            investigation, status="RUNNING",
+            control_state={"branchAssessments": [], "selectedExperiment": asdict(request),
+                           "schedulerAction": "RUN_EXPERIMENT",
+                           "recovery": "TESS_V20_12_TARGET_INTRINSIC_CONTINUATION"},
+        )
+
     prf_transport_repair = _repair_official_prf_transport_terminal(
         store, investigation, control
     )
@@ -1434,6 +1464,17 @@ def plan_tess_branches(
     investigation: Investigation, target: InvestigationTarget
 ) -> tuple[ScientificBranch, ...]:
     """Translate persisted TESS evidence into domain-neutral branch declarations."""
+
+    intrinsic = _intrinsic_target_boundary(investigation)
+    if intrinsic is not None:
+        return (ScientificBranch(
+            id=f"intrinsic-target-residual-after-{intrinsic.id}",
+            experiment=StageRequest(
+                id=_continuation_stage_id(intrinsic, "classify-intrinsic-target-residual"),
+                handler_id="openstar.tess.intrinsic-nonstationary.analyze",
+                parameters={}, triggered_by_stage_id=intrinsic.id,
+            ),
+        ),)
 
     prf_interpretation = _latest_complete(
         investigation, "openstar.tess.official-spoc-prf-forward-modeling.interpret"
