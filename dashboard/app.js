@@ -1,10 +1,11 @@
 const $ = selector => document.querySelector(selector);
 const fmt = value => value == null ? "—" : Intl.NumberFormat(undefined, {notation: "compact", maximumFractionDigits: 1}).format(value);
+const count = value => value == null ? "—" : Intl.NumberFormat().format(value);
 const duration = seconds => seconds == null ? "—" : seconds < 60 ? `${seconds.toFixed(1)} s` : seconds < 3600 ? `${(seconds / 60).toFixed(1)} min` : `${(seconds / 3600).toFixed(1)} h`;
 const relative = timestamp => {
   if (!timestamp) return "Never";
   const seconds = Math.max(0, Date.now() / 1000 - timestamp);
-  return seconds < 60 ? "just now" : seconds < 3600 ? `${Math.floor(seconds / 60)}m ago` : seconds < 86400 ? `${Math.floor(seconds / 3600)}h ago` : `${Math.floor(seconds / 86400)}d ago`;
+  return seconds < 60 ? `${Math.floor(seconds)}s ago` : seconds < 3600 ? `${Math.floor(seconds / 60)}m ${Math.floor(seconds % 60)}s ago` : seconds < 86400 ? `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m ago` : `${Math.floor(seconds / 86400)}d ago`;
 };
 function element(tag, options = {}, children = []) {
   const node = document.createElement(tag);
@@ -25,24 +26,39 @@ function refreshSection(node, value, children) {
 }
 let workers = [];
 
+function reconcileKeyed(container, items, key, render) {
+  const existing = new Map([...container.children].map(node => [node.dataset.key, node]));
+  for (const item of items) {
+    const id = String(key(item));
+    const node = existing.get(id) || render(item);
+    node.dataset.key = id;
+    if (existing.has(id)) render(item, node);
+    container.append(node);
+    existing.delete(id);
+  }
+  for (const node of existing.values()) node.remove();
+}
+
 function renderWorkers() {
   const query = $("#filter").value.toLowerCase();
-  const rows = workers.filter(worker => JSON.stringify(worker).toLowerCase().includes(query)).map(worker => {
+  const visible = workers.filter(worker => JSON.stringify(worker).toLowerCase().includes(query));
+  reconcileKeyed($("#workers"), visible, worker => worker.id, (worker, current) => {
     const identity = element("td", {className: "device"}, [
       element("b", {text: worker.name || worker.id}),
       element("small", {text: [worker.hardwareModel, worker.platform, worker.osVersion].filter(Boolean).join(" · ") || "Telemetry unavailable"})
     ]);
-    const badge = element("span", {className: `badge ${worker.computeState}`, text: worker.computeState.toUpperCase()});
+    const connectionLabel = worker.connectionState === "connected" ? "ONLINE" : worker.connectionState === "recently_disconnected" ? "RECENTLY DISCONNECTED" : "OFFLINE";
+    const badge = element("span", {className: `badge ${worker.connectionState}`, text: connectionLabel});
     const assignment = element("td");
     if (worker.currentAssignments.length) {
       assignment.append(element("b", {text: `${worker.currentAssignments.length} × ${worker.currentAssignments[0].workloadID || "work unit"}`}), element("br"), element("small", {text: worker.currentAssignments[0].projectID || "Unknown project"}));
     } else assignment.textContent = "—";
     const seen = element("td", {text: relative(worker.lastSeenAt), title: worker.lastSeenAt ? new Date(worker.lastSeenAt * 1000).toISOString() : "Unavailable"});
-    const row = element("tr", {}, [identity, element("td", {}, [badge]), assignment, element("td", {text: fmt(worker.completedWorkUnits)}), element("td", {text: duration(worker.cumulativeRuntimeSeconds)}), element("td", {text: worker.measuredThroughput == null ? "—" : `${fmt(worker.measuredThroughput)} eval/s`}), seen]);
-    row.addEventListener("click", () => openDetail(worker.id));
+    const row = current || element("tr");
+    row.replaceChildren(identity, element("td", {}, [badge]), assignment, element("td", {text: count(worker.completedWorkUnits)}), element("td", {text: duration(worker.cumulativeRuntimeSeconds)}), element("td", {text: worker.measuredThroughput == null ? "—" : `${fmt(worker.measuredThroughput)} eval/s`}), seen);
+    if (!current) row.addEventListener("click", () => openDetail(worker.id));
     return row;
   });
-  replace($("#workers"), rows);
 }
 
 function labelledRows(fields) {
@@ -58,9 +74,9 @@ function renderSectors(sweeps) {
     const metrics = [["Remaining", sweep.remaining], ["Runnable", sweep.runnable], ["In flight or recovery", sweep.inFlightOrRecovery], ["Admitted", sweep.admitted], ["Inventory", sweep.inventory]];
     return element("article", {className: "sector"}, [
       element("div", {className: "sector-heading"}, [element("h3", {text: `TESS Sector ${sweep.sector}`}), element("span", {className: `badge ${sweep.status === "COMPLETE" ? "active" : "idle"}`, text: sweep.status})]),
-      element("div", {className: "sector-total"}, [element("b", {text: `${fmt(sweep.complete)} / ${fmt(sweep.inventory)}`}), element("span", {text: " targets complete"}), element("strong", {text: `${(percent * 100).toFixed(1)}%`})]),
+      element("div", {className: "sector-total"}, [element("b", {text: `${count(sweep.complete)} / ${count(sweep.inventory)}`}), element("span", {text: " targets complete"}), element("strong", {text: `${(percent * 100).toFixed(1)}%`})]),
       element("div", {className: "sector-bar", title: `${(percent * 100).toFixed(1)}% complete`}, [Object.assign(element("i"), {style: `width:${percent * 100}%`})]),
-      element("div", {className: "sector-metrics"}, metrics.map(([label, value]) => element("div", {}, [element("span", {text: label}), element("b", {text: fmt(value)})])))
+      element("div", {className: "sector-metrics"}, metrics.map(([label, value]) => element("div", {}, [element("span", {text: label}), element("b", {text: count(value)})])))
     ]);
   }));
 }
@@ -78,23 +94,32 @@ async function openDetail(id) {
   } catch (error) { replace(body, [element("h2", {text: "Worker unavailable"}), element("p", {text: error.message})]); }
 }
 
-async function refresh() {
+async function refreshFleet() {
   try {
-    const [snapshot, activity, history] = await Promise.all(["/api/dashboard/summary", "/api/dashboard/activity", "/api/dashboard/history"].map(url => fetch(url).then(response => response.json())));
-    workers = snapshot.workers;
+    const [snapshot, history] = await Promise.all(["/api/dashboard/summary", "/api/dashboard/history"].map(url => fetch(url).then(response => response.json())));
+    workers = snapshot.workers.slice().sort((a, b) => (b.measuredThroughput ?? -1) - (a.measuredThroughput ?? -1) || a.id.localeCompare(b.id));
     const cards = [["Known workers", snapshot.summary.knownWorkers], ["Connected", snapshot.summary.connectedWorkers], ["Computing", snapshot.summary.activeWorkers], ["Running units", snapshot.summary.runningWorkUnits], ["Completed", snapshot.summary.completedWorkUnits], ["Compute time", duration(snapshot.summary.workerComputeSeconds)]];
-    refreshSection($("#stats"), cards, cards.map(([label, value]) => element("div", {className: "stat"}, [element("span", {text: label}), element("b", {text: value})])));
+    refreshSection($("#stats"), cards, cards.map(([label, value]) => element("div", {className: "stat"}, [element("span", {text: label}), element("b", {text: typeof value === "number" && label !== "Compute time" ? count(value) : value})])));
     renderWorkers();
-    renderSectors(activity.sectorSweeps || []);
     $("#updated").textContent = `${snapshot.summary.health.toUpperCase()} · updated ${relative(snapshot.summary.updatedAt)}`;
-    const projects = activity.projects.map(project => element("div", {className: "row"}, [element("div", {}, [element("b", {text: project.projectID || "Project"}), element("small", {text: ` · ${project.workloadID || "No workload"}`}), element("div", {className: "bar"}, [Object.assign(element("i"), {style: `width:${100 * (project.projectProgress || 0)}%`})])]), element("span", {text: `${project.projectCompletedWorkUnits || 0} / ${project.projectTotalWorkUnits || 0}`})]));
-    const runs = (activity.scienceRuns || []).map(run => element("div", {className: "row"}, [element("span", {text: run.metadata.sector ? `${run.kind} · sector ${run.metadata.sector}` : run.kind}), element("b", {text: run.condition === "degraded" ? "DEGRADED" : run.status})]));
-    const activityRows = [...projects, ...runs];
-    refreshSection($("#activity"), {projects: activity.projects, scienceRuns: activity.scienceRuns}, [element("div", {className: "rows"}, activityRows.length ? activityRows : [element("p", {text: "No active or cataloged science runs"})])]);
-    const contributionRows = history.contributionByWorker.length ? history.contributionByWorker.slice(0, 8).map(node => element("div", {className: "row"}, [element("span", {text: node.nodeID}), element("b", {text: `${fmt(node.acceptedWorkUnits)} units`})])) : [element("p", {text: "Contributions will appear after accepted work."})];
-    refreshSection($("#contribution"), history.contributionByWorker, [element("div", {className: "rows"}, contributionRows)]);
+    const contributions = history.contributionByWorker.slice().sort((a, b) => (b.acceptedWorkUnits || 0) - (a.acceptedWorkUnits || 0));
+    const contributionRows = contributions.length ? contributions.slice(0, 8).map(node => element("div", {className: "row"}, [element("span", {text: node.nodeID}), element("b", {text: `${count(node.acceptedWorkUnits)} units`})])) : [element("p", {text: "Contributions will appear after accepted work."})];
+    refreshSection($("#contribution"), contributions, [element("div", {className: "rows"}, contributionRows)]);
   } catch (_) { $("#updated").textContent = "CONNECTION LOST"; }
 }
+
+async function refreshScience() {
+  try {
+    const activity = await fetch("/api/dashboard/activity").then(response => response.json());
+    renderSectors(activity.sectorSweeps || []);
+    const projects = activity.projects.map(project => element("div", {className: "row"}, [element("div", {}, [element("b", {text: project.projectID || "Project"}), element("small", {text: ` · ${project.workloadID || "No workload"}`}), element("div", {className: "bar"}, [Object.assign(element("i"), {style: `width:${100 * (project.projectProgress || 0)}%`})])]), element("span", {text: `${project.projectCompletedWorkUnits || 0} / ${project.projectTotalWorkUnits || 0}`})]));
+    const runs = (activity.scienceRuns || []).map(run => element("div", {className: "row"}, [element("span", {text: run.metadata.sector ? `${run.kind} · sector ${run.metadata.sector}` : run.kind}), element("b", {text: run.condition === "degraded" ? "DEGRADED" : run.status})]));
+    refreshSection($("#activity"), activity.projects, [element("div", {className: "rows"}, projects.length ? projects : [element("p", {text: "No active projects"})])]);
+    refreshSection($("#scienceRuns"), activity.scienceRuns, [element("div", {className: "rows"}, runs.length ? runs : [element("p", {text: "No cataloged science runs"})])]);
+  } catch (_) { /* Fleet health remains independently visible. */ }
+}
 $("#filter").addEventListener("input", renderWorkers);
-refresh();
-setInterval(refresh, 10000);
+refreshFleet();
+refreshScience();
+setInterval(refreshFleet, 10000);
+setInterval(refreshScience, 3000);

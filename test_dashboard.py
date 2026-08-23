@@ -7,7 +7,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from dashboard import build_snapshot
+from dashboard import build_snapshot, history_snapshot
 from openstar_dashboard import (
     DashboardApplication,
     CoordinatorClient,
@@ -195,6 +195,29 @@ class ProjectionTests(unittest.TestCase):
         self.assertIn("In flight or recovery", script)
         self.assertNotIn("Recovery required", script)
         self.assertIn("project.projectCompletedWorkUnits", script)
+        self.assertIn("reconcileKeyed", script)
+        self.assertIn("RECENTLY DISCONNECTED", script)
+        self.assertIn("`${Math.floor(seconds)}s ago`", script)
+        self.assertIn("setInterval(refreshScience, 3000)", script)
+        self.assertIn("setInterval(refreshFleet, 10000)", script)
+        self.assertIn('$("#scienceRuns")', script)
+
+    def test_workers_are_sorted_by_measured_throughput(self):
+        coordinator = FakeCoordinator()
+        coordinator.observed["contributions"]["allTime"]["nodes"].append({
+            "nodeID": "phone-1", "acceptedWorkUnits": 1,
+            "sampleFrequencyEvaluationsPerMetalSecond": 100,
+        })
+        snapshot = build_snapshot(coordinator.observed["nodes"],
+            coordinator.observed["contributions"], coordinator.observed["projects"], {}, now=100)
+        self.assertEqual(["phone-1", "mac-1"], [worker["id"] for worker in snapshot["workers"]])
+
+    def test_contributions_are_sorted_by_exact_accepted_count(self):
+        history = history_snapshot({"allTime": {"nodes": [
+            {"nodeID": "low", "acceptedWorkUnits": 2},
+            {"nodeID": "high", "acceptedWorkUnits": 1001},
+        ]}})
+        self.assertEqual(["high", "low"], [item["nodeID"] for item in history["contributionByWorker"]])
 
 
 class CoordinatorClientTests(unittest.TestCase):

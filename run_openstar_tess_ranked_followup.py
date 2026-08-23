@@ -11,7 +11,7 @@ from openstar_dispatch import InvestigationDispatcher
 from openstar_external_jobs import ExternalJobMonitor, ExternalJobStore, apply_external_job_wakeups
 from openstar_investigation import InvestigationStore
 from openstar_scheduler import InvestigationScheduler
-from openstar_science_runs import ScienceRunRecorder
+from openstar_science_runs import recorded_science_run
 from workflows.tess.tess_autonomy import (
     WORKFLOW_ID,
     plan_tess_branches,
@@ -63,6 +63,8 @@ def _claim(investigation) -> str | None:
     return None
 
 
+@recorded_science_run("tess-ranked-followup", "deep_state_dir",
+                      logical_identity="sector", metadata=("sector", "sector_state_dir"))
 def run_tess_ranked_followup(sector: int, sector_state_dir: str | Path,
                              deep_state_dir: str | Path, coordinator_url: str,
                              promote_top: int | None = None, *, promote_novel: int | None = None,
@@ -79,9 +81,6 @@ def run_tess_ranked_followup(sector: int, sector_state_dir: str | Path,
     if promote_top is not None and known_period_validation_quota:
         raise ValueError("known quota is only valid with promote_novel")
     sector_root, deep_root = validate_state_roots(sector_state_dir, deep_state_dir)
-    recorder = ScienceRunRecorder("tess-ranked-followup", deep_root, metadata={
-        "sector": sector, "sectorStateRoot": str(sector_root)})
-    recorder.update("RUNNING")
     inventory = TessSectorInventoryStore(sector_root / f"tess-sector-{sector}-inventory.json").load()
     if inventory.sector != sector: raise RuntimeError("Inventory sector does not match requested sector")
     ranking = aggregate_tess_sector_ranking(inventory, InvestigationStore(sector_root / "investigations"))
@@ -151,9 +150,7 @@ def run_tess_ranked_followup(sector: int, sector_state_dir: str | Path,
         if claim: line += f" claim={claim}"
         print(line)
     for item in excluded: print(f"tic={item['ticID']} state=EXCLUDED reason={item['reason']}")
-    exit_code = 1 if any(item.error is not None for item in result.outcomes) else 0
-    recorder.update("FAILED" if exit_code else "FINISHED")
-    return exit_code
+    return 1 if any(item.error is not None for item in result.outcomes) else 0
 
 
 def parse_args(argv=None):

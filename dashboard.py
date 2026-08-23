@@ -156,6 +156,10 @@ def build_snapshot(
                 "recentFailures": copy.deepcopy(telemetry.get("recentFailures") or []),
             }
         )
+    workers.sort(key=lambda worker: (
+        -(worker["measuredThroughput"] if isinstance(worker["measuredThroughput"], (int, float)) else -1),
+        worker["id"].lower(),
+    ))
     states = Counter(worker["computeState"] for worker in workers)
     connected = sum(worker["connectionState"] == "connected" for worker in workers)
     summary = {
@@ -186,6 +190,10 @@ def build_snapshot(
 
 def history_snapshot(contributions: dict[str, Any], science_runs: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     all_time = contributions.get("allTime", {})
+    contribution_by_worker = sorted(
+        copy.deepcopy(all_time.get("nodes", [])),
+        key=lambda node: (-int(node.get("acceptedWorkUnits") or 0), str(node.get("nodeID") or "")),
+    )
     by_model: Counter = Counter()
     for node in all_time.get("nodes", []):
         by_model[node.get("hardwareIdentifier") or "Unknown"] += int(
@@ -195,7 +203,7 @@ def history_snapshot(contributions: dict[str, Any], science_runs: list[dict[str,
         "available": bool(science_runs),
         "reason": None if science_runs else "The coordinator ledger does not retain time-series buckets.",
         "scienceRuns": copy.deepcopy(science_runs or []),
-        "contributionByWorker": all_time.get("nodes", []),
+        "contributionByWorker": contribution_by_worker,
         "completedByDeviceModel": dict(by_model),
         "series": [],
     }

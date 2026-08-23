@@ -13,7 +13,7 @@ from openstar_coordinator_client import OpenStarCoordinatorClient
 from openstar_dispatch import InvestigationDispatcher
 from openstar_investigation import InvestigationStore
 from openstar_scheduler import InvestigationScheduler
-from openstar_science_runs import ScienceRunRecorder
+from openstar_science_runs import recorded_science_run
 from workflows.tess.tess_sector_archive import MastTessSectorArchiveProvider, TessSectorInventoryStore
 from workflows.tess.tess_sector_scan import (
     WORKFLOW_ID, TessSectorScanTargetSource, plan_tess_sector_scan,
@@ -39,6 +39,8 @@ def _install_perf_timing_filter() -> None:
     builtins.print = filtered_print
 
 
+@recorded_science_run("tess-sector-sweep", "state_dir", logical_identity="sector",
+                      metadata=("sector",))
 def run_tess_sector_sweep(sector: int, coordinator_url: str, state_dir: str | Path, *,
                           max_concurrent_investigations: int | None = None,
                           max_targets: int | None = None, provider=None,
@@ -61,8 +63,6 @@ def run_tess_sector_sweep(sector: int, coordinator_url: str, state_dir: str | Pa
             + ", ".join(legacy)
         )
     root.mkdir(parents=True, exist_ok=True)
-    recorder = ScienceRunRecorder("tess-sector-sweep", root, metadata={"sector": sector})
-    recorder.update("RUNNING")
     provider = provider or MastTessSectorArchiveProvider()
     inventory = TessSectorInventoryStore(root / f"tess-sector-{sector}-inventory.json").create_or_load(sector, provider)
     store = InvestigationStore(root / "investigations")
@@ -86,9 +86,7 @@ def run_tess_sector_sweep(sector: int, coordinator_url: str, state_dir: str | Pa
     for outcome in result.outcomes:
         if outcome.error is not None:
             print(f"OpenStar TESS sector sweep target failure: investigation={outcome.investigation.id} error={type(outcome.error).__name__}: {outcome.error}", file=sys.stderr)
-    exit_code = 1 if any(item.error is not None for item in result.outcomes) else 0
-    recorder.update("FAILED" if exit_code else "FINISHED")
-    return exit_code
+    return 1 if any(item.error is not None for item in result.outcomes) else 0
 
 
 def parse_args(argv=None):

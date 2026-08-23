@@ -32,6 +32,15 @@ both runners and the dashboard (or pass `--science-run-catalog` to the
 dashboard) to keep the catalog elsewhere.  Catalog failures affect visibility
 only and never determine or repair science execution.
 
+Historical roots can be indexed explicitly without changing their science
+files. The bounded scan examines only each configured root and its direct
+children; by default it checks `/tmp`, `/private/tmp`, and repository `data`:
+
+```bash
+python backfill_science_run_catalog.py
+python backfill_science_run_catalog.py --root /science/archive --limit 100
+```
+
 New workers may optionally send generic operational telemetry directly to the sidecar. This
 in-memory heartbeat is not required for contribution and never enters scheduling, accounting,
 or scientific result state:

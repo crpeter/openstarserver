@@ -7,6 +7,8 @@ module creates, repairs, or decides whether an investigation should run.
 from __future__ import annotations
 
 import json
+import functools
+import inspect
 import os
 import sqlite3
 import time
@@ -16,17 +18,19 @@ from pathlib import Path
 from typing import Any, Iterable
 
 CATALOG_ENV = "OPENSTAR_SCIENCE_RUN_CATALOG"
-DEFAULT_CATALOG = Path("data/science-runs.sqlite3")
+MODULE_ROOT = Path(__file__).resolve().parent
+DEFAULT_CATALOG = MODULE_ROOT / "data" / "science-runs.sqlite3"
 
 
 def catalog_path(value: str | Path | None = None) -> Path:
     return Path(value or os.environ.get(CATALOG_ENV) or DEFAULT_CATALOG).expanduser().resolve()
 
 
-def stable_run_id(kind: str, state_root: str | Path) -> str:
+def stable_run_id(kind: str, state_root: str | Path, logical_identity: Any = None) -> str:
     """Return an identity stable across process restarts and relative paths."""
     root = str(Path(state_root).expanduser().resolve())
-    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"openstar:science-run:{kind}:{root}"))
+    logical = json.dumps(logical_identity, sort_keys=True, separators=(",", ":"), default=str)
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"openstar:science-run:{kind}:{root}:{logical}"))
 
 
 @dataclass(frozen=True)
@@ -60,11 +64,13 @@ class ScienceRunCatalog:
         return connection
 
     def record(self, kind: str, state_root: str | Path, *, status: str = "RUNNING",
+               logical_identity: Any = None,
                metadata: dict[str, Any] | None = None) -> str:
         root = str(Path(state_root).expanduser().resolve())
-        identity = stable_run_id(kind, root)
+        identity = stable_run_id(kind, root, logical_identity)
         now = time.time()
-        encoded = json.dumps(metadata or {}, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        encoded = json.dumps(metadata or {}, sort_keys=True, separators=(",", ":"),
+                             allow_nan=False, default=str)
         connection = self._connect()
         try:
             connection.execute(
@@ -108,25 +114,64 @@ class ScienceRunRecorder:
     never alter the runner's result.
     """
 
-    def __init__(self, kind: str, state_root: str | Path, *, metadata: dict[str, Any] | None = None,
+    def __init__(self, kind: str, state_root: str | Path, *, logical_identity: Any = None,
+                 metadata: dict[str, Any] | None = None,
                  catalog: ScienceRunCatalog | None = None):
         self.kind, self.state_root, self.metadata = kind, state_root, metadata or {}
+        self.logical_identity = logical_identity
         self.catalog = catalog or ScienceRunCatalog()
-        self.run_id = stable_run_id(kind, state_root)
+        self.run_id = stable_run_id(kind, state_root, logical_identity)
+        self._terminal = False
 
     def update(self, status: str) -> None:
         try:
-            self.run_id = self.catalog.record(self.kind, self.state_root, status=status, metadata=self.metadata)
+            self.run_id = self.catalog.record(self.kind, self.state_root, status=status,
+                logical_identity=self.logical_identity, metadata=self.metadata)
         except Exception:
             pass
+        if status != "RUNNING":
+            self._terminal = True
 
     def __enter__(self) -> "ScienceRunRecorder":
         self.update("RUNNING")
         return self
 
     def __exit__(self, exc_type, exc, traceback) -> bool:
-        self.update("INTERRUPTED" if exc_type is KeyboardInterrupt else "FAILED" if exc_type else "FINISHED")
+        if exc_type is KeyboardInterrupt:
+            self.update("INTERRUPTED")
+        elif exc_type is not None:
+            self.update("FAILED")
+        elif not self._terminal:
+            self.update("FINISHED")
         return False
+
+
+def recorded_science_run(kind: str, state_root: str,
+                         *, logical_identity: str | None = None,
+                         metadata: tuple[str, ...] = ()):
+    """Decorate a runner with exception-safe, result-aware observability."""
+    def decorate(function):
+        signature = inspect.signature(function)
+
+        @functools.wraps(function)
+        def wrapped(*args, **kwargs):
+            bound = signature.bind(*args, **kwargs)
+            bound.apply_defaults()
+            values = bound.arguments
+            recorder = ScienceRunRecorder(
+                kind, values[state_root],
+                logical_identity=values.get(logical_identity) if logical_identity else None,
+                metadata={name: values.get(name) for name in metadata},
+            )
+            with recorder:
+                result = function(*args, **kwargs)
+                if isinstance(result, int) and not isinstance(result, bool) and result != 0:
+                    recorder.update("FAILED")
+                else:
+                    recorder.update("FINISHED")
+                return result
+        return wrapped
+    return decorate
 
 
 def science_run_projection(run: ScienceRun) -> dict[str, Any]:
@@ -173,22 +218,66 @@ def discover_science_runs(path: str | Path | None = None) -> list[dict[str, Any]
 
 def backfill_science_runs(roots: Iterable[str | Path], path: str | Path | None = None,
                           *, limit: int = 250) -> int:
-    """Bounded/idempotent indexing; source roots are exclusively read."""
+    """Index one best shallow/ranking state root per sector without mutating it."""
     catalog = ScienceRunCatalog(path)
-    count = 0
+    candidates: dict[int, tuple[tuple[int, int, float], Path, dict[str, Any]]] = {}
+    inspected = 0
     for supplied in roots:
-        if count >= limit:
+        if inspected >= limit:
             break
         root = Path(supplied).expanduser().resolve()
         if not root.is_dir():
             continue
-        inventories = list(root.glob("tess-sector-*-inventory.json"))[: max(0, limit - count)]
-        for inventory in inventories:
-            try:
-                payload = json.loads(inventory.read_text(encoding="utf-8"))
-                sector = int(payload.get("sector"))
-                catalog.record("tess-sector-sweep", root, status="HISTORICAL", metadata={"sector": sector})
-                count += 1
-            except (OSError, ValueError, TypeError, json.JSONDecodeError, sqlite3.Error):
-                continue
+        try:
+            children = [root, *(item for item in root.iterdir() if item.is_dir())]
+        except OSError:
+            continue
+        for candidate_root in children:
+            if inspected >= limit:
+                break
+            inspected += 1
+            artifacts = [
+                *(candidate_root.glob("tess-sector-*-inventory.json")),
+                *(candidate_root.glob("tess-sector-*-ranking.json")),
+            ]
+            for artifact in artifacts:
+                try:
+                    payload = json.loads(artifact.read_text(encoding="utf-8"))
+                    sector = int(payload["sector"])
+                    if sector < 1:
+                        continue
+                    inventory_backed = artifact.name.endswith("-inventory.json")
+                    active = _root_has_live_pid(candidate_root)
+                    metadata = {"sector": sector, "historicalArtifact": str(artifact),
+                                "inventoryBacked": inventory_backed}
+                    for name in ("inventoryCount", "completedCount", "remainingCount", "rankingComplete"):
+                        if name in payload:
+                            metadata[name] = payload[name]
+                    score = (int(active), int(inventory_backed), artifact.stat().st_mtime)
+                    if sector not in candidates or score > candidates[sector][0]:
+                        candidates[sector] = (score, candidate_root, metadata)
+                except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+                    continue
+    count = 0
+    for sector, (score, root, metadata) in sorted(candidates.items()):
+        status = "RUNNING" if score[0] else "HISTORICAL"
+        try:
+            catalog.record("tess-sector-sweep", root, status=status,
+                           logical_identity=sector, metadata=metadata)
+            count += 1
+        except (OSError, ValueError, TypeError, sqlite3.Error):
+            continue
     return count
+
+
+def _root_has_live_pid(root: Path) -> bool:
+    """Treat PID files only as presence hints; never clean or rewrite them."""
+    for path in root.glob("*.pid"):
+        try:
+            pid = int(path.read_text(encoding="utf-8").strip())
+            if pid > 0:
+                os.kill(pid, 0)
+                return True
+        except (OSError, ValueError):
+            continue
+    return False

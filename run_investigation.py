@@ -162,8 +162,12 @@ def main():
 
     store = InvestigationStore(args.store)
     recorder = ScienceRunRecorder("generic-investigation", args.store, metadata={
-        "investigationID": args.investigation_id})
-    recorder.update("RUNNING")
+        "investigationID": args.investigation_id}, logical_identity=args.investigation_id)
+    with recorder:
+        return _run(args, store)
+
+
+def _run(args, store: InvestigationStore):
     investigation = store.create(
         args.investigation_id,
         WORKFLOW_ID,
@@ -210,7 +214,6 @@ def main():
     if last.result is not None:
         print("terminal result:")
         print(json.dumps(last.result, indent=2, sort_keys=True))
-    recorder.update("FINISHED")
 
 
 if __name__ == "__main__":
