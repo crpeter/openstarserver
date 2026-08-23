@@ -15,6 +15,14 @@ function element(tag, options = {}, children = []) {
   return node;
 }
 function replace(node, children) { node.replaceChildren(...children); }
+// Preserve existing DOM (including focus, scroll and open controls) when a
+// polling response has not changed this section.
+function refreshSection(node, value, children) {
+  const signature = JSON.stringify(value);
+  if (node.dataset.signature === signature) return;
+  node.dataset.signature = signature;
+  node.replaceChildren(...children);
+}
 let workers = [];
 
 function renderWorkers() {
@@ -45,7 +53,7 @@ function renderSectors(sweeps) {
   const panel = $("#sectorPanel");
   panel.hidden = !sweeps.length;
   if (!sweeps.length) { replace($("#sectors"), []); return; }
-  replace($("#sectors"), sweeps.map(sweep => {
+  refreshSection($("#sectors"), sweeps, sweeps.map(sweep => {
     const percent = Math.max(0, Math.min(1, sweep.progress || 0));
     const metrics = [["Remaining", sweep.remaining], ["Runnable", sweep.runnable], ["In flight or recovery", sweep.inFlightOrRecovery], ["Admitted", sweep.admitted], ["Inventory", sweep.inventory]];
     return element("article", {className: "sector"}, [
@@ -75,12 +83,16 @@ async function refresh() {
     const [snapshot, activity, history] = await Promise.all(["/api/dashboard/summary", "/api/dashboard/activity", "/api/dashboard/history"].map(url => fetch(url).then(response => response.json())));
     workers = snapshot.workers;
     const cards = [["Known workers", snapshot.summary.knownWorkers], ["Connected", snapshot.summary.connectedWorkers], ["Computing", snapshot.summary.activeWorkers], ["Running units", snapshot.summary.runningWorkUnits], ["Completed", snapshot.summary.completedWorkUnits], ["Compute time", duration(snapshot.summary.workerComputeSeconds)]];
-    replace($("#stats"), cards.map(([label, value]) => element("div", {className: "stat"}, [element("span", {text: label}), element("b", {text: value})])));
+    refreshSection($("#stats"), cards, cards.map(([label, value]) => element("div", {className: "stat"}, [element("span", {text: label}), element("b", {text: value})])));
     renderWorkers();
     renderSectors(activity.sectorSweeps || []);
     $("#updated").textContent = `${snapshot.summary.health.toUpperCase()} · updated ${relative(snapshot.summary.updatedAt)}`;
-    replace($("#activity"), [element("div", {className: "rows"}, activity.projects.length ? activity.projects.map(project => element("div", {className: "row"}, [element("div", {}, [element("b", {text: project.projectID || "Project"}), element("small", {text: ` · ${project.workloadID || "No workload"}`}), element("div", {className: "bar"}, [Object.assign(element("i"), {style: `width:${100 * (project.projectProgress || 0)}%`})])]), element("span", {text: `${project.projectCompletedWorkUnits || 0} / ${project.projectTotalWorkUnits || 0}`})])) : [element("p", {text: "No active projects"})])]);
-    replace($("#contribution"), [element("div", {className: "rows"}, history.contributionByWorker.length ? history.contributionByWorker.slice(0, 8).map(node => element("div", {className: "row"}, [element("span", {text: node.nodeID}), element("b", {text: `${fmt(node.acceptedWorkUnits)} units`})])) : [element("p", {text: "Contributions will appear after accepted work."})])]);
+    const projects = activity.projects.map(project => element("div", {className: "row"}, [element("div", {}, [element("b", {text: project.projectID || "Project"}), element("small", {text: ` · ${project.workloadID || "No workload"}`}), element("div", {className: "bar"}, [Object.assign(element("i"), {style: `width:${100 * (project.projectProgress || 0)}%`})])]), element("span", {text: `${project.projectCompletedWorkUnits || 0} / ${project.projectTotalWorkUnits || 0}`})]));
+    const runs = (activity.scienceRuns || []).map(run => element("div", {className: "row"}, [element("span", {text: run.metadata.sector ? `${run.kind} · sector ${run.metadata.sector}` : run.kind}), element("b", {text: run.condition === "degraded" ? "DEGRADED" : run.status})]));
+    const activityRows = [...projects, ...runs];
+    refreshSection($("#activity"), {projects: activity.projects, scienceRuns: activity.scienceRuns}, [element("div", {className: "rows"}, activityRows.length ? activityRows : [element("p", {text: "No active or cataloged science runs"})])]);
+    const contributionRows = history.contributionByWorker.length ? history.contributionByWorker.slice(0, 8).map(node => element("div", {className: "row"}, [element("span", {text: node.nodeID}), element("b", {text: `${fmt(node.acceptedWorkUnits)} units`})])) : [element("p", {text: "Contributions will appear after accepted work."})];
+    refreshSection($("#contribution"), history.contributionByWorker, [element("div", {className: "rows"}, contributionRows)]);
   } catch (_) { $("#updated").textContent = "CONNECTION LOST"; }
 }
 $("#filter").addEventListener("input", renderWorkers);

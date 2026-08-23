@@ -13,6 +13,7 @@ from openstar_coordinator_client import OpenStarCoordinatorClient
 from openstar_dispatch import InvestigationDispatcher
 from openstar_investigation import InvestigationStore
 from openstar_scheduler import InvestigationScheduler
+from openstar_science_runs import ScienceRunRecorder
 from workflows.tess.tess_sector_archive import MastTessSectorArchiveProvider, TessSectorInventoryStore
 from workflows.tess.tess_sector_scan import (
     WORKFLOW_ID, TessSectorScanTargetSource, plan_tess_sector_scan,
@@ -60,6 +61,8 @@ def run_tess_sector_sweep(sector: int, coordinator_url: str, state_dir: str | Pa
             + ", ".join(legacy)
         )
     root.mkdir(parents=True, exist_ok=True)
+    recorder = ScienceRunRecorder("tess-sector-sweep", root, metadata={"sector": sector})
+    recorder.update("RUNNING")
     provider = provider or MastTessSectorArchiveProvider()
     inventory = TessSectorInventoryStore(root / f"tess-sector-{sector}-inventory.json").create_or_load(sector, provider)
     store = InvestigationStore(root / "investigations")
@@ -83,7 +86,9 @@ def run_tess_sector_sweep(sector: int, coordinator_url: str, state_dir: str | Pa
     for outcome in result.outcomes:
         if outcome.error is not None:
             print(f"OpenStar TESS sector sweep target failure: investigation={outcome.investigation.id} error={type(outcome.error).__name__}: {outcome.error}", file=sys.stderr)
-    return 1 if any(item.error is not None for item in result.outcomes) else 0
+    exit_code = 1 if any(item.error is not None for item in result.outcomes) else 0
+    recorder.update("FAILED" if exit_code else "FINISHED")
+    return exit_code
 
 
 def parse_args(argv=None):

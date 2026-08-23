@@ -16,6 +16,7 @@ from urllib.request import urlopen
 
 from dashboard import build_snapshot, history_snapshot
 from openstar_sector_sweep_status import sector_sweeps_projection
+from openstar_science_runs import catalog_path, discover_science_runs
 
 ROOT = Path(__file__).resolve().parent
 
@@ -89,6 +90,7 @@ class DashboardApplication:
         telemetry: TelemetryStore | None = None,
         observation_cache_seconds: float = 1.5,
         sector_sweep_state_dirs: Iterable[str | Path] = (),
+        science_run_catalog: str | Path | None = None,
     ):
         self.coordinator = coordinator
         self.telemetry = telemetry or TelemetryStore()
@@ -96,6 +98,7 @@ class DashboardApplication:
         self.sector_sweep_state_dirs = tuple(
             Path(path).expanduser().resolve() for path in sector_sweep_state_dirs
         )
+        self.science_run_catalog = catalog_path(science_run_catalog)
         self._observation_lock = threading.Lock()
         self._cached_observation: dict[str, Any] | None = None
         self._cached_until = 0.0
@@ -106,9 +109,15 @@ class DashboardApplication:
             now = time.monotonic()
             if self._cached_observation is None or now >= self._cached_until:
                 observation = self.coordinator.observation()
-                observation["sectorSweeps"] = sector_sweeps_projection(
-                    self.sector_sweep_state_dirs
-                )
+                science_runs = discover_science_runs(self.science_run_catalog)
+                discovered_roots = [run["stateRoot"] for run in science_runs
+                    if run["kind"] == "tess-sector-sweep" and Path(run["stateRoot"]).is_dir()]
+                roots = tuple(dict.fromkeys((*map(str, self.sector_sweep_state_dirs), *discovered_roots)))
+                try:
+                    observation["sectorSweeps"] = sector_sweeps_projection(roots)
+                except (OSError, ValueError, TypeError):
+                    observation["sectorSweeps"] = []
+                observation["scienceRuns"] = science_runs
                 self._cached_observation = observation
                 self._cached_until = time.monotonic() + self.observation_cache_seconds
             return self._cached_observation
@@ -197,13 +206,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     {
                         "projects": observation["projects"],
                         "sectorSweeps": observation.get("sectorSweeps", []),
+                        "scienceRuns": observation.get("scienceRuns", []),
                         "health": observation["health"],
                         "updatedAt": time.time(),
                     },
                 )
                 return
             if path == "/api/dashboard/history":
-                self.send_json(200, history_snapshot(observation["contributions"]))
+                self.send_json(200, history_snapshot(
+                    observation["contributions"], observation.get("scienceRuns", [])))
                 return
             self.send_json(404, {"message": "Not found."})
         except (
@@ -250,6 +261,10 @@ def main():
         default=[],
         help="Durable TESS sector-sweep state root to observe read-only (repeatable).",
     )
+    parser.add_argument(
+        "--science-run-catalog",
+        help="Optional catalog path (defaults to OPENSTAR_SCIENCE_RUN_CATALOG or data/science-runs.sqlite3).",
+    )
     args = parser.parse_args()
     server = make_server(
         args.host,
@@ -257,6 +272,7 @@ def main():
         DashboardApplication(
             CoordinatorClient(args.coordinator),
             sector_sweep_state_dirs=args.sector_sweep_state_dir,
+            science_run_catalog=args.science_run_catalog,
         ),
     )
     print(f"OpenStar dashboard: http://{args.host}:{args.port}/dashboard/")

@@ -184,7 +184,7 @@ def build_snapshot(
     return {"summary": summary, "workers": workers}
 
 
-def history_snapshot(contributions: dict[str, Any]) -> dict[str, Any]:
+def history_snapshot(contributions: dict[str, Any], science_runs: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     all_time = contributions.get("allTime", {})
     by_model: Counter = Counter()
     for node in all_time.get("nodes", []):
@@ -192,8 +192,9 @@ def history_snapshot(contributions: dict[str, Any]) -> dict[str, Any]:
             node.get("acceptedWorkUnits") or 0
         )
     return {
-        "available": False,
-        "reason": "The coordinator ledger does not retain time-series buckets.",
+        "available": bool(science_runs),
+        "reason": None if science_runs else "The coordinator ledger does not retain time-series buckets.",
+        "scienceRuns": copy.deepcopy(science_runs or []),
         "contributionByWorker": all_time.get("nodes", []),
         "completedByDeviceModel": dict(by_model),
         "series": [],

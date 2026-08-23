@@ -24,6 +24,14 @@ python openstar_dashboard.py --coordinator http://127.0.0.1:8080 \
 
 Open <http://127.0.0.1:8081/dashboard/>.
 
+Science runners also register their durable state roots in the best-effort
+SQLite catalog at `data/science-runs.sqlite3`.  The dashboard uses that catalog
+to discover sector sweeps and investigation history without repeated
+`--sector-sweep-state-dir` arguments.  Set `OPENSTAR_SCIENCE_RUN_CATALOG` for
+both runners and the dashboard (or pass `--science-run-catalog` to the
+dashboard) to keep the catalog elsewhere.  Catalog failures affect visibility
+only and never determine or repair science execution.
+
 New workers may optionally send generic operational telemetry directly to the sidecar. This
 in-memory heartbeat is not required for contribution and never enters scheduling, accounting,
 or scientific result state:

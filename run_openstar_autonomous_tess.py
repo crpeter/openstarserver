@@ -19,6 +19,7 @@ from openstar_dispatch import InvestigationDispatcher
 from openstar_investigation import InvestigationStore
 from openstar_lifecycle import InvestigationLifecycleLoop, LifecycleResult
 from openstar_scheduler import InvestigationScheduler
+from openstar_science_runs import ScienceRunRecorder
 from openstar_targets import InvestigationTargetPortfolio, NoEligibleTargetError
 from workflows.tess.tess_autonomy import (
     WORKFLOW_ID,
@@ -82,6 +83,9 @@ def run_autonomous_tess(
                 + ", ".join(legacy)
             )
     root.mkdir(parents=True, exist_ok=True)
+    recorder = ScienceRunRecorder("tess-autonomous", root, metadata={
+        "multiInvestigation": multi_investigation})
+    recorder.update("RUNNING")
     store = InvestigationStore(root / "investigations")
     external_jobs = ExternalJobStore(root / "external-jobs")
     if external_jobs.pending():
@@ -123,7 +127,9 @@ def run_autonomous_tess(
             if outcome.error is not None:
                 fields.append(f"error={type(outcome.error).__name__}: {outcome.error}")
             print("OpenStar scheduler: " + " ".join(fields))
-        return 1 if any(outcome.error is not None for outcome in result.outcomes) else 0
+        exit_code = 1 if any(outcome.error is not None for outcome in result.outcomes) else 0
+        recorder.update("FAILED" if exit_code else "FINISHED")
+        return exit_code
 
     lifecycle_path = root / "lifecycle.json"
     portfolio = InvestigationTargetPortfolio(root / "portfolio.json", store, dispatcher)
@@ -143,6 +149,7 @@ def run_autonomous_tess(
             target, provenance = portfolio.select_initial(source)
         except NoEligibleTargetError:
             print("OpenStar lifecycle: disposition=NO_ELIGIBLE_TARGETS")
+            recorder.update("FINISHED")
             return 0
         target = replace(
             target,
@@ -176,7 +183,9 @@ def run_autonomous_tess(
         print(_status(result))
         if result.disposition == "LIFECYCLE_CHECKPOINT":
             continue
-        return 2 if result.disposition == "EXPERIMENT_RECOVERY_REQUIRED" else 0
+        exit_code = 2 if result.disposition == "EXPERIMENT_RECOVERY_REQUIRED" else 0
+        recorder.update("FAILED" if exit_code else "FINISHED")
+        return exit_code
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
