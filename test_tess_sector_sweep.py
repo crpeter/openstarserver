@@ -136,7 +136,7 @@ class InventoryTests(unittest.TestCase):
             ("ERROR", "failed", None), create_file=True
         )
         with tempfile.TemporaryDirectory() as tmp, mocked_modules:
-            with self.assertRaisesRegex(RuntimeError, "MAST download failed"):
+            with self.assertRaisesRegex(TessArchiveTransientError, "MAST download failed"):
                 MastTessSectorArchiveProvider().download_light_curve(
                     product(42), Path(tmp)
                 )
@@ -147,7 +147,7 @@ class InventoryTests(unittest.TestCase):
             ("COMPLETE", None, None), create_file=False
         )
         with tempfile.TemporaryDirectory() as tmp, mocked_modules:
-            with self.assertRaisesRegex(RuntimeError, "MAST download failed"):
+            with self.assertRaisesRegex(TessArchiveTransientError, "MAST download failed"):
                 MastTessSectorArchiveProvider().download_light_curve(
                     product(42), Path(tmp)
                 )
@@ -185,6 +185,12 @@ class InventoryTests(unittest.TestCase):
         observations.download_file.side_effect = ValueError("bad product")
         with tempfile.TemporaryDirectory() as tmp, mocked_modules:
             with self.assertRaises(ValueError):
+                MastTessSectorArchiveProvider().download_light_curve(product(42), Path(tmp))
+
+        observations, mocked_modules = self._mock_mast_download(None, create_file=False)
+        observations.download_file.side_effect = RuntimeError("unrelated archive bug")
+        with tempfile.TemporaryDirectory() as tmp, mocked_modules:
+            with self.assertRaisesRegex(RuntimeError, "unrelated archive bug"):
                 MastTessSectorArchiveProvider().download_light_curve(product(42), Path(tmp))
 
         observations, mocked_modules = self._mock_mast_download(None, create_file=False)
@@ -308,6 +314,105 @@ class PreprocessingTests(unittest.TestCase):
 
 
 class SweepTests(unittest.TestCase):
+    def _legacy_unsuccessful_download(self, root, *, error_uri=None, status="FAILED"):
+        store = InvestigationStore(Path(root) / "investigations")
+        selected = product(42)
+        investigation = store.create(
+            "tess-sector-scan-2-tic-42", WORKFLOW_ID, "1",
+            metadata={"archiveProduct": {
+                "product_uri": selected.product_uri,
+                "data_uri": selected.data_uri,
+            }},
+        )
+        running = InvestigationStage(
+            "001-materialize-light-curve", MATERIALIZE_HANDLER, "RUNNING",
+            None, {"preserved": True},
+        )
+        investigation = store.append_running_stage(investigation, running)
+        failed = replace(
+            running,
+            status="FAILED",
+            error=f"RuntimeError: MAST download failed for {error_uri or selected.product_uri}",
+            failure_classification="NON_RETRYABLE",
+        )
+        investigation = store.complete_current_stage(investigation, failed)
+        investigation = store.set_status(investigation, status)
+        return store, investigation, failed
+
+    def test_repairs_exact_legacy_unsuccessful_mast_download_append_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store, investigation, failed = self._legacy_unsuccessful_download(tmp)
+            stage_path = store.stage_path_for(investigation.id, failed.id)
+            failed_bytes = stage_path.read_bytes()
+
+            self.assertTrue(repair_legacy_archive_transport_failure(store, investigation.id))
+
+            repaired = store.load(investigation.id)
+            self.assertEqual((failed,), repaired.stages)
+            self.assertEqual(failed_bytes, stage_path.read_bytes())
+            control = repaired.metadata["controlState"]
+            retry = control["selectedExperiment"]
+            self.assertEqual("002-materialize-light-curve", retry["id"])
+            self.assertEqual(MATERIALIZE_HANDLER, retry["handler_id"])
+            self.assertEqual(failed.parameters, retry["parameters"])
+            self.assertEqual(failed.id, retry["triggered_by_stage_id"])
+            self.assertEqual("RUN_EXPERIMENT", control["schedulerAction"])
+            self.assertEqual(
+                "TESS_ARCHIVE_UNSUCCESSFUL_DOWNLOAD_COMPATIBILITY_RETRY",
+                control["recovery"],
+            )
+            self.assertFalse(repair_legacy_archive_transport_failure(store, investigation.id))
+
+    def test_unsuccessful_download_compatibility_repair_requires_exact_uri_and_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store, investigation, _ = self._legacy_unsuccessful_download(
+                tmp, error_uri="mast:TESS/product/wrong"
+            )
+            before = store.path_for(investigation.id).read_bytes()
+            self.assertFalse(repair_legacy_archive_transport_failure(store, investigation.id))
+            self.assertEqual(before, store.path_for(investigation.id).read_bytes())
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store, investigation, failed = self._legacy_unsuccessful_download(tmp)
+            unrelated = replace(failed, error="RuntimeError: invalid FITS structure")
+            investigation = replace(investigation, stages=(unrelated,))
+            store.save(investigation)
+            self.assertFalse(repair_legacy_archive_transport_failure(store, investigation.id))
+
+    def test_unsuccessful_download_repair_refuses_completed_or_prior_retry_history(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store, investigation, failed = self._legacy_unsuccessful_download(tmp)
+            complete = replace(
+                failed, id="000-materialize-light-curve", status="COMPLETE",
+                error=None, failure_classification=None,
+            )
+            store.save(replace(investigation, stages=(complete, failed)))
+            self.assertFalse(repair_legacy_archive_transport_failure(store, investigation.id))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store, investigation, failed = self._legacy_unsuccessful_download(tmp)
+            metadata = dict(investigation.metadata)
+            metadata["controlState"] = {
+                "schedulerAction": "RUN_EXPERIMENT",
+                "selectedExperiment": {
+                    "id": "002-materialize-light-curve",
+                    "handler_id": MATERIALIZE_HANDLER,
+                    "parameters": {},
+                    "triggered_by_stage_id": failed.id,
+                },
+            }
+            store.save(replace(investigation, metadata=metadata))
+            self.assertFalse(repair_legacy_archive_transport_failure(store, investigation.id))
+
+    def test_unsuccessful_download_repair_never_touches_complete_investigation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store, investigation, _ = self._legacy_unsuccessful_download(
+                tmp, status="COMPLETE"
+            )
+            before = store.path_for(investigation.id).read_bytes()
+            self.assertFalse(repair_legacy_archive_transport_failure(store, investigation.id))
+            self.assertEqual(before, store.path_for(investigation.id).read_bytes())
+
     def test_repairs_legacy_broad_scan_transport_failure_without_rematerializing(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = InvestigationStore(Path(tmp) / "investigations")
