@@ -15,6 +15,7 @@ from openstar_workflow import (
     StageRequest,
     WorkflowEngine,
 )
+from openstar_science_runs import ScienceRunRecorder
 
 
 WORKFLOW_ID = "openstar.workflow.project-smoke.v1"
@@ -160,6 +161,13 @@ def main():
     args = parse_args()
 
     store = InvestigationStore(args.store)
+    recorder = ScienceRunRecorder("generic-investigation", args.store, metadata={
+        "investigationID": args.investigation_id}, logical_identity=args.investigation_id)
+    with recorder:
+        return _run(args, store)
+
+
+def _run(args, store: InvestigationStore):
     investigation = store.create(
         args.investigation_id,
         WORKFLOW_ID,

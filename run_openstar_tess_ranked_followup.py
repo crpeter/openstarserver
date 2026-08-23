@@ -11,6 +11,7 @@ from openstar_dispatch import InvestigationDispatcher
 from openstar_external_jobs import ExternalJobMonitor, ExternalJobStore, apply_external_job_wakeups
 from openstar_investigation import InvestigationStore
 from openstar_scheduler import InvestigationScheduler
+from openstar_science_runs import recorded_science_run
 from workflows.tess.tess_autonomy import (
     WORKFLOW_ID,
     plan_tess_branches,
@@ -62,6 +63,8 @@ def _claim(investigation) -> str | None:
     return None
 
 
+@recorded_science_run("tess-ranked-followup", "deep_state_dir",
+                      logical_identity="sector", metadata=("sector", "sector_state_dir"))
 def run_tess_ranked_followup(sector: int, sector_state_dir: str | Path,
                              deep_state_dir: str | Path, coordinator_url: str,
                              promote_top: int | None = None, *, promote_novel: int | None = None,

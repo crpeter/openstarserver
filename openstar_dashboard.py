@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import sqlite3
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -16,8 +17,28 @@ from urllib.request import urlopen
 
 from dashboard import build_snapshot, history_snapshot
 from openstar_sector_sweep_status import sector_sweeps_projection
+from openstar_science_runs import catalog_path, discover_science_runs
+from openstar_contributions import DEFAULT_CONTRIBUTION_DB
 
 ROOT = Path(__file__).resolve().parent
+
+
+def latest_contribution_activity(path: str | Path | None) -> dict[str, float]:
+    """Read accepted-work presence without creating or modifying the ledger."""
+    if path is None:
+        return {}
+    try:
+        resolved = Path(path).expanduser().resolve()
+        connection = sqlite3.connect(f"file:{resolved}?mode=ro", uri=True, timeout=1.0)
+        try:
+            rows = connection.execute(
+                "SELECT node_id, MAX(accepted_at) FROM contributions GROUP BY node_id"
+            ).fetchall()
+        finally:
+            connection.close()
+        return {str(node).lower(): float(accepted) for node, accepted in rows}
+    except (OSError, ValueError, TypeError, sqlite3.Error):
+        return {}
 
 
 class CoordinatorClient:
@@ -89,6 +110,8 @@ class DashboardApplication:
         telemetry: TelemetryStore | None = None,
         observation_cache_seconds: float = 1.5,
         sector_sweep_state_dirs: Iterable[str | Path] = (),
+        science_run_catalog: str | Path | None = None,
+        contribution_ledger: str | Path | None = DEFAULT_CONTRIBUTION_DB,
     ):
         self.coordinator = coordinator
         self.telemetry = telemetry or TelemetryStore()
@@ -96,6 +119,8 @@ class DashboardApplication:
         self.sector_sweep_state_dirs = tuple(
             Path(path).expanduser().resolve() for path in sector_sweep_state_dirs
         )
+        self.science_run_catalog = catalog_path(science_run_catalog)
+        self.contribution_ledger = contribution_ledger
         self._observation_lock = threading.Lock()
         self._cached_observation: dict[str, Any] | None = None
         self._cached_until = 0.0
@@ -106,9 +131,28 @@ class DashboardApplication:
             now = time.monotonic()
             if self._cached_observation is None or now >= self._cached_until:
                 observation = self.coordinator.observation()
-                observation["sectorSweeps"] = sector_sweeps_projection(
-                    self.sector_sweep_state_dirs
-                )
+                science_runs = discover_science_runs(self.science_run_catalog)
+                discovered_roots = [run["stateRoot"] for run in science_runs
+                    if run["kind"] == "tess-sector-sweep" and Path(run["stateRoot"]).is_dir()]
+                roots = tuple(dict.fromkeys((*map(str, self.sector_sweep_state_dirs), *discovered_roots)))
+                try:
+                    observation["sectorSweeps"] = sector_sweeps_projection(roots)
+                except (OSError, ValueError, TypeError):
+                    observation["sectorSweeps"] = []
+                live_sectors = {item.get("sector") for item in observation["sectorSweeps"]}
+                for run in science_runs:
+                    fallback = run.get("metadata", {}).get("sectorSweep")
+                    if not isinstance(fallback, dict) or fallback.get("sector") in live_sectors:
+                        continue
+                    observation["sectorSweeps"].append({
+                        **fallback,
+                        "admitted": fallback.get("complete", 0),
+                        "runnable": 0,
+                        "inFlightOrRecovery": 0,
+                    })
+                    live_sectors.add(fallback.get("sector"))
+                observation["sectorSweeps"].sort(key=lambda item: item.get("sector", 0))
+                observation["scienceRuns"] = science_runs
                 self._cached_observation = observation
                 self._cached_until = time.monotonic() + self.observation_cache_seconds
             return self._cached_observation
@@ -120,6 +164,7 @@ class DashboardApplication:
             observation["contributions"],
             observation["projects"],
             self.telemetry.snapshot(),
+            contribution_activity=latest_contribution_activity(self.contribution_ledger),
         )
         return snapshot, observation
 
@@ -197,13 +242,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     {
                         "projects": observation["projects"],
                         "sectorSweeps": observation.get("sectorSweeps", []),
+                        "scienceRuns": observation.get("scienceRuns", []),
                         "health": observation["health"],
                         "updatedAt": time.time(),
                     },
                 )
                 return
             if path == "/api/dashboard/history":
-                self.send_json(200, history_snapshot(observation["contributions"]))
+                self.send_json(200, history_snapshot(
+                    observation["contributions"], observation.get("scienceRuns", [])))
                 return
             self.send_json(404, {"message": "Not found."})
         except (
@@ -250,6 +297,15 @@ def main():
         default=[],
         help="Durable TESS sector-sweep state root to observe read-only (repeatable).",
     )
+    parser.add_argument(
+        "--contribution-ledger",
+        default=str(DEFAULT_CONTRIBUTION_DB),
+        help="Read-only contribution ledger used as an optional worker-presence signal.",
+    )
+    parser.add_argument(
+        "--science-run-catalog",
+        help="Optional catalog path (defaults to OPENSTAR_SCIENCE_RUN_CATALOG or data/science-runs.sqlite3).",
+    )
     args = parser.parse_args()
     server = make_server(
         args.host,
@@ -257,6 +313,8 @@ def main():
         DashboardApplication(
             CoordinatorClient(args.coordinator),
             sector_sweep_state_dirs=args.sector_sweep_state_dir,
+            science_run_catalog=args.science_run_catalog,
+            contribution_ledger=args.contribution_ledger,
         ),
     )
     print(f"OpenStar dashboard: http://{args.host}:{args.port}/dashboard/")

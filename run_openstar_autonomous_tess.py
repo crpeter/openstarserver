@@ -19,6 +19,7 @@ from openstar_dispatch import InvestigationDispatcher
 from openstar_investigation import InvestigationStore
 from openstar_lifecycle import InvestigationLifecycleLoop, LifecycleResult
 from openstar_scheduler import InvestigationScheduler
+from openstar_science_runs import recorded_science_run
 from openstar_targets import InvestigationTargetPortfolio, NoEligibleTargetError
 from workflows.tess.tess_autonomy import (
     WORKFLOW_ID,
@@ -58,6 +59,7 @@ def _status(result: LifecycleResult) -> str:
     return "OpenStar lifecycle: " + " ".join(fields)
 
 
+@recorded_science_run("tess-autonomous", "state_dir")
 def run_autonomous_tess(
     project_paths: list[str | Path],
     coordinator_url: str,
