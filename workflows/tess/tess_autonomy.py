@@ -203,28 +203,100 @@ def _awaiting_atlas_signed_reanalysis_adapter(investigation: Investigation) -> b
 def _awaiting_post_atlas_targeted_observation_adapter(
     investigation: Investigation,
 ) -> bool:
-    """Keep a non-signed initial-ATLAS follow-up at its current adapter boundary."""
+    """Recognize only the complete, unambiguous direct v20.24 boundary."""
     stage = _latest_complete(
         investigation, "openstar.tess.atlas-forced-photometry.interpret"
     )
     result = (stage.result or {}) if stage is not None else {}
     if not (
         stage is not None
+        and result.get("classification") == "ATLAS_SOURCE_ATTRIBUTION_UNRESOLVED"
+        and result.get("residualModeOrigin")
+        == "ARCHIVAL_ATLAS_SOURCE_ATTRIBUTION_UNRESOLVED"
         and result.get("recommendedNextTest")
         == "TARGETED_HIGH_RESOLUTION_TIME_SERIES_PHOTOMETRY"
         and result.get("physicalMechanismResolved") is False
     ):
         return False
     position = investigation.stages.index(stage)
+    preceding = investigation.stages[:position]
     later = investigation.stages[position + 1:]
+    if not stage.triggered_by_stage_id or not any(
+        item.id == stage.triggered_by_stage_id
+        and item.status == "COMPLETE"
+        and item.handler_id in (
+            "openstar.tess.atlas-forced-photometry.run",
+            "openstar.tess.atlas-forced-photometry.prepare",
+        )
+        for item in preceding
+    ):
+        return False
+
+    search = dict(
+        (result.get("distributedValidation") or {}).get("frequencySearch")
+        or result.get("frequencySearch")
+        or {}
+    )
+    minimum = search.get(
+        "minimumFrequency", search.get("minFrequency", search.get("startFrequency"))
+    )
+    maximum = search.get(
+        "maximumFrequency", search.get("maxFrequency", search.get("endFrequency"))
+    )
+    try:
+        if maximum is None:
+            total = int(search.get("totalFrequencies", search.get("frequencyCount")))
+            step = float(search.get("frequencyStep", search.get("step")))
+            maximum = float(minimum) + max(total - 1, 0) * step
+        valid_search = (
+            math.isfinite(float(minimum))
+            and math.isfinite(float(maximum))
+            and 0 < float(minimum) < float(maximum)
+        )
+    except (TypeError, ValueError):
+        valid_search = False
+    if not valid_search:
+        return False
+
+    pair = result.get("sourcePair")
+    pair_sources = (
+        pair.get("target") if isinstance(pair, dict) else None,
+        pair.get("counterpart") if isinstance(pair, dict) else None,
+    )
+    pair_is_frozen = bool(
+        isinstance(pair, dict)
+        and pair.get("version") == "openstar.current-source-pair.v1"
+        and all(isinstance(item, dict) for item in pair_sources)
+        and all(
+            item.get("gaiaDR3SourceID") is not None
+            and item.get("raDeg") is not None
+            and item.get("decDeg") is not None
+            for item in pair_sources
+        )
+        and pair_sources[0].get("gaiaDR3SourceID")
+        != pair_sources[1].get("gaiaDR3SourceID")
+    )
+    external_stages = [
+        item for item in preceding
+        if item.handler_id
+        == "openstar.tess.external-high-resolution-variability-validation.interpret"
+        and item.status == "COMPLETE"
+    ]
+    if (
+        not pair_is_frozen
+        or len(external_stages) != 1
+        or (external_stages[0].result or {}).get("sourcePair") != pair
+    ):
+        return False
+
     return not any(
         item.handler_id.startswith((
             "openstar.tess.atlas-forced-photometry-reanalysis.",
             "openstar.tess.atlas-time-resolved.",
-            "openstar.tess.atlas-fixed-windows.",
+            "openstar.tess.atlas-fixed-window.",
             "openstar.tess.targeted-observation-planning.",
         ))
-        for item in later
+        for item in (*preceding, *later)
     )
 
 
@@ -1464,9 +1536,7 @@ def plan_tess_branches(
                     handler_id="openstar.tess.targeted-observation-planning.generate",
                     parameters={}, triggered_by_stage_id=atlas.id,
                 ),
-                required_stage_ids=(
-                    "openstar.capability.current-targeted-observation-planning-adapter",
-                ),
+                required_stage_ids=(),
             ),
         )
     if _awaiting_current_des_adapter(investigation):
