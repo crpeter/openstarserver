@@ -3987,14 +3987,22 @@ def build_engine(
         )
 
     def intrinsic_nonstationary_stage(investigation, request):
-        preparation = _required_latest_result_for_handler(
-            investigation, "openstar.tess.multi-source-residual.prepare"
-        )
-        decomposition = _required_latest_result_for_handler(
-            investigation, "openstar.tess.multi-source-residual.interpret"
-        )
+        preparation_stage = next((stage for stage in reversed(investigation.stages)
+            if stage.handler_id == "openstar.tess.multi-source-residual.prepare"
+            and stage.status == "COMPLETE" and stage.result is not None), None)
+        decomposition_stage = next((stage for stage in reversed(investigation.stages)
+            if stage.handler_id == "openstar.tess.multi-source-residual.interpret"
+            and stage.status == "COMPLETE" and stage.result is not None), None)
+        if preparation_stage is None or decomposition_stage is None:
+            raise RuntimeError("Intrinsic classification requires completed v20.12 prepare + interpret stages.")
+        preparation = preparation_stage.result
+        decomposition = decomposition_stage.result
+        linked_hash = ((decomposition_stage.provenance.input_hashes or {}).get("preparation")
+                       if decomposition_stage.provenance is not None else None)
         summary = classify_target_component(
-            preparation=preparation, decomposition=decomposition
+            preparation=preparation, decomposition=decomposition,
+            authoritative_artifacts=preparation_stage.artifacts,
+            preparation_link_verified=linked_hash == sha256_json(preparation),
         )
         summary["inputProvenance"].update({
             "v20.12PreparationResultHash": sha256_json(preparation),
@@ -4002,14 +4010,14 @@ def build_engine(
         })
         artifact_path = (store.directory_for(investigation.id) / "artifacts" /
                          "intrinsic-nonstationary" /
-                         "intrinsic-nonstationary-v20.13.json")
+                         "intrinsic-nonstationary-v20.31.json")
         _write_json(artifact_path, summary)
         return StageOutcome(
             result=summary,
             next_stage=StageRequest(
                 id=_next_stage_id(request.id, "finalize"),
                 handler_id="openstar.tess.finalize",
-                parameters={"outputSuffix": "v20.13"},
+                parameters={"outputSuffix": "v20.31"},
                 triggered_by_stage_id=request.id,
             ),
             input_hashes={"v20.12Preparation": sha256_json(preparation),

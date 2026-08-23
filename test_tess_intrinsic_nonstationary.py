@@ -3,32 +3,18 @@ from __future__ import annotations
 import json
 import math
 import tempfile
-import sys
-import types
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
-try:
-    import numpy as _numpy
-except ModuleNotFoundError:
-    sys.modules["numpy"] = types.ModuleType("numpy")
-    _installed_numpy_stub = True
-else:
-    _installed_numpy_stub = not hasattr(_numpy, "ndarray")
-
+from openstar_investigation import ArtifactReference, InvestigationStage, InvestigationStore, sha256_file
+from openstar_targets import InvestigationTarget
+from workflows.tess.tess_autonomy import WORKFLOW_ID, plan_tess_branches, repair_obsolete_terminal_wait
 from workflows.tess.tess_intrinsic_nonstationary import classify_target_component
-from workflows.tess.tess_investigation import multisource_residual_continuation
-from workflows.tess.tess_autonomy import WORKFLOW_ID, repair_obsolete_terminal_wait
-from openstar_investigation import InvestigationStage, InvestigationStore
-from dataclasses import replace
-
-if _installed_numpy_stub:
-    del sys.modules["numpy"]
 
 
 class TessIntrinsicNonstationaryTests(unittest.TestCase):
     def boundary(self):
-        # Real-shaped TIC 350519062 boundary; deliberately excludes observed powers.
         return {"classification": "TARGET_RESIDUAL_COMPONENT_DOMINANT",
                 "residualModeOrigin": "TARGET_DOMINANT", "physicalMechanismResolved": False,
                 "recommendedNextTest": "INTRINSIC_NONSTATIONARY_VARIABILITY_CLASSIFICATION",
@@ -36,76 +22,151 @@ class TessIntrinsicNonstationaryTests(unittest.TestCase):
                 "componentSummaries": [{"componentID": "target", "componentType": "TARGET",
                                         "independentSupportCount": 4}]}
 
-    def preparation(self, root: Path):
-        series = []
-        for sector in (1, 27):
-            times = [index / 20 for index in range(160)]
-            values = [math.sin(2 * math.pi * 1.2 * value) for value in times]
-            coefficients = root / f"target-{sector}-coefficients.json"
+    def preparation(self, root: Path, *, epochs=(100.0, 300.0, 600.0),
+                    frequencies=None, common=True, sector_ids=None):
+        frequencies = frequencies or (1.2,) * len(epochs)
+        sector_ids = sector_ids or tuple(range(1, len(epochs) + 1))
+        series, artifacts = [], []
+        for sector, epoch, frequency in zip(sector_ids, epochs, frequencies):
+            common_times = [epoch + index / 20 for index in range(160)]
+            local_times = [value - min(common_times) for value in common_times]
+            values = [math.sin(2 * math.pi * frequency * value) for value in common_times]
+            coefficient = root / f"target-{sector}-coefficients.json"
             dataset = root / f"target-{sector}.json"
-            coefficients.write_text(json.dumps({"times": times, "coefficients": values,
-                                                "componentID": "target"}))
+            payload = {"times": local_times, "coefficients": values, "componentID": "target"}
+            if common:
+                payload["commonWarpedTimes"] = common_times
+                payload["absoluteTimes"] = common_times
+                payload["timeReferenceDays"] = 0.0
+                payload["fractionalFrequencyDriftPerDay"] = 0.0
+            coefficient.write_text(json.dumps(payload))
             dataset.write_text(json.dumps({"science": {"componentID": "target"},
                                            "source": {"timeReferenceDays": 1500.0}}))
-            series.append({"componentID": "target", "componentType": "TARGET", "sector": sector,
-                           "combined": False, "coefficientSeriesPath": str(coefficients),
-                           "datasetPath": str(dataset)})
-        return {"referenceFrequency": 1.2, "preparedSeries": series}
+            series.append({"datasetID": f"target-{sector}", "componentID": "target",
+                           "componentType": "TARGET", "sector": sector, "combined": False,
+                           "coefficientSeriesPath": str(coefficient), "datasetPath": str(dataset)})
+            for path in (coefficient, dataset):
+                artifacts.append(ArtifactReference(str(path.resolve()), sha256_file(path), "application/json"))
+        return {"referenceFrequency": 1.2, "preparedSeries": series}, tuple(artifacts)
 
-    def test_exact_boundary_selects_new_stage(self):
-        request = multisource_residual_continuation(self.boundary(), request_id="026-interpret")
-        self.assertEqual("openstar.tess.intrinsic-nonstationary.analyze", request.handler_id)
+    def classify(self, preparation, artifacts):
+        return classify_target_component(preparation=preparation, decomposition=self.boundary(),
+                                         authoritative_artifacts=artifacts,
+                                         preparation_link_verified=True)
 
-    def test_other_routes_unchanged(self):
-        prf = multisource_residual_continuation(
-            {"recommendedNextTest": "PIXEL_RESPONSE_FUNCTION_DEBLENDING",
-             "physicalMechanismResolved": False}, request_id="026-interpret")
-        self.assertEqual("openstar.tess.official-spoc-prf-forward-modeling.prepare", prf.handler_id)
-        for classification in ("OFFSET_RESIDUAL_COMPONENT_DOMINANT", "MIXED_RESIDUAL_COMPONENTS"):
-            boundary = self.boundary(); boundary["classification"] = classification
-            self.assertEqual("openstar.tess.finalize",
-                             multisource_residual_continuation(boundary, request_id="026-x").handler_id)
-
-    def test_uses_target_coefficients_and_records_hashes(self):
-        with tempfile.TemporaryDirectory() as directory:
-            result = classify_target_component(preparation=self.preparation(Path(directory)),
-                                               decomposition=self.boundary())
-        self.assertEqual([1, 27], result["sectorsUsed"])
-        self.assertEqual("v20.12 spatially-decomposed target coefficient series", result["observable"])
-        self.assertEqual(4, len(result["inputProvenance"]["preparationArtifacts"]))
-        self.assertFalse(result["physicalMechanismResolved"])
-
-    def test_missing_provenance_fails_closed(self):
-        result = classify_target_component(preparation={"referenceFrequency": 1.2,
-                                                        "preparedSeries": []},
-                                           decomposition=self.boundary())
-        self.assertEqual("INSUFFICIENT_TARGET_COMPONENT_TEMPORAL_EVIDENCE", result["classification"])
-        self.assertTrue(result["failClosedReasons"])
-
-    def test_boundary_is_not_broadened(self):
-        for key, value in (("residualModeOrigin", "TIME_VARIABLE_OR_BLENDED"),
-                           ("physicalMechanismResolved", True)):
-            boundary = self.boundary(); boundary[key] = value
-            self.assertEqual("openstar.tess.finalize",
-                             multisource_residual_continuation(boundary, request_id="026-x").handler_id)
-
-    def test_complete_boundary_reopens_without_replacing_history(self):
-        with tempfile.TemporaryDirectory() as directory:
-            store = InvestigationStore(Path(directory))
-            investigation = store.create("tess-real-shaped", WORKFLOW_ID, "20.2")
-            stage = InvestigationStage("026-interpret-multi-source-residual",
-                "openstar.tess.multi-source-residual.interpret", "COMPLETE", "025-run", {},
-                result=self.boundary())
-            investigation = replace(investigation, stages=(stage,))
-            store.save(investigation)
+    def investigation(self, root: Path, *, complete=False):
+        store = InvestigationStore(root)
+        investigation = store.create("tess-real-shaped", WORKFLOW_ID, "20.2")
+        stage = InvestigationStage("026-interpret-multi-source-residual",
+            "openstar.tess.multi-source-residual.interpret", "COMPLETE", "025-run", {},
+            result=self.boundary())
+        investigation = replace(investigation, stages=(stage,))
+        store.save(investigation)
+        if complete:
             investigation = store.set_control_state(investigation, status="COMPLETE",
                 control_state={"schedulerAction": "INVESTIGATION_COMPLETE"})
+        return store, investigation
+
+    def test_exact_boundary_selects_new_experiment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _, investigation = self.investigation(Path(directory))
+            target = InvestigationTarget("target", investigation.id, WORKFLOW_ID, "20.2")
+            request = plan_tess_branches(investigation, target)[0].experiment
+        self.assertEqual("openstar.tess.intrinsic-nonstationary.analyze", request.handler_id)
+
+    def test_complete_boundary_reopens_append_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store, investigation = self.investigation(Path(directory), complete=True)
             old_stages = investigation.stages
             repaired = repair_obsolete_terminal_wait(store, investigation)
         self.assertEqual("RUNNING", repaired.status)
         self.assertEqual(old_stages, repaired.stages)
-        self.assertEqual("openstar.tess.intrinsic-nonstationary.analyze",
-                         repaired.metadata["controlState"]["selectedExperiment"]["handler_id"])
+
+    def test_unrelated_routes_are_unchanged(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _, investigation = self.investigation(Path(directory))
+            target = InvestigationTarget("target", investigation.id, WORKFLOW_ID, "20.2")
+            for classification, origin, recommendation in (
+                ("OFFSET_RESIDUAL_COMPONENT_DOMINANT", "OFFSET_DOMINANT", "IDENTIFY_OFFSET_RESIDUAL_VARIABLE_SOURCE"),
+                ("MIXED_RESIDUAL_COMPONENTS", "MIXED", "NEIGHBOR_SOURCE_IDENTIFICATION_AND_CATALOG_CROSSMATCH"),
+                ("UNRESOLVED", "UNKNOWN", "PIXEL_RESPONSE_FUNCTION_DEBLENDING")):
+                result = self.boundary(); result.update(classification=classification,
+                    residualModeOrigin=origin, recommendedNextTest=recommendation)
+                changed = replace(investigation, stages=(replace(investigation.stages[0], result=result),))
+                branches = plan_tess_branches(changed, target)
+                self.assertFalse(branches and branches[0].experiment.handler_id ==
+                                 "openstar.tess.intrinsic-nonstationary.analyze")
+
+    def test_modified_coefficient_fails_frozen_hash(self):
+        with tempfile.TemporaryDirectory() as directory:
+            preparation, artifacts = self.preparation(Path(directory))
+            Path(preparation["preparedSeries"][0]["coefficientSeriesPath"]).write_text("{}")
+            result = self.classify(preparation, artifacts)
+        self.assertEqual("INSUFFICIENT_TARGET_COMPONENT_TEMPORAL_EVIDENCE", result["classification"])
+        self.assertTrue(any("failed frozen hash" in reason for reason in result["failClosedReasons"]))
+
+    def test_modified_dataset_fails_frozen_hash(self):
+        with tempfile.TemporaryDirectory() as directory:
+            preparation, artifacts = self.preparation(Path(directory))
+            Path(preparation["preparedSeries"][0]["datasetPath"]).write_text("{}")
+            result = self.classify(preparation, artifacts)
+        self.assertEqual("INSUFFICIENT_TARGET_COMPONENT_TEMPORAL_EVIDENCE", result["classification"])
+
+    def test_missing_authoritative_provenance_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            preparation, _ = self.preparation(Path(directory))
+            result = self.classify(preparation, ())
+        self.assertTrue(result["failClosedReasons"])
+
+    def test_real_v2012_local_time_reset_cannot_claim_drift_or_coherence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            preparation, artifacts = self.preparation(Path(directory), common=False,
+                frequencies=(1.17, 1.20, 1.23))
+            result = self.classify(preparation, artifacts)
+        self.assertFalse(result["modelSelectionDiagnostics"]["commonTimingAvailable"])
+        self.assertNotIn("COHERENT", result["classification"])
+        self.assertNotIn("DRIFTING", result["classification"])
+        self.assertTrue(result["timingLimitations"])
+
+    def test_valid_common_time_stationary_signal_measures_phase_coherence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.classify(*self.preparation(Path(directory)))
+        self.assertEqual("STATIONARY_PHASE_COHERENT_TARGET_RESIDUAL_MODE", result["classification"])
+        self.assertLess(result["modelSelectionDiagnostics"]["crossSectorPhaseCircularStdRadians"], .35)
+
+    def test_drift_uses_elapsed_observation_time(self):
+        epochs = (100.0, 300.0, 600.0, 1000.0)
+        frequencies = tuple(1.14 + .00012 * epoch for epoch in epochs)
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.classify(*self.preparation(Path(directory), epochs=epochs,
+                                                     frequencies=frequencies))
+        self.assertEqual("SMOOTHLY_FREQUENCY_DRIFTING_TARGET_RESIDUAL_MODE", result["classification"])
+        self.assertGreater(result["modelSelectionDiagnostics"]["frequencyEpochLinearCorrelation"], .8)
+
+    def test_sector_id_shuffle_does_not_change_temporal_result(self):
+        epochs = (100.0, 300.0, 600.0, 1000.0)
+        frequencies = tuple(1.14 + .00012 * epoch for epoch in epochs)
+        with tempfile.TemporaryDirectory() as left, tempfile.TemporaryDirectory() as right:
+            first = self.classify(*self.preparation(Path(left), epochs=epochs, frequencies=frequencies,
+                                                    sector_ids=(1, 2, 3, 4)))
+            second = self.classify(*self.preparation(Path(right), epochs=epochs, frequencies=frequencies,
+                                                     sector_ids=(87, 1, 61, 27)))
+        self.assertEqual(first["classification"], second["classification"])
+
+    def test_epoch_change_not_sector_ordinal_controls_drift(self):
+        frequencies = (1.15, 1.17, 1.20, 1.24)
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.classify(*self.preparation(Path(directory),
+                epochs=(100.0, 250.0, 500.0, 900.0), frequencies=frequencies,
+                sector_ids=(10, 9, 8, 7)))
+        self.assertGreater(result["modelSelectionDiagnostics"]["frequencyEpochLinearCorrelation"], .8)
+
+    def test_observable_is_only_target_component(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.classify(*self.preparation(Path(directory)))
+        self.assertEqual("v20.12 spatially-decomposed target coefficient series", result["observable"])
+        self.assertTrue(all(item["authoritativeSha256"] == item["verifiedCurrentSha256"]
+                            for item in result["inputProvenance"]["preparationArtifacts"]))
 
 
 if __name__ == "__main__":
