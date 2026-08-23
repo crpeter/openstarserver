@@ -3,6 +3,7 @@ import io
 import json
 import tempfile
 import unittest
+from openstar_test_science_runs import IsolatedScienceRunTestCase
 from pathlib import Path
 
 from coordinator_state import CoordinatorState
@@ -11,7 +12,7 @@ from test_tess_sector_sweep import FakeCoordinator, FakeProvider, Prepared, prod
 from workflows.tess.tess_preprocessing import broad_tess_frequency_search
 
 
-class TessWorkUnitSizingTests(unittest.TestCase):
+class TessWorkUnitSizingTests(IsolatedScienceRunTestCase):
     def test_cli_default_and_benchmark_sizes(self):
         base = ["--sector", "7", "--coordinator-url", "unused", "--state-dir", "state"]
         self.assertIsNone(parse_args(base).frequencies_per_work_unit)

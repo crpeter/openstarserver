@@ -3,6 +3,7 @@ import tempfile
 import threading
 import time
 import unittest
+from openstar_test_science_runs import IsolatedScienceRunTestCase
 import math
 import struct
 import sys
@@ -17,6 +18,7 @@ from openstar_coordinator_client import ProjectRunResult
 from openstar_dispatch import InvestigationDispatcher
 from openstar_investigation import InvestigationStage, InvestigationStore
 from openstar_lifecycle import InvestigationLifecycleDriver, InvestigationSchedulingState
+from openstar_science_runs import DEFAULT_CATALOG, ScienceRunCatalog, stable_run_id
 from openstar_scheduler import InvestigationScheduler
 from workflows.tess.tess_preprocessing import prepare_tess_samples
 from workflows.tess.tess_sector_archive import (
@@ -313,7 +315,7 @@ class PreprocessingTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "standard deviation"): prepare_tess_samples([1, 2], [3, 3])
 
 
-class SweepTests(unittest.TestCase):
+class SweepTests(IsolatedScienceRunTestCase):
     def _legacy_unsuccessful_download(self, root, *, error_uri=None, status="FAILED"):
         store = InvestigationStore(Path(root) / "investigations")
         selected = product(42)
@@ -753,6 +755,29 @@ class SweepTests(unittest.TestCase):
                 run_tess_sector_sweep(7, "unused", tmp, max_targets=2, provider=provider, coordinator=coordinator)
                 self.assertEqual(calls, coordinator.calls); self.assertEqual([7], provider.calls)
             finally: tess_sector_scan.read_and_prepare_tess_light_curve = original
+
+    def test_recorded_runner_uses_disposable_catalog_not_repository_default(self):
+        """Deleting test state cannot leave a dangling run in the real catalog."""
+        default_before = DEFAULT_CATALOG.read_bytes() if DEFAULT_CATALOG.exists() else None
+        provider, coordinator = FakeProvider([product(1)]), FakeCoordinator()
+        from workflows.tess import tess_sector_scan
+        original = tess_sector_scan.read_and_prepare_tess_light_curve
+        tess_sector_scan.read_and_prepare_tess_light_curve = lambda path: Prepared()
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                state_root = Path(temporary) / "state"
+                self.assertEqual(0, run_tess_sector_sweep(
+                    7, "unused", state_root, provider=provider, coordinator=coordinator))
+                run_id = stable_run_id("tess-sector-sweep", state_root, 7)
+                runs = {run.run_id: run for run in
+                        ScienceRunCatalog(self.science_run_catalog_path).list_runs()}
+                self.assertIn(run_id, runs)
+                self.assertEqual("FINISHED", runs[run_id].status)
+            self.assertFalse(state_root.exists())
+        finally:
+            tess_sector_scan.read_and_prepare_tess_light_curve = original
+        default_after = DEFAULT_CATALOG.read_bytes() if DEFAULT_CATALOG.exists() else None
+        self.assertEqual(default_before, default_after)
 
     def test_one_failure_isolated_and_default_admits_all(self):
         provider = FakeProvider([product(1), product(2), product(3)]); coordinator = FakeCoordinator(fail_tic=2)

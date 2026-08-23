@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+from openstar_test_science_runs import IsolatedScienceRunTestCase
 from dataclasses import asdict, replace
 from pathlib import Path
 
@@ -14,7 +15,7 @@ from workflows.tess.tess_sector_ranking import aggregate_tess_sector_ranking
 from run_openstar_tess_sector_sweep import run_tess_sector_sweep
 
 
-class SectorRankingTests(unittest.TestCase):
+class SectorRankingTests(IsolatedScienceRunTestCase):
     def setUp(self):
         self.original_preprocessing = tess_sector_scan.read_and_prepare_tess_light_curve
         tess_sector_scan.read_and_prepare_tess_light_curve = lambda path: Prepared()
