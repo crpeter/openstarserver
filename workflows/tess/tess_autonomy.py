@@ -149,6 +149,29 @@ def _target_residual_mechanism_boundary(investigation: Investigation):
     return None
 
 
+def _old_target_residual_adjudication_boundary(investigation: Investigation):
+    """Match only the known stage-028 old-semantics pending-finalizer boundary."""
+    stage = next((item for item in investigation.stages
+        if item.id == "028-target-residual-mechanism"
+        and item.handler_id == "openstar.tess.target-residual-mechanism.analyze"
+        and item.status == "COMPLETE" and item.result is not None), None)
+    if (stage is None or stage.result.get("adjudicationVersion") is not None
+            or not any(Path(reference.path).name == "target-residual-mechanism-v20.14.json"
+                       and bool(reference.sha256) for reference in stage.artifacts)):
+        return None
+    if any(item.handler_id == "openstar.tess.target-residual-mechanism-adjudication.analyze"
+           for item in investigation.stages):
+        return None
+    control = investigation.metadata.get("controlState") or {}
+    selected = control.get("selectedExperiment") or {}
+    if (investigation.status != "RUNNING"
+            or control.get("schedulerAction") != "RUN_EXPERIMENT"
+            or selected.get("handler_id") != "openstar.tess.finalize"
+            or selected.get("triggered_by_stage_id") != stage.id):
+        return None
+    return stage
+
+
 def _awaiting_nsc_adapter(investigation: Investigation) -> bool:
     """Identify only the incremental SkyMapper-to-NSC implementation boundary."""
     stage = _latest_complete(
@@ -1212,6 +1235,20 @@ def repair_obsolete_terminal_wait(
     control = investigation.metadata.get("controlState")
     if investigation.workflow_id != WORKFLOW_ID or not isinstance(control, dict):
         return investigation
+
+    old_mechanism = _old_target_residual_adjudication_boundary(investigation)
+    if old_mechanism is not None:
+        request = StageRequest(
+            id=_continuation_stage_id(old_mechanism, "target-residual-mechanism-adjudication"),
+            handler_id="openstar.tess.target-residual-mechanism-adjudication.analyze",
+            parameters={}, triggered_by_stage_id=old_mechanism.id,
+        )
+        return store.set_control_state(
+            investigation, status="RUNNING",
+            control_state={"branchAssessments": [], "selectedExperiment": asdict(request),
+                           "schedulerAction": "RUN_EXPERIMENT",
+                           "recovery": "TESS_V20_14_ROUTE_ADJUDICATION_V20_15"},
+        )
 
     mechanism = _target_residual_mechanism_boundary(investigation)
     if (mechanism is not None and investigation.status == "COMPLETE"

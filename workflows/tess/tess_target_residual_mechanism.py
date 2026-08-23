@@ -23,6 +23,69 @@ CONSTANT_MODEL_PARAMETERS = 3
 SMOOTH_MODEL_PARAMETERS = 5
 BEAT_MODEL_PARAMETERS = 6
 INTERMITTENT_MODEL_PARAMETERS = 2 + ENVELOPE_SEGMENTS
+ADJUDICATION_VERSION = "route-independent-all-models-v1"
+UNRESOLVED_CLASSIFICATION = "TARGET_RESIDUAL_MECHANISM_UNRESOLVED"
+
+MODEL_BIC_FIELDS = (
+    ("CONSTANT_AMPLITUDE", "constantAmplitudeBIC"),
+    ("SMOOTH_AMPLITUDE_MODULATION", "smoothEnvelopeBIC"),
+    ("COHERENT_TWO_MODE_BEATING", "twoFrequencyBIC"),
+    ("EPISODIC_ACTIVATION", "intermittentEnvelopeBIC"),
+)
+
+
+def adjudicate_sector_model_evidence(evidence: Iterable[dict[str, Any]], *,
+        fail_closed_reasons: Iterable[str] = ()) -> dict[str, Any]:
+    """Adjudicate already-computed sector models without regard to admission route."""
+    sectors = []
+    labels = []
+    for source in evidence:
+        item = dict(source)
+        eligible = [(model, field, float(item[field])) for model, field in MODEL_BIC_FIELDS
+                    if item.get(field) is not None]
+        eligible.sort(key=lambda candidate: candidate[2])
+        best = eligible[0] if eligible else None
+        second = eligible[1] if len(eligible) > 1 else None
+        delta = second[2] - best[2] if best is not None and second is not None else None
+        decisive = delta is not None and delta >= DECISIVE_DELTA_BIC
+        gate_blocked = False
+        label = UNRESOLVED_CLASSIFICATION
+        if decisive and best[0] == "COHERENT_TWO_MODE_BEATING":
+            label = "COHERENT_TWO_MODE_BEATING_SUPPORTED"
+        elif decisive and best[0] == "SMOOTH_AMPLITUDE_MODULATION":
+            label = "SMOOTH_TARGET_MODE_AMPLITUDE_MODULATION"
+        elif decisive and best[0] == "EPISODIC_ACTIVATION":
+            if item.get("episodicSuppressionAndReappearance") is True:
+                label = "EPISODIC_TARGET_MODE_ACTIVATION"
+            else:
+                gate_blocked = True
+        # A decisively best constant model is recorded but cannot manufacture a
+        # physical explanation for a target admitted on nonstationary evidence.
+        item.update({
+            "bestModel": best[0] if best else None,
+            "bestModelBICField": best[1] if best else None,
+            "secondBestModel": second[0] if second else None,
+            "secondBestModelBICField": second[1] if second else None,
+            "deltaBICToSecondBest": delta,
+            "decisiveBestModel": decisive,
+            "extraMorphologyGateBlockedPromotion": gate_blocked,
+            "sectorClassification": label,
+        })
+        sectors.append(item)
+        labels.append(label)
+
+    replicated = {label for label in labels if label != UNRESOLVED_CLASSIFICATION
+                  and labels.count(label) >= MIN_REPLICATING_SECTORS}
+    reasons = list(fail_closed_reasons)
+    promoted = len(replicated) == 1 and not reasons
+    classification = next(iter(replicated)) if promoted else UNRESOLVED_CLASSIFICATION
+    return {
+        "classification": classification,
+        "recommendedNextTest": ("ASTROPHYSICAL_MECHANISM_INTERPRETATION" if promoted
+                                else "TARGET_RESIDUAL_PHYSICAL_MECHANISM_FOLLOWUP"),
+        "sectorModelEvidence": sectors,
+        "replicatedMechanisms": sorted(replicated),
+    }
 
 
 def _hash(path: str | Path) -> str:
@@ -227,42 +290,18 @@ def analyze_target_residual_mechanism(*, preparation: dict[str, Any],
                        "timingCoordinate": coordinate})
         evidence.append(models)
 
-    sector_labels = []
-    mode = v2013_result["classification"]
-    for item in evidence:
-        constant, smooth = item["constantAmplitudeBIC"], item["smoothEnvelopeBIC"]
-        if mode == "AMPLITUDE_EVOLVING_TARGET_RESIDUAL":
-            beat = item["twoFrequencyBIC"]
-            if beat is not None and min(constant, smooth) - beat >= DECISIVE_DELTA_BIC:
-                label = "COHERENT_TWO_MODE_BEATING_SUPPORTED"
-            elif min(constant, beat if beat is not None else float("inf")) - smooth >= DECISIVE_DELTA_BIC:
-                label = "SMOOTH_SINGLE_MODE_AMPLITUDE_EVOLUTION"
-            else:
-                label = "AMPLITUDE_EVOLUTION_MECHANISM_UNRESOLVED"
-        else:
-            episodic = item["intermittentEnvelopeBIC"]
-            if (item["episodicSuppressionAndReappearance"]
-                    and min(constant, smooth) - episodic >= DECISIVE_DELTA_BIC):
-                label = "EPISODIC_TARGET_MODE_ACTIVATION"
-            elif min(constant, episodic) - smooth >= DECISIVE_DELTA_BIC:
-                label = "SMOOTH_TARGET_MODE_AMPLITUDE_MODULATION"
-            else:
-                label = "INTERMITTENCY_MECHANISM_UNRESOLVED"
-        item["sectorClassification"] = label
-        sector_labels.append(label)
-    candidates = [label for label in set(sector_labels) if "UNRESOLVED" not in label
-                  and sector_labels.count(label) >= MIN_REPLICATING_SECTORS]
-    unresolved = ("AMPLITUDE_EVOLUTION_MECHANISM_UNRESOLVED" if mode.startswith("AMPLITUDE")
-                  else "INTERMITTENCY_MECHANISM_UNRESOLVED")
-    promoted = len(candidates) == 1 and not reasons
-    classification = candidates[0] if promoted else unresolved
-    return {"classification": classification, "physicalMechanismResolved": False,
-            "recommendedNextTest": "ASTROPHYSICAL_MECHANISM_INTERPRETATION" if promoted
-                                   else "TARGET_RESIDUAL_PHYSICAL_MECHANISM_FOLLOWUP",
+    adjudication = adjudicate_sector_model_evidence(evidence, fail_closed_reasons=reasons)
+    return {"classification": adjudication["classification"], "physicalMechanismResolved": False,
+            "recommendedNextTest": adjudication["recommendedNextTest"],
             "observable": "frozen v20.12 spatially-decomposed target coefficient series",
-            "sectorModelEvidence": evidence, "failClosedReasons": reasons,
+            "sectorModelEvidence": adjudication["sectorModelEvidence"],
+            "replicatedMechanisms": adjudication["replicatedMechanisms"],
+            "failClosedReasons": reasons,
             "crossSectorPhaseUsed": False,
-            "preRegisteredRules": {"decisiveDeltaBIC": DECISIVE_DELTA_BIC,
+            "adjudicationVersion": ADJUDICATION_VERSION,
+            "admissionClassification": v2013_result["classification"],
+            "preRegisteredRules": {"adjudicationVersion": ADJUDICATION_VERSION,
+                "decisiveDeltaBIC": DECISIVE_DELTA_BIC,
                 "minimumReplicatingSectors": MIN_REPLICATING_SECTORS,
                 "beatGridSize": BEAT_GRID_SIZE, "envelopeSegments": ENVELOPE_SEGMENTS,
                 "carrierPhaseGridSize": PHASE_GRID_SIZE,
