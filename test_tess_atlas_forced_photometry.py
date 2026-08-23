@@ -413,30 +413,66 @@ class CurrentATLASForcedPhotometryTests(unittest.TestCase):
         self.assertEqual(migrated.metadata["controlState"], again.metadata["controlState"])
         self.assertEqual(len(inv.stages), len(migrated.stages))
 
-    def test_post_atlas_targeted_observation_is_durable_and_not_completed(self):
-        stage = InvestigationStage("053-interpret-atlas-forced-photometry",
-            "openstar.tess.atlas-forced-photometry.interpret", "COMPLETE", None, {},
-            result={"recommendedNextTest": atlas.HISTORICAL_TRIGGER,
-                    "physicalMechanismResolved": False}, stop=True)
+    def test_post_atlas_targeted_observation_adapter_is_append_only_and_idempotent(self):
+        search = {"minimumFrequency": 0.2, "maximumFrequency": 4.0,
+                  "frequencyStep": 0.01, "totalFrequencies": 381}
+        stages = (
+            InvestigationStage("001-prepare-target", "openstar.tess.prepare-target",
+                "COMPLETE", None, {}, result={"sourceProjectID": "p",
+                                                "datasetID": "d", "ticID": 1}),
+            InvestigationStage("019-external", "openstar.tess.external-high-resolution-variability-validation.interpret",
+                "COMPLETE", "001-prepare-target", {}, result={"sourcePair": self.pair}),
+            InvestigationStage("052-run-atlas-forced-photometry",
+                "openstar.tess.atlas-forced-photometry.run", "COMPLETE",
+                "051-prepare-atlas-forced-photometry", {}, result={}),
+            InvestigationStage("053-interpret-atlas-forced-photometry",
+                "openstar.tess.atlas-forced-photometry.interpret", "COMPLETE",
+                "052-run-atlas-forced-photometry", {}, result={
+                    "classification": "ATLAS_SOURCE_ATTRIBUTION_UNRESOLVED",
+                    "residualModeOrigin": "ARCHIVAL_ATLAS_SOURCE_ATTRIBUTION_UNRESOLVED",
+                    "recommendedNextTest": atlas.HISTORICAL_TRIGGER,
+                    "physicalMechanismResolved": False, "sourcePair": self.pair,
+                    "distributedValidation": {"frequencySearch": search}}, stop=True),
+        )
         inv = Investigation("targeted", "openstar.workflow.tess-investigation.v1", "20.2",
             "BLOCKED", "now", "now", {"datasetID": "targeted", "controlState": {
-                "schedulerAction": "WAIT_FOR_PREREQUISITES"}}, (stage,))
+                "schedulerAction": "WAIT_FOR_PREREQUISITES"}}, stages)
         branch = plan_tess_branches(inv, InvestigationTarget(
             "targeted", "targeted", inv.workflow_id, inv.workflow_version))[0]
         self.assertEqual("openstar.tess.targeted-observation-planning.generate",
                          branch.experiment.handler_id)
-        self.assertEqual(("openstar.capability.current-targeted-observation-planning-adapter",),
-                         branch.required_stage_ids)
+        self.assertEqual((), branch.required_stage_ids)
         store = InvestigationStore(self.root / "targeted"); store.save(inv)
+        atlas_stage_path = store.stage_path_for(
+            inv.id, "053-interpret-atlas-forced-photometry")
+        atlas_stage_path.parent.mkdir(parents=True, exist_ok=True)
+        atlas_stage_path.write_bytes(b"immutable persisted v20.24 terminal evidence\n")
+        historical_bytes = atlas_stage_path.read_bytes()
         repaired = repair_obsolete_terminal_wait(store, inv)
-        self.assertEqual("BLOCKED", repaired.status)
-        self.assertEqual("WAIT_FOR_PREREQUISITES",
+        self.assertEqual("RUNNING", repaired.status)
+        self.assertEqual("RUN_EXPERIMENT",
                          repaired.metadata["controlState"]["schedulerAction"])
-        self.assertEqual(
-            ("openstar.capability.current-targeted-observation-planning-adapter",),
-            repaired.metadata["controlState"]["branchAssessments"][0][
-                "missing_stage_ids"
-            ])
+        self.assertEqual("054-generate-targeted-observation-plan",
+            repaired.metadata["controlState"]["selectedExperiment"]["id"])
+        self.assertEqual(historical_bytes, atlas_stage_path.read_bytes())
+        self.assertEqual(repaired, repair_obsolete_terminal_wait(store, repaired))
+
+        engine = _build_engine(store, mock.Mock(), poll_interval=0, timeout=1)
+        engine.chain_stages = False
+        completed = engine.run(repaired, branch.experiment,
+                               software_id="test", software_version="20.29")
+        planned = completed.stages[-1]
+        self.assertEqual("v20.24 ATLAS forced-photometry interpretation",
+                         planned.result["provenance"]["priorStage"])
+        self.assertIn("atlasForcedPhotometry", planned.provenance.input_hashes)
+        self.assertNotIn("atlasFixedWindowRecurrence", planned.provenance.input_hashes)
+        self.assertEqual("COLLECT_TARGETED_TIME_SERIES_PHOTOMETRY",
+                         planned.result["recommendedNextTest"])
+        self.assertFalse(planned.result["claimLevelChanged"])
+        self.assertFalse(any("reanalysis" in item.handler_id
+                             or "time-resolved" in item.handler_id
+                             or "fixed-window" in item.handler_id
+                             for item in completed.stages))
 
     def _handler_evidence(self, investigation_id):
         return Investigation(investigation_id,

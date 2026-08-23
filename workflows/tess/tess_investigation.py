@@ -187,7 +187,7 @@ from .tess_multisector import (
 WORKFLOW_ID = "openstar.workflow.tess-investigation.v1"
 WORKFLOW_VERSION = "20.2"
 SOFTWARE_ID = "openstar.tess-investigation-plugin"
-SOFTWARE_VERSION = "20.29"
+SOFTWARE_VERSION = "20.30"
 
 
 def _stage(investigation: Investigation, stage_id: str):
@@ -7181,13 +7181,73 @@ def build_engine(
             investigation,
             "openstar.tess.atlas-fixed-window.interpret",
         )
+        atlas_forced_stage = next((
+            stage for stage in reversed(investigation.stages)
+            if stage.handler_id == "openstar.tess.atlas-forced-photometry.interpret"
+            and stage.status == "COMPLETE"
+            and stage.result is not None
+        ), None)
+        atlas_forced = atlas_forced_stage.result if atlas_forced_stage is not None else None
 
-        if prepared is None or external is None or atlas_fixed is None:
+        if prepared is None or external is None or (
+            atlas_fixed is None and atlas_forced is None
+        ):
             raise RuntimeError(
-                "v20.28 requires the frozen target plus completed v20.19 and v20.27 results."
+                "v20.28 requires the frozen target, completed v20.19 evidence, and a supported ATLAS result."
             )
 
-        if atlas_fixed.get("recommendedNextTest") != (
+        direct_atlas = atlas_fixed is None
+        if direct_atlas:
+            assert atlas_forced_stage is not None and atlas_forced is not None
+            position = investigation.stages.index(atlas_forced_stage)
+            preceding = investigation.stages[:position]
+            later = investigation.stages[position + 1:]
+            valid_lineage = bool(
+                request.triggered_by_stage_id == atlas_forced_stage.id
+                and atlas_forced_stage.triggered_by_stage_id
+                and any(
+                    item.id == atlas_forced_stage.triggered_by_stage_id
+                    and item.status == "COMPLETE"
+                    and item.handler_id in (
+                        "openstar.tess.atlas-forced-photometry.run",
+                        "openstar.tess.atlas-forced-photometry.prepare",
+                    )
+                    for item in preceding
+                )
+            )
+            superseded = any(
+                item.handler_id.startswith((
+                    "openstar.tess.atlas-forced-photometry-reanalysis.",
+                    "openstar.tess.atlas-time-resolved.",
+                    "openstar.tess.atlas-fixed-window.",
+                ))
+                for item in later
+            )
+            prior_attempt = any(
+                item.handler_id
+                == "openstar.tess.targeted-observation-planning.generate"
+                and item.id != request.id
+                for item in investigation.stages
+            )
+            if not (
+                valid_lineage
+                and not superseded
+                and not prior_attempt
+                and atlas_forced.get("classification")
+                == "ATLAS_SOURCE_ATTRIBUTION_UNRESOLVED"
+                and atlas_forced.get("residualModeOrigin")
+                == "ARCHIVAL_ATLAS_SOURCE_ATTRIBUTION_UNRESOLVED"
+                and atlas_forced.get("recommendedNextTest")
+                == "TARGETED_HIGH_RESOLUTION_TIME_SERIES_PHOTOMETRY"
+                and atlas_forced.get("physicalMechanismResolved") is False
+                and isinstance(atlas_forced.get("sourcePair"), dict)
+                and atlas_forced.get("sourcePair")
+                == external.get("sourcePair")
+            ):
+                raise RuntimeError(
+                    "Direct v20.24 targeted-observation planning evidence is incomplete, ambiguous, or superseded."
+                )
+        elif atlas_fixed.get("recommendedNextTest") != (
             "TARGETED_HIGH_RESOLUTION_TIME_SERIES_PHOTOMETRY"
         ):
             raise RuntimeError(
@@ -7212,8 +7272,9 @@ def build_engine(
             source_dataset_id=str(prepared["datasetID"]),
             investigation_id=investigation.id,
             external_high_resolution_summary=external,
-            atlas_fixed_window_summary=atlas_fixed,
             output_dir=artifact_root,
+            atlas_fixed_window_summary=atlas_fixed,
+            atlas_forced_photometry_summary=(atlas_forced if direct_atlas else None),
         )
 
         geometry = plan.get("sourceGeometry") or {}
@@ -7263,9 +7324,11 @@ def build_engine(
                 "externalHighResolutionValidation": sha256_json(
                     external
                 ),
-                "atlasFixedWindowRecurrence": sha256_json(
-                    atlas_fixed
-                ),
+                (
+                    "atlasForcedPhotometry"
+                    if direct_atlas
+                    else "atlasFixedWindowRecurrence"
+                ): sha256_json(atlas_forced if direct_atlas else atlas_fixed),
             },
             artifacts=tuple(artifacts),
         )

@@ -13,6 +13,7 @@ from .tess_residual_localization import (
 )
 from .tess_noirlab_forced_photometry import (
     _angular_separation_arcsec,
+    _frozen_source_pair,
     _source_records_by_role,
 )
 
@@ -107,14 +108,17 @@ def _frozen_sources(
     external_high_resolution_summary: dict[str, Any],
 ) -> list[dict[str, Any]]:
     records = _source_records_by_role(external_high_resolution_summary)
+    pair_sources, _ = _frozen_source_pair(external_high_resolution_summary)
+    pair_by_role = {item["sourceRole"]: item for item in pair_sources}
 
     sources: list[dict[str, Any]] = []
     for role in ("target-control", "catalog-counterpart"):
         record = records.get(role) or {}
         metadata = record.get("metadata") or {}
-        source_id = _int(record.get("gaiaDR3SourceID"))
-        ra = _float(metadata.get("raDeg"))
-        dec = _float(metadata.get("decDeg"))
+        frozen = pair_by_role.get(role) or {}
+        source_id = _int(frozen.get("gaiaDR3SourceID"))
+        ra = _float(frozen.get("raDeg"))
+        dec = _float(frozen.get("decDeg"))
 
         if source_id is None or ra is None or dec is None:
             raise RuntimeError(
@@ -668,21 +672,46 @@ def build_targeted_observation_plan(
     source_dataset_id: str,
     investigation_id: str,
     external_high_resolution_summary: dict[str, Any],
-    atlas_fixed_window_summary: dict[str, Any],
     output_dir: str | Path,
+    atlas_fixed_window_summary: dict[str, Any] | None = None,
+    atlas_forced_photometry_summary: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    if atlas_fixed_window_summary.get("recommendedNextTest") != (
+    if (atlas_fixed_window_summary is None) == (atlas_forced_photometry_summary is None):
+        raise RuntimeError(
+            "v20.28 requires exactly one frozen ATLAS archive summary."
+        )
+
+    archive_summary = (
+        atlas_fixed_window_summary
+        if atlas_fixed_window_summary is not None
+        else atlas_forced_photometry_summary
+    )
+    assert archive_summary is not None
+
+    if archive_summary.get("recommendedNextTest") != (
         "TARGETED_HIGH_RESOLUTION_TIME_SERIES_PHOTOMETRY"
     ):
         raise RuntimeError(
-            "v20.28 requires v20.27 to recommend targeted high-resolution "
+            "v20.28 requires its frozen prior archive evidence to recommend targeted high-resolution "
             "time-series photometry."
+        )
+
+    if atlas_forced_photometry_summary is not None and not (
+        archive_summary.get("classification")
+        == "ATLAS_SOURCE_ATTRIBUTION_UNRESOLVED"
+        and archive_summary.get("residualModeOrigin")
+        == "ARCHIVAL_ATLAS_SOURCE_ATTRIBUTION_UNRESOLVED"
+        and archive_summary.get("physicalMechanismResolved") is False
+    ):
+        raise RuntimeError(
+            "Direct v20.24 planning requires unresolved ATLAS source attribution."
         )
 
     search = dict(
         (
-            (atlas_fixed_window_summary.get("distributedValidation") or {})
+            (archive_summary.get("distributedValidation") or {})
             .get("frequencySearch")
+            or archive_summary.get("frequencySearch")
             or {}
         )
     )
@@ -734,12 +763,16 @@ def build_targeted_observation_plan(
             "retainRejectedMeasurements": True,
         },
         "provenance": {
-            "priorStage": "v20.27 ATLAS fixed-window recurrence",
+            "priorStage": (
+                "v20.27 ATLAS fixed-window recurrence"
+                if atlas_fixed_window_summary is not None
+                else "v20.24 ATLAS forced-photometry interpretation"
+            ),
             "priorClassification": (
-                atlas_fixed_window_summary.get("classification")
+                archive_summary.get("classification")
             ),
             "priorRecommendedNextTest": (
-                atlas_fixed_window_summary.get("recommendedNextTest")
+                archive_summary.get("recommendedNextTest")
             ),
             "frozenFrequencySearch": search,
             "archiveBranchConsideredExhaustedForThisQuestion": True,
