@@ -3,6 +3,7 @@ import io
 import json
 import tempfile
 import unittest
+from openstar_test_science_runs import IsolatedScienceRunTestCase
 from pathlib import Path
 from unittest.mock import patch
 
@@ -12,7 +13,7 @@ from openstar_workflow import StageOutcome, StageRequest, WorkflowEngine
 import run_openstar_autonomous_tess as runner
 
 
-class AutonomousTessEntryPointTests(unittest.TestCase):
+class AutonomousTessEntryPointTests(IsolatedScienceRunTestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)

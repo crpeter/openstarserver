@@ -3,6 +3,7 @@ import json
 import tempfile
 import threading
 import unittest
+from openstar_test_science_runs import IsolatedScienceRunTestCase
 from contextlib import redirect_stdout
 from dataclasses import replace
 from pathlib import Path
@@ -25,7 +26,7 @@ from workflows.tess.tess_sector_archive import TessSectorInventoryStore
 from workflows.tess.tess_sector_ranking import aggregate_tess_sector_ranking
 
 
-class RankedFollowupTests(unittest.TestCase):
+class RankedFollowupTests(IsolatedScienceRunTestCase):
     def setUp(self):
         self.original = tess_sector_scan.read_and_prepare_tess_light_curve
         tess_sector_scan.read_and_prepare_tess_light_curve = lambda path: Prepared()

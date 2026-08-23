@@ -5,7 +5,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from openstar_dashboard import DashboardApplication
 from openstar_science_runs import (
@@ -42,7 +42,8 @@ class ScienceRunCatalogTests(unittest.TestCase):
 
     def test_default_catalog_does_not_depend_on_cwd(self):
         original = Path.cwd()
-        with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
+        with patch.dict(os.environ, {}, clear=True), \
+             tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
             try:
                 os.chdir(first); one = catalog_path()
                 os.chdir(second); two = catalog_path()
