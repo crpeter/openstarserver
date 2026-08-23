@@ -14,6 +14,7 @@ from workflows.tess.tess_target_residual_mechanism import (
     DECISIVE_DELTA_BIC,
     _bic,
     _model_sector,
+    adjudicate_sector_model_evidence,
     analyze_target_residual_mechanism,
 )
 
@@ -85,14 +86,14 @@ class TessTargetResidualMechanismTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             result = self.analyze(self.inputs(Path(directory), signal,
                 "AMPLITUDE_EVOLVING_TARGET_RESIDUAL"))
-        self.assertEqual("SMOOTH_SINGLE_MODE_AMPLITUDE_EVOLUTION", result["classification"])
+        self.assertEqual("SMOOTH_TARGET_MODE_AMPLITUDE_MODULATION", result["classification"])
 
     def test_smooth_phase_evolution_is_not_called_amplitude_evolution(self):
         signal = lambda t: math.sin(2 * math.pi * t + .9 * ((t - 10) / 10) ** 2)
         with tempfile.TemporaryDirectory() as directory:
             result = self.analyze(self.inputs(Path(directory), signal,
                 "AMPLITUDE_EVOLVING_TARGET_RESIDUAL"))
-        self.assertNotEqual("SMOOTH_SINGLE_MODE_AMPLITUDE_EVOLUTION", result["classification"])
+        self.assertNotEqual("SMOOTH_TARGET_MODE_AMPLITUDE_MODULATION", result["classification"])
 
     def test_intermittent_suppression_and_reappearance(self):
         signal = lambda t: (.05 if 8 <= t < 12 else 1.0) * math.sin(2 * math.pi * t)
@@ -200,7 +201,7 @@ class TessTargetResidualMechanismTests(unittest.TestCase):
                        side_effect=[copy.deepcopy(beating), copy.deepcopy(beating),
                                     copy.deepcopy(smooth), copy.deepcopy(smooth)]):
                 result = self.analyze(inputs)
-        self.assertEqual("AMPLITUDE_EVOLUTION_MECHANISM_UNRESOLVED", result["classification"])
+        self.assertEqual("TARGET_RESIDUAL_MECHANISM_UNRESOLVED", result["classification"])
         self.assertEqual("TARGET_RESIDUAL_PHYSICAL_MECHANISM_FOLLOWUP",
                          result["recommendedNextTest"])
 
@@ -211,6 +212,94 @@ class TessTargetResidualMechanismTests(unittest.TestCase):
             frozen_results = copy.deepcopy(inputs[:3])
             self.analyze(inputs)
         self.assertEqual(frozen_results, inputs[:3])
+
+    @staticmethod
+    def evidence(best, *, episodic=True, sector=1, gap=20.0):
+        values = {"constantAmplitudeBIC": 100.0, "smoothEnvelopeBIC": 100.0,
+                  "twoFrequencyBIC": 100.0, "intermittentEnvelopeBIC": 100.0}
+        fields = {"constant": "constantAmplitudeBIC", "smooth": "smoothEnvelopeBIC",
+                  "beating": "twoFrequencyBIC", "episodic": "intermittentEnvelopeBIC"}
+        values[fields[best]] = 100.0 - gap
+        return {"sector": sector, **values,
+                "episodicSuppressionAndReappearance": episodic}
+
+    def test_route_independent_sector_winners(self):
+        for admission in ("AMPLITUDE_EVOLVING_TARGET_RESIDUAL",
+                          "TRANSIENT_INTERMITTENT_TARGET_RESIDUAL"):
+            for model, expected in (
+                ("beating", "COHERENT_TWO_MODE_BEATING_SUPPORTED"),
+                ("smooth", "SMOOTH_TARGET_MODE_AMPLITUDE_MODULATION"),
+                ("episodic", "EPISODIC_TARGET_MODE_ACTIVATION"),
+            ):
+                with self.subTest(admission=admission, model=model):
+                    # Admission is intentionally absent from the shared API.
+                    result = adjudicate_sector_model_evidence(
+                        [self.evidence(model), self.evidence(model, sector=2)])
+                    self.assertEqual(expected, result["classification"])
+
+    def test_intermitttent_best_without_shape_has_no_smooth_fallback(self):
+        real = self.evidence("episodic", episodic=False)
+        real.update(smoothEnvelopeBIC=31402.58867522472,
+                    intermittentEnvelopeBIC=30943.414321673405,
+                    constantAmplitudeBIC=31600.0, twoFrequencyBIC=31700.0)
+        result = adjudicate_sector_model_evidence([real])
+        sector = result["sectorModelEvidence"][0]
+        self.assertEqual("EPISODIC_ACTIVATION", sector["bestModel"])
+        self.assertTrue(sector["extraMorphologyGateBlockedPromotion"])
+        self.assertEqual("TARGET_RESIDUAL_MECHANISM_UNRESOLVED",
+                         sector["sectorClassification"])
+
+    def test_real_sector_69_beating_competes_but_one_sector_does_not_promote(self):
+        real = self.evidence("beating")
+        real.update(smoothEnvelopeBIC=24868.075748741066,
+                    twoFrequencyBIC=24839.166068701925,
+                    constantAmplitudeBIC=25000.0, intermittentEnvelopeBIC=25100.0)
+        result = adjudicate_sector_model_evidence([real])
+        self.assertEqual("COHERENT_TWO_MODE_BEATING_SUPPORTED",
+                         result["sectorModelEvidence"][0]["sectorClassification"])
+        self.assertEqual("TARGET_RESIDUAL_MECHANISM_UNRESOLVED", result["classification"])
+
+    def test_nondecisive_and_constant_best_are_unresolved(self):
+        nondecisive = self.evidence("smooth", gap=9.99)
+        constant = self.evidence("constant")
+        for item in (nondecisive, constant):
+            with self.subTest(best=min((key for key in item if key.endswith("BIC")), key=item.get)):
+                result = adjudicate_sector_model_evidence([item, dict(item, sector=2)])
+                self.assertEqual("TARGET_RESIDUAL_MECHANISM_UNRESOLVED", result["classification"])
+
+    def test_one_replicating_mechanism_promotes_but_two_do_not(self):
+        beating = [self.evidence("beating", sector=1), self.evidence("beating", sector=2)]
+        promoted = adjudicate_sector_model_evidence(beating + [self.evidence("smooth", sector=3)])
+        self.assertEqual("COHERENT_TWO_MODE_BEATING_SUPPORTED", promoted["classification"])
+        conflict = adjudicate_sector_model_evidence(beating +
+            [self.evidence("smooth", sector=3), self.evidence("smooth", sector=4)])
+        self.assertEqual("TARGET_RESIDUAL_MECHANISM_UNRESOLVED", conflict["classification"])
+
+    def test_duplicate_same_sector_rows_never_establish_independent_replication(self):
+        duplicated = [self.evidence("beating", sector=69),
+                      self.evidence("beating", sector=69)]
+        result = adjudicate_sector_model_evidence(duplicated)
+        self.assertEqual("TARGET_RESIDUAL_MECHANISM_UNRESOLVED", result["classification"])
+        self.assertEqual([], result["replicatedMechanisms"])
+        self.assertTrue(any("duplicate persisted sector" in reason
+                            for reason in result["failClosedReasons"]))
+
+    def test_distinct_sector_replication_records_auditable_support(self):
+        result = adjudicate_sector_model_evidence([
+            self.evidence("beating", sector=69), self.evidence("beating", sector=95)])
+        self.assertEqual("COHERENT_TWO_MODE_BEATING_SUPPORTED", result["classification"])
+        self.assertEqual(
+            {"COHERENT_TWO_MODE_BEATING_SUPPORTED": [69, 95]},
+            result["replicatedMechanismSupportingSectorIDs"],
+        )
+
+    def test_conflicting_duplicate_sector_evidence_fails_closed(self):
+        result = adjudicate_sector_model_evidence([
+            self.evidence("beating", sector=69), self.evidence("smooth", sector=69),
+            self.evidence("beating", sector=70), self.evidence("smooth", sector=71)])
+        self.assertEqual("TARGET_RESIDUAL_MECHANISM_UNRESOLVED", result["classification"])
+        self.assertTrue(any("duplicate persisted sector evidence IDs: 69" == reason
+                            for reason in result["failClosedReasons"]))
 
 
 if __name__ == "__main__":

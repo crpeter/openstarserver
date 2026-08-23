@@ -74,6 +74,9 @@ from .tess_multisource_residual import (
 )
 from .tess_intrinsic_nonstationary import classify_target_component
 from .tess_target_residual_mechanism import analyze_target_residual_mechanism
+from .tess_target_residual_mechanism_adjudication import (
+    adjudicate_frozen_target_residual_mechanism,
+)
 from .tess_offset_source import identify_offset_residual_source
 from .tess_offset_variability import (
     build_offset_source_variability_project,
@@ -4083,6 +4086,32 @@ def build_engine(
             input_hashes={"v20.12Preparation": sha256_json(preparation_stage.result),
                           "v20.12Interpretation": sha256_json(decomposition_stage.result),
                           "v20.13Result": sha256_json(v2013_stage.result)},
+            artifacts=(_artifact(artifact_path, "application/json"),),
+        )
+
+    def target_residual_mechanism_adjudication_stage(investigation, request):
+        v2014_stage = next((stage for stage in reversed(investigation.stages)
+            if stage.handler_id == "openstar.tess.target-residual-mechanism.analyze"
+            and stage.status == "COMPLETE" and stage.result is not None), None)
+        if v2014_stage is None:
+            raise RuntimeError("v20.15 requires a COMPLETE v20.14 target-residual-mechanism stage.")
+        summary = adjudicate_frozen_target_residual_mechanism(
+            v2014_result=v2014_stage.result,
+            authoritative_v2014_artifacts=v2014_stage.artifacts,
+        )
+        artifact_path = (store.directory_for(investigation.id) / "artifacts" /
+                         "target-residual-mechanism-adjudication" /
+                         "target-residual-mechanism-adjudication-v20.15.json")
+        _write_json(artifact_path, summary)
+        return StageOutcome(
+            result=summary,
+            next_stage=StageRequest(id=_next_stage_id(request.id, "finalize"),
+                handler_id="openstar.tess.finalize",
+                parameters={"outputSuffix": "v20.15-intrinsic-corrective-adjudication"},
+                triggered_by_stage_id=request.id),
+            input_hashes={"v20.14Result": sha256_json(v2014_stage.result),
+                          "v20.14Artifact": summary["inputProvenance"]
+                          ["frozenV20.14ArtifactSHA256"]},
             artifacts=(_artifact(artifact_path, "application/json"),),
         )
 
@@ -9089,6 +9118,10 @@ def build_engine(
     engine.register_handler(
         "openstar.tess.target-residual-mechanism.analyze",
         target_residual_mechanism_stage,
+    )
+    engine.register_handler(
+        "openstar.tess.target-residual-mechanism-adjudication.analyze",
+        target_residual_mechanism_adjudication_stage,
     )
     engine.register_handler(
         "openstar.tess.offset-source-identification.analyze",
