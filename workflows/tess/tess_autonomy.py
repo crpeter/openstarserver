@@ -16,6 +16,7 @@ from openstar_investigation import Investigation, InvestigationStore
 from openstar_targets import InvestigationTarget
 from openstar_workflow import StageRequest, WorkflowEngine
 from .tess_localization_evidence import frozen_residual_localization_family
+from .tess_source_pair_lineage import frozen_source_pair_evidence
 
 # Kept identical to the public identifiers in tess_investigation.  Importing that
 # module eagerly would also import optional numerical/astronomy dependencies,
@@ -258,35 +259,7 @@ def _awaiting_post_atlas_targeted_observation_adapter(
     if not valid_search:
         return False
 
-    pair = result.get("sourcePair")
-    pair_sources = (
-        pair.get("target") if isinstance(pair, dict) else None,
-        pair.get("counterpart") if isinstance(pair, dict) else None,
-    )
-    pair_is_frozen = bool(
-        isinstance(pair, dict)
-        and pair.get("version") == "openstar.current-source-pair.v1"
-        and all(isinstance(item, dict) for item in pair_sources)
-        and all(
-            item.get("gaiaDR3SourceID") is not None
-            and item.get("raDeg") is not None
-            and item.get("decDeg") is not None
-            for item in pair_sources
-        )
-        and pair_sources[0].get("gaiaDR3SourceID")
-        != pair_sources[1].get("gaiaDR3SourceID")
-    )
-    external_stages = [
-        item for item in preceding
-        if item.handler_id
-        == "openstar.tess.external-high-resolution-variability-validation.interpret"
-        and item.status == "COMPLETE"
-    ]
-    if (
-        not pair_is_frozen
-        or len(external_stages) != 1
-        or (external_stages[0].result or {}).get("sourcePair") != pair
-    ):
+    if frozen_source_pair_evidence(investigation, stage) is None:
         return False
 
     return not any(
@@ -297,6 +270,26 @@ def _awaiting_post_atlas_targeted_observation_adapter(
             "openstar.tess.targeted-observation-planning.",
         ))
         for item in (*preceding, *later)
+    )
+
+
+def _is_unresolved_atlas_targeted_observation_boundary(investigation) -> bool:
+    """Identify the semantic boundary even when its adapter evidence is invalid."""
+    stage = _latest_complete(
+        investigation, "openstar.tess.atlas-forced-photometry.interpret"
+    )
+    result = (stage.result or {}) if stage is not None else {}
+    return bool(
+        stage is not None
+        and result.get("classification") == "ATLAS_SOURCE_ATTRIBUTION_UNRESOLVED"
+        and result.get("residualModeOrigin")
+        == "ARCHIVAL_ATLAS_SOURCE_ATTRIBUTION_UNRESOLVED"
+        and result.get("recommendedNextTest")
+        == "TARGETED_HIGH_RESOLUTION_TIME_SERIES_PHOTOMETRY"
+        and result.get("physicalMechanismResolved") is False
+        and not any(item.handler_id.startswith(
+            "openstar.tess.targeted-observation-planning."
+        ) for item in investigation.stages)
     )
 
 
@@ -1264,11 +1257,18 @@ def repair_obsolete_terminal_wait(
         return repaired
 
     if (
-        investigation.status == "BLOCKED"
-        and control.get("schedulerAction") == "WAIT_FOR_PREREQUISITES"
-        and (
-            _awaiting_atlas_signed_reanalysis_adapter(investigation)
-            or _awaiting_post_atlas_targeted_observation_adapter(investigation)
+        (
+            investigation.status == "BLOCKED"
+            and control.get("schedulerAction") == "WAIT_FOR_PREREQUISITES"
+            and (
+                _awaiting_atlas_signed_reanalysis_adapter(investigation)
+                or _awaiting_post_atlas_targeted_observation_adapter(investigation)
+            )
+        )
+        or (
+            investigation.status == "COMPLETE"
+            and control.get("schedulerAction") == "INVESTIGATION_COMPLETE"
+            and _awaiting_post_atlas_targeted_observation_adapter(investigation)
         )
     ):
         metadata = investigation.metadata or {}
@@ -1355,6 +1355,7 @@ def repair_obsolete_terminal_wait(
         and not _awaiting_current_atlas_adapter(investigation)
         and not _awaiting_atlas_signed_reanalysis_adapter(investigation)
         and not _awaiting_post_atlas_targeted_observation_adapter(investigation)
+        and not _is_unresolved_atlas_targeted_observation_boundary(investigation)
     ):
         repaired, _ = AutonomousInvestigationEngine(store).decide(investigation, ())
         return repaired
