@@ -372,10 +372,18 @@ class CoordinatorClientTests(unittest.TestCase):
 class SidecarHTTPTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        cls.temporary = tempfile.TemporaryDirectory()
         cls.coordinator = FakeCoordinator()
         cls.telemetry = TelemetryStore()
         cls.server = make_server(
-            "127.0.0.1", 0, DashboardApplication(cls.coordinator, cls.telemetry)
+            "127.0.0.1",
+            0,
+            DashboardApplication(
+                cls.coordinator,
+                cls.telemetry,
+                science_run_catalog=Path(cls.temporary.name) / "science-runs.sqlite3",
+                contribution_ledger=None,
+            ),
         )
         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
         cls.thread.start()

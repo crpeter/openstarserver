@@ -184,7 +184,7 @@ class ScienceRunCatalogTests(unittest.TestCase):
             (partial / "investigations" / "old" / "stages").mkdir(parents=True)
             (partial / "runner.pid").write_text("999999", encoding="utf-8")
             catalog.record("generic-investigation", partial)
-            record = next(item for item in discover_science_runs(catalog_path) if item["stateRoot"] == str(partial))
+            record = next(item for item in discover_science_runs(catalog_path) if item["stateRoot"] == str(partial.resolve()))
             self.assertIn("investigation_records_missing", record["issues"])
             self.assertTrue((partial / "runner.pid").exists())
 
@@ -218,13 +218,13 @@ class ScienceRunCatalogTests(unittest.TestCase):
             path = scan / "catalog.sqlite3"
             self.assertEqual(2, backfill_science_runs([scan], path))
             runs = {run.metadata["sector"]: run for run in ScienceRunCatalog(path).list_runs()}
-            self.assertEqual(str(ranking_root), runs[1].state_root)
+            self.assertEqual(str(ranking_root.resolve()), runs[1].state_root)
             self.assertEqual(100, runs[1].metadata["inventoryCount"])
             self.assertEqual({"sector": 1, "inventory": 100, "complete": 80,
                 "remaining": 20, "progress": 0.8, "status": "HISTORICAL",
                 "historical": True, "rankingComplete": False},
                 runs[1].metadata["sectorSweep"])
-            self.assertEqual(str(active), runs[2].state_root)
+            self.assertEqual(str(active.resolve()), runs[2].state_root)
             self.assertEqual("RUNNING", runs[2].status)
             self.assertEqual(2, backfill_science_runs([scan], path))
             self.assertEqual(before, {source: source.read_bytes() for source in before})
