@@ -57,3 +57,67 @@ Content-Type: application/json
 
 {"nodeID":"worker-id","telemetry":{"deviceName":"Lab Mac","thermalState":"nominal","batteryLevel":0.82,"powerState":"charging","lowPowerMode":false,"osVersion":"15.0","appVersion":"1.0","computeState":"computing"}}
 ```
+
+## Targeted observation campaign
+
+Two Sector 1 deep investigations have reached a genuine external-observation boundary. OpenStar
+has exhausted the intended archive/computational continuation for these residual-source questions
+and generated pre-registered `openstar.tess-targeted-observation-plan.v1` plans. Do not replace or
+retune those plans after looking at new data.
+
+### Targets
+
+| Investigation | TIC | Target Gaia DR3 | Counterpart Gaia DR3 | Gaia separation | Frozen residual frequency band |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `tess-discovery-sector-1-tic-24705603` | 24705603 | 4697673673172278528 | 4698424605253172352 | 143.604 arcsec | 0.223447247-0.232567543 cycles/day |
+| `tess-discovery-sector-1-tic-350862394` | 350862394 | 5498909546046688256 | 5498909782268097280 | 70.627 arcsec | 0.351962961-0.527944441 cycles/day |
+
+The established main TESS periodic family remains target-associated. This campaign tests only
+which frozen Gaia source produces the separate drifting residual component: target, counterpart,
+both, or neither.
+
+### Pre-registered observing contract
+
+Minimum campaign requirements per target:
+
+- baseline: 45 days minimum; 90 days preferred
+- distinct nights: 24 minimum; 45 preferred
+- visits: at least 2 per observed night, preferably separated by 1-3 hours
+- filters: at least 2 standard/well-characterized passbands; prefer `r/i`, acceptable alternate `g/r`
+- image quality: prefer <=3 arcsec FWHM; hard source-attribution limit <=5 arcsec FWHM
+- pixel scale: prefer <=1 arcsec/pixel; hard maximum <=2 arcsec/pixel
+- each visit must contain paired short-tier and deep-tier imaging
+- short tier: target S/N >=100, unsaturated, peak <=70% of documented detector linear/saturation level
+- deep tier: counterpart S/N >=20, preferred >=30; target saturation is allowed only if its saturation structure cannot contaminate the counterpart measurement
+- vary observation time across the campaign when practical rather than sampling at the same sidereal/local time every night
+
+Preferred deliverables are calibrated/reduced FITS images for every accepted and rejected
+exposure plus the generated OpenStar CSV ingest schema. Preserve timing, filter, exposure,
+observatory, airmass/FWHM when available, saturation/contamination flags, and rejected
+measurements. BJD_TDB is preferred; UTC mid-exposure plus observatory coordinates is sufficient
+for OpenStar to compute barycentric time.
+
+### Frozen analysis / stop rule
+
+Do not expand the frequency band, move cadence windows, lower the prominence threshold, or change
+filter acceptance after seeing the new periodograms. A supported source requires a reliable,
+non-boundary signal with independent-peak prominence >=2, recurrence in at least two filters,
+and recurrence in the pre-defined time-resolved campaign windows. If neither source satisfies the
+contract, leave the source unresolved and reassess the model instead of tuning until a source wins.
+
+### Execution options
+
+The targets are southern objects (approximately Dec -67 and -57), so a southern observatory or
+worldwide robotic network is required. Candidate paths researched for the first campaign are:
+
+1. **AAVSOnet** - preferred low-cost proposal route for a sustained multi-night photometric campaign.
+2. **Slooh** - use a small pilot first to verify that its presets can satisfy the paired short/deep dynamic-range requirements and return usable calibrated FITS.
+3. **iTelescope / Siding Spring** - paid fallback when exact exposure and filter control is required.
+4. **Las Cumbres Observatory** - proposal/DDT route when professional robotic-network time is available.
+
+Before committing a full paid campaign, obtain pilot FITS for at least one target and measure target
+peak counts/linearity, target S/N, counterpart S/N, FWHM, and contamination. Use those measurements
+to choose the exposure durations without changing the already-frozen cadence/filter/analysis rules.
+
+Generated plan artifacts live under each investigation's
+`artifacts/targeted-observation-plan/` directory in its durable deep-state root.
