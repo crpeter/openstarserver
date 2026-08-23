@@ -100,6 +100,45 @@ class TessIntrinsicNonstationaryTests(unittest.TestCase):
                 self.assertFalse(branches and branches[0].experiment.handler_id ==
                                  "openstar.tess.intrinsic-nonstationary.analyze")
 
+    def test_complete_v2013_mechanism_boundary_reopens_append_only_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = InvestigationStore(Path(directory))
+            investigation = store.create("v2013-mechanism", WORKFLOW_ID, "20.2")
+            result = {"classification": "AMPLITUDE_EVOLVING_TARGET_RESIDUAL",
+                      "physicalMechanismResolved": False,
+                      "recommendedNextTest": "TARGET_RESIDUAL_PHYSICAL_MECHANISM_FOLLOWUP"}
+            stage = InvestigationStage("027-classify-intrinsic-target-residual",
+                "openstar.tess.intrinsic-nonstationary.analyze", "COMPLETE", "026-interpret", {},
+                result=result)
+            investigation = replace(investigation, stages=(stage,))
+            store.save(investigation)
+            investigation = store.set_control_state(investigation, status="COMPLETE",
+                control_state={"schedulerAction": "INVESTIGATION_COMPLETE"})
+            immutable_stages = investigation.stages
+            repaired = repair_obsolete_terminal_wait(store, investigation)
+            repeated = repair_obsolete_terminal_wait(store, repaired)
+        self.assertEqual("RUNNING", repaired.status)
+        self.assertEqual("openstar.tess.target-residual-mechanism.analyze",
+                         repaired.metadata["controlState"]["selectedExperiment"]["handler_id"])
+        self.assertEqual(immutable_stages, repaired.stages)
+        self.assertEqual(repaired, repeated)
+
+    def test_unrelated_complete_v2013_does_not_reopen(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = InvestigationStore(Path(directory))
+            investigation = store.create("v2013-unrelated", WORKFLOW_ID, "20.2")
+            stage = InvestigationStage("027-classify-intrinsic-target-residual",
+                "openstar.tess.intrinsic-nonstationary.analyze", "COMPLETE", "026-interpret", {},
+                result={"classification": "STATIONARY_FREQUENCY_COMPATIBLE_TARGET_RESIDUAL",
+                        "physicalMechanismResolved": False,
+                        "recommendedNextTest": "OTHER"})
+            investigation = replace(investigation, stages=(stage,))
+            store.save(investigation)
+            investigation = store.set_control_state(investigation, status="COMPLETE",
+                control_state={"schedulerAction": "INVESTIGATION_COMPLETE"})
+            repaired = repair_obsolete_terminal_wait(store, investigation)
+        self.assertEqual(investigation, repaired)
+
     def test_modified_coefficient_fails_frozen_hash(self):
         with tempfile.TemporaryDirectory() as directory:
             preparation, artifacts = self.preparation(Path(directory))

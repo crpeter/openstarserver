@@ -1,13 +1,21 @@
 from __future__ import annotations
 
+import copy
 import json
 import math
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from openstar_investigation import ArtifactReference, sha256_file
-from workflows.tess.tess_target_residual_mechanism import analyze_target_residual_mechanism
+from workflows.tess.tess_target_residual_mechanism import (
+    BEAT_MODEL_PARAMETERS,
+    DECISIVE_DELTA_BIC,
+    _bic,
+    _model_sector,
+    analyze_target_residual_mechanism,
+)
 
 
 class TessTargetResidualMechanismTests(unittest.TestCase):
@@ -30,19 +38,22 @@ class TessTargetResidualMechanismTests(unittest.TestCase):
             for path in (coefficient, dataset):
                 artifacts.append(ArtifactReference(str(path.resolve()), sha256_file(path),
                                                    "application/json"))
-        preparation = {"preparedSeries": prepared}
-        decomposition = {"targetComponentID": "target"}
         v13 = {"classification": classification, "physicalMechanismResolved": False,
                "recommendedNextTest": "TARGET_RESIDUAL_PHYSICAL_MECHANISM_FOLLOWUP",
                "temporalModelEvidence": temporal}
-        return preparation, decomposition, v13, artifacts
+        v13_path = root / "intrinsic-nonstationary-v20.13.json"
+        v13_path.write_text(json.dumps(v13, sort_keys=True))
+        v13_artifacts = (ArtifactReference(str(v13_path.resolve()), sha256_file(v13_path),
+                                          "application/json"),)
+        return {"preparedSeries": prepared}, {"targetComponentID": "target"}, v13, artifacts, v13_artifacts
 
     def analyze(self, inputs, **kwargs):
-        preparation, decomposition, v13, artifacts = inputs
+        preparation, decomposition, v13, artifacts, v13_artifacts = inputs
         return analyze_target_residual_mechanism(preparation=preparation,
             decomposition=decomposition, v2013_result=v13,
             authoritative_artifacts=artifacts,
-            v2013_lineage_verified=kwargs.get("lineage", True))
+            v2013_lineage_verified=kwargs.get("lineage", True),
+            authoritative_v2013_artifacts=v13_artifacts)
 
     def test_true_close_frequencies_prefer_beating(self):
         signal = lambda t: math.sin(2 * math.pi * .96 * t) + math.sin(2 * math.pi * 1.04 * t)
@@ -50,6 +61,24 @@ class TessTargetResidualMechanismTests(unittest.TestCase):
             result = self.analyze(self.inputs(Path(directory), signal,
                 "AMPLITUDE_EVOLVING_TARGET_RESIDUAL"))
         self.assertEqual("COHERENT_TWO_MODE_BEATING_SUPPORTED", result["classification"])
+        self.assertEqual(6, result["preRegisteredRules"]["modelParameterCounts"]
+                         ["twoFrequencyIncludingGridOptimizedSeparation"])
+
+    def test_grid_separation_penalty_changes_boundary_decision(self):
+        count = 400
+        # This RSS produces an 8-point win after charging six parameters. The
+        # old five-parameter score adds ln(400), crossing the decisive +10 rule.
+        beat_rss = math.exp(-(8 + 3 * math.log(count)) / count)
+        def fitted(rows, values):
+            width = len(rows[0])
+            return (beat_rss if width == 5 else 1.0), [0.0] * width
+        with patch("workflows.tess.tess_target_residual_mechanism._linear_fit", side_effect=fitted):
+            model = _model_sector([index / 20 for index in range(count)], [0.0] * count, 1.0)
+        current_margin = model["constantAmplitudeBIC"] - model["twoFrequencyBIC"]
+        old_margin = model["constantAmplitudeBIC"] - _bic(beat_rss, count, 5)
+        self.assertLess(current_margin, DECISIVE_DELTA_BIC)
+        self.assertGreaterEqual(old_margin, DECISIVE_DELTA_BIC)
+        self.assertEqual(6, BEAT_MODEL_PARAMETERS)
 
     def test_smooth_evolution_is_not_false_beating(self):
         signal = lambda t: (1 + .7 * ((t - 10) / 10) ** 2) * math.sin(2 * math.pi * t)
@@ -59,47 +88,82 @@ class TessTargetResidualMechanismTests(unittest.TestCase):
         self.assertEqual("SMOOTH_SINGLE_MODE_AMPLITUDE_EVOLUTION", result["classification"])
 
     def test_intermittent_suppression_and_reappearance(self):
-        def signal(t):
-            amplitude = .05 if 8 <= t < 12 else 1.0
-            return amplitude * math.sin(2 * math.pi * t)
+        signal = lambda t: (.05 if 8 <= t < 12 else 1.0) * math.sin(2 * math.pi * t)
         with tempfile.TemporaryDirectory() as directory:
             result = self.analyze(self.inputs(Path(directory), signal,
                 "TRANSIENT_INTERMITTENT_TARGET_RESIDUAL"))
         self.assertEqual("EPISODIC_TARGET_MODE_ACTIVATION", result["classification"])
 
-    def test_sector_clock_resets_and_ids_do_not_change_result(self):
+    def test_transient_boundary_can_select_smooth_modulation(self):
+        signal = lambda t: (1 + .8 * ((t - 10) / 10) ** 2) * math.sin(2 * math.pi * t)
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.analyze(self.inputs(Path(directory), signal,
+                "TRANSIENT_INTERMITTENT_TARGET_RESIDUAL"))
+        self.assertEqual("SMOOTH_TARGET_MODE_AMPLITUDE_MODULATION", result["classification"])
+
+    def test_sector_clock_reset_invariance_and_no_cross_sector_phase(self):
+        signal = lambda t: math.sin(2 * math.pi * .96 * t) + math.sin(2 * math.pi * 1.04 * t)
+        with tempfile.TemporaryDirectory() as left, tempfile.TemporaryDirectory() as right:
+            first = self.analyze(self.inputs(Path(left), signal,
+                "AMPLITUDE_EVOLVING_TARGET_RESIDUAL"))
+            reset = self.analyze(self.inputs(Path(right), signal,
+                "AMPLITUDE_EVOLVING_TARGET_RESIDUAL", shifts=(3, 17, 41)))
+        self.assertEqual(first["classification"], reset["classification"])
+        self.assertFalse(reset["crossSectorPhaseUsed"])
+        self.assertTrue(all(item["timingCoordinate"] == "SECTOR_LOCAL_WARPED_TIME"
+                            for item in reset["sectorModelEvidence"]))
+
+    def test_sector_id_permutation_invariance(self):
         signal = lambda t: math.sin(2 * math.pi * .96 * t) + math.sin(2 * math.pi * 1.04 * t)
         with tempfile.TemporaryDirectory() as left, tempfile.TemporaryDirectory() as right:
             first = self.analyze(self.inputs(Path(left), signal,
                 "AMPLITUDE_EVOLVING_TARGET_RESIDUAL", sectors=(1, 2, 3)))
-            second = self.analyze(self.inputs(Path(right), signal,
-                "AMPLITUDE_EVOLVING_TARGET_RESIDUAL", sectors=(91, 7, 44), shifts=(3, 17, 41)))
-        self.assertEqual(first["classification"], second["classification"])
-        self.assertFalse(second["crossSectorPhaseUsed"])
-        self.assertTrue(all(item["timingCoordinate"] == "SECTOR_LOCAL_WARPED_TIME"
-                            for item in second["sectorModelEvidence"]))
+            permuted = self.analyze(self.inputs(Path(right), signal,
+                "AMPLITUDE_EVOLVING_TARGET_RESIDUAL", sectors=(91, 7, 44)))
+        self.assertEqual(first["classification"], permuted["classification"])
 
-    def test_modified_artifact_fails_closed(self):
-        signal = lambda t: math.sin(2 * math.pi * t)
+    def test_modified_v2012_coefficient_fails_sha(self):
         with tempfile.TemporaryDirectory() as directory:
-            inputs = self.inputs(Path(directory), signal, "AMPLITUDE_EVOLVING_TARGET_RESIDUAL")
+            inputs = self.inputs(Path(directory), lambda t: math.sin(2 * math.pi * t),
+                                 "AMPLITUDE_EVOLVING_TARGET_RESIDUAL")
             Path(inputs[0]["preparedSeries"][0]["coefficientSeriesPath"]).write_text("{}")
             result = self.analyze(inputs)
-        self.assertTrue(any("SHA" in reason for reason in result["failClosedReasons"]))
-        self.assertEqual("AMPLITUDE_EVOLUTION_MECHANISM_UNRESOLVED", result["classification"])
+        self.assertTrue(any("v20.12 SHA" in reason for reason in result["failClosedReasons"]))
+
+    def test_modified_v2012_dataset_fails_sha(self):
+        with tempfile.TemporaryDirectory() as directory:
+            inputs = self.inputs(Path(directory), lambda t: math.sin(2 * math.pi * t),
+                                 "AMPLITUDE_EVOLVING_TARGET_RESIDUAL")
+            Path(inputs[0]["preparedSeries"][0]["datasetPath"]).write_text("{}")
+            result = self.analyze(inputs)
+        self.assertTrue(any("v20.12 SHA" in reason for reason in result["failClosedReasons"]))
+
+    def test_modified_v2013_artifact_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            inputs = self.inputs(Path(directory), lambda t: math.sin(2 * math.pi * t),
+                                 "AMPLITUDE_EVOLVING_TARGET_RESIDUAL")
+            Path(inputs[4][0].path).write_text("{}")
+            result = self.analyze(inputs)
+        self.assertTrue(any("v20.13 artifact" in reason for reason in result["failClosedReasons"]))
+
+    def test_falsified_v2013_snapshot_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            inputs = self.inputs(Path(directory), lambda t: math.sin(2 * math.pi * t),
+                                 "AMPLITUDE_EVOLVING_TARGET_RESIDUAL")
+            inputs[2]["temporalModelEvidence"][0]["frequency"] = 1.01
+            result = self.analyze(inputs)
+        self.assertTrue(any("v20.13 artifact" in reason for reason in result["failClosedReasons"]))
 
     def test_mismatched_v2013_lineage_fails_closed(self):
-        signal = lambda t: math.sin(2 * math.pi * .96 * t) + math.sin(2 * math.pi * 1.04 * t)
         with tempfile.TemporaryDirectory() as directory:
-            result = self.analyze(self.inputs(Path(directory), signal,
+            result = self.analyze(self.inputs(Path(directory), lambda t: math.sin(2 * math.pi * t),
                 "AMPLITUDE_EVOLVING_TARGET_RESIDUAL"), lineage=False)
-        self.assertEqual("AMPLITUDE_EVOLUTION_MECHANISM_UNRESOLVED", result["classification"])
-        self.assertTrue(result["failClosedReasons"])
+        self.assertTrue(any("lineage" in reason for reason in result["failClosedReasons"]))
 
     def test_offset_and_blended_series_cannot_enter_observable(self):
-        signal = lambda t: math.sin(2 * math.pi * t)
         with tempfile.TemporaryDirectory() as directory:
-            inputs = self.inputs(Path(directory), signal, "AMPLITUDE_EVOLVING_TARGET_RESIDUAL")
+            inputs = self.inputs(Path(directory), lambda t: math.sin(2 * math.pi * t),
+                                 "AMPLITUDE_EVOLVING_TARGET_RESIDUAL")
             inputs[0]["preparedSeries"].extend([
                 {"componentID": "offset-1", "componentType": "OFFSET", "sector": 1},
                 {"componentID": "target", "componentType": "TARGET", "combined": True, "sector": 1},
@@ -107,6 +171,31 @@ class TessTargetResidualMechanismTests(unittest.TestCase):
             result = self.analyze(inputs)
         self.assertEqual(3, len(result["sectorModelEvidence"]))
         self.assertIn("target coefficient", result["observable"])
+
+    def test_mixed_replicated_mechanisms_do_not_advance(self):
+        beating = {"constantAmplitudeBIC": 30., "smoothEnvelopeBIC": 20., "twoFrequencyBIC": 0.,
+            "intermittentEnvelopeBIC": 40., "beatFrequencySeparation": .08,
+            "intermittentSegmentAmplitudes": [1.] * 5, "episodicSuppressionAndReappearance": False}
+        smooth = dict(beating, constantAmplitudeBIC=30., smoothEnvelopeBIC=0., twoFrequencyBIC=20.)
+        with tempfile.TemporaryDirectory() as directory:
+            inputs = self.inputs(Path(directory), lambda t: math.sin(2 * math.pi * t),
+                "AMPLITUDE_EVOLVING_TARGET_RESIDUAL", sectors=(1, 2, 3, 4))
+            with patch("workflows.tess.tess_target_residual_mechanism._model_sector",
+                       side_effect=[copy.deepcopy(beating), copy.deepcopy(beating),
+                                    copy.deepcopy(smooth), copy.deepcopy(smooth)]):
+                result = self.analyze(inputs)
+        self.assertEqual("AMPLITUDE_EVOLUTION_MECHANISM_UNRESOLVED", result["classification"])
+        self.assertEqual("TARGET_RESIDUAL_PHYSICAL_MECHANISM_FOLLOWUP",
+                         result["recommendedNextTest"])
+
+    def test_consumed_science_results_are_not_mutated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            inputs = self.inputs(Path(directory), lambda t: math.sin(2 * math.pi * t),
+                                 "AMPLITUDE_EVOLVING_TARGET_RESIDUAL")
+            frozen_results = copy.deepcopy(inputs[:3])
+            self.analyze(inputs)
+        self.assertEqual(frozen_results, inputs[:3])
+
 
 if __name__ == "__main__":
     unittest.main()

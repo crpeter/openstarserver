@@ -4069,6 +4069,7 @@ def build_engine(
             v2013_result=v2013_stage.result,
             authoritative_artifacts=preparation_stage.artifacts,
             v2013_lineage_verified=lineage_verified,
+            authoritative_v2013_artifacts=v2013_stage.artifacts,
         )
         artifact_path = (store.directory_for(investigation.id) / "artifacts" /
                          "target-residual-mechanism" /

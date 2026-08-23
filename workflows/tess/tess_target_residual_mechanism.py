@@ -18,6 +18,10 @@ BEAT_GRID_SIZE = 81
 BEAT_MIN_RESOLUTION_CYCLES = 0.6
 BEAT_MAX_FRACTIONAL_SEPARATION = 0.12
 INTERMITTENT_SUPPRESSION_RATIO = 3.0
+CONSTANT_MODEL_PARAMETERS = 3
+SMOOTH_MODEL_PARAMETERS = 7
+BEAT_MODEL_PARAMETERS = 6
+INTERMITTENT_MODEL_PARAMETERS = 1 + 2 * ENVELOPE_SEGMENTS
 
 
 def _hash(path: str | Path) -> str:
@@ -111,10 +115,13 @@ def _model_sector(times: list[float], values: list[float], frequency: float) -> 
                       and min(max(amplitudes[:weakest]), max(amplitudes[weakest + 1:]))
                       / max(amplitudes[weakest], 1e-15) >= INTERMITTENT_SUPPRESSION_RATIO)
     return {
-        "constantAmplitudeBIC": _bic(constant_rss, count, 3),
-        "smoothEnvelopeBIC": _bic(smooth_rss, count, 7),
-        "twoFrequencyBIC": _bic(beat_rss, count, 5) if beat_delta is not None else None,
-        "intermittentEnvelopeBIC": _bic(intermittent_rss, count, 1 + 2 * ENVELOPE_SEGMENTS),
+        "constantAmplitudeBIC": _bic(constant_rss, count, CONSTANT_MODEL_PARAMETERS),
+        "smoothEnvelopeBIC": _bic(smooth_rss, count, SMOOTH_MODEL_PARAMETERS),
+        # The separation is selected by minimizing RSS over the preregistered
+        # grid, so it is the sixth fitted parameter; it is not a free search.
+        "twoFrequencyBIC": (_bic(beat_rss, count, BEAT_MODEL_PARAMETERS)
+                            if beat_delta is not None else None),
+        "intermittentEnvelopeBIC": _bic(intermittent_rss, count, INTERMITTENT_MODEL_PARAMETERS),
         "beatFrequencySeparation": beat_delta,
         "intermittentSegmentAmplitudes": amplitudes,
         "episodicSuppressionAndReappearance": episodic_shape,
@@ -123,7 +130,8 @@ def _model_sector(times: list[float], values: list[float], frequency: float) -> 
 
 def analyze_target_residual_mechanism(*, preparation: dict[str, Any],
         decomposition: dict[str, Any], v2013_result: dict[str, Any],
-        authoritative_artifacts: Iterable[Any], v2013_lineage_verified: bool) -> dict[str, Any]:
+        authoritative_artifacts: Iterable[Any], v2013_lineage_verified: bool,
+        authoritative_v2013_artifacts: Iterable[Any] = ()) -> dict[str, Any]:
     """Compare preregistered models using only frozen target coefficients."""
     allowed = {"AMPLITUDE_EVOLVING_TARGET_RESIDUAL", "TRANSIENT_INTERMITTENT_TARGET_RESIDUAL"}
     if (v2013_result.get("classification") not in allowed
@@ -133,6 +141,22 @@ def analyze_target_residual_mechanism(*, preparation: dict[str, Any],
     reasons = []
     if not v2013_lineage_verified:
         reasons.append("v20.13 stage/result hash lineage is absent or inconsistent")
+    v2013_verified = False
+    for reference in authoritative_v2013_artifacts:
+        path = reference.path if hasattr(reference, "path") else reference.get("path")
+        sha = reference.sha256 if hasattr(reference, "sha256") else reference.get("sha256")
+        if not path or not sha or not Path(path).is_file() or _hash(path) != str(sha):
+            continue
+        try:
+            with Path(path).open(encoding="utf-8") as handle:
+                frozen_result = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            continue
+        if frozen_result == v2013_result:
+            v2013_verified = True
+            break
+    if not v2013_verified:
+        reasons.append("frozen v20.13 artifact SHA or result content is absent or inconsistent")
     frozen = {}
     for reference in authoritative_artifacts:
         path = reference.path if hasattr(reference, "path") else reference.get("path")
@@ -199,9 +223,10 @@ def analyze_target_residual_mechanism(*, preparation: dict[str, Any],
                   and sector_labels.count(label) >= MIN_REPLICATING_SECTORS]
     unresolved = ("AMPLITUDE_EVOLUTION_MECHANISM_UNRESOLVED" if mode.startswith("AMPLITUDE")
                   else "INTERMITTENCY_MECHANISM_UNRESOLVED")
-    classification = candidates[0] if len(candidates) == 1 and not reasons else unresolved
+    promoted = len(candidates) == 1 and not reasons
+    classification = candidates[0] if promoted else unresolved
     return {"classification": classification, "physicalMechanismResolved": False,
-            "recommendedNextTest": "ASTROPHYSICAL_MECHANISM_INTERPRETATION" if candidates and not reasons
+            "recommendedNextTest": "ASTROPHYSICAL_MECHANISM_INTERPRETATION" if promoted
                                    else "TARGET_RESIDUAL_PHYSICAL_MECHANISM_FOLLOWUP",
             "observable": "frozen v20.12 spatially-decomposed target coefficient series",
             "sectorModelEvidence": evidence, "failClosedReasons": reasons,
@@ -209,4 +234,8 @@ def analyze_target_residual_mechanism(*, preparation: dict[str, Any],
             "preRegisteredRules": {"decisiveDeltaBIC": DECISIVE_DELTA_BIC,
                 "minimumReplicatingSectors": MIN_REPLICATING_SECTORS,
                 "beatGridSize": BEAT_GRID_SIZE, "envelopeSegments": ENVELOPE_SEGMENTS,
-                "intermittentSuppressionRatio": INTERMITTENT_SUPPRESSION_RATIO}}
+                "intermittentSuppressionRatio": INTERMITTENT_SUPPRESSION_RATIO,
+                "modelParameterCounts": {"constantAmplitude": CONSTANT_MODEL_PARAMETERS,
+                    "smoothEnvelope": SMOOTH_MODEL_PARAMETERS,
+                    "twoFrequencyIncludingGridOptimizedSeparation": BEAT_MODEL_PARAMETERS,
+                    "intermittentEnvelope": INTERMITTENT_MODEL_PARAMETERS}}}
