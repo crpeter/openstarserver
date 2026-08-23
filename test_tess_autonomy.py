@@ -1415,6 +1415,127 @@ class TessAutonomyIntegrationTests(unittest.TestCase):
         self.assertFalse(reloaded.stages[-1].stop)
         self.assertEqual((), plan_tess_branches(reloaded, target))
 
+    def _completed_atlas_collect(self, *, project_path="/immutable/atlas-project.json",
+                                 continuation_handler=None, continuation_parameters=None):
+        target = self.source.enumerate_targets()[0]
+        investigation = self.store.create(
+            target.investigation_id, WORKFLOW_ID, WORKFLOW_VERSION,
+            metadata=target.metadata,
+        )
+        handler = continuation_handler or (
+            "openstar.tess.atlas-forced-photometry.run" if project_path else
+            "openstar.tess.atlas-forced-photometry.interpret"
+        )
+        parameters = continuation_parameters if continuation_parameters is not None else (
+            {"projectPath": project_path} if project_path else
+            {"distributedRunExpected": False}
+        )
+        continuation = StageRequest(
+            "056-persisted-atlas-continuation", handler, parameters,
+            "055-collect-atlas-forced-photometry",
+        )
+        result = {"available": True, "projectID": "atlas-project",
+                  "totalWorkUnits": 4}
+        if project_path:
+            result["projectPath"] = project_path
+        investigation = self._complete(
+            investigation, "055-collect-atlas-forced-photometry",
+            "openstar.tess.atlas-forced-photometry.collect", result,
+            next_stage=continuation,
+        )
+        investigation = self.store.set_control_state(
+            investigation, status="COMPLETE",
+            control_state={"branchAssessments": [], "selectedExperiment": None,
+                           "schedulerAction": "INVESTIGATION_COMPLETE"},
+        )
+        return investigation, continuation
+
+    def test_completed_atlas_collect_recovers_persisted_run_append_only_once(self):
+        investigation, continuation = self._completed_atlas_collect()
+        stage_path = self.store.stage_path_for(
+            investigation.id, "055-collect-atlas-forced-photometry")
+        historical_bytes = stage_path.read_bytes()
+
+        repaired = repair_obsolete_terminal_wait(self.store, investigation)
+
+        self.assertEqual("RUNNING", repaired.status)
+        self.assertEqual(
+            asdict(continuation), repaired.metadata["controlState"]["selectedExperiment"])
+        self.assertEqual("RUN_EXPERIMENT",
+                         repaired.metadata["controlState"]["schedulerAction"])
+        self.assertEqual(historical_bytes, stage_path.read_bytes())
+        self.assertEqual(repaired, repair_obsolete_terminal_wait(self.store, repaired))
+        self.assertEqual(1, len(repaired.stages))
+
+    def test_completed_atlas_collect_without_project_recovers_persisted_interpret(self):
+        investigation, continuation = self._completed_atlas_collect(project_path=None)
+
+        repaired = repair_obsolete_terminal_wait(self.store, investigation)
+
+        self.assertEqual("RUNNING", repaired.status)
+        self.assertEqual(
+            asdict(continuation), repaired.metadata["controlState"]["selectedExperiment"])
+
+    def test_completed_atlas_collect_continuation_fails_closed(self):
+        cases = (
+            ("malformed-handler", "/project.json", "openstar.tess.finalize",
+             {"projectPath": "/project.json"}),
+            ("malformed-run-parameters", "/project.json",
+             "openstar.tess.atlas-forced-photometry.run", {"projectPath": "/other.json"}),
+            ("malformed-interpret-parameters", None,
+             "openstar.tess.atlas-forced-photometry.interpret",
+             {"distributedRunExpected": True}),
+        )
+        for name, project_path, handler, parameters in cases:
+            with self.subTest(name=name):
+                investigation, _ = self._completed_atlas_collect(
+                    project_path=project_path, continuation_handler=handler,
+                    continuation_parameters=parameters)
+                before = self.store.path_for(investigation.id).read_bytes()
+                self.assertEqual(
+                    investigation, repair_obsolete_terminal_wait(self.store, investigation))
+                self.assertEqual(before, self.store.path_for(investigation.id).read_bytes())
+                shutil.rmtree(self.store.directory_for(investigation.id))
+
+    def test_attempted_atlas_run_or_interpret_blocks_collect_recovery(self):
+        for handler in ("openstar.tess.atlas-forced-photometry.run",
+                        "openstar.tess.atlas-forced-photometry.interpret"):
+            with self.subTest(handler=handler):
+                investigation, _ = self._completed_atlas_collect()
+                investigation = self._complete(
+                    investigation, "056-attempted", handler, {"attempted": True})
+                investigation = self.store.set_control_state(
+                    investigation, status="COMPLETE",
+                    control_state={"branchAssessments": [], "selectedExperiment": None,
+                                   "schedulerAction": "INVESTIGATION_COMPLETE"})
+                before = self.store.path_for(investigation.id).read_bytes()
+                self.assertEqual(
+                    investigation, repair_obsolete_terminal_wait(self.store, investigation))
+                self.assertEqual(before, self.store.path_for(investigation.id).read_bytes())
+                shutil.rmtree(self.store.directory_for(investigation.id))
+
+    def test_missing_or_malformed_atlas_collect_lineage_fails_closed(self):
+        for name, next_stage in (
+            ("missing", None),
+            ("wrong-trigger", {
+                "id": "056-persisted-atlas-continuation",
+                "handler_id": "openstar.tess.atlas-forced-photometry.run",
+                "parameters": {"projectPath": "/immutable/atlas-project.json"},
+                "triggered_by_stage_id": "054-unrelated-stage",
+            }),
+        ):
+            with self.subTest(name=name):
+                investigation, _ = self._completed_atlas_collect()
+                malformed = replace(investigation.stages[-1], next_stage=next_stage)
+                investigation = replace(investigation, stages=(malformed,))
+                self.store.save(investigation)
+                before = self.store.path_for(investigation.id).read_bytes()
+
+                self.assertEqual(
+                    investigation, repair_obsolete_terminal_wait(self.store, investigation))
+                self.assertEqual(before, self.store.path_for(investigation.id).read_bytes())
+                shutil.rmtree(self.store.directory_for(investigation.id))
+
     def test_restart_after_terminal_finalize_advances_once_without_rerun(self):
         finished_target, next_target = self.source.enumerate_targets()
         investigation = self.store.create(

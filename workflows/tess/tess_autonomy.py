@@ -229,7 +229,7 @@ def _awaiting_post_atlas_targeted_observation_adapter(
 
 
 def _persisted_archive_continuation(investigation: Investigation):
-    """Return an unattempted continuation recorded by an archive prepare/run stage."""
+    """Return a valid unattempted continuation recorded by an archive stage."""
     attempted_ids = {stage.id for stage in investigation.stages}
     archive_handlers = {
         "openstar.tess.gaia-source-resolved-counterpart-photometry.prepare",
@@ -243,16 +243,56 @@ def _persisted_archive_continuation(investigation: Investigation):
         "openstar.tess.des-dr2-se-local-forced-photometry.prepare",
         "openstar.tess.des-dr2-se-local-forced-photometry.run",
         "openstar.tess.atlas-forced-photometry.prepare",
+        "openstar.tess.atlas-forced-photometry.collect",
         "openstar.tess.atlas-forced-photometry.run",
     }
     for stage in reversed(investigation.stages):
+        if stage.handler_id not in archive_handlers or stage.status != "COMPLETE":
+            continue
+        raw = stage.next_stage
+        if not isinstance(raw, dict):
+            continue
+        continuation_id = raw.get("id")
+        handler_id = raw.get("handler_id")
+        parameters = raw.get("parameters")
         if (
-            stage.handler_id in archive_handlers
-            and stage.status == "COMPLETE"
-            and stage.next_stage is not None
-            and str(stage.next_stage.get("id")) not in attempted_ids
+            not isinstance(continuation_id, str)
+            or not continuation_id
+            or continuation_id in attempted_ids
+            or not isinstance(handler_id, str)
+            or not isinstance(parameters, dict)
+            or raw.get("triggered_by_stage_id") != stage.id
         ):
-            return stage, stage.next_stage
+            continue
+
+        # Collection is an asynchronous archive boundary.  Resume only the exact
+        # immutable continuation that the collector produced, and ensure its
+        # parameters agree with that durable collection result.  In particular,
+        # never infer a replacement run or repeat archive collection here.
+        if stage.handler_id == "openstar.tess.atlas-forced-photometry.collect":
+            result = stage.result if isinstance(stage.result, dict) else {}
+            project_path = result.get("projectPath")
+            if handler_id == "openstar.tess.atlas-forced-photometry.run":
+                valid = (
+                    isinstance(project_path, str)
+                    and bool(project_path)
+                    and parameters == {"projectPath": project_path}
+                )
+            elif handler_id == "openstar.tess.atlas-forced-photometry.interpret":
+                valid = not project_path and parameters == {
+                    "distributedRunExpected": False
+                }
+            else:
+                valid = False
+            if not valid or any(
+                item.handler_id in {
+                    "openstar.tess.atlas-forced-photometry.run",
+                    "openstar.tess.atlas-forced-photometry.interpret",
+                }
+                for item in investigation.stages
+            ):
+                continue
+        return stage, raw
     return None
 
 
