@@ -18,10 +18,11 @@ BEAT_GRID_SIZE = 81
 BEAT_MIN_RESOLUTION_CYCLES = 0.6
 BEAT_MAX_FRACTIONAL_SEPARATION = 0.12
 INTERMITTENT_SUPPRESSION_RATIO = 3.0
+PHASE_GRID_SIZE = 181
 CONSTANT_MODEL_PARAMETERS = 3
-SMOOTH_MODEL_PARAMETERS = 7
+SMOOTH_MODEL_PARAMETERS = 5
 BEAT_MODEL_PARAMETERS = 6
-INTERMITTENT_MODEL_PARAMETERS = 1 + 2 * ENVELOPE_SEGMENTS
+INTERMITTENT_MODEL_PARAMETERS = 2 + ENVELOPE_SEGMENTS
 
 
 def _hash(path: str | Path) -> str:
@@ -65,24 +66,48 @@ def _bic(rss: float, count: int, parameters: int) -> float:
     return count * math.log(rss / count) + parameters * math.log(count)
 
 
-def _basis(times: list[float], frequency: float, powers: int = 1) -> list[list[float]]:
-    middle = (min(times) + max(times)) / 2
-    half_span = max((max(times) - min(times)) / 2, 1e-12)
-    rows = []
-    for time in times:
-        x = (time - middle) / half_span
-        sine, cosine = math.sin(2 * math.pi * frequency * time), math.cos(2 * math.pi * frequency * time)
-        row = [1.0]
-        for power in range(powers):
-            row.extend(((x ** power) * sine, (x ** power) * cosine))
-        rows.append(row)
-    return rows
+def _constant_basis(times: list[float], frequency: float) -> list[list[float]]:
+    return [[1.0, math.sin(2 * math.pi * frequency * time),
+             math.cos(2 * math.pi * frequency * time)] for time in times]
+
+
+def _shared_phase_envelope_fit(times: list[float], values: list[float], frequency: float,
+                               *, segmented: bool) -> tuple[float, list[float], float]:
+    """Fit nonnegative scalar amplitudes against one sector-wide carrier phase."""
+    low, high = min(times), max(times)
+    middle, half_span = (low + high) / 2, max((high - low) / 2, 1e-12)
+    best = (float("inf"), [], 0.0)
+    for index in range(PHASE_GRID_SIZE):
+        phase = 2 * math.pi * index / PHASE_GRID_SIZE
+        rows = []
+        for time in times:
+            carrier = math.sin(2 * math.pi * frequency * time + phase)
+            if segmented:
+                segment = min(ENVELOPE_SEGMENTS - 1,
+                              int((time - low) / max(high - low, 1e-12) * ENVELOPE_SEGMENTS))
+                row = [1.0] + [0.0] * ENVELOPE_SEGMENTS
+                row[1 + segment] = carrier
+            else:
+                x = (time - middle) / half_span
+                row = [1.0, carrier, x * carrier, x * x * carrier]
+            rows.append(row)
+        rss, beta = _linear_fit(rows, values)
+        if segmented:
+            envelope = beta[1:]
+        else:
+            envelope = [beta[1] + beta[2] * (2 * sample / 100 - 1)
+                        + beta[3] * (2 * sample / 100 - 1) ** 2 for sample in range(101)]
+        # Negative scalar amplitudes are forbidden: they are hidden pi phase jumps.
+        if envelope and min(envelope) >= -1e-12 and rss < best[0]:
+            best = (rss, beta, phase)
+    return best
 
 
 def _model_sector(times: list[float], values: list[float], frequency: float) -> dict[str, Any]:
     count, span = len(times), max(times) - min(times)
-    constant_rss, _ = _linear_fit(_basis(times, frequency), values)
-    smooth_rss, _ = _linear_fit(_basis(times, frequency, 3), values)
+    constant_rss, _ = _linear_fit(_constant_basis(times, frequency), values)
+    smooth_rss, _, smooth_phase = _shared_phase_envelope_fit(
+        times, values, frequency, segmented=False)
     minimum_delta = BEAT_MIN_RESOLUTION_CYCLES / max(span, 1e-12)
     maximum_delta = frequency * BEAT_MAX_FRACTIONAL_SEPARATION
     beat_rss, beat_delta = float("inf"), None
@@ -106,10 +131,13 @@ def _model_sector(times: list[float], values: list[float], frequency: float) -> 
         row[1 + 2 * segment] = math.sin(2 * math.pi * frequency * time)
         row[2 + 2 * segment] = math.cos(2 * math.pi * frequency * time)
         segment_rows.append(row)
-    intermittent_rss, intermittent_beta = _linear_fit(segment_rows, values)
+    # Independent-phase segment amplitudes are diagnostic only: they prevent a
+    # phase jump from masquerading as suppression.  They do not enter the BIC.
+    _, intermittent_beta = _linear_fit(segment_rows, values)
     amplitudes = [math.hypot(intermittent_beta[1 + 2 * index],
-                             intermittent_beta[2 + 2 * index])
-                  for index in range(ENVELOPE_SEGMENTS)]
+                             intermittent_beta[2 + 2 * index]) for index in range(ENVELOPE_SEGMENTS)]
+    intermittent_rss, shared_beta, intermittent_phase = _shared_phase_envelope_fit(
+        times, values, frequency, segmented=True)
     weakest = min(range(ENVELOPE_SEGMENTS), key=amplitudes.__getitem__)
     episodic_shape = (0 < weakest < ENVELOPE_SEGMENTS - 1
                       and min(max(amplitudes[:weakest]), max(amplitudes[weakest + 1:]))
@@ -123,6 +151,9 @@ def _model_sector(times: list[float], values: list[float], frequency: float) -> 
                             if beat_delta is not None else None),
         "intermittentEnvelopeBIC": _bic(intermittent_rss, count, INTERMITTENT_MODEL_PARAMETERS),
         "beatFrequencySeparation": beat_delta,
+        "smoothCarrierPhaseRadians": smooth_phase,
+        "intermittentCarrierPhaseRadians": intermittent_phase,
+        "intermittentSharedPhaseSegmentAmplitudes": shared_beta[1:] if shared_beta else [],
         "intermittentSegmentAmplitudes": amplitudes,
         "episodicSuppressionAndReappearance": episodic_shape,
     }
@@ -234,7 +265,13 @@ def analyze_target_residual_mechanism(*, preparation: dict[str, Any],
             "preRegisteredRules": {"decisiveDeltaBIC": DECISIVE_DELTA_BIC,
                 "minimumReplicatingSectors": MIN_REPLICATING_SECTORS,
                 "beatGridSize": BEAT_GRID_SIZE, "envelopeSegments": ENVELOPE_SEGMENTS,
+                "carrierPhaseGridSize": PHASE_GRID_SIZE,
                 "intermittentSuppressionRatio": INTERMITTENT_SUPPRESSION_RATIO,
+                "amplitudeEnvelopeConstraint": (
+                    "one shared sector carrier phase; scalar envelope nonnegative over fitted domain"),
+                "episodicPhaseJumpVeto": (
+                    "suppression/reappearance is measured from phase-free segment amplitudes, "
+                    "while only the shared-phase envelope enters model BIC"),
                 "modelParameterCounts": {"constantAmplitude": CONSTANT_MODEL_PARAMETERS,
                     "smoothEnvelope": SMOOTH_MODEL_PARAMETERS,
                     "twoFrequencyIncludingGridOptimizedSeparation": BEAT_MODEL_PARAMETERS,

@@ -87,12 +87,28 @@ class TessTargetResidualMechanismTests(unittest.TestCase):
                 "AMPLITUDE_EVOLVING_TARGET_RESIDUAL"))
         self.assertEqual("SMOOTH_SINGLE_MODE_AMPLITUDE_EVOLUTION", result["classification"])
 
+    def test_smooth_phase_evolution_is_not_called_amplitude_evolution(self):
+        signal = lambda t: math.sin(2 * math.pi * t + .9 * ((t - 10) / 10) ** 2)
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.analyze(self.inputs(Path(directory), signal,
+                "AMPLITUDE_EVOLVING_TARGET_RESIDUAL"))
+        self.assertNotEqual("SMOOTH_SINGLE_MODE_AMPLITUDE_EVOLUTION", result["classification"])
+
     def test_intermittent_suppression_and_reappearance(self):
         signal = lambda t: (.05 if 8 <= t < 12 else 1.0) * math.sin(2 * math.pi * t)
         with tempfile.TemporaryDirectory() as directory:
             result = self.analyze(self.inputs(Path(directory), signal,
                 "TRANSIENT_INTERMITTENT_TARGET_RESIDUAL"))
         self.assertEqual("EPISODIC_TARGET_MODE_ACTIVATION", result["classification"])
+
+    def test_phase_jumps_are_not_called_episodic_activation(self):
+        def signal(t):
+            phase = 0.0 if t < 8 else (math.pi / 2 if t < 12 else math.pi / 4)
+            return math.sin(2 * math.pi * t + phase)
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.analyze(self.inputs(Path(directory), signal,
+                "TRANSIENT_INTERMITTENT_TARGET_RESIDUAL"))
+        self.assertNotEqual("EPISODIC_TARGET_MODE_ACTIVATION", result["classification"])
 
     def test_transient_boundary_can_select_smooth_modulation(self):
         signal = lambda t: (1 + .8 * ((t - 10) / 10) ** 2) * math.sin(2 * math.pi * t)
