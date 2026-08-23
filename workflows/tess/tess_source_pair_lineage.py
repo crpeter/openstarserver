@@ -22,6 +22,10 @@ def valid_current_source_pair(pair: object) -> bool:
     counterpart = pair.get("counterpart")
     if not isinstance(target, dict) or not isinstance(counterpart, dict):
         return False
+    if target.get("sourceRole") not in (None, "target-control"):
+        return False
+    if counterpart.get("sourceRole") not in (None, "catalog-counterpart"):
+        return False
     identities = (target.get("gaiaDR3SourceID"), counterpart.get("gaiaDR3SourceID"))
     if identities[0] is None or identities[1] is None or identities[0] == identities[1]:
         return False
@@ -44,12 +48,20 @@ def frozen_source_pair_evidence(investigation, atlas_interpretation_stage):
         return None
     position = investigation.stages.index(atlas_interpretation_stage)
     preceding = investigation.stages[:position]
-    for handlers in (INTERPRETATION_SOURCE_PAIR_HANDLERS,
-                     TRANSPORT_SOURCE_PAIR_HANDLERS):
+    for handlers in (
+        INTERPRETATION_SOURCE_PAIR_HANDLERS,
+        TRANSPORT_SOURCE_PAIR_HANDLERS,
+    ):
         for stage in reversed(preceding):
             result = stage.result if isinstance(stage.result, dict) else None
-            if (stage.status == "COMPLETE" and stage.handler_id in handlers
-                    and result is not None and result.get("sourcePair") == atlas_pair
-                    and valid_current_source_pair(result.get("sourcePair"))):
-                return result
+            if (
+                stage.status == "COMPLETE"
+                and stage.handler_id in handlers
+                and result is not None
+                and valid_current_source_pair(result.get("sourcePair"))
+            ):
+                # The latest valid stage in the preferred provenance class is
+                # authoritative.  A contradiction is ambiguous evidence, not
+                # permission to search backward for a convenient match.
+                return result if result.get("sourcePair") == atlas_pair else None
     return None
