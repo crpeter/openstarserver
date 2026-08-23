@@ -131,6 +131,24 @@ def _intrinsic_target_boundary(investigation: Investigation):
     return None
 
 
+def _target_residual_mechanism_boundary(investigation: Investigation):
+    """Return only an unconsumed v20.13 temporal-mechanism recommendation."""
+    stage = _latest_complete(investigation, "openstar.tess.intrinsic-nonstationary.analyze")
+    result = (stage.result or {}) if stage is not None else {}
+    attempted = any(item.handler_id == "openstar.tess.target-residual-mechanism.analyze"
+                    for item in investigation.stages)
+    if (stage is not None and not attempted
+            and result.get("classification") in {
+                "AMPLITUDE_EVOLVING_TARGET_RESIDUAL",
+                "TRANSIENT_INTERMITTENT_TARGET_RESIDUAL",
+            }
+            and result.get("recommendedNextTest")
+            == "TARGET_RESIDUAL_PHYSICAL_MECHANISM_FOLLOWUP"
+            and result.get("physicalMechanismResolved") is False):
+        return stage
+    return None
+
+
 def _awaiting_nsc_adapter(investigation: Investigation) -> bool:
     """Identify only the incremental SkyMapper-to-NSC implementation boundary."""
     stage = _latest_complete(
@@ -1195,6 +1213,21 @@ def repair_obsolete_terminal_wait(
     if investigation.workflow_id != WORKFLOW_ID or not isinstance(control, dict):
         return investigation
 
+    mechanism = _target_residual_mechanism_boundary(investigation)
+    if (mechanism is not None and investigation.status == "COMPLETE"
+            and control.get("schedulerAction") == "INVESTIGATION_COMPLETE"):
+        request = StageRequest(
+            id=_continuation_stage_id(mechanism, "target-residual-mechanism"),
+            handler_id="openstar.tess.target-residual-mechanism.analyze",
+            parameters={}, triggered_by_stage_id=mechanism.id,
+        )
+        return store.set_control_state(
+            investigation, status="RUNNING",
+            control_state={"branchAssessments": [], "selectedExperiment": asdict(request),
+                           "schedulerAction": "RUN_EXPERIMENT",
+                           "recovery": "TESS_V20_13_TARGET_MECHANISM_CONTINUATION"},
+        )
+
     intrinsic = _intrinsic_target_boundary(investigation)
     if (intrinsic is not None and investigation.status == "COMPLETE"
             and control.get("schedulerAction") == "INVESTIGATION_COMPLETE"):
@@ -1464,6 +1497,17 @@ def plan_tess_branches(
     investigation: Investigation, target: InvestigationTarget
 ) -> tuple[ScientificBranch, ...]:
     """Translate persisted TESS evidence into domain-neutral branch declarations."""
+
+    mechanism = _target_residual_mechanism_boundary(investigation)
+    if mechanism is not None:
+        return (ScientificBranch(
+            id=f"target-residual-mechanism-after-{mechanism.id}",
+            experiment=StageRequest(
+                id=_continuation_stage_id(mechanism, "target-residual-mechanism"),
+                handler_id="openstar.tess.target-residual-mechanism.analyze",
+                parameters={}, triggered_by_stage_id=mechanism.id,
+            ),
+        ),)
 
     intrinsic = _intrinsic_target_boundary(investigation)
     if intrinsic is not None:

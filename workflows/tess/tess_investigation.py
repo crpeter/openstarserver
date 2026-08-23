@@ -73,6 +73,7 @@ from .tess_multisource_residual import (
     interpret_multisource_residual_project,
 )
 from .tess_intrinsic_nonstationary import classify_target_component
+from .tess_target_residual_mechanism import analyze_target_residual_mechanism
 from .tess_offset_source import identify_offset_residual_source
 from .tess_offset_variability import (
     build_offset_source_variability_project,
@@ -511,7 +512,6 @@ def multisource_residual_continuation(
         and summary.get("residualModeOrigin") == "TARGET_DOMINANT"
         and summary.get("physicalMechanismResolved") is False
     )
-
     run_prf = (
         summary.get("recommendedNextTest") == "PIXEL_RESPONSE_FUNCTION_DEBLENDING"
         and summary.get("physicalMechanismResolved") is False
@@ -527,6 +527,28 @@ def multisource_residual_continuation(
              if run_prf else "openstar.tess.finalize")
         ),
         parameters={} if (run_prf or run_intrinsic) else {"outputSuffix": "v20.12"},
+        triggered_by_stage_id=request_id,
+    )
+
+
+def intrinsic_nonstationary_continuation(
+    summary: dict[str, Any], *, request_id: str
+) -> StageRequest:
+    """Append the narrow temporal-mechanism experiment after exact v20.13 results."""
+    run_followup = (
+        summary.get("classification") in {
+            "AMPLITUDE_EVOLVING_TARGET_RESIDUAL",
+            "TRANSIENT_INTERMITTENT_TARGET_RESIDUAL",
+        }
+        and summary.get("recommendedNextTest")
+        == "TARGET_RESIDUAL_PHYSICAL_MECHANISM_FOLLOWUP"
+        and summary.get("physicalMechanismResolved") is False
+    )
+    return StageRequest(
+        id=_next_stage_id(request_id, "target-residual-mechanism" if run_followup else "finalize"),
+        handler_id=("openstar.tess.target-residual-mechanism.analyze" if run_followup
+                    else "openstar.tess.finalize"),
+        parameters={} if run_followup else {"outputSuffix": "v20.13-intrinsic"},
         triggered_by_stage_id=request_id,
     )
 
@@ -4014,14 +4036,52 @@ def build_engine(
         _write_json(artifact_path, summary)
         return StageOutcome(
             result=summary,
-            next_stage=StageRequest(
-                id=_next_stage_id(request.id, "finalize"),
-                handler_id="openstar.tess.finalize",
-                parameters={"outputSuffix": "v20.31"},
-                triggered_by_stage_id=request.id,
-            ),
+            next_stage=intrinsic_nonstationary_continuation(summary, request_id=request.id),
             input_hashes={"v20.12Preparation": sha256_json(preparation),
                           "v20.12Interpretation": sha256_json(decomposition)},
+            artifacts=(_artifact(artifact_path, "application/json"),),
+        )
+
+    def target_residual_mechanism_stage(investigation, request):
+        preparation_stage = next((stage for stage in reversed(investigation.stages)
+            if stage.handler_id == "openstar.tess.multi-source-residual.prepare"
+            and stage.status == "COMPLETE" and stage.result is not None), None)
+        decomposition_stage = next((stage for stage in reversed(investigation.stages)
+            if stage.handler_id == "openstar.tess.multi-source-residual.interpret"
+            and stage.status == "COMPLETE" and stage.result is not None), None)
+        v2013_stage = next((stage for stage in reversed(investigation.stages)
+            if stage.handler_id == "openstar.tess.intrinsic-nonstationary.analyze"
+            and stage.status == "COMPLETE" and stage.result is not None), None)
+        if preparation_stage is None or decomposition_stage is None or v2013_stage is None:
+            raise RuntimeError("Target residual mechanism follow-up requires frozen v20.12 and v20.13 stages.")
+        hashes = v2013_stage.provenance.input_hashes if v2013_stage.provenance else {}
+        lineage_verified = (
+            hashes.get("v20.12Preparation") == sha256_json(preparation_stage.result)
+            and hashes.get("v20.12Interpretation") == sha256_json(decomposition_stage.result)
+            and (v2013_stage.result.get("inputProvenance") or {}).get(
+                "v20.12PreparationResultHash") == sha256_json(preparation_stage.result)
+            and (v2013_stage.result.get("inputProvenance") or {}).get(
+                "v20.12InterpretationResultHash") == sha256_json(decomposition_stage.result)
+        )
+        summary = analyze_target_residual_mechanism(
+            preparation=preparation_stage.result,
+            decomposition=decomposition_stage.result,
+            v2013_result=v2013_stage.result,
+            authoritative_artifacts=preparation_stage.artifacts,
+            v2013_lineage_verified=lineage_verified,
+        )
+        artifact_path = (store.directory_for(investigation.id) / "artifacts" /
+                         "target-residual-mechanism" /
+                         "target-residual-mechanism-v20.14.json")
+        _write_json(artifact_path, summary)
+        return StageOutcome(
+            result=summary,
+            next_stage=StageRequest(id=_next_stage_id(request.id, "finalize"),
+                handler_id="openstar.tess.finalize", parameters={"outputSuffix": "v20.14-intrinsic"},
+                triggered_by_stage_id=request.id),
+            input_hashes={"v20.12Preparation": sha256_json(preparation_stage.result),
+                          "v20.12Interpretation": sha256_json(decomposition_stage.result),
+                          "v20.13Result": sha256_json(v2013_stage.result)},
             artifacts=(_artifact(artifact_path, "application/json"),),
         )
 
@@ -9024,6 +9084,10 @@ def build_engine(
     engine.register_handler(
         "openstar.tess.intrinsic-nonstationary.analyze",
         intrinsic_nonstationary_stage,
+    )
+    engine.register_handler(
+        "openstar.tess.target-residual-mechanism.analyze",
+        target_residual_mechanism_stage,
     )
     engine.register_handler(
         "openstar.tess.offset-source-identification.analyze",
