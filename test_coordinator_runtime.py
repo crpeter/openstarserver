@@ -832,7 +832,7 @@ class CoordinatorClientTests(unittest.TestCase):
             side_effect=CoordinatorUnavailableError("offline"),
         ), self.assertRaises(CoordinatorUnavailableError):
             client.run_projects(["one.json", "two.json"])
-        remove.assert_called_once_with("a")
+        remove.assert_not_called()
 
 
 if __name__ == "__main__":

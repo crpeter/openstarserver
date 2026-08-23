@@ -306,6 +306,7 @@ class CoordinatorClientTests(unittest.TestCase):
 
     def test_dashboard_reads_configured_sector_sweep_state_directly(self):
         with tempfile.TemporaryDirectory() as root:
+            science_run_catalog = Path(root, "science-runs.sqlite3")
             Path(root, "tess-sector-9-inventory.json").write_text(
                 json.dumps({"sector": 9, "entries": []}),
                 encoding="utf-8",
@@ -314,6 +315,7 @@ class CoordinatorClientTests(unittest.TestCase):
             application = DashboardApplication(
                 coordinator,
                 sector_sweep_state_dirs=(root,),
+                science_run_catalog=science_run_catalog,
             )
 
             _, observation = application.snapshot()
@@ -322,12 +324,16 @@ class CoordinatorClientTests(unittest.TestCase):
             self.assertEqual(9, observation["sectorSweeps"][0]["sector"])
 
     def test_dashboard_without_configured_sector_state_has_no_sector_sweeps(self):
-        coordinator = FakeCoordinator()
-        application = DashboardApplication(coordinator)
+        with tempfile.TemporaryDirectory() as root:
+            coordinator = FakeCoordinator()
+            application = DashboardApplication(
+                coordinator,
+                science_run_catalog=Path(root, "science-runs.sqlite3"),
+            )
 
-        _, observation = application.snapshot()
+            _, observation = application.snapshot()
 
-        self.assertEqual([], observation["sectorSweeps"])
+            self.assertEqual([], observation["sectorSweeps"])
 
     def test_concurrent_snapshots_share_short_lived_observation(self):
         coordinator = FakeCoordinator()
