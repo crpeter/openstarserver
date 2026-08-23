@@ -89,22 +89,58 @@ class ScienceRunCatalogTests(unittest.TestCase):
             path = Path(temporary) / "catalog.sqlite3"
             connection = sqlite3.connect(path)
             connection.execute("""CREATE TABLE science_runs (
-                id TEXT PRIMARY KEY, kind TEXT, display_name TEXT, workflow_id TEXT,
-                status TEXT, state_root TEXT, started_at REAL, updated_at REAL,
-                completed_at REAL, metadata_json TEXT, summary_json TEXT)""")
-            connection.execute("INSERT INTO science_runs VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                ("legacy-id", "generic-investigation", "Legacy", "workflow.v1", "COMPLETE",
-                 temporary, 10, 20, 20, '{"target":"old"}', '{"complete":true}'))
+                id TEXT PRIMARY KEY, kind TEXT NOT NULL, display_name TEXT NOT NULL,
+                workflow_id TEXT, status TEXT NOT NULL, state_root TEXT NOT NULL,
+                started_at TEXT NOT NULL, updated_at TEXT NOT NULL, completed_at TEXT,
+                metadata_json TEXT NOT NULL, summary_json TEXT NOT NULL)""")
+            roots = {kind: str(Path(temporary) / kind) for kind in (
+                "tess-sector-sweep", "tess-ranked-followup",
+                "generic-investigation", "tess-autonomous")}
+            records = (
+                ("old-sweep", "tess-sector-sweep", "Sweep", "sweep.v1", "RUNNING",
+                 roots["tess-sector-sweep"], "2026-08-23T13:00:00Z",
+                 "2026-08-23T13:01:00Z", None, '{"sector":2}', '{"complete":false}'),
+                ("old-ranked", "tess-ranked-followup", "Ranked", "ranked.v1", "COMPLETE",
+                 roots["tess-ranked-followup"], "2026-08-23T14:00:00+01:00",
+                 "2026-08-23T14:02:00+01:00", "2026-08-23T14:02:00+01:00",
+                 '{"sector":2}', '{"complete":true}'),
+                ("old-generic", "generic-investigation", "Generic", "workflow.v1", "COMPLETE",
+                 roots["generic-investigation"], "2026-08-23T13:00:00Z",
+                 "2026-08-23T13:03:00Z", "2026-08-23T13:03:00Z",
+                 '{"investigationID":"investigation-1"}', '{"complete":true}'),
+                ("old-autonomous", "tess-autonomous", "Autonomous", "tess.v1", "RUNNING",
+                 roots["tess-autonomous"], "2026-08-23T13:00:00Z",
+                 "2026-08-23T13:04:00Z", None, '{}', '{}'),
+            )
+            connection.executemany("INSERT INTO science_runs VALUES(?,?,?,?,?,?,?,?,?,?,?)", records)
             connection.commit(); connection.close()
             catalog = ScienceRunCatalog(path)
-            legacy = catalog.list_runs()[0]
-            self.assertEqual("legacy-id", legacy.run_id)
-            self.assertEqual("Legacy", legacy.metadata["legacy72"]["display_name"])
+            migrated = catalog.list_runs()
+            self.assertEqual(4, len(migrated))
+            self.assertTrue(all(isinstance(item.created_at, float) and
+                                isinstance(item.updated_at, float) for item in migrated))
+            self.assertTrue(all(item.created_at <= item.updated_at for item in migrated))
+            self.assertEqual(4, len(discover_science_runs(path)))
+            expected = {
+                stable_run_id("tess-sector-sweep", roots["tess-sector-sweep"], 2),
+                stable_run_id("tess-ranked-followup", roots["tess-ranked-followup"], 2),
+                stable_run_id("generic-investigation", roots["generic-investigation"], "investigation-1"),
+                stable_run_id("tess-autonomous", roots["tess-autonomous"]),
+            }
+            self.assertEqual(expected, {item.run_id for item in migrated})
+            catalog.record("tess-sector-sweep", roots["tess-sector-sweep"], logical_identity=2)
+            catalog.record("tess-ranked-followup", roots["tess-ranked-followup"], logical_identity=2)
+            catalog.record("generic-investigation", roots["generic-investigation"],
+                           logical_identity="investigation-1")
+            catalog.record("tess-autonomous", roots["tess-autonomous"])
+            self.assertEqual(4, len(catalog.list_runs()))
             new_id = catalog.record("generic-investigation", temporary,
                                     logical_identity="new-investigation")
-            self.assertEqual(2, len(catalog.list_runs()))
+            self.assertEqual(5, len(catalog.list_runs()))
             self.assertIn(new_id, {item.run_id for item in catalog.list_runs()})
-            self.assertEqual(2, len(discover_science_runs(path)))
+            legacy = next(item for item in catalog.list_runs()
+                          if item.kind == "generic-investigation" and item.state_root == roots[item.kind])
+            self.assertEqual("Generic", legacy.metadata["legacy72"]["display_name"])
             connection = sqlite3.connect(path)
             try:
                 columns = {row[1] for row in connection.execute(

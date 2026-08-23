@@ -13,6 +13,7 @@ import os
 import sqlite3
 import time
 import uuid
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -112,11 +113,27 @@ class ScienceRunCatalog:
                     legacy["summary"] = summary
             if legacy:
                 metadata.setdefault("legacy72", {}).update(legacy)
+            kind = str(old["kind"])
+            state_root = str(old["state_root"])
+            logical_identity = None
+            if kind in {"tess-sector-sweep", "tess-ranked-followup"}:
+                logical_identity = metadata.get("sector")
+            elif kind == "generic-investigation":
+                logical_identity = metadata.get("investigationID")
+            can_resynthesize = kind == "tess-autonomous" or logical_identity is not None
+            identity = (stable_run_id(kind, state_root, logical_identity)
+                        if can_resynthesize else str(old["id"]))
             connection.execute(
-                "INSERT INTO science_runs VALUES(?,?,?,?,?,?,?)",
-                (str(old["id"]), str(old["kind"]), str(old["state_root"]),
-                 str(old["status"]), float(old.get("started_at") or old.get("updated_at") or time.time()),
-                 float(old.get("updated_at") or old.get("started_at") or time.time()),
+                """INSERT INTO science_runs VALUES(?,?,?,?,?,?,?)
+                   ON CONFLICT(run_id) DO UPDATE SET
+                     status=CASE WHEN excluded.updated_at >= updated_at
+                                 THEN excluded.status ELSE status END,
+                     updated_at=MAX(updated_at, excluded.updated_at),
+                     metadata_json=CASE WHEN excluded.updated_at >= updated_at
+                                        THEN excluded.metadata_json ELSE metadata_json END""",
+                (identity, kind, state_root, str(old["status"]),
+                 _epoch_seconds(old.get("started_at") or old.get("updated_at")),
+                 _epoch_seconds(old.get("updated_at") or old.get("started_at")),
                  json.dumps(metadata, sort_keys=True, separators=(",", ":"), default=str)),
             )
         connection.execute("DROP TABLE science_runs_legacy_72")
@@ -128,10 +145,22 @@ class ScienceRunCatalog:
         root = str(Path(state_root).expanduser().resolve())
         identity = stable_run_id(kind, root, logical_identity)
         now = time.time()
-        encoded = json.dumps(metadata or {}, sort_keys=True, separators=(",", ":"),
-                             allow_nan=False, default=str)
         connection = self._connect()
         try:
+            combined_metadata: dict[str, Any] = {}
+            existing = connection.execute(
+                "SELECT metadata_json FROM science_runs WHERE run_id=?", (identity,)
+            ).fetchone()
+            if existing is not None:
+                try:
+                    decoded = json.loads(existing[0])
+                    if isinstance(decoded, dict):
+                        combined_metadata.update(decoded)
+                except (TypeError, json.JSONDecodeError):
+                    pass
+            combined_metadata.update(metadata or {})
+            encoded = json.dumps(combined_metadata, sort_keys=True, separators=(",", ":"),
+                                 allow_nan=False, default=str)
             connection.execute(
                 """INSERT INTO science_runs
                    (run_id,kind,state_root,status,created_at,updated_at,metadata_json)
@@ -365,3 +394,21 @@ def _nonnegative_int(value: Any) -> int | None:
     except (TypeError, ValueError):
         return None
     return result if result >= 0 else None
+
+
+def _epoch_seconds(value: Any) -> float:
+    """Normalize legacy numeric or ISO-8601 UTC/offset timestamps."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    if isinstance(value, str):
+        stripped = value.strip()
+        try:
+            return float(stripped)
+        except ValueError:
+            parsed = datetime.fromisoformat(
+                stripped[:-1] + "+00:00" if stripped.endswith(("Z", "z")) else stripped
+            )
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.timestamp()
+    raise ValueError(f"Unsupported legacy catalog timestamp: {value!r}")
