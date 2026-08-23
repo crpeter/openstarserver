@@ -158,22 +158,54 @@ def repair_legacy_archive_transport_failure(
             for stage in investigation.stages
         )
     )
+    archive_product = investigation.metadata.get("archiveProduct")
+    archive_uri = None
+    if isinstance(archive_product, dict):
+        archive_uri = archive_product.get("product_uri") or archive_product.get("data_uri")
+    legacy_unsuccessful_archive_download = (
+        failed.handler_id == MATERIALIZE_HANDLER
+        and isinstance(archive_uri, str)
+        and bool(archive_uri)
+        and failed.error == f"RuntimeError: MAST download failed for {archive_uri}"
+        and not any(
+            stage.handler_id == MATERIALIZE_HANDLER and stage.status == "COMPLETE"
+            for stage in investigation.stages
+        )
+    )
+    retry_already_recorded = any(
+        stage.triggered_by_stage_id == failed.id for stage in investigation.stages
+    )
+    control = investigation.metadata.get("controlState")
+    selected = control.get("selectedExperiment") if isinstance(control, dict) else None
+    retry_already_persisted = (
+        isinstance(selected, dict)
+        and selected.get("triggered_by_stage_id") == failed.id
+    )
     if (
         failed.status != "FAILED"
         or failed.failure_classification != "NON_RETRYABLE"
         or not failed.error
-        or not (legacy_archive_transport_failure or legacy_scan_transport_failure)
+        or not (
+            legacy_archive_transport_failure
+            or legacy_scan_transport_failure
+            or legacy_unsuccessful_archive_download
+        )
+        or retry_already_recorded
+        or retry_already_persisted
     ):
         return False
 
     prefixes = []
     for stage in investigation.stages:
         prefix, separator, _ = stage.id.partition("-")
-        if separator and prefix.isdigit():
-            prefixes.append(int(prefix))
+        if not separator or not prefix.isdigit():
+            return False
+        prefixes.append(int(prefix))
+    if len({stage.id for stage in investigation.stages}) != len(investigation.stages):
+        return False
     _, separator, label = failed.id.partition("-")
-    if not separator:
-        raise ValueError(f"Stage id has no label: {failed.id}")
+    if not separator or not label:
+        return False
     retry = StageRequest(
         f"{max(prefixes, default=0) + 1:03d}-{label}",
         failed.handler_id,
@@ -190,7 +222,11 @@ def repair_legacy_archive_transport_failure(
             "recovery": (
                 "TESS_COORDINATOR_TRANSPORT_COMPATIBILITY_RETRY"
                 if legacy_scan_transport_failure
-                else "TESS_ARCHIVE_TRANSPORT_COMPATIBILITY_RETRY"
+                else (
+                    "TESS_ARCHIVE_UNSUCCESSFUL_DOWNLOAD_COMPATIBILITY_RETRY"
+                    if legacy_unsuccessful_archive_download
+                    else "TESS_ARCHIVE_TRANSPORT_COMPATIBILITY_RETRY"
+                )
             ),
         },
     )

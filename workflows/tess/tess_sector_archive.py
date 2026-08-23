@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import math
 import os
 import re
 import socket
@@ -336,5 +337,5 @@ class MastTessSectorArchiveProvider:
             raise
         status = result[0] if isinstance(result, (tuple, list)) and result else result
         if str(status).upper() != "COMPLETE" or not path.exists():
-            raise RuntimeError(f"MAST download failed for {uri}")
+            raise TessArchiveTransientError(f"MAST download failed for {uri}")
         return path
