@@ -39,6 +39,8 @@ def adjudicate_sector_model_evidence(evidence: Iterable[dict[str, Any]], *,
     """Adjudicate already-computed sector models without regard to admission route."""
     sectors = []
     labels = []
+    sector_ids = []
+    adjudication_reasons = list(fail_closed_reasons)
     for source in evidence:
         item = dict(source)
         eligible = [(model, field, float(item[field])) for model, field in MODEL_BIC_FIELDS
@@ -73,11 +75,34 @@ def adjudicate_sector_model_evidence(evidence: Iterable[dict[str, Any]], *,
         })
         sectors.append(item)
         labels.append(label)
+        sector = item.get("sector")
+        if not isinstance(sector, int) or isinstance(sector, bool) or sector <= 0:
+            sector_ids.append(None)
+            adjudication_reasons.append(
+                f"sector evidence row {len(sectors) - 1} lacks a valid persisted sector ID")
+        else:
+            sector_ids.append(sector)
 
-    replicated = {label for label in labels if label != UNRESOLVED_CLASSIFICATION
-                  and labels.count(label) >= MIN_REPLICATING_SECTORS}
-    reasons = list(fail_closed_reasons)
-    promoted = len(replicated) == 1 and not reasons
+    seen = set()
+    duplicates = set()
+    for sector in sector_ids:
+        if sector is not None and sector in seen:
+            duplicates.add(sector)
+        elif sector is not None:
+            seen.add(sector)
+    if duplicates:
+        adjudication_reasons.append(
+            "duplicate persisted sector evidence IDs: "
+            + ", ".join(str(sector) for sector in sorted(duplicates)))
+
+    supporting = {}
+    for label, sector in zip(labels, sector_ids):
+        if label != UNRESOLVED_CLASSIFICATION and sector is not None:
+            supporting.setdefault(label, set()).add(sector)
+    replicated_support = {label: sorted(ids) for label, ids in supporting.items()
+                          if len(ids) >= MIN_REPLICATING_SECTORS}
+    replicated = set(replicated_support)
+    promoted = len(replicated) == 1 and not adjudication_reasons
     classification = next(iter(replicated)) if promoted else UNRESOLVED_CLASSIFICATION
     return {
         "classification": classification,
@@ -85,6 +110,8 @@ def adjudicate_sector_model_evidence(evidence: Iterable[dict[str, Any]], *,
                                 else "TARGET_RESIDUAL_PHYSICAL_MECHANISM_FOLLOWUP"),
         "sectorModelEvidence": sectors,
         "replicatedMechanisms": sorted(replicated),
+        "replicatedMechanismSupportingSectorIDs": replicated_support,
+        "failClosedReasons": adjudication_reasons,
     }
 
 
@@ -296,7 +323,9 @@ def analyze_target_residual_mechanism(*, preparation: dict[str, Any],
             "observable": "frozen v20.12 spatially-decomposed target coefficient series",
             "sectorModelEvidence": adjudication["sectorModelEvidence"],
             "replicatedMechanisms": adjudication["replicatedMechanisms"],
-            "failClosedReasons": reasons,
+            "replicatedMechanismSupportingSectorIDs":
+                adjudication["replicatedMechanismSupportingSectorIDs"],
+            "failClosedReasons": adjudication["failClosedReasons"],
             "crossSectorPhaseUsed": False,
             "adjudicationVersion": ADJUDICATION_VERSION,
             "admissionClassification": v2013_result["classification"],

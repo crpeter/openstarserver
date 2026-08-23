@@ -164,10 +164,17 @@ def _old_target_residual_adjudication_boundary(investigation: Investigation):
         return None
     control = investigation.metadata.get("controlState") or {}
     selected = control.get("selectedExperiment") or {}
+    expected_next_stage = {
+        "id": "029-finalize",
+        "handler_id": "openstar.tess.finalize",
+        "parameters": {"outputSuffix": "v20.14-intrinsic"},
+        "triggered_by_stage_id": "028-target-residual-mechanism",
+    }
     if (investigation.status != "RUNNING"
             or control.get("schedulerAction") != "RUN_EXPERIMENT"
-            or selected.get("handler_id") != "openstar.tess.finalize"
-            or selected.get("triggered_by_stage_id") != stage.id):
+            or not isinstance(stage.next_stage, dict)
+            or stage.next_stage != expected_next_stage
+            or selected != stage.next_stage):
         return None
     return stage
 

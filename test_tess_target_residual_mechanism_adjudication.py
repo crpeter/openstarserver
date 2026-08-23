@@ -74,7 +74,10 @@ class TessTargetResidualMechanismAdjudicationTests(unittest.TestCase):
             result, artifact = self.frozen(Path(directory))
             stage = InvestigationStage("028-target-residual-mechanism",
                 "openstar.tess.target-residual-mechanism.analyze", "COMPLETE", "027-old", {},
-                result=result, artifacts=(artifact,))
+                result=result, artifacts=(artifact,), next_stage=asdict(StageRequest(
+                    "029-finalize", "openstar.tess.finalize",
+                    {"outputSuffix": "v20.14-intrinsic"},
+                    "028-target-residual-mechanism")))
             investigation = replace(investigation, stages=(stage,))
             store.save(investigation)
             finalizer = StageRequest("029-finalize", "openstar.tess.finalize",
@@ -97,6 +100,32 @@ class TessTargetResidualMechanismAdjudicationTests(unittest.TestCase):
             self.assertEqual(repaired, repeated)
             self.assertNotEqual(old_snapshot, store.path_for(investigation.id).read_bytes())
             self.assertFalse(old_stage_file.exists())
+
+    def test_old_v2014_repair_requires_exact_persisted_next_stage_and_control(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = InvestigationStore(Path(directory))
+            base = store.create("old-v2014-negative", WORKFLOW_ID, "20.2")
+            result, artifact = self.frozen(Path(directory))
+            exact = asdict(StageRequest("029-finalize", "openstar.tess.finalize",
+                {"outputSuffix": "v20.14-intrinsic"}, "028-target-residual-mechanism"))
+            stage = InvestigationStage("028-target-residual-mechanism",
+                "openstar.tess.target-residual-mechanism.analyze", "COMPLETE", "027-old", {},
+                result=result, artifacts=(artifact,), next_stage=exact)
+            cases = (
+                (replace(stage, next_stage={**exact,
+                    "parameters": {"outputSuffix": "altered"}}), exact),
+                (replace(stage, next_stage={**exact, "id": "030-finalize"}), exact),
+                (stage, {**exact, "id": "030-finalize"}),
+                (replace(stage, next_stage=None), exact),
+            )
+            for index, (candidate_stage, selected) in enumerate(cases):
+                with self.subTest(case=index):
+                    candidate = replace(base, id=f"negative-{index}", status="RUNNING",
+                        stages=(candidate_stage,), metadata={"controlState": {
+                            "branchAssessments": [], "schedulerAction": "RUN_EXPERIMENT",
+                            "selectedExperiment": selected}})
+                    self.assertEqual(candidate,
+                                     repair_obsolete_terminal_wait(store, candidate))
 
     def test_corrected_finalized_and_unrelated_histories_are_unchanged(self):
         with tempfile.TemporaryDirectory() as directory:

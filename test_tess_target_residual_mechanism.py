@@ -275,6 +275,32 @@ class TessTargetResidualMechanismTests(unittest.TestCase):
             [self.evidence("smooth", sector=3), self.evidence("smooth", sector=4)])
         self.assertEqual("TARGET_RESIDUAL_MECHANISM_UNRESOLVED", conflict["classification"])
 
+    def test_duplicate_same_sector_rows_never_establish_independent_replication(self):
+        duplicated = [self.evidence("beating", sector=69),
+                      self.evidence("beating", sector=69)]
+        result = adjudicate_sector_model_evidence(duplicated)
+        self.assertEqual("TARGET_RESIDUAL_MECHANISM_UNRESOLVED", result["classification"])
+        self.assertEqual([], result["replicatedMechanisms"])
+        self.assertTrue(any("duplicate persisted sector" in reason
+                            for reason in result["failClosedReasons"]))
+
+    def test_distinct_sector_replication_records_auditable_support(self):
+        result = adjudicate_sector_model_evidence([
+            self.evidence("beating", sector=69), self.evidence("beating", sector=95)])
+        self.assertEqual("COHERENT_TWO_MODE_BEATING_SUPPORTED", result["classification"])
+        self.assertEqual(
+            {"COHERENT_TWO_MODE_BEATING_SUPPORTED": [69, 95]},
+            result["replicatedMechanismSupportingSectorIDs"],
+        )
+
+    def test_conflicting_duplicate_sector_evidence_fails_closed(self):
+        result = adjudicate_sector_model_evidence([
+            self.evidence("beating", sector=69), self.evidence("smooth", sector=69),
+            self.evidence("beating", sector=70), self.evidence("smooth", sector=71)])
+        self.assertEqual("TARGET_RESIDUAL_MECHANISM_UNRESOLVED", result["classification"])
+        self.assertTrue(any("duplicate persisted sector evidence IDs: 69" == reason
+                            for reason in result["failClosedReasons"]))
+
 
 if __name__ == "__main__":
     unittest.main()
