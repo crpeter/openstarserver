@@ -113,7 +113,17 @@ class ScienceRunCatalog:
                     legacy["summary"] = summary
             if legacy:
                 metadata.setdefault("legacy72", {}).update(legacy)
-            kind = str(old["kind"])
+            old_kind = str(old["kind"])
+            kind = {
+                "investigation": "generic-investigation",
+                "autonomous-investigation": "tess-autonomous",
+            }.get(old_kind, old_kind)
+            if kind != old_kind:
+                metadata.setdefault("legacy72", {})["kind"] = old_kind
+            legacy_summary = legacy.get("summary")
+            if (isinstance(legacy_summary, dict)
+                    and isinstance(legacy_summary.get("sectorSweep"), dict)):
+                metadata.setdefault("sectorSweep", legacy_summary["sectorSweep"])
             state_root = str(old["state_root"])
             logical_identity = None
             if kind in {"tess-sector-sweep", "tess-ranked-followup"}:

@@ -99,16 +99,17 @@ class ScienceRunCatalogTests(unittest.TestCase):
             records = (
                 ("old-sweep", "tess-sector-sweep", "Sweep", "sweep.v1", "RUNNING",
                  roots["tess-sector-sweep"], "2026-08-23T13:00:00Z",
-                 "2026-08-23T13:01:00Z", None, '{"sector":2}', '{"complete":false}'),
+                 "2026-08-23T13:01:00Z", None, '{"sector":2}',
+                 '{"sectorSweep":{"sector":2,"inventory":20,"complete":12,"remaining":8,"progress":0.6,"status":"HISTORICAL"}}'),
                 ("old-ranked", "tess-ranked-followup", "Ranked", "ranked.v1", "COMPLETE",
                  roots["tess-ranked-followup"], "2026-08-23T14:00:00+01:00",
                  "2026-08-23T14:02:00+01:00", "2026-08-23T14:02:00+01:00",
                  '{"sector":2}', '{"complete":true}'),
-                ("old-generic", "generic-investigation", "Generic", "workflow.v1", "COMPLETE",
+                ("old-generic", "investigation", "Generic", "workflow.v1", "COMPLETE",
                  roots["generic-investigation"], "2026-08-23T13:00:00Z",
                  "2026-08-23T13:03:00Z", "2026-08-23T13:03:00Z",
                  '{"investigationID":"investigation-1"}', '{"complete":true}'),
-                ("old-autonomous", "tess-autonomous", "Autonomous", "tess.v1", "RUNNING",
+                ("old-autonomous", "autonomous-investigation", "Autonomous", "tess.v1", "RUNNING",
                  roots["tess-autonomous"], "2026-08-23T13:00:00Z",
                  "2026-08-23T13:04:00Z", None, '{}', '{}'),
             )
@@ -128,6 +129,12 @@ class ScienceRunCatalogTests(unittest.TestCase):
                 stable_run_id("tess-autonomous", roots["tess-autonomous"]),
             }
             self.assertEqual(expected, {item.run_id for item in migrated})
+            self.assertEqual({"generic-investigation", "tess-autonomous",
+                "tess-ranked-followup", "tess-sector-sweep"},
+                {item.kind for item in migrated})
+            migrated_sweep = next(item for item in migrated
+                                  if item.kind == "tess-sector-sweep")
+            self.assertEqual(12, migrated_sweep.metadata["sectorSweep"]["complete"])
             catalog.record("tess-sector-sweep", roots["tess-sector-sweep"], logical_identity=2)
             catalog.record("tess-ranked-followup", roots["tess-ranked-followup"], logical_identity=2)
             catalog.record("generic-investigation", roots["generic-investigation"],
@@ -141,6 +148,11 @@ class ScienceRunCatalogTests(unittest.TestCase):
             legacy = next(item for item in catalog.list_runs()
                           if item.kind == "generic-investigation" and item.state_root == roots[item.kind])
             self.assertEqual("Generic", legacy.metadata["legacy72"]["display_name"])
+            self.assertEqual("investigation", legacy.metadata["legacy72"]["kind"])
+            autonomous = next(item for item in catalog.list_runs()
+                              if item.kind == "tess-autonomous")
+            self.assertEqual("autonomous-investigation",
+                             autonomous.metadata["legacy72"]["kind"])
             connection = sqlite3.connect(path)
             try:
                 columns = {row[1] for row in connection.execute(
