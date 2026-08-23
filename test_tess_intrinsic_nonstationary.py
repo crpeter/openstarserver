@@ -23,22 +23,25 @@ class TessIntrinsicNonstationaryTests(unittest.TestCase):
                                         "independentSupportCount": 4}]}
 
     def preparation(self, root: Path, *, epochs=(100.0, 300.0, 600.0),
-                    frequencies=None, common=True, sector_ids=None):
+                    frequencies=None, common=True, sector_ids=None, q=0.0,
+                    time_reference=0.0):
         frequencies = frequencies or (1.2,) * len(epochs)
         sector_ids = sector_ids or tuple(range(1, len(epochs) + 1))
         series, artifacts = [], []
         for sector, epoch, frequency in zip(sector_ids, epochs, frequencies):
-            common_times = [epoch + index / 20 for index in range(160)]
+            absolute_times = [epoch + index / 20 for index in range(160)]
+            relative_times = [value - time_reference for value in absolute_times]
+            common_times = [value + 0.5 * q * value * value for value in relative_times]
             local_times = [value - min(common_times) for value in common_times]
-            values = [math.sin(2 * math.pi * frequency * value) for value in common_times]
+            values = [math.sin(2 * math.pi * frequency * value) for value in absolute_times]
             coefficient = root / f"target-{sector}-coefficients.json"
             dataset = root / f"target-{sector}.json"
             payload = {"times": local_times, "coefficients": values, "componentID": "target"}
             if common:
                 payload["commonWarpedTimes"] = common_times
-                payload["absoluteTimes"] = common_times
-                payload["timeReferenceDays"] = 0.0
-                payload["fractionalFrequencyDriftPerDay"] = 0.0
+                payload["absoluteTimes"] = absolute_times
+                payload["timeReferenceDays"] = time_reference
+                payload["fractionalFrequencyDriftPerDay"] = q
             coefficient.write_text(json.dumps(payload))
             dataset.write_text(json.dumps({"science": {"componentID": "target"},
                                            "source": {"timeReferenceDays": 1500.0}}))
@@ -160,6 +163,49 @@ class TessIntrinsicNonstationaryTests(unittest.TestCase):
                 epochs=(100.0, 250.0, 500.0, 900.0), frequencies=frequencies,
                 sector_ids=(10, 9, 8, 7)))
         self.assertGreater(result["modelSelectionDiagnostics"]["frequencyEpochLinearCorrelation"], .8)
+
+    def test_nonzero_frozen_warp_cannot_erase_absolute_time_drift(self):
+        epochs = (100.0, 300.0, 600.0, 1000.0)
+        frequencies = tuple(1.14 + .00012 * epoch for epoch in epochs)
+        with tempfile.TemporaryDirectory() as left, tempfile.TemporaryDirectory() as right:
+            unwarped = self.classify(*self.preparation(
+                Path(left), epochs=epochs, frequencies=frequencies, q=0.0,
+                sector_ids=(1, 2, 3, 4)))
+            warped = self.classify(*self.preparation(
+                Path(right), epochs=epochs, frequencies=frequencies, q=0.0002,
+                sector_ids=(61, 1, 87, 27)))
+        self.assertEqual("SMOOTHLY_FREQUENCY_DRIFTING_TARGET_RESIDUAL_MODE",
+                         unwarped["classification"])
+        self.assertEqual(unwarped["classification"], warped["classification"])
+        self.assertTrue(all(item["frequencyCoordinate"] == "ORIGINAL_ABSOLUTE_TIME"
+                            for item in warped["temporalModelEvidence"]))
+
+    def test_upstream_maximum_drift_range_expands_physical_search(self):
+        # v20.9 permits a 30% edge drift.  The last physical frequency is
+        # outside a fixed +20% search and must nevertheless be recovered.
+        epochs = (0.0, 333.0, 667.0, 1000.0)
+        q = 0.0003
+        frequencies = tuple(1.2 * (1.0 + q * epoch) for epoch in epochs)
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.classify(*self.preparation(
+                Path(directory), epochs=epochs, frequencies=frequencies, q=q))
+        last = max(result["temporalModelEvidence"],
+                   key=lambda item: item["observationEpochAbsoluteDays"])
+        self.assertGreater(last["frequency"], 1.2 * 1.2)
+        self.assertGreater(last["maximumFrequency"], frequencies[-1])
+        self.assertFalse(last["winnerAtSearchBoundary"])
+
+    def test_zero_q_is_invariant_to_global_absolute_time_translation(self):
+        with tempfile.TemporaryDirectory() as left, tempfile.TemporaryDirectory() as right:
+            first = self.classify(*self.preparation(
+                Path(left), epochs=(100.0, 300.0, 600.0), q=0.0))
+            shifted = self.classify(*self.preparation(
+                Path(right), epochs=(10100.0, 10300.0, 10600.0), q=0.0))
+        self.assertEqual(first["classification"], shifted["classification"])
+        self.assertEqual(
+            [round(item["frequency"], 9) for item in first["temporalModelEvidence"]],
+            [round(item["frequency"], 9) for item in shifted["temporalModelEvidence"]],
+        )
 
     def test_observable_is_only_target_component(self):
         with tempfile.TemporaryDirectory() as directory:

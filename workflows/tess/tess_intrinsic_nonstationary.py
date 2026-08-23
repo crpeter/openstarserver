@@ -70,9 +70,15 @@ def _fit(times: list[float], flux: list[float], frequency: float) -> tuple[float
     return rss, math.hypot(beta[1], beta[2]), math.atan2(beta[2], beta[1])
 
 
-def _scan(times: list[float], flux: list[float], reference: float) -> dict[str, float]:
-    low = reference * (1 - FREQUENCY_HALF_WIDTH_FRACTION)
-    high = reference * (1 + FREQUENCY_HALF_WIDTH_FRACTION)
+def _scan(times: list[float], flux: list[float], reference: float, *,
+          minimum_frequency: float | None = None,
+          maximum_frequency: float | None = None) -> dict[str, float]:
+    low = (reference * (1 - FREQUENCY_HALF_WIDTH_FRACTION)
+           if minimum_frequency is None else minimum_frequency)
+    high = (reference * (1 + FREQUENCY_HALF_WIDTH_FRACTION)
+            if maximum_frequency is None else maximum_frequency)
+    if low <= 0 or high <= low:
+        raise ValueError("The pre-registered physical frequency interval is invalid.")
     frequencies = [low + (high - low) * index / (FREQUENCY_GRID_SIZE - 1)
                    for index in range(FREQUENCY_GRID_SIZE)]
     fits = [_fit(times, flux, frequency) for frequency in frequencies]
@@ -87,7 +93,10 @@ def _scan(times: list[float], flux: list[float], reference: float) -> dict[str, 
     secondary_power = 1 - fits[secondary][0] / null_rss if secondary is not None and null_rss > 0 else 0.0
     return {"frequency": frequencies[winner], "power": power, "rss": fits[winner][0],
             "amplitude": fits[winner][1], "phase": fits[winner][2],
-            "secondaryPeakPowerRatio": secondary_power / power if power > 0 else 0.0}
+            "secondaryPeakPowerRatio": secondary_power / power if power > 0 else 0.0,
+            "minimumFrequency": low, "maximumFrequency": high,
+            "winnerGridIndex": winner,
+            "winnerAtSearchBoundary": winner <= 1 or winner >= FREQUENCY_GRID_SIZE - 2}
 
 
 def _correlation(x: list[float], y: list[float]) -> float:
@@ -193,20 +202,53 @@ def classify_target_component(*, preparation: dict[str, Any], decomposition: dic
             reasons.append(f"sector {entry.get('sector')} absolute-to-warped timing reconstruction disagrees")
             continue
         mean = sum(flux) / len(flux)
-        scan = _scan(local_times, [value - mean for value in flux], reference)
+        physical_times = absolute_times if absolute_times is not None else local_times
+        if absolute_times is not None:
+            time_reference = float(component["timeReferenceDays"])
+            q = float(component["fractionalFrequencyDriftPerDay"])
+            upstream_physical_frequencies = [
+                reference * (1.0 + q * (time - time_reference))
+                for time in absolute_times
+            ]
+            expected_minimum = min(upstream_physical_frequencies)
+            expected_maximum = max(upstream_physical_frequencies)
+            physical_minimum = expected_minimum * (1.0 - FREQUENCY_HALF_WIDTH_FRACTION)
+            physical_maximum = expected_maximum * (1.0 + FREQUENCY_HALF_WIDTH_FRACTION)
+        else:
+            q = None
+            expected_minimum = expected_maximum = None
+            physical_minimum = physical_maximum = None
+        scan = _scan(physical_times, [value - mean for value in flux], reference,
+                     minimum_frequency=physical_minimum,
+                     maximum_frequency=physical_maximum)
+        if scan["winnerAtSearchBoundary"]:
+            reasons.append(f"sector {entry.get('sector')} physical-frequency winner is search-boundary truncated")
+            continue
         windows = []
         for window in range(WINDOW_COUNT):
             start, end = len(flux) * window // WINDOW_COUNT, len(flux) * (window + 1) // WINDOW_COUNT
             if end - start >= MIN_WINDOW_SAMPLES:
-                _, amplitude, phase = _fit(local_times[start:end], flux[start:end], scan["frequency"])
-                windows.append({"sampleCount": end - start, "amplitude": amplitude, "phaseRadians": phase})
+                _, amplitude, phase = _fit(physical_times[start:end], flux[start:end], scan["frequency"])
+                windows.append({"sampleCount": end - start, "amplitude": amplitude,
+                                "phaseRadians": phase,
+                                "measurementCoordinate": ("ORIGINAL_ABSOLUTE_TIME"
+                                    if absolute_times is not None else
+                                    "SECTOR_LOCAL_WARPED_TIME_NO_CROSS_SECTOR_CLOCK")})
         scan.update({"sector": int(entry["sector"]), "datasetID": entry["datasetID"],
                      "sampleCount": len(flux), "windows": windows,
                      "observationEpochCommonWarpedDays": (sum(common_times) / len(common_times)
                                                            if common_times else None),
                      "observationEpochAbsoluteDays": (sum(absolute_times) / len(absolute_times)
                                                        if absolute_times else None),
-                     "commonTimes": common_times, "localTimes": local_times, "flux": flux})
+                     "frequencyCoordinate": ("ORIGINAL_ABSOLUTE_TIME"
+                                             if absolute_times is not None else
+                                             "SECTOR_LOCAL_WARPED_TIME_NO_CROSS_SECTOR_CLOCK"),
+                     "upstreamFractionalFrequencyDriftPerDay": q,
+                     "upstreamExpectedPhysicalFrequencyRange": (
+                         {"minimumFrequency": expected_minimum,
+                          "maximumFrequency": expected_maximum}
+                         if expected_minimum is not None else None),
+                     "commonTimes": common_times, "physicalTimes": physical_times, "flux": flux})
         evidence.append(scan)
     if len(evidence) < MIN_SECTORS:
         reasons.append("fewer than two frozen, valid target-component sectors remain")
@@ -222,7 +264,8 @@ def classify_target_component(*, preparation: dict[str, Any], decomposition: dic
         multi = any(item["secondaryPeakPowerRatio"] >= SECONDARY_PEAK_POWER_RATIO for item in evidence)
         count = sum(item["sampleCount"] for item in evidence)
         shared_frequency = sum(frequencies) / len(frequencies)
-        shared_rss = sum(_fit(item["localTimes"], item["flux"], shared_frequency)[0] for item in evidence)
+        shared_rss = sum(_fit(item["physicalTimes"], item["flux"], shared_frequency)[0]
+                         for item in evidence)
         free_rss = sum(item["rss"] for item in evidence)
         bic_shared = count * math.log(max(shared_rss / count, 1e-30)) + (2 * len(evidence) + 1) * math.log(count)
         bic_free = count * math.log(max(free_rss / count, 1e-30)) + 3 * len(evidence) * math.log(count)
@@ -238,13 +281,15 @@ def classify_target_component(*, preparation: dict[str, Any], decomposition: dic
             slope = (sum((epoch - epoch_mean) * (frequency - frequency_mean)
                          for epoch, frequency in zip(epochs, frequencies)) / slope_denominator
                      if slope_denominator else 0.0)
-            phases = [_fit(item["commonTimes"], item["flux"], shared_frequency)[2] for item in evidence]
+            phases = [_fit(item["physicalTimes"], item["flux"], shared_frequency)[2]
+                      for item in evidence]
             resultant = math.hypot(sum(math.cos(value) for value in phases),
                                    sum(math.sin(value) for value in phases)) / len(phases)
             phase_std = math.sqrt(max(0.0, -2 * math.log(max(resultant, 1e-15))))
             diagnostics.update({"frequencyDriftPerAbsoluteDay": slope,
                                 "frequencyEpochLinearCorrelation": correlation,
-                                "crossSectorPhaseCircularStdRadians": phase_std})
+                                "crossSectorPhaseCircularStdRadians": phase_std,
+                                "phaseCoherenceCoordinate": "ORIGINAL_ABSOLUTE_TIME"})
         else:
             correlation, phase_std = None, None
         if multi:
@@ -264,7 +309,7 @@ def classify_target_component(*, preparation: dict[str, Any], decomposition: dic
             classification = "STATIONARY_FREQUENCY_COMPATIBLE_TARGET_RESIDUAL"
 
     for item in evidence:
-        item.pop("commonTimes", None); item.pop("localTimes", None); item.pop("flux", None)
+        item.pop("commonTimes", None); item.pop("physicalTimes", None); item.pop("flux", None)
     return {"classification": classification, "targetComponentID": target_id,
             "sectorsUsed": [item["sector"] for item in evidence], "temporalModelEvidence": evidence,
             "modelSelectionDiagnostics": diagnostics, "failClosedReasons": reasons,
@@ -277,6 +322,9 @@ def classify_target_component(*, preparation: dict[str, Any], decomposition: dic
             "preRegisteredRules": {"minimumSectors": MIN_SECTORS, "minimumSamples": MIN_SAMPLES,
                 "windowCount": WINDOW_COUNT, "frequencyGridSize": FREQUENCY_GRID_SIZE,
                 "frequencyHalfWidthFraction": FREQUENCY_HALF_WIDTH_FRACTION,
+                "physicalFrequencySearchRule": (
+                    "[min(referenceFrequency*(1+q*(absoluteTime-timeReference)))*0.8, "
+                    "max(referenceFrequency*(1+q*(absoluteTime-timeReference)))*1.2]"),
                 "decisiveDeltaBIC": BIC_DECISIVE_DELTA, "frequencyDriftFraction": FREQUENCY_DRIFT_FRACTION,
                 "minimumDriftSectors": MIN_DRIFT_SECTORS,
                 "minimumDriftLinearCorrelation": MIN_DRIFT_LINEAR_CORRELATION,
