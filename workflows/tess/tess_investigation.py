@@ -72,6 +72,7 @@ from .tess_multisource_residual import (
     build_multisource_residual_project,
     interpret_multisource_residual_project,
 )
+from .tess_intrinsic_nonstationary import classify_target_component
 from .tess_offset_source import identify_offset_residual_source
 from .tess_offset_variability import (
     build_offset_source_variability_project,
@@ -188,7 +189,7 @@ from .tess_multisector import (
 WORKFLOW_ID = "openstar.workflow.tess-investigation.v1"
 WORKFLOW_VERSION = "20.2"
 SOFTWARE_ID = "openstar.tess-investigation-plugin"
-SOFTWARE_VERSION = "20.30"
+SOFTWARE_VERSION = "20.31"
 
 
 def _stage(investigation: Investigation, stage_id: str):
@@ -501,19 +502,31 @@ def residual_mode_localization_review_continuation(
 def multisource_residual_continuation(
     summary: dict[str, Any], *, request_id: str
 ) -> StageRequest:
-    """Enter the historical official-SPOC PRF path only on its exact request."""
+    """Continue only exact v20.12 boundaries, preserving historical routes."""
+
+    run_intrinsic = (
+        summary.get("recommendedNextTest")
+        == "INTRINSIC_NONSTATIONARY_VARIABILITY_CLASSIFICATION"
+        and summary.get("classification") == "TARGET_RESIDUAL_COMPONENT_DOMINANT"
+        and summary.get("residualModeOrigin") == "TARGET_DOMINANT"
+        and summary.get("physicalMechanismResolved") is False
+    )
 
     run_prf = (
         summary.get("recommendedNextTest") == "PIXEL_RESPONSE_FUNCTION_DEBLENDING"
         and summary.get("physicalMechanismResolved") is False
     )
+    label = "classify-intrinsic-target-residual" if run_intrinsic else (
+        "prepare-prf-deblending" if run_prf else "finalize"
+    )
     return StageRequest(
-        id=_next_stage_id(request_id, "prepare-prf-deblending" if run_prf else "finalize"),
+        id=_next_stage_id(request_id, label),
         handler_id=(
-            "openstar.tess.official-spoc-prf-forward-modeling.prepare"
-            if run_prf else "openstar.tess.finalize"
+            "openstar.tess.intrinsic-nonstationary.analyze" if run_intrinsic else
+            ("openstar.tess.official-spoc-prf-forward-modeling.prepare"
+             if run_prf else "openstar.tess.finalize")
         ),
-        parameters={} if run_prf else {"outputSuffix": "v20.12"},
+        parameters={} if (run_prf or run_intrinsic) else {"outputSuffix": "v20.12"},
         triggered_by_stage_id=request_id,
     )
 
@@ -3970,6 +3983,45 @@ def build_engine(
                 "preparation": sha256_json(preparation),
                 "projectResult": sha256_json(run),
             },
+            artifacts=(_artifact(artifact_path, "application/json"),),
+        )
+
+    def intrinsic_nonstationary_stage(investigation, request):
+        preparation_stage = next((stage for stage in reversed(investigation.stages)
+            if stage.handler_id == "openstar.tess.multi-source-residual.prepare"
+            and stage.status == "COMPLETE" and stage.result is not None), None)
+        decomposition_stage = next((stage for stage in reversed(investigation.stages)
+            if stage.handler_id == "openstar.tess.multi-source-residual.interpret"
+            and stage.status == "COMPLETE" and stage.result is not None), None)
+        if preparation_stage is None or decomposition_stage is None:
+            raise RuntimeError("Intrinsic classification requires completed v20.12 prepare + interpret stages.")
+        preparation = preparation_stage.result
+        decomposition = decomposition_stage.result
+        linked_hash = ((decomposition_stage.provenance.input_hashes or {}).get("preparation")
+                       if decomposition_stage.provenance is not None else None)
+        summary = classify_target_component(
+            preparation=preparation, decomposition=decomposition,
+            authoritative_artifacts=preparation_stage.artifacts,
+            preparation_link_verified=linked_hash == sha256_json(preparation),
+        )
+        summary["inputProvenance"].update({
+            "v20.12PreparationResultHash": sha256_json(preparation),
+            "v20.12InterpretationResultHash": sha256_json(decomposition),
+        })
+        artifact_path = (store.directory_for(investigation.id) / "artifacts" /
+                         "intrinsic-nonstationary" /
+                         "intrinsic-nonstationary-v20.31.json")
+        _write_json(artifact_path, summary)
+        return StageOutcome(
+            result=summary,
+            next_stage=StageRequest(
+                id=_next_stage_id(request.id, "finalize"),
+                handler_id="openstar.tess.finalize",
+                parameters={"outputSuffix": "v20.31"},
+                triggered_by_stage_id=request.id,
+            ),
+            input_hashes={"v20.12Preparation": sha256_json(preparation),
+                          "v20.12Interpretation": sha256_json(decomposition)},
             artifacts=(_artifact(artifact_path, "application/json"),),
         )
 
@@ -8968,6 +9020,10 @@ def build_engine(
     engine.register_handler(
         "openstar.tess.multi-source-residual.interpret",
         multisource_residual_interpret_stage,
+    )
+    engine.register_handler(
+        "openstar.tess.intrinsic-nonstationary.analyze",
+        intrinsic_nonstationary_stage,
     )
     engine.register_handler(
         "openstar.tess.offset-source-identification.analyze",

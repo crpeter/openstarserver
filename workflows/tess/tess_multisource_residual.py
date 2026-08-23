@@ -483,6 +483,13 @@ def build_multisource_residual_project(
                 coefficient_path = root / f"{_safe(dataset_id)}-coefficients.json"
                 _write_json(coefficient_path, {
                     "times": np.asarray(local_times, dtype=np.float64).tolist(),
+                    # Prospective v20.12 timing lineage.  ``times`` remains the
+                    # historical worker-local axis; this unshifted warped axis
+                    # is the common coordinate needed by later temporal science.
+                    "commonWarpedTimes": np.asarray(warped, dtype=np.float64).tolist(),
+                    "absoluteTimes": np.asarray(absolute_times, dtype=np.float64).tolist(),
+                    "timeReferenceDays": float(time_reference),
+                    "fractionalFrequencyDriftPerDay": float(q),
                     "coefficients": np.asarray(values, dtype=np.float64).tolist(),
                     "componentID": component_id,
                     "spatialComponentOrder": component.get("spatialComponentOrder"),
@@ -513,6 +520,8 @@ def build_multisource_residual_project(
                         "distributedSamples": int(len(local_times)),
                         "baselineDays": float(np.max(absolute_times) - np.min(absolute_times)),
                         "timeReferenceDays": float(time_reference),
+                        "localTimeOriginCommonWarpedDays": float(np.min(warped)),
+                        "timingSemantics": "times=commonWarpedTimes-localTimeOriginCommonWarpedDays",
                         "sourceType": source.get("sourceType"),
                         "author": source.get("author"),
                         "cadenceSeconds": source.get("cadenceSeconds"),
