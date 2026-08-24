@@ -116,6 +116,24 @@ def prewhiten_established_family(times: Iterable[float], flux: Iterable[float],
         "historicalResidualDriftExtrapolated": False}
 
 
+def _product_provenance(selected: Any, *, author: str,
+                        cadence_seconds: float | None) -> dict[str, Any]:
+    table = getattr(selected, "table", None)
+    columns = set(getattr(table, "colnames", []))
+    def value(*names: str) -> Any:
+        for name in names:
+            if name in columns and len(table):
+                item = table[name][0]
+                return item.item() if hasattr(item, "item") else str(item)
+        return None
+    return {"mission": value("mission") or "TESS", "author": author,
+        "cadenceSeconds": cadence_seconds,
+        "observationID": value("obs_id", "obsID", "observation_id"),
+        "productFilename": value("productFilename", "productFilename", "dataURI"),
+        "productURI": value("dataURI", "data_uri"),
+        "selectionRule": "official-author-priority-SPOC-then-TESS-SPOC; shortest-cadence; catalog-order"}
+
+
 def adjudicate_sector(candidate: dict[str, Any], envelope: tuple[float, float]) -> dict[str, Any]:
     low, high = map(float, envelope); result = copy.deepcopy(candidate)
     f = candidate.get("candidateFrequency"); ci = candidate.get("candidateFrequencyConfidenceInterval")
@@ -126,17 +144,20 @@ def adjudicate_sector(candidate: dict[str, Any], envelope: tuple[float, float]) 
     cycles = float(candidate.get("cycleCoverage") or (float(f)*baseline if isinstance(f,(int,float)) else 0))
     reliable = candidate.get("periodStatus") == "RELIABLE" and str(candidate.get("periodConfidence", "")).lower() in {"high","medium"}
     boundary = bool(candidate.get("boundaryHit")); inside = isinstance(f,(int,float)) and low <= f <= high
+    coverage_ok = cycles >= MIN_CYCLE_COVERAGE
+    eligible = coverage_ok and not boundary
     overlap = valid_ci and ci[1] >= low and ci[0] <= high
     resolved = valid_ci and rayleigh is not None and width <= rayleigh
-    supports = bool(reliable and cycles >= MIN_CYCLE_COVERAGE and not boundary and resolved and inside and overlap)
-    if supports: classification = "SUPPORTING_HISTORICAL_RESIDUAL_FAMILY"
+    supports = bool(eligible and reliable and resolved and inside and overlap)
+    if not eligible: classification = "INELIGIBLE"
+    elif supports: classification = "SUPPORTING_HISTORICAL_RESIDUAL_FAMILY"
     elif valid_ci and not resolved: classification = "RESOLUTION_LIMITED"
     elif reliable and not boundary and isinstance(f,(int,float)) and not inside: classification = "INTERIOR_RESIDUAL_BAND_PEAK_OUTSIDE_HISTORICAL_ENVELOPE"
     else: classification = "NONSUPPORTING"
     result.update({"candidateFrequency": f, "candidatePeriodDays": 1/f if isinstance(f,(int,float)) and f>0 else None,
         "candidateFrequencyConfidenceInterval": list(ci) if valid_ci else None,
         "rayleighFrequencyResolution": rayleigh, "boundaryHit": boundary, "cycleCoverage": cycles,
-        "eligibleForResidualRecurrence": True, "historicalFrequencyEnvelope": {"minimum":low,"maximum":high},
+        "eligibleForResidualRecurrence": eligible, "historicalFrequencyEnvelope": {"minimum":low,"maximum":high},
         "candidateInsideHistoricalEnvelope": inside, "confidenceIntervalOverlapsHistoricalEnvelope": bool(overlap),
         "frequencyIntervalResolved": bool(resolved), "supportsHistoricalResidualFamily": supports,
         "recurrenceClassification": classification})
@@ -170,7 +191,9 @@ def adjudicate_target(sectors: Iterable[dict[str, Any]]) -> dict[str, Any]:
         "FFI_ONLY_RESIDUAL_BASELINE_EXTENSION" if classification.endswith("INSUFFICIENT") else "EXTERNAL_LONG_BASELINE_OR_FFI_RESIDUAL_VALIDATION")
     return {"classification":classification,"recommendedNextTest":recommendation,"eligibleSectorCount":len(eligible),"supportingSectorCount":len(support),
         "resolutionLimitedSectorCount":sum(x.get("recurrenceClassification")=="RESOLUTION_LIMITED" for x in eligible),
-        "nonSupportingSectorCount":sum(not x.get("supportsHistoricalResidualFamily") for x in eligible),"supportingTemporalSpanDays":span,
+        "nonSupportingSectorCount":sum(x.get("recurrenceClassification") not in {
+            "SUPPORTING_HISTORICAL_RESIDUAL_FAMILY", "RESOLUTION_LIMITED"} for x in eligible),
+        "supportingTemporalSpanDays":span,
         "selectedFuturePixelFollowupSectors":_followups(support),"sectorEvidence":rows,"physicalMechanismResolved":False,"sourceAttributionResolved":False,
         "crossSectorPhaseUsed":False,"historicalResidualDriftExtrapolated":False}
 
@@ -186,6 +209,129 @@ def verified_json_result(stage: Any, filenames: str|tuple[str,...]) -> tuple[str
     raise RuntimeError(f"artifact SHA verification failed for {names[0]}")
 
 
+def _all_artifacts_verified(stage: Any) -> dict[str, str]:
+    verified = {}
+    for ref in stage.artifacts:
+        path = Path(ref.path)
+        if not ref.sha256 or not path.is_file() or sha256_file(path) != ref.sha256:
+            raise RuntimeError(f"artifact SHA verification failed for {path.name}")
+        verified[str(path.resolve())] = ref.sha256
+    if not verified:
+        raise RuntimeError(f"stage {stage.id} has no authoritative artifacts")
+    return verified
+
+
+def verify_frozen_science_lineage(stages: Iterable[Any]) -> dict[str, Any]:
+    """Verify the connected v20.12--v20.16 chain before any archive I/O."""
+    rows = list(stages)
+    def latest(handler: str) -> Any:
+        stage = next((s for s in reversed(rows) if s.handler_id == handler and
+                      s.status == "COMPLETE" and isinstance(s.result, dict)), None)
+        if stage is None: raise RuntimeError(f"missing frozen predecessor {handler}")
+        return stage
+    prepare_target = latest("openstar.tess.prepare-target")
+    morphology = latest("openstar.tess.morphology.analyze")
+    v12_prepare = latest("openstar.tess.multi-source-residual.prepare")
+    v12_interpret = latest("openstar.tess.multi-source-residual.interpret")
+    v13 = latest("openstar.tess.intrinsic-nonstationary.analyze")
+    v14 = latest("openstar.tess.target-residual-mechanism.analyze")
+    v16 = latest("openstar.tess.target-residual-mechanism-predictive-validation.analyze")
+    final = latest("openstar.tess.finalize")
+
+    artifact_hashes = {"prepareTargetArtifacts": _all_artifacts_verified(prepare_target),
+        "v20.12PreparationArtifacts": _all_artifacts_verified(v12_prepare)}
+    for item in v12_prepare.result.get("preparedSeries") or []:
+        for key in ("coefficientSeriesPath", "datasetPath"):
+            path = item.get(key)
+            if path and str(Path(path).resolve()) not in artifact_hashes["v20.12PreparationArtifacts"]:
+                raise RuntimeError(f"v20.12 preparedSeries {key} lacks an authoritative ArtifactReference")
+    target_hashes = prepare_target.provenance.input_hashes if prepare_target.provenance else {}
+    source_project = Path(str(prepare_target.result.get("sourceProjectPath") or ""))
+    source_dataset = Path(str(prepare_target.result.get("datasetPath") or ""))
+    primary_project_path = str(Path(str(prepare_target.result.get("projectPath") or "")).resolve())
+    if not (primary_project_path in artifact_hashes["prepareTargetArtifacts"]
+            and source_project.is_file() and source_dataset.is_file()
+            and target_hashes.get("sourceProjectManifest") == sha256_file(source_project)
+            and target_hashes.get("sourceDataset") == sha256_file(source_dataset)):
+        raise RuntimeError("prepare-target source project/dataset provenance is not authoritative")
+    morphology_sha, _ = verified_json_result(morphology, "morphology-v20.4.json")
+    v12_interpret_sha, _ = verified_json_result(v12_interpret, "multi-source-residual-v20.12.json")
+    v13_sha, _ = verified_json_result(v13, ("intrinsic-nonstationary-v20.13.json",
+                                             "intrinsic-nonstationary-v20.31.json"))
+    v14_sha, _ = verified_json_result(v14, "target-residual-mechanism-v20.14.json")
+    v16_sha, _ = verified_json_result(v16,
+        "target-residual-mechanism-predictive-validation-v20.16.json")
+    final_sha, _ = verified_json_result(final,
+        "conclusion-v20.16-target-residual-predictive-validation.json")
+
+    from .tess_target_residual_mechanism_predictive_validation import v2013_lineage_matches
+    v12_interpret_hashes = (v12_interpret.provenance.input_hashes
+                            if v12_interpret.provenance else {})
+    if v12_interpret_hashes.get("preparation") != sha256_json(v12_prepare.result):
+        raise RuntimeError("v20.12 interpretation does not bind its preparation")
+    v13_hashes = v13.provenance.input_hashes if v13.provenance else {}
+    if not v2013_lineage_matches(stage_input_hashes=v13_hashes,
+            result_input_provenance=v13.result.get("inputProvenance") or {},
+            preparation=v12_prepare.result, interpretation=v12_interpret.result):
+        raise RuntimeError("v20.13 does not bind the exact v20.12 snapshots")
+    v14_hashes = v14.provenance.input_hashes if v14.provenance else {}
+    if not (v14_hashes.get("v20.12Preparation") == sha256_json(v12_prepare.result)
+            and v14_hashes.get("v20.12Interpretation") == sha256_json(v12_interpret.result)
+            and v14_hashes.get("v20.13Result") == sha256_json(v13.result)):
+        raise RuntimeError("v20.14 lineage does not bind v20.12/v20.13")
+
+    source = v16.result.get("adjudicationSource") or {}
+    source_handler = source.get("handlerID")
+    if source_handler == "openstar.tess.target-residual-mechanism-adjudication.analyze":
+        v15 = latest(source_handler)
+        v15_sha, _ = verified_json_result(v15,
+            "target-residual-mechanism-adjudication-v20.15.json")
+        v15_hashes = v15.provenance.input_hashes if v15.provenance else {}
+        v15_input = v15.result.get("inputProvenance") or {}
+        if not (v15_hashes.get("v20.14Result") == sha256_json(v14.result)
+                and v15_hashes.get("v20.14Artifact") == v14_sha
+                and v15_input.get("frozenV20.14ResultHash") == sha256_json(v14.result)
+                and v15_input.get("frozenV20.14ArtifactSHA256") == v14_sha):
+            raise RuntimeError("v20.15 lineage does not bind frozen v20.14")
+        adjudication, adjudication_sha = v15, v15_sha
+    elif source_handler == "openstar.tess.target-residual-mechanism.analyze":
+        if v14.result.get("adjudicationVersion") != "route-independent-all-models-v1":
+            raise RuntimeError("direct v20.14 source lacks corrected semantics")
+        adjudication, adjudication_sha = v14, v14_sha
+    else:
+        raise RuntimeError("v20.16 adjudication source is not authoritative")
+    if not (source.get("stageID") == adjudication.id
+            and source.get("resultHash") == sha256_json(adjudication.result)
+            and source.get("artifactSHA256") == adjudication_sha
+            and v16.result.get("frozenV20.14ResultHash") == sha256_json(v14.result)
+            and v16.result.get("frozenV20.14ArtifactSHA256") == v14_sha
+            and v16.result.get("frozenV20.13ResultHash") == sha256_json(v13.result)
+            and v16.result.get("frozenV20.13ArtifactSHA256") == v13_sha):
+        raise RuntimeError("v20.16 does not bind the authoritative frozen chain")
+    v16_hashes = v16.provenance.input_hashes if v16.provenance else {}
+    if not (v16_hashes.get("adjudicationResult") == sha256_json(adjudication.result)
+            and v16_hashes.get("adjudicationArtifact") == adjudication_sha
+            and v16_hashes.get("v20.14Result") == sha256_json(v14.result)
+            and v16_hashes.get("v20.14Artifact") == v14_sha
+            and v16_hashes.get("v20.13Result") == sha256_json(v13.result)
+            and v16_hashes.get("v20.13Artifact") == v13_sha):
+        raise RuntimeError("v20.16 stage provenance does not bind the frozen chain")
+    if not (final.id == "031-finalize" and final.triggered_by_stage_id == v16.id
+            and final.parameters.get("outputSuffix") == "v20.16-target-residual-predictive-validation"
+            and final.result.get("targetResidualMechanismPredictiveValidation") == v16.result
+            and final.result.get("recommendedNextTest") ==
+                "ADDITIONAL_TEMPORAL_BASELINE_OR_MECHANISM_DISCRIMINATION"):
+        raise RuntimeError("031 conclusion is not the exact unresolved v20.16 boundary")
+    return {"prepareTarget": prepare_target, "morphology": morphology,
+        "v20.12Preparation": v12_prepare, "v20.12Interpretation": v12_interpret,
+        "v20.13": v13, "v20.14": v14, "adjudication": adjudication,
+        "v20.16": v16, "finalizer": final, "artifactHashes": artifact_hashes,
+        "verifiedArtifactSHA256": {"morphology": morphology_sha,
+            "v20.12Interpretation": v12_interpret_sha, "v20.13": v13_sha,
+            "v20.14": v14_sha, "adjudication": adjudication_sha,
+            "v20.16": v16_sha, "finalizer": final_sha}}
+
+
 def build_archival_baseline_project(*, source_project_path: str|Path,
         source_dataset_entry: dict[str,Any], tic_id: int, candidate_sectors: Iterable[int]|None,
         previously_consumed: dict[int,list[dict[str,str]]], residual_reference_frequency: float,
@@ -194,10 +340,11 @@ def build_archival_baseline_project(*, source_project_path: str|Path,
     """Query once and materialize every unseen official sector, without a science cap."""
     from .tess_multisector import (TessArchiveInfrastructureError,
         _MAST_LIGHTKURVE_LOCK, _archive_io_failure, _download_selected_sector,
-        _prepare_samples, _safe, _search_lightcurves, _select_product_from_search)
+        _prepare_samples_float64, _safe, _search_lightcurves, _select_product_from_search)
     grid=frozen_search_grid(residual_reference_frequency)  # freeze before archive I/O
-    sectors=sorted({_valid_sector(x) for x in candidate_sectors}) if candidate_sectors is not None else []
-    if None in sectors: raise ValueError("invalid archival sector ID")
+    parsed=[_valid_sector(x) for x in candidate_sectors] if candidate_sectors is not None else []
+    if None in parsed: raise ValueError("invalid archival sector ID")
+    sectors=sorted(set(parsed))
     source_project=json.loads(Path(source_project_path).read_text(encoding="utf-8"))
     materialized=[]; errors=[]
     try:
@@ -215,11 +362,15 @@ def build_archival_baseline_project(*, source_project_path: str|Path,
             for sector in eligible:
                 try:
                     selected,author,cadence=_select_product_from_search(search,sector)
+                    product = _product_provenance(selected, author=author,
+                                                  cadence_seconds=cadence)
                     lc,_=_download_selected_sector(selected,tic_id=tic_id,sector=sector,author=author,cadence_seconds=cadence)
-                    # Reuse the established immutable finite/sort/downsample path.
-                    times,normalized,prep=_prepare_samples(lc)
-                    residual,prewhite=prewhiten_established_family(times,normalized,established_frequency)
-                    materialized.append((sector,author,cadence,times,residual,prep,prewhite))
+                    # Fit in Float64, then and only then quantize the generic payload.
+                    times64,flux64,prep=_prepare_samples_float64(lc)
+                    residual,prewhite=prewhiten_established_family(times64,flux64,established_frequency)
+                    import numpy as np
+                    times=np.asarray(times64-times64[0],dtype=np.float32); times[0]=np.float32(0)
+                    materialized.append((sector,author,cadence,product,times,residual,prep,prewhite))
                 except Exception as error:
                     diagnostic={"sector":sector,"operation":"archive-materialization","error":f"{type(error).__name__}: {error}"}
                     if _archive_io_failure(error):
@@ -231,7 +382,7 @@ def build_archival_baseline_project(*, source_project_path: str|Path,
             raise TessArchiveInfrastructureError("TESS archive search is temporarily unavailable",{"errors":[{"sector":None,"operation":"archive-search","error":f"{type(error).__name__}: {error}"}]}) from error
         raise
     root=Path(output_dir)/"target-residual-archival-baseline"; entries=[]; prepared=[]
-    for sector,author,cadence,times,residual,prep,prewhite in materialized:
+    for sector,author,cadence,product,times,residual,prep,prewhite in materialized:
         dataset_id=f"{source_dataset_entry['id']}-sector-{sector}-archival-residual-v1"
         dataset={"id":dataset_id,"targetName":f"TIC {tic_id} archival residual Sector {sector}","timeUnit":"days",
             "timeReference":"relative-to-first-distributed-sample","numericRepresentation":"Float32","fluxUnit":"normalized-prewhitened-residual",
@@ -239,8 +390,10 @@ def build_archival_baseline_project(*, source_project_path: str|Path,
         path=root/f"{_safe(dataset_id)}.json"; path.parent.mkdir(parents=True,exist_ok=True); path.write_text(json.dumps(dataset,indent=2,allow_nan=False)+"\n",encoding="utf-8")
         entry=copy.deepcopy(source_dataset_entry); entry.update({"id":dataset_id,"path":str(path.resolve()),"ticID":int(tic_id),"sector":sector,"author":author,"cadenceSeconds":cadence,"role":"archival-target-residual-baseline"}); entries.append(entry)
         prepared.append({"sector":sector,"datasetID":dataset_id,"datasetPath":str(path.resolve()),"author":author,"cadenceSeconds":cadence,
-            "originalSamples":prep["originalSamples"],"finiteSampleCount":prep["originalSamples"],"distributedSamples":prep["distributedSamples"],
-            "originalTimeOriginDays":prep["originalTimeOriginDays"],"baselineDays":prep["baselineDays"],"priorSectorExclusionStatus":"UNSEEN_ADMITTED",
+            "originalSamples":prep["originalSamples"],"finiteSamples":prep["finiteSamples"],
+            "finiteSampleCount":prep["finiteSamples"],"distributedSamples":prep["distributedSamples"],
+            "originalTimeOriginDays":prep["originalTimeOriginDays"],"baselineDays":prep["baselineDaysFloat64"],"priorSectorExclusionStatus":"UNSEEN_ADMITTED",
+            "selectedProduct":product,
             "productSelectionRule":"official-author-priority-SPOC-then-TESS-SPOC; shortest-cadence; catalog-order",
             "prewhitening":prewhite,"frozenResidualReferenceFrequency":residual_reference_frequency,"frequencySearch":dict(grid)})
     project_id=f"{source_project['id']}.investigation.{_safe(investigation_id)}.archival-residual-v1"

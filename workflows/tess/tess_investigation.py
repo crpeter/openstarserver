@@ -83,7 +83,7 @@ from .tess_target_residual_mechanism_predictive_validation import (
 )
 from .tess_target_residual_archival_baseline import (
     adjudicate_target, adjudicate_sector, build_archival_baseline_project,
-    previously_consumed_tess_sectors, verified_json_result,
+    previously_consumed_tess_sectors, verify_frozen_science_lineage,
 )
 from .tess_offset_source import identify_offset_residual_source
 from .tess_offset_variability import (
@@ -4242,24 +4242,17 @@ def build_engine(
     def archival_baseline_prepare_stage(investigation, request):
         if any(s.handler_id.startswith("openstar.tess.target-residual-archival-baseline.") and s.id != request.id for s in investigation.stages):
             raise RuntimeError("an existing v20.17 archival-baseline attempt already exists")
-        handlers=("openstar.tess.multi-source-residual.prepare","openstar.tess.multi-source-residual.interpret",
-            "openstar.tess.intrinsic-nonstationary.analyze","openstar.tess.target-residual-mechanism.analyze",
-            "openstar.tess.target-residual-mechanism-predictive-validation.analyze","openstar.tess.finalize")
-        frozen=[]
-        for handler in handlers:
-            stage=next((s for s in reversed(investigation.stages) if s.handler_id==handler and s.status=="COMPLETE"),None)
-            if stage is None: raise RuntimeError(f"v20.17 missing frozen predecessor {handler}")
-            verified_json_result(stage,tuple(Path(a.path).name for a in stage.artifacts if Path(a.path).suffix==".json"))
-            frozen.append(stage)
-        prep,decomposition,v13,v14,v16,final=frozen
+        lineage=verify_frozen_science_lineage(investigation.stages)
+        prep=lineage["v20.12Preparation"]; decomposition=lineage["v20.12Interpretation"]
+        v13=lineage["v20.13"]
         target=[x for x in decomposition.result.get("componentSummaries") or [] if x.get("componentID")=="target" and x.get("componentType")=="TARGET"]
         if len(target)!=1: raise RuntimeError("v20.17 requires exactly one frozen TARGET component")
         reference=float(target[0]["combinedFrequency"])
         frequencies=[float(x["frequency"]) for x in v13.result.get("temporalModelEvidence") or [] if x.get("frequency") is not None]
         if not frequencies: raise RuntimeError("v20.17 has no lineage-verified historical frequency envelope")
-        morphology=_required_latest_result_for_handler(investigation,"openstar.tess.morphology.analyze")
+        morphology=lineage["morphology"].result
         established_period=float(morphology["resolvedPhysicalPeriodDays"])
-        primary=_required_latest_result_for_handler(investigation,"openstar.tess.prepare-target")
+        primary=lineage["prepareTarget"].result
         exclusions=previously_consumed_tess_sectors(investigation.stages)
         spec=build_archival_baseline_project(source_project_path=primary["sourceProjectPath"],source_dataset_entry=primary["sourceDatasetEntry"],
             tic_id=int(primary["ticID"]),candidate_sectors=None,previously_consumed=exclusions,residual_reference_frequency=reference,
@@ -4267,9 +4260,16 @@ def build_engine(
             output_dir=store.directory_for(investigation.id)/"artifacts",investigation_id=investigation.id)
         artifact_path=store.directory_for(investigation.id)/"artifacts"/"target-residual-archival-baseline"/"target-residual-archival-baseline-prepare-v20.17.json"
         _write_json(artifact_path,spec)
-        return StageOutcome(result=spec,next_stage=StageRequest("033-target-residual-archival-baseline-run",
-            "openstar.tess.target-residual-archival-baseline.run",{"projectPath":spec["projectPath"]},request.id),
-            input_hashes={f"predecessor:{s.id}":sha256_json(s.result) for s in frozen},artifacts=(_artifact(artifact_path,"application/json"),))
+        next_stage=StageRequest("033-target-residual-archival-baseline-run",
+            "openstar.tess.target-residual-archival-baseline.run",{"projectPath":spec["projectPath"]},request.id) if spec["available"] else StageRequest(
+            "034-target-residual-archival-baseline-interpret",
+            "openstar.tess.target-residual-archival-baseline.interpret",{"noProject":True},request.id)
+        return StageOutcome(result=spec,next_stage=next_stage,
+            input_hashes={**{f"predecessor:{key}":sha256_json(stage.result) for key,stage in lineage.items() if hasattr(stage,"result")},
+                "prepareTargetResult":sha256_json(lineage["prepareTarget"].result),
+                "morphologyPhysicalPeriodResult":sha256_json(lineage["morphology"].result),
+                **{f"artifact:{key}":value for key,value in lineage["verifiedArtifactSHA256"].items()}},
+            artifacts=(_artifact(artifact_path,"application/json"),))
 
     def archival_baseline_run_stage(investigation, request):
         run=coordinator.run_project(request.parameters["projectPath"],poll_interval=poll_interval,timeout=timeout)
@@ -4278,7 +4278,11 @@ def build_engine(
 
     def archival_baseline_interpret_stage(investigation, request):
         spec=_required_latest_result_for_handler(investigation,"openstar.tess.target-residual-archival-baseline.prepare")
-        run=_required_latest_result_for_handler(investigation,"openstar.tess.target-residual-archival-baseline.run")
+        run=_latest_result_for_handler(investigation,"openstar.tess.target-residual-archival-baseline.run")
+        if run is None:
+            if request.parameters.get("noProject") is not True or spec.get("available") is not False:
+                raise RuntimeError("v20.17 interpretation is missing its generic run")
+            run={"datasets":[]}
         prepared={x["datasetID"]:x for x in spec.get("preparedSectors") or []}; evidence=[]
         grid=spec["frequencySearch"]
         for row in run.get("datasets") or []:

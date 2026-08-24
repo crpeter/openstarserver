@@ -236,9 +236,11 @@ def _rank_independent_sectors(
 
 
 
-def _prepare_samples(light_curve: Any) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+def _prepare_samples_float64(light_curve: Any) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+    """Materialize immutable finite/sorted/downsampled Float64 archive samples."""
     times64 = np.asarray(light_curve.time.value, dtype=np.float64)
     flux64 = np.asarray(light_curve.flux.value, dtype=np.float64)
+    original_count = len(times64)
     finite = np.isfinite(times64) & np.isfinite(flux64)
     times64 = times64[finite]
     flux64 = flux64[finite]
@@ -250,12 +252,25 @@ def _prepare_samples(light_curve: Any) -> tuple[np.ndarray, np.ndarray, dict[str
     times64 = times64[order]
     flux64 = flux64[order]
 
-    source_count = len(times64)
-    selected_count = min(source_count, MAX_SAMPLES_PER_SECTOR)
-    if selected_count < source_count:
-        indices = np.linspace(0, source_count - 1, selected_count, dtype=np.int64)
+    finite_count = len(times64)
+    selected_count = min(finite_count, MAX_SAMPLES_PER_SECTOR)
+    if selected_count < finite_count:
+        indices = np.linspace(0, finite_count - 1, selected_count, dtype=np.int64)
         times64 = times64[indices]
         flux64 = flux64[indices]
+
+    time_origin = float(times64[0])
+    return times64, flux64, {
+        "originalSamples": int(original_count),
+        "finiteSamples": int(finite_count),
+        "distributedSamples": int(len(times64)),
+        "originalTimeOriginDays": time_origin,
+        "baselineDaysFloat64": float(times64[-1] - times64[0]),
+    }
+
+
+def _prepare_samples(light_curve: Any) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+    times64, flux64, raw = _prepare_samples_float64(light_curve)
 
     flux_mean = float(np.mean(flux64))
     flux_stddev = float(np.std(flux64))
@@ -263,7 +278,7 @@ def _prepare_samples(light_curve: Any) -> tuple[np.ndarray, np.ndarray, dict[str
         raise RuntimeError("Independent sector has invalid flux standard deviation.")
 
     normalized64 = (flux64 - flux_mean) / flux_stddev
-    time_origin = float(times64[0])
+    time_origin = raw["originalTimeOriginDays"]
     relative64 = times64 - time_origin
     times = np.asarray(relative64, dtype=np.float32)
     flux = np.asarray(normalized64, dtype=np.float32)
@@ -274,7 +289,9 @@ def _prepare_samples(light_curve: Any) -> tuple[np.ndarray, np.ndarray, dict[str
 
     baseline = float(times[-1] - times[0]) if len(times) > 1 else 0.0
     return times, flux, {
-        "originalSamples": int(source_count),
+        # Preserve the historical meaning/numerics of the old independent path:
+        # this field counted finite rows before downsampling.
+        "originalSamples": raw["finiteSamples"],
         "distributedSamples": int(len(times)),
         "originalTimeOriginDays": time_origin,
         "sourceFluxMean": flux_mean,
