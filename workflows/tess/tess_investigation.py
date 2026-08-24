@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+
 import json
 from functools import wraps
 from pathlib import Path
@@ -4397,7 +4399,19 @@ def build_engine(
         if any(stage.handler_id.startswith("openstar.tess.target-residual-multisector-source.")
                and stage.id != request.id for stage in investigation.stages):
             raise RuntimeError("an existing v20.19 attempt already exists")
-        lineage = verify_v2018_lineage(investigation.stages, resolver=historical_path_resolver)
+        current_stage = investigation.stages[-1] if investigation.stages else None
+        if (
+            current_stage is None
+            or current_stage.id != request.id
+            or current_stage.handler_id != "openstar.tess.target-residual-multisector-source.prepare"
+            or current_stage.status != "RUNNING"
+            or current_stage.triggered_by_stage_id != "039-finalize"
+        ):
+            raise RuntimeError("invalid active v20.19 prepare stage")
+        lineage = verify_v2018_lineage(
+            investigation.stages[:-1],
+            resolver=historical_path_resolver,
+        )
         old_prepare = lineage["prepare"].result
         old_run = lineage["run"].result
         v17_science = lineage["v20.17"]["science"].result
