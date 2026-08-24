@@ -4254,10 +4254,19 @@ def build_engine(
         established_period=float(morphology["resolvedPhysicalPeriodDays"])
         primary=lineage["prepareTarget"].result
         exclusions=previously_consumed_tess_sectors(investigation.stages)
-        spec=build_archival_baseline_project(source_project_path=primary["sourceProjectPath"],source_dataset_entry=primary["sourceDatasetEntry"],
-            tic_id=int(primary["ticID"]),candidate_sectors=None,previously_consumed=exclusions,residual_reference_frequency=reference,
-            established_frequency=1/established_period,historical_frequency_envelope=(min(frequencies),max(frequencies)),
-            output_dir=store.directory_for(investigation.id)/"artifacts",investigation_id=investigation.id)
+        frozen_input_hashes={**{f"predecessor:{key}":sha256_json(stage.result)
+            for key,stage in lineage.items() if hasattr(stage,"result")},
+            "prepareTargetResult":sha256_json(lineage["prepareTarget"].result),
+            "morphologyPhysicalPeriodResult":sha256_json(lineage["morphology"].result),
+            **{f"artifact:{key}":value for key,value in lineage["verifiedArtifactSHA256"].items()}}
+        try:
+            spec=build_archival_baseline_project(source_project_path=primary["sourceProjectPath"],source_dataset_entry=primary["sourceDatasetEntry"],
+                tic_id=int(primary["ticID"]),candidate_sectors=None,previously_consumed=exclusions,residual_reference_frequency=reference,
+                established_frequency=1/established_period,historical_frequency_envelope=(min(frequencies),max(frequencies)),
+                output_dir=store.directory_for(investigation.id)/"artifacts",investigation_id=investigation.id)
+        except TessArchiveInfrastructureError as error:
+            raise RetryableExecutionError(str(error), result=error.diagnostics,
+                input_hashes=frozen_input_hashes) from error
         artifact_path=store.directory_for(investigation.id)/"artifacts"/"target-residual-archival-baseline"/"target-residual-archival-baseline-prepare-v20.17.json"
         _write_json(artifact_path,spec)
         next_stage=StageRequest("033-target-residual-archival-baseline-run",
@@ -4265,10 +4274,7 @@ def build_engine(
             "034-target-residual-archival-baseline-interpret",
             "openstar.tess.target-residual-archival-baseline.interpret",{"noProject":True},request.id)
         return StageOutcome(result=spec,next_stage=next_stage,
-            input_hashes={**{f"predecessor:{key}":sha256_json(stage.result) for key,stage in lineage.items() if hasattr(stage,"result")},
-                "prepareTargetResult":sha256_json(lineage["prepareTarget"].result),
-                "morphologyPhysicalPeriodResult":sha256_json(lineage["morphology"].result),
-                **{f"artifact:{key}":value for key,value in lineage["verifiedArtifactSHA256"].items()}},
+            input_hashes=frozen_input_hashes,
             artifacts=(_artifact(artifact_path,"application/json"),))
 
     def archival_baseline_run_stage(investigation, request):

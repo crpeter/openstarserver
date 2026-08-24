@@ -148,10 +148,15 @@ def adjudicate_sector(candidate: dict[str, Any], envelope: tuple[float, float]) 
     eligible = coverage_ok and not boundary
     overlap = valid_ci and ci[1] >= low and ci[0] <= high
     resolved = valid_ci and rayleigh is not None and width <= rayleigh
+    distance = (0.0 if inside else min(abs(float(f)-low), abs(float(f)-high))
+                if isinstance(f, (int, float)) and math.isfinite(float(f)) else None)
+    missing_ci_resolution_limited = bool(eligible and reliable and not valid_ci
+        and rayleigh is not None and distance is not None and distance < rayleigh)
     supports = bool(eligible and reliable and resolved and inside and overlap)
     if not eligible: classification = "INELIGIBLE"
     elif supports: classification = "SUPPORTING_HISTORICAL_RESIDUAL_FAMILY"
-    elif valid_ci and not resolved: classification = "RESOLUTION_LIMITED"
+    elif (valid_ci and not resolved) or missing_ci_resolution_limited:
+        classification = "RESOLUTION_LIMITED"
     elif reliable and not boundary and isinstance(f,(int,float)) and not inside: classification = "INTERIOR_RESIDUAL_BAND_PEAK_OUTSIDE_HISTORICAL_ENVELOPE"
     else: classification = "NONSUPPORTING"
     result.update({"candidateFrequency": f, "candidatePeriodDays": 1/f if isinstance(f,(int,float)) and f>0 else None,
@@ -160,6 +165,7 @@ def adjudicate_sector(candidate: dict[str, Any], envelope: tuple[float, float]) 
         "eligibleForResidualRecurrence": eligible, "historicalFrequencyEnvelope": {"minimum":low,"maximum":high},
         "candidateInsideHistoricalEnvelope": inside, "confidenceIntervalOverlapsHistoricalEnvelope": bool(overlap),
         "frequencyIntervalResolved": bool(resolved), "supportsHistoricalResidualFamily": supports,
+        "candidateDistanceToHistoricalEnvelope": distance,
         "recurrenceClassification": classification})
     return result
 
@@ -231,6 +237,16 @@ def verify_frozen_science_lineage(stages: Iterable[Any]) -> dict[str, Any]:
         return stage
     prepare_target = latest("openstar.tess.prepare-target")
     morphology = latest("openstar.tess.morphology.analyze")
+    independent_prepare = latest("openstar.tess.independent.prepare")
+    harmonic_family = next((s for s in reversed(rows) if s.handler_id ==
+        "openstar.tess.independent.harmonic-family.interpret" and
+        s.status == "COMPLETE" and isinstance(s.result, dict)), None)
+    broad_family = next((s for s in reversed(rows) if s.handler_id ==
+        "openstar.tess.independent.broad.interpret" and
+        s.status == "COMPLETE" and isinstance(s.result, dict)), None)
+    family_stage = harmonic_family or broad_family
+    if family_stage is None:
+        raise RuntimeError("missing authoritative morphology period family")
     v12_prepare = latest("openstar.tess.multi-source-residual.prepare")
     v12_interpret = latest("openstar.tess.multi-source-residual.interpret")
     v13 = latest("openstar.tess.intrinsic-nonstationary.analyze")
@@ -255,6 +271,18 @@ def verify_frozen_science_lineage(stages: Iterable[Any]) -> dict[str, Any]:
             and target_hashes.get("sourceDataset") == sha256_file(source_dataset)):
         raise RuntimeError("prepare-target source project/dataset provenance is not authoritative")
     morphology_sha, _ = verified_json_result(morphology, "morphology-v20.4.json")
+    morphology_hashes = morphology.provenance.input_hashes if morphology.provenance else {}
+    exact_family = (family_stage.result.get("harmonicFamily") or {})
+    if morphology_hashes.get("periodFamily") != sha256_json(exact_family):
+        raise RuntimeError("morphology period-family lineage is inconsistent")
+    if morphology_hashes.get("primaryDataset") != sha256_file(source_dataset):
+        raise RuntimeError("morphology primary-dataset lineage is inconsistent")
+    for item in independent_prepare.result.get("preparedSectors") or []:
+        sector, raw_path = item.get("sector"), item.get("datasetPath")
+        path = Path(str(raw_path or ""))
+        if (not path.is_file() or morphology_hashes.get(f"independentSector{sector}")
+                != sha256_file(path)):
+            raise RuntimeError(f"morphology independent Sector {sector} lineage is inconsistent")
     v12_interpret_sha, _ = verified_json_result(v12_interpret, "multi-source-residual-v20.12.json")
     v13_sha, _ = verified_json_result(v13, ("intrinsic-nonstationary-v20.13.json",
                                              "intrinsic-nonstationary-v20.31.json"))
@@ -323,6 +351,7 @@ def verify_frozen_science_lineage(stages: Iterable[Any]) -> dict[str, Any]:
                 "ADDITIONAL_TEMPORAL_BASELINE_OR_MECHANISM_DISCRIMINATION"):
         raise RuntimeError("031 conclusion is not the exact unresolved v20.16 boundary")
     return {"prepareTarget": prepare_target, "morphology": morphology,
+        "independentPreparation": independent_prepare, "morphologyFamily": family_stage,
         "v20.12Preparation": v12_prepare, "v20.12Interpretation": v12_interpret,
         "v20.13": v13, "v20.14": v14, "adjudication": adjudication,
         "v20.16": v16, "finalizer": final, "artifactHashes": artifact_hashes,

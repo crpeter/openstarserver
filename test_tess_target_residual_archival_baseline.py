@@ -2,6 +2,7 @@ import math
 import unittest
 import json
 import tempfile
+from unittest import mock
 from pathlib import Path
 try:
     import numpy as np
@@ -52,6 +53,16 @@ class TessTargetResidualArchivalBaselineTests(unittest.TestCase):
             self.assertFalse(adjudicate_sector(self._candidate(**changed),(.09,.11))["supportsHistoricalResidualFamily"])
         limited=adjudicate_sector(self._candidate(candidateFrequencyConfidenceInterval={"lower":.05,"upper":.15}),(.09,.11))
         self.assertEqual("RESOLUTION_LIMITED",limited["recurrenceClassification"])
+
+    def test_missing_ci_is_resolution_limited_only_within_rayleigh_distance(self):
+        inside=adjudicate_sector(self._candidate(1,candidateFrequencyConfidenceInterval=None),(.09,.11))
+        near=adjudicate_sector(self._candidate(2,frequency=.12,candidateFrequencyConfidenceInterval=None),(.09,.11))
+        far=adjudicate_sector(self._candidate(3,frequency=.20,candidateFrequencyConfidenceInterval=None),(.09,.11))
+        self.assertEqual("RESOLUTION_LIMITED",inside["recurrenceClassification"])
+        self.assertEqual("RESOLUTION_LIMITED",near["recurrenceClassification"])
+        self.assertEqual("INTERIOR_RESIDUAL_BAND_PEAK_OUTSIDE_HISTORICAL_ENVELOPE",far["recurrenceClassification"])
+        counts=adjudicate_target([inside,near,far])
+        self.assertEqual((3,0,2,1),(counts["eligibleSectorCount"],counts["supportingSectorCount"],counts["resolutionLimitedSectorCount"],counts["nonSupportingSectorCount"]))
 
     def test_target_classifications_and_invariants(self):
         rows=[adjudicate_sector(self._candidate(i,.1,(i-1)*400),(.09,.11)) for i in range(1,4)]
@@ -174,8 +185,15 @@ class TessTargetResidualArchivalBaselineTests(unittest.TestCase):
         target_result={"sourceProjectPath":str(source_project),"datasetPath":str(source_dataset),"projectPath":primary_manifest.path,"ticID":1,"sourceDatasetEntry":{"id":"d"}}
         target=InvestigationStage("001-prepare-target","openstar.tess.prepare-target","COMPLETE",None,{},result=target_result,
             artifacts=(primary_manifest,),provenance=StageProvenance("test","1",{"sourceProjectManifest":sha256_file(source_project),"sourceDataset":sha256_file(source_dataset)}))
+        independent_dataset=root/"independent-sector-2.json"; independent_dataset.write_text('{}\n')
+        independent_result={"preparedSectors":[{"sector":2,"datasetPath":str(independent_dataset)}]}
+        independent=stage("005-independent","openstar.tess.independent.prepare",independent_result,"independent.json")
+        family_result={"harmonicFamily":{"representativeRawPeriodDays":5.0,"possibleDoubleCycleDays":10.0}}
+        family_handler=("openstar.tess.independent.broad.interpret" if direct else
+            "openstar.tess.independent.harmonic-family.interpret")
+        family=stage("009-family",family_handler,family_result,"family.json")
         morphology_result={"resolvedPhysicalPeriodDays":10.0}
-        morphology=stage("010-morphology","openstar.tess.morphology.analyze",morphology_result,"morphology-v20.4.json")
+        morphology=stage("010-morphology","openstar.tess.morphology.analyze",morphology_result,"morphology-v20.4.json",{"periodFamily":sha256_json(family_result["harmonicFamily"]),"primaryDataset":sha256_file(source_dataset),"independentSector2":sha256_file(independent_dataset)})
         prep_result={"preparedSeries":[]}; prep=stage("020-prep","openstar.tess.multi-source-residual.prepare",prep_result,"prepared-dataset.json")
         interpretation_result={"componentSummaries":[]}; interpretation=stage("021-interpret","openstar.tess.multi-source-residual.interpret",interpretation_result,"multi-source-residual-v20.12.json",{"preparation":sha256_json(prep_result)})
         v13_result={"inputProvenance":{"v20.12PreparationResultHash":sha256_json(prep_result),"v20.12InterpretationResultHash":sha256_json(interpretation_result)}}
@@ -193,7 +211,7 @@ class TessTargetResidualArchivalBaselineTests(unittest.TestCase):
         v16=stage("030-target-residual-mechanism-predictive-validation","openstar.tess.target-residual-mechanism-predictive-validation.analyze",v16_result,"target-residual-mechanism-predictive-validation-v20.16.json",{"adjudicationResult":sha256_json(adjudication.result),"adjudicationArtifact":adjudication.artifacts[0].sha256,"v20.14Result":sha256_json(v14_result),"v20.14Artifact":v14_sha,"v20.13Result":sha256_json(v13_result),"v20.13Artifact":v13.artifacts[0].sha256})
         conclusion={"targetResidualMechanismPredictiveValidation":v16_result,"recommendedNextTest":"ADDITIONAL_TEMPORAL_BASELINE_OR_MECHANISM_DISCRIMINATION"}
         final=stage("031-finalize","openstar.tess.finalize",conclusion,"conclusion-v20.16-target-residual-predictive-validation.json",trigger=v16.id,parameters={"outputSuffix":"v20.16-target-residual-predictive-validation"})
-        return [target,morphology,prep,interpretation,v13,v14]+([] if direct else [v15])+[v16,final]
+        return [target,independent,family,morphology,prep,interpretation,v13,v14]+([] if direct else [v15])+[v16,final]
 
     def test_connected_historical_v2015_and_direct_v2014_lineages_verify(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -202,7 +220,7 @@ class TessTargetResidualArchivalBaselineTests(unittest.TestCase):
             self.assertEqual("028-v14",verify_frozen_science_lineage(self._lineage(directory,True))["adjudication"].id)
 
     def test_each_broken_lineage_link_fails_closed(self):
-        for index,key in ((4,"v20.12Preparation"),(5,"v20.13Result"),(6,"v20.14Result")):
+        for index,key in ((6,"v20.12Preparation"),(7,"v20.13Result"),(8,"v20.14Result")):
             with self.subTest(key=key), tempfile.TemporaryDirectory() as directory:
                 stages=self._lineage(directory)
                 target=stages[index]; hashes=dict(target.provenance.input_hashes); hashes[key]="broken"
@@ -211,10 +229,49 @@ class TessTargetResidualArchivalBaselineTests(unittest.TestCase):
 
     def test_modified_artifact_or_final_conclusion_fails_closed(self):
         with tempfile.TemporaryDirectory() as directory:
-            stages=self._lineage(directory); Path(stages[4].artifacts[0].path).write_text('{}')
+            stages=self._lineage(directory); Path(stages[6].artifacts[0].path).write_text('{}')
             with self.assertRaises(RuntimeError): verify_frozen_science_lineage(stages)
         with tempfile.TemporaryDirectory() as directory:
             stages=self._lineage(directory); stages[-1]=replace(stages[-1],result={"recommendedNextTest":"wrong"})
             with self.assertRaises(RuntimeError): verify_frozen_science_lineage(stages)
+
+    def test_morphology_lineage_mutations_fail_closed(self):
+        for mutation in ("family", "primary", "independent"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as directory:
+                stages=self._lineage(directory)
+                if mutation == "family":
+                    morphology=stages[3]; hashes=dict(morphology.provenance.input_hashes); hashes["periodFamily"]="broken"
+                    stages[3]=replace(morphology,provenance=replace(morphology.provenance,input_hashes=hashes))
+                elif mutation == "primary":
+                    Path(stages[0].result["datasetPath"]).write_text('{"changed":true}')
+                else:
+                    Path(stages[1].result["preparedSectors"][0]["datasetPath"]).write_text('{"changed":true}')
+                with self.assertRaises(RuntimeError): verify_frozen_science_lineage(stages)
+
+    @unittest.skipIf(np is None or not hasattr(np, "asarray"), "NumPy is required for workflow-handler integration")
+    def test_archive_infrastructure_errors_are_retryable_at_prepare_handler(self):
+        from openstar_workflow import RetryableExecutionError, StageRequest
+        from workflows.tess.tess_investigation import build_engine
+        from workflows.tess.tess_multisector import TessArchiveInfrastructureError
+        with tempfile.TemporaryDirectory() as directory:
+            store=InvestigationStore(Path(directory)/"investigations")
+            inv=store.create("retryable-archival",WORKFLOW_ID,WORKFLOW_VERSION)
+            dummy=lambda result: SimpleNamespace(result=result)
+            lineage={"v20.12Preparation":dummy({}),"v20.12Interpretation":dummy({"componentSummaries":[{"componentID":"target","componentType":"TARGET","combinedFrequency":.1}]}),
+                "v20.13":dummy({"temporalModelEvidence":[{"frequency":.095},{"frequency":.105}]}),
+                "morphology":dummy({"resolvedPhysicalPeriodDays":10.}),
+                "prepareTarget":dummy({"sourceProjectPath":"unused","sourceDatasetEntry":{"id":"d"},"ticID":1}),
+                "verifiedArtifactSHA256":{"v20.16":"abc"}}
+            engine=build_engine(store,SimpleNamespace(),poll_interval=0,timeout=None)
+            for operation in ("archive-search","archive-materialization"):
+                error=TessArchiveInfrastructureError("temporary MAST outage",{"errors":[{"operation":operation}]})
+                with self.subTest(operation=operation), mock.patch(
+                    "workflows.tess.tess_investigation.verify_frozen_science_lineage",return_value=lineage), mock.patch(
+                    "workflows.tess.tess_investigation.build_archival_baseline_project",side_effect=error):
+                    with self.assertRaises(RetryableExecutionError) as caught:
+                        engine.handlers["openstar.tess.target-residual-archival-baseline.prepare"](
+                            inv,StageRequest("032-target-residual-archival-baseline-prepare","openstar.tess.target-residual-archival-baseline.prepare",{}))
+                    self.assertEqual(error.diagnostics,caught.exception.result)
+                    self.assertIn("artifact:v20.16",caught.exception.input_hashes)
 
 if __name__ == "__main__": unittest.main()
