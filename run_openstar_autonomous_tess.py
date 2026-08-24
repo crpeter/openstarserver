@@ -18,6 +18,7 @@ from openstar_external_jobs import (
 from openstar_dispatch import InvestigationDispatcher
 from openstar_investigation import InvestigationStore
 from openstar_lifecycle import InvestigationLifecycleLoop, LifecycleResult
+from openstar_path_relocation import HistoricalPathResolver
 from openstar_scheduler import InvestigationScheduler
 from openstar_science_runs import recorded_science_run
 from openstar_state_storage import require_durable_state_path
@@ -71,6 +72,7 @@ def run_autonomous_tess(
     multi_investigation: bool = False,
     max_concurrent_investigations: int | None = None,
     allow_temporary_state: bool = False,
+    historical_path_resolver: HistoricalPathResolver | None = None,
 ) -> int:
     """Construct and run the existing lifecycle, returning a process exit code."""
     root = require_durable_state_path(state_dir, allow_temporary_state=allow_temporary_state)
@@ -101,9 +103,10 @@ def run_autonomous_tess(
     # after the last job completed but before its investigation was awakened.
     apply_external_job_wakeups(store, external_jobs.ready_dependencies())
     coordinator = OpenStarCoordinatorClient(coordinator_url)
-    workflow = register_tess_workflow_handlers(
-        store, coordinator, poll_interval=poll_interval, timeout=timeout
-    )
+    workflow_options = {"poll_interval": poll_interval, "timeout": timeout}
+    if historical_path_resolver is not None:
+        workflow_options["historical_path_resolver"] = historical_path_resolver
+    workflow = register_tess_workflow_handlers(store, coordinator, **workflow_options)
     dispatcher = InvestigationDispatcher(store, workflow)
     source = TessInvestigationTargetSource(project_paths)
     if multi_investigation:
@@ -193,6 +196,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--coordinator-url", required=True)
     parser.add_argument("--state-dir", required=True)
     parser.add_argument("--allow-temporary-state", action="store_true")
+    parser.add_argument(
+        "--relocate-historical-root", action="append", default=[], metavar="OLD=NEW",
+        help="Read immutable paths beneath OLD from the explicit durable directory NEW.",
+    )
     parser.add_argument("--poll-interval", type=float, default=1.0)
     parser.add_argument("--timeout", type=float)
     parser.add_argument("--multi-investigation", action="store_true")
@@ -207,6 +214,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         and args.max_concurrent_investigations <= 0
     ):
         parser.error("--max-concurrent-investigations must be positive")
+    mappings = []
+    for entry in args.relocate_historical_root:
+        if entry.count("=") != 1 or not all(part.strip() for part in entry.split("=", 1)):
+            parser.error("--relocate-historical-root requires OLD=NEW")
+        mappings.append(tuple(part.strip() for part in entry.split("=", 1)))
+    try:
+        args.historical_path_resolver = HistoricalPathResolver(mappings)
+    except (ValueError, RuntimeError) as error:
+        parser.error(str(error))
     return args
 
 
@@ -222,6 +238,7 @@ def main(argv: list[str] | None = None) -> int:
             multi_investigation=args.multi_investigation,
             max_concurrent_investigations=args.max_concurrent_investigations,
             allow_temporary_state=args.allow_temporary_state,
+            historical_path_resolver=args.historical_path_resolver,
         )
     except KeyboardInterrupt:
         print("OpenStar lifecycle: disposition=SHUTDOWN", file=sys.stderr)

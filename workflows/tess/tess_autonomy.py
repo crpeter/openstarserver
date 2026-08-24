@@ -2326,6 +2326,7 @@ def register_tess_workflow_handlers(
     *,
     poll_interval: float = 1.0,
     timeout: float | None = None,
+    historical_path_resolver=None,
 ) -> WorkflowEngine:
     """Register the existing v20.28 TESS handlers for autonomous dispatch."""
 
@@ -2336,6 +2337,7 @@ def register_tess_workflow_handlers(
         coordinator,
         poll_interval=poll_interval,
         timeout=timeout,
+        historical_path_resolver=historical_path_resolver,
     )
     engine.chain_stages = False
     return engine

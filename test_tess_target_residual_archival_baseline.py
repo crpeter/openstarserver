@@ -2,6 +2,9 @@ import math
 import unittest
 import json
 import tempfile
+import shutil
+import copy
+import uuid
 from unittest import mock
 from pathlib import Path
 try:
@@ -11,6 +14,7 @@ except ModuleNotFoundError:
 from types import SimpleNamespace
 from dataclasses import replace
 from openstar_investigation import (ArtifactReference, InvestigationStage, InvestigationStore, StageProvenance, sha256_file, sha256_json)
+from openstar_path_relocation import HistoricalPathResolver
 from workflows.tess.tess_autonomy import WORKFLOW_ID, WORKFLOW_VERSION, repair_obsolete_terminal_wait
 from workflows.tess.tess_target_residual_archival_baseline import (
     FREQUENCIES_PER_WORK_UNIT, HARMONIC_ORDERS, TOTAL_FREQUENCIES,
@@ -238,8 +242,9 @@ class TessTargetResidualArchivalBaselineTests(unittest.TestCase):
                     '{"altered":true}\n',encoding="utf-8")
                 self.assertEqual(inv,repair_obsolete_terminal_wait(store,inv))
 
-    def _lineage(self, directory, direct=False):
+    def _lineage(self, directory, direct=False, shallow_directory=None):
         root=Path(directory)
+        shallow_root=Path(shallow_directory) if shallow_directory else root
         def artifact(name,value):
             path=root/name; path.write_text(json.dumps(value)+"\n",encoding="utf-8")
             return ArtifactReference(str(path),sha256_file(path),"application/json")
@@ -252,18 +257,31 @@ class TessTargetResidualArchivalBaselineTests(unittest.TestCase):
         target_result={"sourceProjectPath":str(source_project),"datasetPath":str(source_dataset),"projectPath":primary_manifest.path,"ticID":1,"sourceDatasetEntry":{"id":"d"}}
         target=InvestigationStage("001-prepare-target","openstar.tess.prepare-target","COMPLETE",None,{},result=target_result,
             artifacts=(primary_manifest,),provenance=StageProvenance("test","1",{"sourceProjectManifest":sha256_file(source_project),"sourceDataset":sha256_file(source_dataset)}))
-        independent_dataset=root/"independent-sector-2.json"; independent_dataset.write_text('{}\n')
+        independent_dataset=shallow_root/"independent-sector-2.json"; independent_dataset.write_text('{}\n')
         independent_result={"preparedSectors":[{"sector":2,"datasetPath":str(independent_dataset)}]}
-        independent=stage("005-independent","openstar.tess.independent.prepare",independent_result,"independent.json")
+        independent_path=shallow_root/"independent.json"
+        independent_path.write_text(json.dumps(independent_result)+"\n",encoding="utf-8")
+        independent=InvestigationStage("005-independent","openstar.tess.independent.prepare","COMPLETE",None,{},result=independent_result,
+            artifacts=(ArtifactReference(str(independent_path),sha256_file(independent_path),"application/json"),),
+            provenance=StageProvenance("test","1",{}))
         family_result={"harmonicFamily":{"representativeRawPeriodDays":5.0,"possibleDoubleCycleDays":10.0}}
         family_handler=("openstar.tess.independent.broad.interpret" if direct else
             "openstar.tess.independent.harmonic-family.interpret")
         family=stage("009-family",family_handler,family_result,"family.json")
         morphology_result={"resolvedPhysicalPeriodDays":10.0}
         morphology=stage("010-morphology","openstar.tess.morphology.analyze",morphology_result,"morphology-v20.4.json",{"periodFamily":sha256_json(family_result["harmonicFamily"]),"primaryDataset":sha256_file(source_dataset),"independentSector2":sha256_file(independent_dataset)})
-        prep_result={"preparedSeries":[]}; prep=stage("020-prep","openstar.tess.multi-source-residual.prepare",prep_result,"prepared-dataset.json")
-        interpretation_result={"componentSummaries":[]}; interpretation=stage("021-interpret","openstar.tess.multi-source-residual.interpret",interpretation_result,"multi-source-residual-v20.12.json",{"preparation":sha256_json(prep_result)})
-        v13_result={"inputProvenance":{"v20.12PreparationResultHash":sha256_json(prep_result),"v20.12InterpretationResultHash":sha256_json(interpretation_result)}}
+        coefficient_path=root/"target-coefficients.json"; coefficient_path.write_text('{}\n')
+        residual_dataset_path=root/"target-residual-dataset.json"; residual_dataset_path.write_text('{}\n')
+        prep_result={"preparedSeries":[{"componentID":"target",
+            "coefficientSeriesPath":str(coefficient_path),"datasetPath":str(residual_dataset_path)}]}
+        prep_result_path=root/"prepared-dataset.json"; prep_result_path.write_text(json.dumps(prep_result)+"\n")
+        prep=InvestigationStage("020-prep","openstar.tess.multi-source-residual.prepare","COMPLETE",None,{},result=prep_result,
+            artifacts=tuple(ArtifactReference(str(path),sha256_file(path),"application/json")
+                for path in (prep_result_path,coefficient_path,residual_dataset_path)),
+            provenance=StageProvenance("test","1",{}))
+        interpretation_result={"componentSummaries":[{"componentID":"target","componentType":"TARGET","combinedFrequency":.1}]}; interpretation=stage("021-interpret","openstar.tess.multi-source-residual.interpret",interpretation_result,"multi-source-residual-v20.12.json",{"preparation":sha256_json(prep_result)})
+        v13_result={"inputProvenance":{"v20.12PreparationResultHash":sha256_json(prep_result),"v20.12InterpretationResultHash":sha256_json(interpretation_result)},
+            "temporalModelEvidence":[{"frequency":.095},{"frequency":.105}]}
         v13=stage("022-v13","openstar.tess.intrinsic-nonstationary.analyze",v13_result,"intrinsic-nonstationary-v20.31.json",{"v20.12Preparation":sha256_json(prep_result),"v20.12Interpretation":sha256_json(interpretation_result)})
         v14_result={"adjudicationVersion":"route-independent-all-models-v1"}
         v14=stage("028-v14","openstar.tess.target-residual-mechanism.analyze",v14_result,"target-residual-mechanism-v20.14.json",{"v20.12Preparation":sha256_json(prep_result),"v20.12Interpretation":sha256_json(interpretation_result),"v20.13Result":sha256_json(v13_result)})
@@ -279,6 +297,86 @@ class TessTargetResidualArchivalBaselineTests(unittest.TestCase):
         conclusion={"targetResidualMechanismPredictiveValidation":v16_result,"recommendedNextTest":"ADDITIONAL_TEMPORAL_BASELINE_OR_MECHANISM_DISCRIMINATION"}
         final=stage("031-finalize","openstar.tess.finalize",conclusion,"conclusion-v20.16-target-residual-predictive-validation.json",trigger=v16.id,parameters={"outputSuffix":"v20.16-target-residual-predictive-validation"})
         return [target,independent,family,morphology,prep,interpretation,v13,v14]+([] if direct else [v15])+[v16,final]
+
+    def _durable_test_root(self):
+        root=Path.cwd()/f".v2017-relocation-{uuid.uuid4().hex}"
+        root.mkdir()
+        self.addCleanup(shutil.rmtree,root,True)
+        return root
+
+    def _relocated_lineage(self):
+        historical=tempfile.TemporaryDirectory(); self.addCleanup(historical.cleanup)
+        old=Path(historical.name); deep=old/"historical-deep"; shallow=old/"historical-shallow"
+        deep.mkdir(); shallow.mkdir()
+        stages=self._lineage(deep,shallow_directory=shallow)
+        frozen=copy.deepcopy(stages)
+        durable=self._durable_test_root(); durable_deep=durable/"deep"; durable_shallow=durable/"shallow"
+        shutil.copytree(deep,durable_deep); shutil.copytree(shallow,durable_shallow)
+        shutil.rmtree(deep); shutil.rmtree(shallow)
+        resolver=HistoricalPathResolver([(deep,durable_deep),(shallow,durable_shallow)])
+        return stages,frozen,resolver,(deep,shallow),(durable_deep,durable_shallow)
+
+    def test_complete_frozen_lineage_survives_two_root_relocation_unchanged(self):
+        stages,frozen,resolver,old,durable=self._relocated_lineage()
+        expected={ref.path:ref.sha256 for stage in stages for ref in stage.artifacts}
+        verified=verify_frozen_science_lineage(stages,resolver=resolver)
+        self.assertEqual("029-v15",verified["adjudication"].id)
+        self.assertEqual(frozen,stages)
+        self.assertEqual(expected,{ref.path:ref.sha256 for stage in stages for ref in stage.artifacts})
+        self.assertFalse(any(path.exists() for path in old))
+        for stage in stages:
+            for ref in stage.artifacts:
+                self.assertEqual(ref.sha256,sha256_file(resolver.resolve(ref.path)))
+
+    def test_relocated_lineage_fails_closed_for_missing_or_changed_files(self):
+        cases=("no resolver","missing mapped artifact","changed mapped bytes",
+            "mapped JSON differs from result","deep only","shallow only")
+        for case in cases:
+            with self.subTest(case=case):
+                stages,_,resolver,old,durable=self._relocated_lineage()
+                selected=resolver
+                if case == "no resolver": selected=None
+                elif case == "missing mapped artifact": resolver.resolve(stages[-1].artifacts[0].path).unlink()
+                elif case == "changed mapped bytes": resolver.resolve(stages[-2].artifacts[0].path).write_text('{"changed":true}\n')
+                elif case == "mapped JSON differs from result":
+                    path=resolver.resolve(stages[3].artifacts[0].path); path.write_text('{"different":true}\n')
+                elif case == "deep only": selected=HistoricalPathResolver({old[0]:durable[0]})
+                else: selected=HistoricalPathResolver({old[1]:durable[1]})
+                if case == "mapped JSON differs from result":
+                    expected=stages[3].artifacts[0].sha256
+                    real_sha=sha256_file
+                    with mock.patch("workflows.tess.tess_target_residual_archival_baseline.sha256_file",
+                            side_effect=lambda candidate: expected if Path(candidate)==path else real_sha(candidate)):
+                        with self.assertRaisesRegex(RuntimeError,"frozen artifact JSON differ"):
+                            verify_frozen_science_lineage(stages,resolver=selected)
+                else:
+                    with self.assertRaises(RuntimeError):
+                        verify_frozen_science_lineage(stages,resolver=selected)
+
+    @unittest.skipIf(np is None or not hasattr(np,"asarray"),
+        "NumPy is required to import the full workflow engine")
+    def test_v2017_prepare_reads_relocation_and_writes_only_durable_store(self):
+        from openstar_workflow import StageRequest
+        from workflows.tess.tess_investigation import build_engine
+        stages,frozen,resolver,old,_=self._relocated_lineage()
+        working=self._durable_test_root()/"working"
+        store=InvestigationStore(working/"investigations")
+        inv=replace(store.create("relocated",WORKFLOW_ID,WORKFLOW_VERSION),stages=tuple(stages))
+        engine=build_engine(store,SimpleNamespace(),poll_interval=0,timeout=None,
+            historical_path_resolver=resolver)
+        empty={"available":False,"projectID":None,"projectPath":None,"preparedSectors":[],"errors":[],
+            "frequencySearch":frozen_search_grid(.1),"frozenResidualReferenceFrequency":.1,
+            "frozenResidualReferencePeriodDays":10.,"historicalFrequencyEnvelope":{"minimum":.095,"maximum":.105}}
+        with mock.patch("workflows.tess.tess_investigation.build_archival_baseline_project",return_value=empty) as builder:
+            outcome=engine.handlers["openstar.tess.target-residual-archival-baseline.prepare"](
+                inv,StageRequest("032-target-residual-archival-baseline-prepare",
+                    "openstar.tess.target-residual-archival-baseline.prepare",{}))
+        self.assertEqual(frozen,stages)
+        self.assertFalse(any(path.exists() for path in old))
+        self.assertEqual(resolver.resolve(stages[0].result["sourceProjectPath"]),
+            Path(builder.call_args.kwargs["source_project_path"]))
+        self.assertTrue(outcome.artifacts[0].path.startswith(str(working.resolve())))
+        self.assertFalse(any(outcome.artifacts[0].path.startswith(str(path)) for path in old))
 
     def test_connected_historical_v2015_and_direct_v2014_lineages_verify(self):
         with tempfile.TemporaryDirectory() as directory:
