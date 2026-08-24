@@ -29,6 +29,18 @@ except ModuleNotFoundError as error:
 
 @unittest.skipIf(classify_centroid is None, "optional numerical dependencies unavailable")
 class TargetResidualPixelRecurrenceTests(unittest.TestCase):
+    STALE_V2017_CONTROL = {
+        "branchAssessments": [],
+        "recovery": "TESS_V20_16_ARCHIVAL_BASELINE_EXTENSION_V20_17",
+        "schedulerAction": "RUN_EXPERIMENT",
+        "selectedExperiment": {
+            "handler_id": "openstar.tess.target-residual-archival-baseline.prepare",
+            "id": "032-target-residual-archival-baseline-prepare",
+            "parameters": {},
+            "triggered_by_stage_id": "031-finalize",
+        },
+    }
+
     def _boundary(self,directory,classification="ARCHIVAL_TARGET_RESIDUAL_RECURRENCE_SUPPORTED"):
         base=archival_tests.TessTargetResidualArchivalBaselineTests(methodName="test_constants_preserve_generic_boundary")
         stages=base._lineage(directory)
@@ -84,6 +96,62 @@ class TargetResidualPixelRecurrenceTests(unittest.TestCase):
                 self.assertEqual("036-target-residual-pixel-recurrence-prepare",admitted.metadata["controlState"]["selectedExperiment"]["id"])
                 self.assertEqual(before,admitted.stages)
                 self.assertEqual(admitted,repair_obsolete_terminal_wait(store,admitted))
+
+    def test_exact_stale_v2017_control_admits_append_only_and_idempotently(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store,inv=self._boundary(directory); before=inv.stages
+            inv=store.set_control_state(inv,status="COMPLETE",
+                control_state=copy.deepcopy(self.STALE_V2017_CONTROL))
+            admitted=repair_obsolete_terminal_wait(store,inv)
+            self.assertEqual("RUNNING",admitted.status)
+            self.assertEqual("036-target-residual-pixel-recurrence-prepare",
+                admitted.metadata["controlState"]["selectedExperiment"]["id"])
+            self.assertIs(before,admitted.stages)
+            self.assertEqual(admitted,repair_obsolete_terminal_wait(store,admitted))
+
+    def test_near_miss_stale_v2017_controls_refuse(self):
+        changes = {
+            "recovery": lambda c: c.update(recovery="WRONG"),
+            "handler": lambda c: c["selectedExperiment"].update(handler_id="wrong"),
+            "stage_id": lambda c: c["selectedExperiment"].update(id="wrong"),
+            "trigger": lambda c: c["selectedExperiment"].update(triggered_by_stage_id="wrong"),
+            "parameters": lambda c: c["selectedExperiment"].update(parameters={"extra": True}),
+        }
+        for name,alter in changes.items():
+            with self.subTest(name=name),tempfile.TemporaryDirectory() as directory:
+                store,inv=self._boundary(directory); control=copy.deepcopy(self.STALE_V2017_CONTROL)
+                alter(control); inv=store.set_control_state(inv,status="COMPLETE",control_state=control)
+                self.assertEqual(inv,repair_obsolete_terminal_wait(store,inv))
+
+    def test_stale_control_retains_all_v2018_lineage_safeguards(self):
+        for change in ("science","artifact","existing"):
+            with self.subTest(change=change),tempfile.TemporaryDirectory() as directory:
+                store,inv=self._boundary(directory)
+                if change == "science":
+                    result=copy.deepcopy(inv.stages[-2].result); result["recommendedNextTest"]="WRONG"
+                    inv=self._replace_science_consistently(inv,result)
+                elif change == "artifact":
+                    Path(inv.stages[-2].artifacts[0].path).write_text("{}\n")
+                else:
+                    inv=replace(inv,stages=inv.stages+(InvestigationStage("036-existing",
+                        "openstar.tess.target-residual-pixel-recurrence.prepare","FAILED",
+                        inv.stages[-1].id,{}),))
+                inv=store.set_control_state(inv,status="COMPLETE",
+                    control_state=copy.deepcopy(self.STALE_V2017_CONTROL))
+                self.assertEqual(inv,repair_obsolete_terminal_wait(store,inv))
+
+    def test_stale_control_admission_uses_relocated_v2017_artifacts(self):
+        root=Path.cwd()/f".v2018-stale-relocation-{uuid.uuid4().hex}"; self.addCleanup(shutil.rmtree,root,True)
+        old=root/"OLD"; new=root/"NEW"; active=root/"ACTIVE"; old.mkdir(parents=True)
+        _,inv=self._boundary(old); before=inv.stages
+        inv=replace(inv,status="COMPLETE",metadata={**inv.metadata,
+            "controlState":copy.deepcopy(self.STALE_V2017_CONTROL)})
+        shutil.copytree(old,new); shutil.rmtree(old)
+        admitted=repair_obsolete_terminal_wait(InvestigationStore(active),inv,
+            historical_path_resolver=HistoricalPathResolver({old:new}))
+        self.assertEqual("036-target-residual-pixel-recurrence-prepare",
+            admitted.metadata["controlState"]["selectedExperiment"]["id"])
+        self.assertIs(before,admitted.stages)
 
     def test_complete_v2017_history_relocates_without_rewriting_immutable_paths(self):
         root=Path.cwd()/f".v2018-relocation-{uuid.uuid4().hex}"; self.addCleanup(shutil.rmtree,root,True)
