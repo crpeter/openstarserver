@@ -86,6 +86,9 @@ from .tess_target_residual_archival_baseline import (
     adjudicate_target, adjudicate_sector, build_archival_baseline_project,
     previously_consumed_tess_sectors, verify_frozen_science_lineage,
 )
+from .tess_target_residual_pixel_recurrence import (
+    verify_v2017_lineage, interpret_sectors, frozen_catalog_hypotheses, measure_sector,
+)
 from .tess_offset_source import identify_offset_residual_source
 from .tess_offset_variability import (
     build_offset_source_variability_project,
@@ -202,7 +205,7 @@ from .tess_multisector import (
 WORKFLOW_ID = "openstar.workflow.tess-investigation.v1"
 WORKFLOW_VERSION = "20.2"
 SOFTWARE_ID = "openstar.tess-investigation-plugin"
-SOFTWARE_VERSION = "20.34"
+SOFTWARE_VERSION = "20.35"
 
 
 def _stage(investigation: Investigation, stage_id: str):
@@ -4308,6 +4311,71 @@ def build_engine(
             {"outputSuffix":"v20.17-target-residual-archival-baseline"},request.id),
             input_hashes={"preparation":sha256_json(spec),"distributedResult":sha256_json(run)},artifacts=(_artifact(artifact_path,"application/json"),))
 
+    def pixel_recurrence_prepare_stage(investigation, request):
+        if any(s.handler_id.startswith("openstar.tess.target-residual-pixel-recurrence.") and s.id != request.id for s in investigation.stages):
+            raise RuntimeError("an existing v20.18 attempt already exists")
+        lineage=verify_v2017_lineage(investigation.stages,resolver=historical_path_resolver)
+        primary=_result(investigation,"001-prepare-target")
+        identity=_required_latest_result_for_handler(investigation,"openstar.tess.catalog-identity")
+        metadata=((identity.get("tic") or {}).get("metadata") or {})
+        ra=primary.get("raDeg",metadata.get("raDeg")); dec=primary.get("decDeg",metadata.get("decDeg"))
+        if ra is None or dec is None: raise RuntimeError("authoritative target sky position is absent")
+        hypotheses=frozen_catalog_hypotheses(identity,tic_id=int(primary["ticID"]),ra_deg=float(ra),dec_deg=float(dec))
+        morphology=lineage["science"]  # boundary hash anchors the sector list below
+        old=lineage["frozenScienceLineage"]
+        established=1/float(old["morphology"].result["resolvedPhysicalPeriodDays"])
+        result={"version":"openstar.tess-target-residual-pixel-recurrence-preparation.v1",
+            "ticID":int(primary["ticID"]),"targetSourceID":f"TIC-{int(primary['ticID'])}",
+            "targetSky":{"raDeg":float(ra),"decDeg":float(dec)},"catalogHypotheses":hypotheses,
+            "catalogHypothesesFrozenBeforePixelAcquisition":True,
+            "selectedSectorEvidence":lineage["selectedSectorEvidence"],
+            "frozenEstablishedPhysicalFrequency":established,"crossSectorPhaseUsed":False,
+            "historicalResidualDriftExtrapolated":False}
+        path=store.directory_for(investigation.id)/"artifacts"/"target-residual-pixel-recurrence"/"target-residual-pixel-recurrence-prepare-v20.18.json"; _write_json(path,result)
+        return StageOutcome(result=result,next_stage=StageRequest("037-target-residual-pixel-recurrence-run",
+            "openstar.tess.target-residual-pixel-recurrence.run",{},request.id),
+            input_hashes={"v20.17":sha256_json(morphology.result)},artifacts=(_artifact(path,"application/json"),))
+
+    def pixel_recurrence_run_stage(investigation, request):
+        import numpy as np
+        from .tess_residual_localization import _download_tpf, _background_subtract_cube
+        from .tess_offset_variability import _skycoord
+        prep=_required_latest_result_for_handler(investigation,"openstar.tess.target-residual-pixel-recurrence.prepare")
+        rows=[]
+        for frozen in prep["selectedSectorEvidence"]:
+            sector=int(frozen["sector"])
+            try:
+                tpf,source=_download_tpf(tic_id=prep["ticID"],sector=sector,
+                    ra_deg=prep["targetSky"]["raDeg"],dec_deg=prep["targetSky"]["decDeg"])
+                times=np.asarray(tpf.time.value,float); flux=np.asarray(getattr(tpf.flux,"value",tpf.flux),float)
+                keep=np.isfinite(times)&np.any(np.isfinite(flux.reshape(len(flux),-1)),axis=1); times=times[keep]; flux=flux[keep]
+                cube,_=_background_subtract_cube(flux); valid=np.any(np.isfinite(cube),axis=0)
+                hypotheses=[]
+                for item in prep["catalogHypotheses"]:
+                    x,y=tpf.wcs.world_to_pixel(_skycoord(item["raDeg"],item["decDeg"]))
+                    hypotheses.append({**item,"x":float(x),"y":float(y)})
+                measured=measure_sector(times,cube,valid,established_frequency=prep["frozenEstablishedPhysicalFrequency"],
+                    candidate_frequency=frozen["candidateFrequency"],hypotheses=hypotheses)
+                rows.append({**frozen,**measured,"sector":sector,"pixelSourceType":source.get("sourceType"),
+                    "author":source.get("author"),"cadenceSeconds":source.get("cadenceSeconds"),"usableCadenceCount":len(times),
+                    "catalogPixelPositions":hypotheses,"acquisitionProvenance":source,"acquisitionErrors":[]})
+            except FileNotFoundError as error:
+                rows.append({**frozen,"sector":sector,"classification":"UNAVAILABLE","acquisitionErrors":[str(error)]})
+        result={"version":"openstar.tess-target-residual-pixel-recurrence-run.v1","sectorResults":rows,
+            "crossSectorPhaseUsed":False,"historicalResidualDriftExtrapolated":False}
+        path=store.directory_for(investigation.id)/"artifacts"/"target-residual-pixel-recurrence"/"target-residual-pixel-recurrence-run-v20.18.json"; _write_json(path,result)
+        return StageOutcome(result=result,next_stage=StageRequest("038-target-residual-pixel-recurrence-interpret",
+            "openstar.tess.target-residual-pixel-recurrence.interpret",{},request.id),input_hashes={"preparation":sha256_json(prep)},artifacts=(_artifact(path,"application/json"),))
+
+    def pixel_recurrence_interpret_stage(investigation, request):
+        prep=_required_latest_result_for_handler(investigation,"openstar.tess.target-residual-pixel-recurrence.prepare")
+        run=_required_latest_result_for_handler(investigation,"openstar.tess.target-residual-pixel-recurrence.run")
+        summary=interpret_sectors(run["sectorResults"],prep["targetSourceID"])
+        path=store.directory_for(investigation.id)/"artifacts"/"target-residual-pixel-recurrence"/"target-residual-pixel-recurrence-v20.18.json"; _write_json(path,summary)
+        return StageOutcome(result=summary,next_stage=StageRequest("039-finalize","openstar.tess.finalize",
+            {"outputSuffix":"v20.18-target-residual-pixel-recurrence-validation"},request.id),
+            input_hashes={"preparation":sha256_json(prep),"run":sha256_json(run)},artifacts=(_artifact(path,"application/json"),))
+
     def prf_deblending_prepare_stage(investigation, request):
         required_handlers = {
             "targetPreparation": "openstar.tess.prepare-target",
@@ -7829,6 +7897,9 @@ def build_engine(
         target_residual_archival_baseline_extension = _latest_result_for_handler(
             investigation, "openstar.tess.target-residual-archival-baseline.interpret",
         )
+        target_residual_pixel_recurrence = _latest_result_for_handler(
+            investigation, "openstar.tess.target-residual-pixel-recurrence.interpret",
+        )
 
         if harmonic_family_interpretation is not None:
             claim_decision = harmonic_family_interpretation["claimDecision"]
@@ -8872,6 +8943,7 @@ def build_engine(
                 target_residual_mechanism_predictive_validation
             ),
             "targetResidualArchivalBaselineExtension": target_residual_archival_baseline_extension,
+            "targetResidualPixelRecurrenceValidation": target_residual_pixel_recurrence,
             "offsetResidualSourceIdentification": offset_source_identification,
             "offsetSourceVariabilityValidation": offset_source_variability,
             "calibratedPrfSourceDeblending": calibrated_prf_deblending,
@@ -9394,6 +9466,9 @@ def build_engine(
     engine.register_handler("openstar.tess.target-residual-archival-baseline.prepare", archival_baseline_prepare_stage)
     engine.register_handler("openstar.tess.target-residual-archival-baseline.run", archival_baseline_run_stage)
     engine.register_handler("openstar.tess.target-residual-archival-baseline.interpret", archival_baseline_interpret_stage)
+    engine.register_handler("openstar.tess.target-residual-pixel-recurrence.prepare", pixel_recurrence_prepare_stage)
+    engine.register_handler("openstar.tess.target-residual-pixel-recurrence.run", pixel_recurrence_run_stage)
+    engine.register_handler("openstar.tess.target-residual-pixel-recurrence.interpret", pixel_recurrence_interpret_stage)
     engine.register_handler(
         "openstar.tess.offset-source-identification.analyze",
         offset_source_identification_stage,

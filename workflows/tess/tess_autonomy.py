@@ -29,6 +29,26 @@ WORKFLOW_ID = "openstar.workflow.tess-investigation.v1"
 WORKFLOW_VERSION = "20.2"
 
 _V2017_HANDLER_PREFIX = "openstar.tess.target-residual-archival-baseline."
+_V2018_HANDLER_PREFIX = "openstar.tess.target-residual-pixel-recurrence."
+
+
+def _continue_finalized_v2017_pixel_recurrence(store, investigation, control, *, historical_path_resolver):
+    """Admit only the cryptographically verified v20.17 terminal boundary."""
+    if (investigation.status != "COMPLETE"
+            or control.get("schedulerAction") != "INVESTIGATION_COMPLETE"
+            or any(s.handler_id.startswith(_V2018_HANDLER_PREFIX) for s in investigation.stages)):
+        return None
+    try:
+        from .tess_target_residual_pixel_recurrence import verify_v2017_lineage
+        lineage = verify_v2017_lineage(investigation.stages, resolver=historical_path_resolver)
+    except (RuntimeError, ValueError, OSError, KeyError, TypeError):
+        return None
+    if lineage["finalizer"] is not investigation.stages[-1]: return None
+    request=StageRequest("036-target-residual-pixel-recurrence-prepare",
+        "openstar.tess.target-residual-pixel-recurrence.prepare",{},lineage["finalizer"].id)
+    return store.set_control_state(investigation,status="RUNNING",control_state={
+        "branchAssessments":[],"selectedExperiment":asdict(request),"schedulerAction":"RUN_EXPERIMENT",
+        "recovery":"TESS_V20_17_PIXEL_RECURRENCE_LOCALIZATION_V20_18"})
 
 
 def _verified_stage_json(
@@ -1377,6 +1397,10 @@ def repair_obsolete_terminal_wait(
         return investigation
 
     resolver = historical_path_resolver or NO_HISTORICAL_PATH_RELOCATION
+    pixel = _continue_finalized_v2017_pixel_recurrence(
+        store, investigation, control, historical_path_resolver=resolver)
+    if pixel is not None:
+        return pixel
     archival = _continue_finalized_v2016_archival_baseline(
         store, investigation, control, historical_path_resolver=resolver)
     if archival is not None:
