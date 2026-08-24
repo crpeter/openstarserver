@@ -12,7 +12,7 @@ from openstar_autonomy import (
     ExternalDataDependency,
     ScientificBranch,
 )
-from openstar_investigation import Investigation, InvestigationStore, sha256_file
+from openstar_investigation import Investigation, InvestigationStore, sha256_file, sha256_json
 from openstar_targets import InvestigationTarget
 from openstar_workflow import StageRequest, WorkflowEngine
 from .tess_localization_evidence import frozen_residual_localization_family
@@ -190,13 +190,41 @@ def _v2015_predictive_validation_boundary(investigation: Investigation):
             for item in investigation.stages):
         return None
     result = stage.result
+    artifacts = [ref for ref in stage.artifacts
+        if Path(ref.path).name == "target-residual-mechanism-adjudication-v20.15.json"]
+    if len(artifacts) != 1:
+        return None
+    artifact = artifacts[0]
+    try:
+        if (not artifact.sha256 or not Path(artifact.path).is_file()
+                or sha256_file(artifact.path) != artifact.sha256):
+            return None
+        with Path(artifact.path).open(encoding="utf-8") as handle:
+            frozen_result = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if frozen_result != result:
+        return None
+    v14_stage = next((item for item in reversed(investigation.stages)
+        if item.handler_id == "openstar.tess.target-residual-mechanism.analyze"
+        and item.status == "COMPLETE" and item.result is not None), None)
+    if v14_stage is None:
+        return None
+    v14_artifacts = [ref for ref in v14_stage.artifacts
+        if Path(ref.path).name == "target-residual-mechanism-v20.14.json"]
+    if len(v14_artifacts) != 1:
+        return None
+    v14_artifact = v14_artifacts[0]
+    provenance = result.get("inputProvenance") or {}
+    if (not v14_artifact.sha256 or not Path(v14_artifact.path).is_file()
+            or sha256_file(v14_artifact.path) != v14_artifact.sha256
+            or provenance.get("frozenV20.14ResultHash") != sha256_json(v14_stage.result)
+            or provenance.get("frozenV20.14ArtifactSHA256") != v14_artifact.sha256):
+        return None
     if (result.get("classification") != "TARGET_RESIDUAL_MECHANISM_UNRESOLVED"
             or result.get("recommendedNextTest") != "TARGET_RESIDUAL_PHYSICAL_MECHANISM_FOLLOWUP"
             or result.get("physicalMechanismResolved") is not False
-            or result.get("failClosedReasons")
-            or not any(Path(ref.path).name == "target-residual-mechanism-adjudication-v20.15.json"
-                       and ref.sha256 and Path(ref.path).is_file()
-                       and sha256_file(ref.path) == ref.sha256 for ref in stage.artifacts)):
+            or result.get("failClosedReasons")):
         return None
     expected = {"id": "030-finalize", "handler_id": "openstar.tess.finalize",
         "parameters": {"outputSuffix": "v20.15-intrinsic-corrective-adjudication"},

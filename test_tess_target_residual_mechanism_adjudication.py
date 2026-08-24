@@ -8,7 +8,8 @@ from dataclasses import asdict, replace
 from pathlib import Path
 from unittest.mock import patch
 
-from openstar_investigation import ArtifactReference, InvestigationStage, InvestigationStore, sha256_file
+from openstar_investigation import (ArtifactReference, InvestigationStage, InvestigationStore,
+                                    sha256_file, sha256_json)
 from openstar_workflow import StageRequest
 from workflows.tess.tess_autonomy import WORKFLOW_ID, repair_obsolete_terminal_wait
 from workflows.tess.tess_target_residual_mechanism_adjudication import (
@@ -146,6 +147,59 @@ class TessTargetResidualMechanismAdjudicationTests(unittest.TestCase):
                     metadata={"controlState": {"schedulerAction": "INVESTIGATION_COMPLETE",
                                                "selectedExperiment": None}})
                 self.assertEqual(candidate, repair_obsolete_terminal_wait(store, candidate))
+
+    def _v2015_boundary(self, root: Path, *, artifact_value=None, malformed=False,
+                        wrong_provenance=False):
+        v14, v14_artifact = self.frozen(root)
+        v15 = {"classification": "TARGET_RESIDUAL_MECHANISM_UNRESOLVED",
+            "recommendedNextTest": "TARGET_RESIDUAL_PHYSICAL_MECHANISM_FOLLOWUP",
+            "physicalMechanismResolved": False, "failClosedReasons": [],
+            "inputProvenance": {"frozenV20.14ResultHash": sha256_json(v14),
+                "frozenV20.14ArtifactSHA256": v14_artifact.sha256}}
+        if wrong_provenance:
+            v15["inputProvenance"]["frozenV20.14ResultHash"] = "0" * 64
+        path = root / "target-residual-mechanism-adjudication-v20.15.json"
+        path.write_text("{" if malformed else json.dumps(
+            v15 if artifact_value is None else artifact_value, sort_keys=True), encoding="utf-8")
+        v15_artifact = ArtifactReference(str(path), sha256_file(path), "application/json")
+        v14_stage = InvestigationStage("028-target-residual-mechanism",
+            "openstar.tess.target-residual-mechanism.analyze", "COMPLETE", None, {},
+            result=v14, artifacts=(v14_artifact,))
+        expected = asdict(StageRequest("030-finalize", "openstar.tess.finalize",
+            {"outputSuffix": "v20.15-intrinsic-corrective-adjudication"},
+            "029-target-residual-mechanism-adjudication"))
+        v15_stage = InvestigationStage("029-target-residual-mechanism-adjudication",
+            "openstar.tess.target-residual-mechanism-adjudication.analyze", "COMPLETE",
+            v14_stage.id, {}, result=v15, artifacts=(v15_artifact,), next_stage=expected)
+        return (v14_stage, v15_stage), expected
+
+    def test_exact_v2015_pending_finalizer_schedules_predictive_validation_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, store = Path(directory), InvestigationStore(Path(directory) / "store")
+            base = store.create("v2015-boundary", WORKFLOW_ID, "20.2")
+            stages, expected = self._v2015_boundary(root)
+            current = replace(base, status="RUNNING", stages=stages, metadata={"controlState": {
+                "branchAssessments": [], "schedulerAction": "RUN_EXPERIMENT",
+                "selectedExperiment": expected}})
+            repaired = repair_obsolete_terminal_wait(store, current)
+            selected = repaired.metadata["controlState"]["selectedExperiment"]
+            self.assertEqual("openstar.tess.target-residual-mechanism-predictive-validation.analyze",
+                             selected["handler_id"])
+            self.assertEqual(stages, repaired.stages)
+            self.assertEqual(repaired, repair_obsolete_terminal_wait(store, repaired))
+
+    def test_v2015_artifact_result_or_provenance_mismatch_leaves_history_unchanged(self):
+        cases = ({"artifact_value": {"different": True}}, {"malformed": True},
+                 {"wrong_provenance": True})
+        for index, options in enumerate(cases):
+            with self.subTest(case=index), tempfile.TemporaryDirectory() as directory:
+                root, store = Path(directory), InvestigationStore(Path(directory) / "store")
+                base = store.create(f"negative-v2015-{index}", WORKFLOW_ID, "20.2")
+                stages, expected = self._v2015_boundary(root, **options)
+                current = replace(base, status="RUNNING", stages=stages,
+                    metadata={"controlState": {"branchAssessments": [],
+                        "schedulerAction": "RUN_EXPERIMENT", "selectedExperiment": expected}})
+                self.assertEqual(current, repair_obsolete_terminal_wait(store, current))
 
 
 if __name__ == "__main__":

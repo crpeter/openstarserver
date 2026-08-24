@@ -77,7 +77,10 @@ from .tess_target_residual_mechanism import analyze_target_residual_mechanism
 from .tess_target_residual_mechanism_adjudication import (
     adjudicate_frozen_target_residual_mechanism,
 )
-from .tess_target_residual_mechanism_predictive_validation import analyze_predictive_validation
+from .tess_target_residual_mechanism_predictive_validation import (
+    analyze_predictive_validation,
+    v2013_lineage_matches,
+)
 from .tess_offset_source import identify_offset_residual_source
 from .tess_offset_variability import (
     build_offset_source_variability_project,
@@ -4146,7 +4149,11 @@ def build_engine(
         v13_hashes = v13_stage.provenance.input_hashes if v13_stage.provenance else {}
         v14_hashes = v14_stage.provenance.input_hashes if v14_stage.provenance else {}
         source_hashes = source_stage.provenance.input_hashes if source_stage.provenance else {}
-        lineage = (v14_hashes.get("v20.12Preparation") == sha256_json(preparation_stage.result)
+        v13_input = v13_stage.result.get("inputProvenance") or {}
+        lineage = (v2013_lineage_matches(stage_input_hashes=v13_hashes,
+            result_input_provenance=v13_input, preparation=preparation_stage.result,
+            interpretation=decomposition_stage.result)
+            and v14_hashes.get("v20.12Preparation") == sha256_json(preparation_stage.result)
             and v14_hashes.get("v20.12Interpretation") == sha256_json(decomposition_stage.result)
             and v14_hashes.get("v20.13Result") == sha256_json(v13_stage.result)
             and (source_stage is v14_stage or

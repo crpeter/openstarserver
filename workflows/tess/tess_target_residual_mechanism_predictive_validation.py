@@ -35,6 +35,18 @@ MODEL_LABELS = {
 }
 
 
+def v2013_lineage_matches(*, stage_input_hashes: dict[str, Any],
+                          result_input_provenance: dict[str, Any],
+                          preparation: dict[str, Any], interpretation: dict[str, Any]) -> bool:
+    """Independently bind v20.13 to the exact v20.12 snapshots consumed now."""
+    preparation_hash = sha256_json(preparation)
+    interpretation_hash = sha256_json(interpretation)
+    return (stage_input_hashes.get("v20.12Preparation") == preparation_hash
+            and stage_input_hashes.get("v20.12Interpretation") == interpretation_hash
+            and result_input_provenance.get("v20.12PreparationResultHash") == preparation_hash
+            and result_input_provenance.get("v20.12InterpretationResultHash") == interpretation_hash)
+
+
 def freeze_model_domain(times: list[float], frequency: float) -> dict[str, Any]:
     low, high = min(times), max(times)
     span = high - low
@@ -161,16 +173,6 @@ def fit_training_model(model: str, times: list[float], values: list[float],
         if best is None or rss < best["trainingRSS"]:
             best = {"trainingRSS": rss, "coefficients": beta,
                     "carrierPhaseRadians": phase, "beatFrequencySeparation": delta}
-    # The all-zero envelope is a legitimate boundary point of both constrained
-    # shared-phase families.  Retain it so a signal with phase reversals cannot
-    # make a competing preregistered family disappear from the comparison.
-    if best is None and model in {"SMOOTH_AMPLITUDE_MODULATION", "EPISODIC_ACTIVATION"}:
-        mean = sum(values) / len(values)
-        width = 4 if model == "SMOOTH_AMPLITUDE_MODULATION" else 1 + ENVELOPE_SEGMENTS
-        best = {"trainingRSS": sum((value - mean) ** 2 for value in values),
-                "coefficients": [mean] + [0.] * (width - 1),
-                "carrierPhaseRadians": 0., "beatFrequencySeparation": None,
-                "constraintBoundaryFit": True}
     if best is None:
         raise ValueError(f"no identifiable valid nonnegative {model} training fit")
     return best
@@ -215,11 +217,14 @@ def validate_sector(times: list[float], values: list[float], frequency: float,
             maximum = max(scores.values())
             winners = [model for model, score in scores.items() if score == maximum]
             if len(winners) == 1: wins[winners[0]] += 1
+    fair = not reasons and all(len(model_folds[model]) == PREDICTIVE_FOLDS
+                               for model in MODEL_NAMES)
     ranking = sorted(totals, key=lambda model: totals[model], reverse=True)
     best, second = (ranking + [None, None])[:2]
     delta = totals[best]-totals[second] if best and second else None
-    decisive = bool(best and delta >= DECISIVE_PREDICTIVE_DELTA_LOG_LIKELIHOOD
+    predictive_winner_meets_rules = bool(best and delta >= DECISIVE_PREDICTIVE_DELTA_LOG_LIKELIHOOD
                     and wins[best] >= MIN_PREDICTIVE_FOLD_WINS)
+    decisive = fair and predictive_winner_meets_rules
     blocked = decisive and best == "EPISODIC_ACTIVATION" and episodic_morphology is not True
     label = MODEL_LABELS.get(best, UNRESOLVED) if decisive and not blocked else UNRESOLVED
     return {"sector": sector, "datasetID": dataset_id, "timingCoordinate": timing_coordinate,
@@ -232,6 +237,8 @@ def validate_sector(times: list[float], values: list[float], frequency: float,
         "bestTotalHeldOutLogLikelihood": totals.get(best),
         "secondBestTotalHeldOutLogLikelihood": totals.get(second),
         "predictiveDeltaLogLikelihood": delta, "foldWinsByModel": wins,
+        "fairAllModelComparisonCompleted": fair,
+        "predictiveWinnerMeetsNumericalRules": predictive_winner_meets_rules,
         "decisivePredictiveWinner": decisive, "frozenEpisodicSuppressionAndReappearance": episodic_morphology,
         "morphologyGateBlockedPromotion": blocked, "sectorClassification": label,
         "failClosedReasons": reasons}
@@ -250,6 +257,38 @@ def _verified_artifact(result: dict[str, Any], artifacts: Iterable[Any], filenam
     raise RuntimeError(f"{filenames[0]} SHA verification failed")
 
 
+def adjudicate_predictive_sectors(sectors: Iterable[dict[str, Any]], *,
+                                  fail_closed_reasons: Iterable[str] = ()) -> dict[str, Any]:
+    """Apply only the preregistered distinct-sector target promotion rule."""
+    rows = list(sectors)
+    reasons = list(fail_closed_reasons)
+    ids = []
+    support: dict[str, set[int]] = {}
+    for index, row in enumerate(rows):
+        sector = row.get("sector")
+        if not isinstance(sector, int) or isinstance(sector, bool) or sector <= 0:
+            reasons.append(f"sector predictive row {index} lacks a valid persisted sector ID")
+            continue
+        ids.append(sector)
+        label = row.get("sectorClassification")
+        if (row.get("fairAllModelComparisonCompleted") is True
+                and not row.get("failClosedReasons") and label != UNRESOLVED):
+            support.setdefault(label, set()).add(sector)
+    duplicates = sorted({sector for sector in ids if ids.count(sector) > 1})
+    if duplicates:
+        reasons.append("duplicate persisted sector IDs: " + ", ".join(map(str, duplicates)))
+    replicated_support = {key: sorted(value) for key, value in support.items()
+                          if len(value) >= MIN_REPLICATING_SECTORS}
+    replicated = sorted(replicated_support)
+    promoted = len(replicated) == 1 and not reasons
+    return {"classification": replicated[0] if promoted else UNRESOLVED,
+        "recommendedNextTest": ("ASTROPHYSICAL_MECHANISM_INTERPRETATION" if promoted else
+                                 "ADDITIONAL_TEMPORAL_BASELINE_OR_MECHANISM_DISCRIMINATION"),
+        "replicatedPredictiveMechanisms": replicated,
+        "replicatedPredictiveMechanismSupportingSectorIDs": replicated_support,
+        "failClosedReasons": reasons}
+
+
 def analyze_predictive_validation(*, preparation: dict[str, Any], v2013_result: dict[str, Any],
         v2014_result: dict[str, Any], adjudication_result: dict[str, Any],
         adjudication_stage_id: str, adjudication_handler_id: str,
@@ -257,11 +296,19 @@ def analyze_predictive_validation(*, preparation: dict[str, Any], v2013_result: 
         v2014_artifacts: Iterable[Any], adjudication_artifacts: Iterable[Any],
         lineage_verified: bool) -> dict[str, Any]:
     """Verify all snapshots, then perform the only new work: local training fits."""
+    if adjudication_handler_id not in {
+            "openstar.tess.target-residual-mechanism.analyze",
+            "openstar.tess.target-residual-mechanism-adjudication.analyze"}:
+        raise RuntimeError("v20.16 adjudication source handler is not authoritative")
     if (adjudication_result.get("classification") != "TARGET_RESIDUAL_MECHANISM_UNRESOLVED"
             or adjudication_result.get("recommendedNextTest") != "TARGET_RESIDUAL_PHYSICAL_MECHANISM_FOLLOWUP"
             or adjudication_result.get("physicalMechanismResolved") is not False
             or adjudication_result.get("failClosedReasons")):
         raise RuntimeError("v20.16 requires the exact fail-open unresolved adjudication boundary")
+    if (adjudication_handler_id == "openstar.tess.target-residual-mechanism.analyze"
+            and adjudication_result.get("adjudicationVersion")
+                != "route-independent-all-models-v1"):
+        raise RuntimeError("direct v20.14 admission requires corrected route-independent semantics")
     adjudication_name = ("target-residual-mechanism-adjudication-v20.15.json"
         if adjudication_handler_id.endswith("adjudication.analyze") else "target-residual-mechanism-v20.14.json")
     adjudication_sha, _ = _verified_artifact(adjudication_result, adjudication_artifacts, adjudication_name)
@@ -283,13 +330,12 @@ def analyze_predictive_validation(*, preparation: dict[str, Any], v2013_result: 
                    for row in v2013_result.get("temporalModelEvidence") or [] if row.get("frequency") is not None}
     morphology = {str(row.get("datasetID")): row.get("episodicSuppressionAndReappearance") is True
                   for row in v2014_result.get("sectorModelEvidence") or []}
-    sectors, hashes, reasons, ids = [], {}, [], []
+    sectors, hashes, reasons = [], {}, []
     for entry in preparation.get("preparedSeries") or []:
         if entry.get("componentID") != "target" or entry.get("componentType") != "TARGET" or entry.get("combined"): continue
         sector, dataset_id = entry.get("sector"), str(entry.get("datasetID"))
         if not isinstance(sector, int) or isinstance(sector, bool) or sector <= 0:
             reasons.append("invalid persisted sector ID"); continue
-        ids.append(sector)
         coefficient, dataset = Path(entry.get("coefficientSeriesPath", "")), Path(entry.get("datasetPath", ""))
         coefficient_sha, dataset_sha = frozen_paths.get(str(coefficient.resolve())), frozen_paths.get(str(dataset.resolve()))
         if not coefficient_sha or not dataset_sha:
@@ -308,30 +354,22 @@ def analyze_predictive_validation(*, preparation: dict[str, Any], v2013_result: 
                 timing_coordinate=("ORIGINAL_ABSOLUTE_TIME" if series.get("absoluteTimes") else "SECTOR_LOCAL_WARPED_TIME"),
                 episodic_morphology=morphology.get(dataset_id, False)))
         except ValueError as error: reasons.append(f"sector {sector}: {error}")
-    if len(ids) != len(set(ids)): reasons.append("duplicate persisted sector IDs")
     reasons.extend(reason for sector in sectors for reason in sector["failClosedReasons"])
-    support = {}
-    for sector in sectors:
-        label = sector["sectorClassification"]
-        if label != UNRESOLVED: support.setdefault(label, set()).add(sector["sector"])
-    replicated_support = {key: sorted(value) for key, value in support.items()
-                          if len(value) >= MIN_REPLICATING_SECTORS}
-    replicated = sorted(replicated_support)
-    promoted = len(replicated) == 1 and not reasons
+    adjudication = adjudicate_predictive_sectors(sectors, fail_closed_reasons=reasons)
     return {"validationVersion": VALIDATION_VERSION,
-        "classification": replicated[0] if promoted else UNRESOLVED,
+        "classification": adjudication["classification"],
         "physicalMechanismResolved": False,
-        "recommendedNextTest": ("ASTROPHYSICAL_MECHANISM_INTERPRETATION" if promoted else
-                                 "ADDITIONAL_TEMPORAL_BASELINE_OR_MECHANISM_DISCRIMINATION"),
+        "recommendedNextTest": adjudication["recommendedNextTest"],
         "observable": "frozen v20.12 spatially-decomposed target coefficient series",
         "adjudicationSource": {"stageID": adjudication_stage_id, "handlerID": adjudication_handler_id,
             "resultHash": sha256_json(adjudication_result), "artifactSHA256": adjudication_sha},
         "frozenV20.14ResultHash": sha256_json(v2014_result), "frozenV20.14ArtifactSHA256": v14_sha,
         "frozenV20.13ResultHash": sha256_json(v2013_result), "frozenV20.13ArtifactSHA256": v13_sha,
         "frozenV20.12ArtifactsByDataset": hashes, "sectorPredictiveEvidence": sectors,
-        "replicatedPredictiveMechanisms": replicated,
-        "replicatedPredictiveMechanismSupportingSectorIDs": replicated_support,
-        "failClosedReasons": reasons, "crossSectorPhaseUsed": False,
+        "replicatedPredictiveMechanisms": adjudication["replicatedPredictiveMechanisms"],
+        "replicatedPredictiveMechanismSupportingSectorIDs":
+            adjudication["replicatedPredictiveMechanismSupportingSectorIDs"],
+        "failClosedReasons": adjudication["failClosedReasons"], "crossSectorPhaseUsed": False,
         "foldConstruction": {"method": "five-segment-stratified-chronological-contiguous-blocks",
                              "foldCount": PREDICTIVE_FOLDS},
         "preregisteredRules": {"predictiveFoldCount": PREDICTIVE_FOLDS,
