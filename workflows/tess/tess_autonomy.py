@@ -45,7 +45,22 @@ def _continue_finalized_v2016_archival_baseline(store: InvestigationStore,
     """Narrow, idempotent admission of the exact finalized v20.16 boundary."""
     expected_terminal_control = {"branchAssessments": [], "selectedExperiment": None,
                                  "schedulerAction": "INVESTIGATION_COMPLETE"}
-    if (investigation.status != "COMPLETE" or control != expected_terminal_control
+    expected_stale_finalizer = {
+        "branchAssessments": [],
+        "recovery": "TESS_V20_16_AWAITING_REVIEW",
+        "schedulerAction": "RUN_EXPERIMENT",
+        "selectedExperiment": {
+            "handler_id": "openstar.tess.finalize",
+            "id": "031-finalize",
+            "parameters": {
+                "outputSuffix": "v20.16-target-residual-predictive-validation",
+            },
+            "triggered_by_stage_id":
+                "030-target-residual-mechanism-predictive-validation",
+        },
+    }
+    if (investigation.status != "COMPLETE"
+            or control not in (expected_terminal_control, expected_stale_finalizer)
             or any(s.handler_id.startswith(_V2017_HANDLER_PREFIX) for s in investigation.stages)):
         return None
     science=next((s for s in investigation.stages if s.id=="030-target-residual-mechanism-predictive-validation"),None)

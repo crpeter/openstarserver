@@ -128,7 +128,7 @@ class TessTargetResidualArchivalBaselineTests(unittest.TestCase):
         self.assertGreater(abs(np.dot(output,np.sin(2*np.pi*.1*local))),
                            20*abs(np.dot(output,np.sin(2*np.pi*.2*local))))
 
-    def _finalized_boundary(self, directory):
+    def _finalized_boundary(self, directory, historical_control=False):
         store = InvestigationStore(Path(directory)/"investigations")
         inv = store.create("archival-boundary", WORKFLOW_ID, WORKFLOW_VERSION)
         predictive = {"classification":"TARGET_RESIDUAL_MECHANISM_PREDICTIVE_VALIDATION_UNRESOLVED",
@@ -146,7 +146,15 @@ class TessTargetResidualArchivalBaselineTests(unittest.TestCase):
             {"outputSuffix":"v20.16-target-residual-predictive-validation"},result=conclusion,
             artifacts=(artifact("conclusion-v20.16-target-residual-predictive-validation.json",conclusion),),stop=True)
         inv=replace(inv,stages=(science,final))
-        inv=store.set_control_state(inv,status="COMPLETE",control_state={"branchAssessments":[],"selectedExperiment":None,"schedulerAction":"INVESTIGATION_COMPLETE"})
+        control={"branchAssessments":[],"selectedExperiment":None,
+            "schedulerAction":"INVESTIGATION_COMPLETE"}
+        if historical_control:
+            control={"branchAssessments":[],"recovery":"TESS_V20_16_AWAITING_REVIEW",
+                "schedulerAction":"RUN_EXPERIMENT","selectedExperiment":{
+                    "handler_id":"openstar.tess.finalize","id":"031-finalize",
+                    "parameters":{"outputSuffix":"v20.16-target-residual-predictive-validation"},
+                    "triggered_by_stage_id":"030-target-residual-mechanism-predictive-validation"}}
+        inv=store.set_control_state(inv,status="COMPLETE",control_state=control)
         return store,inv
 
     def test_exact_post_031_boundary_reopens_once_and_altered_control_does_not(self):
@@ -170,6 +178,65 @@ class TessTargetResidualArchivalBaselineTests(unittest.TestCase):
             bad=InvestigationStage(**{**bad.__dict__,"parameters":{"outputSuffix":"wrong"}})
             inv=replace(inv,stages=inv.stages[:-1]+(bad,))
             self.assertEqual(inv,repair_obsolete_terminal_wait(store,inv))
+
+    def test_historical_stale_finalizer_reopens_without_changing_history(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store,inv=self._finalized_boundary(directory,historical_control=True)
+            stages_before=inv.stages
+            artifact_bytes=[Path(reference.path).read_bytes()
+                for stage in inv.stages for reference in stage.artifacts]
+            reopened=repair_obsolete_terminal_wait(store,inv)
+            self.assertEqual("RUNNING",reopened.status)
+            self.assertEqual("032-target-residual-archival-baseline-prepare",
+                reopened.metadata["controlState"]["selectedExperiment"]["id"])
+            self.assertEqual(len(stages_before),len(reopened.stages))
+            self.assertEqual(stages_before,reopened.stages)
+            self.assertEqual(artifact_bytes,[Path(reference.path).read_bytes()
+                for stage in reopened.stages for reference in stage.artifacts])
+            self.assertEqual(reopened,repair_obsolete_terminal_wait(store,reopened))
+
+    def test_historical_stale_finalizer_requires_exact_control(self):
+        mutations={
+            "wrong recovery": lambda control: control.update(recovery="WRONG"),
+            "wrong selected id": lambda control: control["selectedExperiment"].update(id="030-finalize"),
+            "wrong selected handler": lambda control: control["selectedExperiment"].update(handler_id="openstar.tess.other"),
+            "wrong output suffix": lambda control: control["selectedExperiment"]["parameters"].update(outputSuffix="wrong"),
+            "wrong trigger": lambda control: control["selectedExperiment"].update(triggered_by_stage_id="029-other"),
+            "wrong scheduler action": lambda control: control.update(schedulerAction="AWAIT_REVIEW"),
+        }
+        for label,mutate in mutations.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                store,inv=self._finalized_boundary(directory,historical_control=True)
+                control=json.loads(json.dumps(inv.metadata["controlState"]))
+                mutate(control)
+                changed=store.set_control_state(inv,status="COMPLETE",control_state=control)
+                self.assertEqual(changed,repair_obsolete_terminal_wait(store,changed))
+
+    def test_historical_stale_finalizer_requires_exact_finalized_history(self):
+        def not_complete(inv):
+            return replace(inv,status="RUNNING")
+        def final_not_last(inv):
+            extra=InvestigationStage("unrelated","openstar.other","COMPLETE",None,{})
+            return replace(inv,stages=inv.stages+(extra,))
+        def existing_v2017(inv):
+            extra=InvestigationStage("032-existing",
+                "openstar.tess.target-residual-archival-baseline.prepare","FAILED",None,{})
+            return replace(inv,stages=inv.stages+(extra,))
+        for label,mutate in (("investigation not complete",not_complete),
+                ("stage 031 not last",final_not_last),
+                ("existing v20.17 attempt",existing_v2017)):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                store,inv=self._finalized_boundary(directory,historical_control=True)
+                changed=mutate(inv)
+                self.assertEqual(changed,repair_obsolete_terminal_wait(store,changed))
+
+    def test_historical_stale_finalizer_requires_verified_artifacts(self):
+        for stage_index in (0,1):
+            with self.subTest(stage_index=stage_index), tempfile.TemporaryDirectory() as directory:
+                store,inv=self._finalized_boundary(directory,historical_control=True)
+                Path(inv.stages[stage_index].artifacts[0].path).write_text(
+                    '{"altered":true}\n',encoding="utf-8")
+                self.assertEqual(inv,repair_obsolete_terminal_wait(store,inv))
 
     def _lineage(self, directory, direct=False):
         root=Path(directory)
