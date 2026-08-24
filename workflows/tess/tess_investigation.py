@@ -77,6 +77,7 @@ from .tess_target_residual_mechanism import analyze_target_residual_mechanism
 from .tess_target_residual_mechanism_adjudication import (
     adjudicate_frozen_target_residual_mechanism,
 )
+from .tess_target_residual_mechanism_predictive_validation import analyze_predictive_validation
 from .tess_offset_source import identify_offset_residual_source
 from .tess_offset_variability import (
     build_offset_source_variability_project,
@@ -193,7 +194,7 @@ from .tess_multisector import (
 WORKFLOW_ID = "openstar.workflow.tess-investigation.v1"
 WORKFLOW_VERSION = "20.2"
 SOFTWARE_ID = "openstar.tess-investigation-plugin"
-SOFTWARE_VERSION = "20.31"
+SOFTWARE_VERSION = "20.32"
 
 
 def _stage(investigation: Investigation, stage_id: str):
@@ -4078,11 +4079,20 @@ def build_engine(
                          "target-residual-mechanism" /
                          "target-residual-mechanism-v20.14.json")
         _write_json(artifact_path, summary)
+        corrected_unresolved = (summary.get("adjudicationVersion") == "route-independent-all-models-v1"
+            and summary.get("classification") == "TARGET_RESIDUAL_MECHANISM_UNRESOLVED"
+            and summary.get("recommendedNextTest") == "TARGET_RESIDUAL_PHYSICAL_MECHANISM_FOLLOWUP"
+            and summary.get("physicalMechanismResolved") is False
+            and not summary.get("failClosedReasons"))
+        next_request = StageRequest(
+            id=_next_stage_id(request.id, "target-residual-mechanism-predictive-validation"),
+            handler_id="openstar.tess.target-residual-mechanism-predictive-validation.analyze",
+            parameters={}, triggered_by_stage_id=request.id) if corrected_unresolved else StageRequest(
+                id=_next_stage_id(request.id, "finalize"), handler_id="openstar.tess.finalize",
+                parameters={"outputSuffix": "v20.14-intrinsic"}, triggered_by_stage_id=request.id)
         return StageOutcome(
             result=summary,
-            next_stage=StageRequest(id=_next_stage_id(request.id, "finalize"),
-                handler_id="openstar.tess.finalize", parameters={"outputSuffix": "v20.14-intrinsic"},
-                triggered_by_stage_id=request.id),
+            next_stage=next_request,
             input_hashes={"v20.12Preparation": sha256_json(preparation_stage.result),
                           "v20.12Interpretation": sha256_json(decomposition_stage.result),
                           "v20.13Result": sha256_json(v2013_stage.result)},
@@ -4114,6 +4124,60 @@ def build_engine(
                           ["frozenV20.14ArtifactSHA256"]},
             artifacts=(_artifact(artifact_path, "application/json"),),
         )
+
+    def target_residual_mechanism_predictive_validation_stage(investigation, request):
+        if any(stage.handler_id == request.handler_id and stage.id != request.id
+               for stage in investigation.stages):
+            raise RuntimeError("an existing v20.16 predictive-validation attempt already exists")
+        preparation_stage = next((s for s in reversed(investigation.stages)
+            if s.handler_id == "openstar.tess.multi-source-residual.prepare" and s.status == "COMPLETE"), None)
+        decomposition_stage = next((s for s in reversed(investigation.stages)
+            if s.handler_id == "openstar.tess.multi-source-residual.interpret" and s.status == "COMPLETE"), None)
+        v13_stage = next((s for s in reversed(investigation.stages)
+            if s.handler_id == "openstar.tess.intrinsic-nonstationary.analyze" and s.status == "COMPLETE"), None)
+        v14_stage = next((s for s in reversed(investigation.stages)
+            if s.handler_id == "openstar.tess.target-residual-mechanism.analyze" and s.status == "COMPLETE"), None)
+        source_stage = next((s for s in reversed(investigation.stages)
+            if s.status == "COMPLETE" and s.handler_id in {
+                "openstar.tess.target-residual-mechanism-adjudication.analyze",
+                "openstar.tess.target-residual-mechanism.analyze"}), None)
+        if not all((preparation_stage, decomposition_stage, v13_stage, v14_stage, source_stage)):
+            raise RuntimeError("v20.16 requires complete frozen v20.12-v20.15 lineage")
+        v13_hashes = v13_stage.provenance.input_hashes if v13_stage.provenance else {}
+        v14_hashes = v14_stage.provenance.input_hashes if v14_stage.provenance else {}
+        source_hashes = source_stage.provenance.input_hashes if source_stage.provenance else {}
+        lineage = (v14_hashes.get("v20.12Preparation") == sha256_json(preparation_stage.result)
+            and v14_hashes.get("v20.12Interpretation") == sha256_json(decomposition_stage.result)
+            and v14_hashes.get("v20.13Result") == sha256_json(v13_stage.result)
+            and (source_stage is v14_stage or
+                 (source_hashes.get("v20.14Result") == sha256_json(v14_stage.result)
+                  and (source_stage.result.get("inputProvenance") or {}).get("frozenV20.14ResultHash")
+                      == sha256_json(v14_stage.result))))
+        summary = analyze_predictive_validation(preparation=preparation_stage.result,
+            v2013_result=v13_stage.result, v2014_result=v14_stage.result,
+            adjudication_result=source_stage.result, adjudication_stage_id=source_stage.id,
+            adjudication_handler_id=source_stage.handler_id,
+            preparation_artifacts=preparation_stage.artifacts, v2013_artifacts=v13_stage.artifacts,
+            v2014_artifacts=v14_stage.artifacts, adjudication_artifacts=source_stage.artifacts,
+            lineage_verified=lineage)
+        artifact_path = (store.directory_for(investigation.id) / "artifacts" /
+            "target-residual-mechanism-predictive-validation" /
+            "target-residual-mechanism-predictive-validation-v20.16.json")
+        _write_json(artifact_path, summary)
+        return StageOutcome(result=summary, next_stage=StageRequest(
+            id=_next_stage_id(request.id, "finalize"), handler_id="openstar.tess.finalize",
+            parameters={"outputSuffix": "v20.16-target-residual-predictive-validation"},
+            triggered_by_stage_id=request.id), input_hashes={
+                "adjudicationResult": sha256_json(source_stage.result),
+                "adjudicationArtifact": summary["adjudicationSource"]["artifactSHA256"],
+                "v20.14Result": summary["frozenV20.14ResultHash"],
+                "v20.14Artifact": summary["frozenV20.14ArtifactSHA256"],
+                "v20.13Result": summary["frozenV20.13ResultHash"],
+                "v20.13Artifact": summary["frozenV20.13ArtifactSHA256"],
+                **{f"v20.12:{key}:{kind}": value[kind] for key, value in
+                   summary["frozenV20.12ArtifactsByDataset"].items()
+                   for kind in ("coefficientSeriesSHA256", "datasetSHA256")}},
+            artifacts=(_artifact(artifact_path, "application/json"),))
 
     def prf_deblending_prepare_stage(investigation, request):
         required_handlers = {
@@ -9122,6 +9186,10 @@ def build_engine(
     engine.register_handler(
         "openstar.tess.target-residual-mechanism-adjudication.analyze",
         target_residual_mechanism_adjudication_stage,
+    )
+    engine.register_handler(
+        "openstar.tess.target-residual-mechanism-predictive-validation.analyze",
+        target_residual_mechanism_predictive_validation_stage,
     )
     engine.register_handler(
         "openstar.tess.offset-source-identification.analyze",
