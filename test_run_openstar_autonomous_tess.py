@@ -2,6 +2,8 @@ import contextlib
 import io
 import json
 import tempfile
+import shutil
+import uuid
 import unittest
 from openstar_test_science_runs import IsolatedScienceRunTestCase
 from pathlib import Path
@@ -286,6 +288,32 @@ class AutonomousTessEntryPointTests(IsolatedScienceRunTestCase):
                         multi_investigation=True,
                         allow_temporary_state=True)
                 self.assertEqual("legacy-state", legacy.read_text(encoding="utf-8"))
+
+    def test_repeated_historical_root_relocations_parse(self):
+        durable=Path.cwd()/f".cli-relocation-{uuid.uuid4().hex}"
+        self.addCleanup(shutil.rmtree,durable,True)
+        (durable/"one").mkdir(parents=True); (durable/"two").mkdir()
+        args=runner.parse_args(["--project",str(self.project),"--coordinator-url","http://test",
+            "--state-dir",str(self.root/"state"),"--relocate-historical-root",f"/missing/old-one={durable/'one'}",
+            "--relocate-historical-root",f"/missing/old-two={durable/'two'}"])
+        mappings=dict(args.historical_path_resolver.mappings)
+        self.assertEqual((durable/"one").resolve(),mappings[Path("/missing/old-one")])
+        self.assertEqual((durable/"two").resolve(),mappings[Path("/missing/old-two")])
+
+    def test_invalid_historical_root_relocations_are_rejected(self):
+        durable=Path.cwd()/f".cli-relocation-{uuid.uuid4().hex}"; durable.mkdir()
+        self.addCleanup(shutil.rmtree,durable,True)
+        base=["--project",str(self.project),"--coordinator-url","http://test","--state-dir",str(self.root/"state")]
+        invalid=("malformed",f"/old={durable}/missing",f"/old=/tmp",
+            f"/old={durable}",f"/old/../old={durable}")
+        # The first mapping is independently valid; the final pair proves
+        # duplicate OLD roots are rejected after normalization.
+        for entry in invalid[:3]:
+            with self.subTest(entry=entry),self.assertRaises(SystemExit):
+                runner.parse_args(base+["--relocate-historical-root",entry])
+        with self.assertRaises(SystemExit):
+            runner.parse_args(base+["--relocate-historical-root",invalid[3],
+                "--relocate-historical-root",invalid[4]])
 
 
 if __name__ == "__main__":
