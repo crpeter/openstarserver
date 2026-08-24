@@ -19,7 +19,7 @@ except ModuleNotFoundError:
     np = None; NUMPY_AVAILABLE = False
 from workflows.tess.tess_target_residual_multisector_source import (
     MAX_COMPETING_SOURCES, V2018_SECTOR_IDS, derive_additional_sectors,
-    derive_competing_sources, interpret_multisector,
+    derive_competing_sources, interpret_multisector, run_multisector_source_localization,
 )
 
 
@@ -46,6 +46,14 @@ class MultisectorSourceTests(unittest.TestCase):
             "handler_id": "openstar.tess.target-residual-pixel-recurrence.prepare",
             "id": "036-target-residual-pixel-recurrence-prepare", "parameters": {},
             "triggered_by_stage_id": "035-finalize"}}
+
+    def _production_preparation(self, directory):
+        return {"artifactRoot": directory, "ticID": 1, "targetSky": {"raDeg": 10., "decDeg": 20.},
+            "targetSourceID": "target", "catalogHypotheses": [
+                {"sourceID": "target", "raDeg": 10., "decDeg": 20.}],
+            "additionalSectorEvidence": [{"sector": 100, "candidateFrequency": .123456789,
+                "originalTimeOriginDays": 1000.}], "excludedV2018SectorIDs": list(V2018_SECTOR_IDS),
+            "establishedPhysicalFamilyFrequency": .2}
 
     def _boundary(self, directory, control=None):
         fixture = v2018_tests.TargetResidualPixelRecurrenceTests(methodName="test_unique_target_and_catalog_localizations")
@@ -142,7 +150,28 @@ class MultisectorSourceTests(unittest.TestCase):
                 "041-target-residual-multisector-source-run",
                 "042-target-residual-multisector-source-interpret", "043-finalize"],
                 [stage.id for stage in inv.stages[len(historical):]])
+            stage042, final = inv.stages[-2:]
+            self.assertEqual(stage042.result,
+                final.result["targetResidualMultisectorSourceLocalization"])
+            self.assertEqual(stage042.result["recommendedNextTest"],
+                             final.result["recommendedNextTest"])
             self.assertIsNone(request); self.assertFalse(any(stage.id.startswith("044-") for stage in inv.stages))
+
+    @unittest.skipUnless(NUMPY_AVAILABLE, "NumPy required for public-handler retry test")
+    def test_transient_tpf_failure_is_retryable_infrastructure(self):
+        from workflows.tess.tess_investigation import build_engine
+        from workflows.tess.tess_sector_archive import TessArchiveTransientError
+        from openstar_workflow import RetryableExecutionError
+        with tempfile.TemporaryDirectory() as directory:
+            store, inv = self._boundary(directory); inv = repair_obsolete_terminal_wait(store, inv)
+            engine = build_engine(store, SimpleNamespace(), poll_interval=0, timeout=None); engine.chain_stages = False
+            request = StageRequest(**inv.metadata["controlState"]["selectedExperiment"])
+            inv, request = engine.run_stage(inv, request, software_id="test", software_version="20.36")
+            with mock.patch("workflows.tess.tess_residual_localization._download_tpf",
+                            side_effect=TessArchiveTransientError("temporary outage")), self.assertRaises(RetryableExecutionError):
+                engine.run_stage(inv, request, software_id="test", software_version="20.36")
+            failed = store.load(inv.id).stages[-1]
+            self.assertEqual("TRANSIENT_INFRASTRUCTURE", failed.failure_classification)
 
     @unittest.skipUnless(NUMPY_AVAILABLE, "NumPy required for generalized model tests")
     def test_hypotheses_are_all_nonempty_subsets_in_deterministic_order(self):
@@ -201,6 +230,50 @@ class MultisectorSourceTests(unittest.TestCase):
             "TARGET_PLUS_CANDIDATE_1", "TARGET_PLUS_CANDIDATE_2",
             "CANDIDATE_1_PLUS_CANDIDATE_2", "TARGET_PLUS_BOTH"], list(MODEL_COMPONENTS))
 
+    @unittest.skipUnless(NUMPY_AVAILABLE, "NumPy required for production acquisition tests")
+    def test_exact_no_coverage_is_unavailable(self):
+        def absent(**kwargs):
+            raise RuntimeError("No official TPF or TESScut coverage available for Sector 100.")
+        with tempfile.TemporaryDirectory() as directory, mock.patch(
+                "workflows.tess.tess_residual_localization._download_tpf", side_effect=absent):
+            result = run_multisector_source_localization(self._production_preparation(directory))
+        self.assertEqual("UNAVAILABLE", result["sectorResults"][0]["availability"])
+
+    @unittest.skipUnless(NUMPY_AVAILABLE, "NumPy required for production acquisition tests")
+    def test_production_preserves_mask_frequency_and_harmonic_prewhitening(self):
+        class WCS:
+            def world_to_pixel(self, coordinate): return 1., 1.
+        masked = np.ma.array(np.ones((120, 3, 3)), mask=False); masked.mask[4, 1, 1] = True
+        tpf = SimpleNamespace(time=SimpleNamespace(value=np.linspace(1000., 1027., 120)),
+            flux=SimpleNamespace(value=masked), wcs=WCS())
+        seen = {}
+        def background(cube):
+            seen["maskedNaN"] = bool(np.isnan(cube[4, 1, 1])); return cube, {"method": "mock"}
+        def prewhiten(**kwargs):
+            seen["orders"] = kwargs["harmonic_orders"]
+            return kwargs["cube"], np.ones((3, 3), bool)
+        def analyze(**kwargs):
+            seen["frequency"] = kwargs["candidate_frequency"]
+            return {"sector": 100, "scientificallyValid": False,
+                "fullDataComparison": {"bestModel": None, "bestModelIdentifiable": False,
+                    "completeModelFullRank": False},
+                "temporalPredictiveValidation": {"predictiveModel": None, "predictiveSupport": False}}
+        with tempfile.TemporaryDirectory() as directory, mock.patch(
+                "workflows.tess.tess_residual_localization._download_tpf",
+                return_value=(tpf, {"sourceType": "OFFICIAL_TPF", "author": "SPOC"})), mock.patch(
+                "workflows.tess.tess_residual_localization._background_subtract_cube", side_effect=background), mock.patch(
+                "workflows.tess.tess_multisource_residual._prewhiten_cube_raw", side_effect=prewhiten), mock.patch(
+                "workflows.tess.tess_spoc_prf._tpf_detector_geometry", return_value=(1, 1, 0., 0.)), mock.patch(
+                "workflows.tess.tess_spoc_prf._list_official_prf_grid", return_value=[]), mock.patch(
+                "workflows.tess.tess_spoc_prf._official_prf_at_detector_position",
+                return_value=(np.ones((3, 3)), {}, ["official-prf.fits"])), mock.patch(
+                "workflows.tess.tess_catalog_guided_localization.analyze_generalized_catalog_guided_sector",
+                side_effect=analyze):
+            run_multisector_source_localization(self._production_preparation(directory))
+        self.assertTrue(seen["maskedNaN"])
+        self.assertEqual((1, 2), seen["orders"])
+        self.assertEqual(.123456789, seen["frequency"])
+
     def test_target_catalog_blend_switching_unavailable_and_unresolved(self):
         target = interpret_multisector([sector(i, ("target",)) for i in range(3)], "target")
         self.assertEqual("TARGET_SUPPORTED", target["classification"])
@@ -210,6 +283,20 @@ class MultisectorSourceTests(unittest.TestCase):
         self.assertEqual("SOURCE_SWITCHING_OR_BLEND", blend["classification"])
         self.assertFalse(blend["sourceAttributionResolved"])
         self.assertTrue(blend["sourceSwitchingOrBlendDetected"])
+        target_with_blend = interpret_multisector(
+            [sector(i, ("target",)) for i in range(3)]
+            + [sector(10 + i, ("target", "other")) for i in range(2)], "target")
+        self.assertEqual("SOURCE_SWITCHING_OR_BLEND", target_with_blend["classification"])
+        self.assertFalse(target_with_blend["sourceAttributionResolved"])
+        self.assertTrue(target_with_blend["sourceSwitchingOrBlendDetected"])
+        self.assertEqual("SOURCE_SWITCHING_TEMPORAL_MODEL",
+                         target_with_blend["recommendedNextTest"])
+        catalog_with_blend = interpret_multisector(
+            [sector(i, ("other",)) for i in range(3)]
+            + [sector(10 + i, ("target", "other")) for i in range(2)], "target")
+        self.assertEqual("SOURCE_SWITCHING_OR_BLEND", catalog_with_blend["classification"])
+        self.assertFalse(catalog_with_blend["sourceAttributionResolved"])
+        self.assertTrue(catalog_with_blend["sourceSwitchingOrBlendDetected"])
         switching = interpret_multisector([sector(1, ("target",)), sector(2, ("target",)),
             sector(3, ("other",)), sector(4, ("other",))], "target")
         self.assertEqual("SOURCE_SWITCHING_OR_BLEND", switching["classification"])
@@ -219,6 +306,15 @@ class MultisectorSourceTests(unittest.TestCase):
         self.assertEqual([2], unresolved["unavailableSectors"])
         self.assertEqual("TARGETED_HIGH_RESOLUTION_TIME_SERIES_PHOTOMETRY",
                          unresolved["recommendedNextTest"])
+
+    def test_rank_deficient_complete_model_is_scientifically_invalid_not_negative(self):
+        invalid = sector(7, ("target",), identifiable=False)
+        invalid["scientificallyValid"] = False
+        result = interpret_multisector([invalid, sector(8, available=False)], "target")
+        self.assertEqual("UNRESOLVED", result["classification"])
+        self.assertEqual(0, result["validSectorCount"])
+        self.assertEqual([7], result["scientificallyInvalidSectors"])
+        self.assertEqual([8], result["unavailableSectors"])
 
 
 if __name__ == "__main__":

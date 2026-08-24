@@ -159,9 +159,12 @@ def interpret_multisector(sectors: list[dict[str, Any]], target_source_id: str) 
     resolved = bool(winner and len(counts[winner]) >= 3
                     and len(counts[winner]) > len(unique) / 2 and len(repeated) < 2)
     switching = len(repeated) >= 2 or any(value >= 2 for value in blends.values())
-    decision = ("TARGET_SUPPORTED" if resolved and winner == target_source_id else
-                "CATALOG_SOURCE_SUPPORTED" if resolved else
-                "SOURCE_SWITCHING_OR_BLEND" if switching else "UNRESOLVED")
+    # Persistent blends/switching invalidate an otherwise majority single-source
+    # attribution: repeated coupled winners are positive contrary evidence, not
+    # merely extra unresolved sectors.
+    decision = ("SOURCE_SWITCHING_OR_BLEND" if switching else
+                "TARGET_SUPPORTED" if resolved and winner == target_source_id else
+                "CATALOG_SOURCE_SUPPORTED" if resolved else "UNRESOLVED")
     recommendation = {"TARGET_SUPPORTED": "ARCHIVAL_RECURRENCE_INFORMED_TARGET_MECHANISM_MODELING",
         "CATALOG_SOURCE_SUPPORTED": "INDEPENDENT_COUNTERPART_PHOTOMETRIC_VARIABILITY_VALIDATION",
         "SOURCE_SWITCHING_OR_BLEND": "SOURCE_SWITCHING_TEMPORAL_MODEL",
@@ -175,8 +178,10 @@ def interpret_multisector(sectors: list[dict[str, Any]], target_source_id: str) 
         "unresolvedSectors": [int(row["sector"]) for row in rows if row["classification"] == "UNRESOLVED"],
         "unavailableSectors": [int(row["sector"]) for row in rows if row["classification"] == "UNAVAILABLE"],
         "scientificallyInvalidSectors": [int(row["sector"]) for row in rows if row["classification"] == "SCIENTIFICALLY_INVALID"],
-        "sourceSupportTable": counts, "sectorResults": rows, "preferredSource": winner if resolved else None,
-        "sourceAttributionResolved": resolved, "sourceSwitchingOrBlendDetected": switching,
+        "sourceSupportTable": counts, "sectorResults": rows,
+        "preferredSource": winner if resolved and not switching else None,
+        "sourceAttributionResolved": resolved and not switching,
+        "sourceSwitchingOrBlendDetected": switching,
         "physicalMechanismResolved": False,
         "crossSectorPhaseUsed": False, "historicalResidualDriftExtrapolated": False,
         "recommendedNextTest": recommendation}
