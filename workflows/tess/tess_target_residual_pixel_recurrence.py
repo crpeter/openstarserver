@@ -57,6 +57,7 @@ def verify_v2017_lineage(stages: Iterable[Any], *, resolver: HistoricalPathResol
         "physicalMechanismResolved":False,"crossSectorPhaseUsed":False,
         "historicalResidualDriftExtrapolated":False}
     if any(result.get(k) != v for k,v in required.items()): raise RuntimeError("altered v20.17 science boundary")
+    if not isinstance(final.result,dict): raise RuntimeError("malformed v20.17 finalizer result")
     if (final.parameters != {"outputSuffix":"v20.17-target-residual-archival-baseline"}
             or final.result.get("targetResidualArchivalBaselineExtension") != result
             or final.result.get("recommendedNextTest") != RECOMMENDATION):
@@ -138,7 +139,7 @@ def interpret_sectors(sectors: list[dict[str,Any]], target_source_id: str) -> di
         "INDEPENDENT_COUNTERPART_PHOTOMETRIC_VARIABILITY_VALIDATION" if classification.endswith("CATALOG_SOURCE_SUPPORTED") else
         "SOURCE_SWITCHING_TEMPORAL_MODEL" if "SWITCHING" in classification else "ADDITIONAL_SOURCE_LOCALIZATION_DATA")
     return {"classification":classification,"qualitySectorCount":len(quality),"targetSupportingSectors":[x["sector"] for x in quality if x.get("preferredSource")==target_source_id],
-        "supportByCatalogSource":counts,"ambiguousSectors":[x["sector"] for x in sectors if x.get("classification")=="AMBIGUOUS_OR_BLENDED"],
+        "supportByCatalogSource":{key:value for key,value in counts.items() if key != target_source_id},"ambiguousSectors":[x["sector"] for x in sectors if x.get("classification")=="AMBIGUOUS_OR_BLENDED"],
         "unavailableSectors":[x["sector"] for x in sectors if x.get("classification")=="UNAVAILABLE"],"preferredSource":winner if resolved else None,
         "sourceAttributionResolved":resolved,"physicalMechanismResolved":False,"crossSectorPhaseUsed":False,
         "historicalResidualDriftExtrapolated":False,"recommendedNextTest":recommendation,"sectorResults":sectors}

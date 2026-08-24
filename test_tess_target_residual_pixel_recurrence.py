@@ -8,6 +8,7 @@ from openstar_investigation import (ArtifactReference, InvestigationStage, Inves
     StageProvenance, sha256_file, sha256_json)
 from workflows.tess.tess_autonomy import repair_obsolete_terminal_wait, WORKFLOW_ID, WORKFLOW_VERSION
 from openstar_path_relocation import HistoricalPathResolver
+from openstar_workflow import StageRequest
 import test_tess_target_residual_archival_baseline as archival_tests
 try:
     import numpy as np
@@ -31,6 +32,16 @@ class TargetResidualPixelRecurrenceTests(unittest.TestCase):
     def _boundary(self,directory,classification="ARCHIVAL_TARGET_RESIDUAL_RECURRENCE_SUPPORTED"):
         base=archival_tests.TessTargetResidualArchivalBaselineTests(methodName="test_constants_preserve_generic_boundary")
         stages=base._lineage(directory)
+        target=stages[0]; stages[0]=replace(target,result={**target.result,"datasetID":"d","targetName":"TIC 1","sector":1})
+        family_index=next(i for i,s in enumerate(stages) if s.handler_id.endswith("harmonic-family.interpret"))
+        family=stages[family_index]; family_result={**family.result,"claimDecision":{"claim":"CANDIDATE_PERIOD","rationale":["test"]},"selectedPeriodDays":10.,"selectedSource":"test"}
+        family_path=Path(family.artifacts[0].path); family_path.write_text(json.dumps(family_result)+"\n")
+        stages[family_index]=replace(family,result=family_result,artifacts=(replace(family.artifacts[0],sha256=sha256_file(family_path)),))
+        stages.extend([
+            InvestigationStage("003-catalog-identity","openstar.tess.catalog-identity","COMPLETE","002-primary",{},result={"tic":{"metadata":{"raDeg":10.,"decDeg":20.}}}),
+            InvestigationStage("003-hypotheses","openstar.tess.hypotheses","COMPLETE","002-primary",{},result={"observedPeriodDays":5.}),
+            InvestigationStage("004-planner","openstar.tess.planner","COMPLETE","003-hypotheses",{},result={"claimDecision":{"claim":"CANDIDATE_PERIOD","rationale":["test"]}}),
+        ])
         def artifact(name,value):
             path=Path(directory)/name; path.write_text(json.dumps(value)+"\n")
             return ArtifactReference(str(path),sha256_file(path),"application/json")
@@ -89,6 +100,73 @@ class TargetResidualPixelRecurrenceTests(unittest.TestCase):
         self.assertEqual(hashes,tuple(ref.sha256 for stage in admitted.stages for ref in stage.artifacts))
         self.assertFalse(old.exists())
 
+    @unittest.skipUnless(NUMPY_AVAILABLE,"NumPy required for full mocked workflow lifecycle")
+    def test_full_mocked_v2018_lifecycle_is_append_only_durable_and_ordered(self):
+        from workflows.tess.tess_investigation import build_engine
+        root=Path.cwd()/f".v2018-lifecycle-{uuid.uuid4().hex}"; self.addCleanup(shutil.rmtree,root,True); root.mkdir()
+        store,inv=self._boundary(root); historical=copy.deepcopy(inv.stages); historical_paths=tuple(
+            ref.path for stage in inv.stages for ref in stage.artifacts)
+        admitted=repair_obsolete_terminal_wait(store,inv); selected=admitted.metadata["controlState"]["selectedExperiment"]
+        self.assertEqual("036-target-residual-pixel-recurrence-prepare",selected["id"])
+        calls=[]; frozen=[{"sourceID":"TIC-1","isTarget":True,"ticID":1,"gaiaDR3SourceID":11,"raDeg":10.,"decDeg":20.},
+            {"sourceID":"TIC-2","isTarget":False,"ticID":2,"gaiaDR3SourceID":22,"raDeg":10.01,"decDeg":20.}]
+        def freeze(**kwargs):
+            calls.append("catalog-freeze"); return {"catalogHypotheses":copy.deepcopy(frozen),"catalogQueries":{"tic":{"sources":[]},"gaiaDR3":{"sources":[]}},"queryProvenance":{"mocked":True}}
+        class WCS:
+            def world_to_pixel(self,coord): return (1.,1.) if coord[0]==10. else (4.,4.)
+            def pixel_to_world(self,x,y): return SimpleNamespace(ra=SimpleNamespace(deg=10.),dec=SimpleNamespace(deg=20.))
+        tpf=SimpleNamespace(time=SimpleNamespace(value=np.linspace(0.,27.,400)),flux=SimpleNamespace(value=np.ones((400,5,5))),wcs=WCS())
+        def download(**kwargs): calls.append("pixel-download"); return tpf,{"sourceType":"OFFICIAL_TPF","author":"SPOC","cadenceSeconds":120.}
+        measured={"candidateFrequencyUsed":.1,"establishedFamilyPrewhitening":{"harmonicOrders":[1,2]},"highCadenceCount":100,"lowCadenceCount":100,
+            "differenceImage":[],"snrImage":[],"peakSNR":10.,"centroidX":1.,"centroidY":1.,"centroidUncertaintyPixels":.1,
+            "jackknifeCentroids":[],"classification":"UNIQUE_SOURCE_SUPPORTED","preferredSource":"TIC-1","distancesPixels":{"TIC-1":0.,"TIC-2":3.},
+            "crossSectorPhaseUsed":False,"historicalResidualDriftExtrapolated":False}
+        engine=build_engine(store,SimpleNamespace(),poll_interval=0,timeout=None); engine.chain_stages=False
+        request=StageRequest(**selected)
+        with mock.patch("workflows.tess.tess_investigation.freeze_catalog_hypotheses",side_effect=freeze),mock.patch(
+                "workflows.tess.tess_residual_localization._download_tpf",side_effect=download),mock.patch(
+                "workflows.tess.tess_investigation.measure_sector",return_value=measured),mock.patch(
+                "workflows.tess.tess_offset_variability._skycoord",side_effect=lambda ra,dec:(ra,dec)):
+            inv,request=engine.run_stage(admitted,request,software_id="test",software_version="20.35")
+            self.assertEqual(["catalog-freeze"],calls); persisted_hypotheses=copy.deepcopy(inv.stages[-1].result["catalogHypotheses"])
+            inv,request=engine.run_stage(inv,request,software_id="test",software_version="20.35")
+            self.assertEqual(["catalog-freeze","pixel-download"],calls)
+            projected=inv.stages[-1].result["sectorResults"][0]["catalogPixelPositions"]
+            self.assertEqual([x["sourceID"] for x in persisted_hypotheses],[x["sourceID"] for x in projected])
+            self.assertEqual(persisted_hypotheses,[{k:v for k,v in x.items() if k not in {"x","y"}} for x in projected])
+            inv,request=engine.run_stage(inv,request,software_id="test",software_version="20.35")
+            stage038=inv.stages[-1]
+            inv,request=engine.run_stage(inv,request,software_id="test",software_version="20.35")
+        appended=inv.stages[len(historical):]
+        self.assertEqual(["036-target-residual-pixel-recurrence-prepare","037-target-residual-pixel-recurrence-run",
+            "038-target-residual-pixel-recurrence-interpret","039-finalize"],[x.id for x in appended])
+        self.assertTrue(all(x.status=="COMPLETE" for x in appended)); self.assertEqual(historical,inv.stages[:len(historical)])
+        self.assertEqual(historical_paths,tuple(ref.path for stage in inv.stages[:len(historical)] for ref in stage.artifacts))
+        active=store.directory_for(inv.id).resolve()
+        for stage in appended:
+            for ref in stage.artifacts:
+                self.assertTrue(Path(ref.path).resolve().is_relative_to(active)); self.assertFalse(str(ref.path).startswith(("/tmp/","/private/tmp/","/var/tmp/")))
+        final=appended[-1]
+        self.assertEqual({"outputSuffix":"v20.18-target-residual-pixel-recurrence-validation"},final.parameters)
+        self.assertEqual(stage038.result,final.result["targetResidualPixelRecurrenceValidation"])
+        self.assertEqual(stage038.result["recommendedNextTest"],final.result["recommendedNextTest"])
+        self.assertNotEqual("PIXEL_LEVEL_SOURCE_RESOLVED_RESIDUAL_RECURRENCE_VALIDATION",final.result["recommendedNextTest"])
+        self.assertTrue(final.stop); self.assertIsNone(request); self.assertFalse(any(x.id.startswith("040-") for x in inv.stages))
+
+    @unittest.skipUnless(NUMPY_AVAILABLE,"NumPy required for workflow handler integration")
+    def test_stage036_catalog_failure_is_persisted_retryable_without_stage037(self):
+        from workflows.tess.tess_investigation import build_engine
+        from openstar_workflow import RetryableExecutionError
+        root=Path.cwd()/f".v2018-catalog-retry-{uuid.uuid4().hex}"; self.addCleanup(shutil.rmtree,root,True); root.mkdir()
+        store,inv=self._boundary(root); admitted=repair_obsolete_terminal_wait(store,inv)
+        request=StageRequest(**admitted.metadata["controlState"]["selectedExperiment"])
+        engine=build_engine(store,SimpleNamespace(),poll_interval=0,timeout=None); engine.chain_stages=False
+        with mock.patch("workflows.tess.tess_investigation.freeze_catalog_hypotheses",side_effect=CatalogInfrastructureError("outage")),self.assertRaises(RetryableExecutionError):
+            engine.run_stage(admitted,request,software_id="test",software_version="20.35")
+        failed=store.load(inv.id).stages[-1]
+        self.assertEqual("FAILED",failed.status); self.assertEqual("TRANSIENT_INFRASTRUCTURE",failed.failure_classification)
+        self.assertFalse(any(x.id=="037-target-residual-pixel-recurrence-run" for x in store.load(inv.id).stages))
+
     def test_nonrecurrence_wrong_recommendation_and_existing_attempt_refuse(self):
         for change in ("classification","baseline","recommendation","existing"):
             with self.subTest(change=change),tempfile.TemporaryDirectory() as directory:
@@ -108,6 +186,13 @@ class TargetResidualPixelRecurrenceTests(unittest.TestCase):
             with self.subTest(stage=index),tempfile.TemporaryDirectory() as directory:
                 store,inv=self._boundary(directory); Path(inv.stages[index].artifacts[0].path).unlink()
                 self.assertEqual(inv,repair_obsolete_terminal_wait(store,inv))
+
+    def test_malformed_complete_finalizer_refuses_without_attribute_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store,inv=self._boundary(directory); stages=list(inv.stages)
+            path=Path(stages[-1].artifacts[0].path); path.write_text("null\n")
+            stages[-1]=replace(stages[-1],result=None,artifacts=(replace(stages[-1].artifacts[0],sha256=sha256_file(path)),)); inv=replace(inv,stages=tuple(stages))
+            self.assertEqual(inv,repair_obsolete_terminal_wait(store,inv))
 
     def test_selected_metadata_disagreement_refuses(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -208,6 +293,7 @@ class TargetResidualPixelRecurrenceTests(unittest.TestCase):
         self.assertFalse(interpret_sectors(rows[:2],"target")["sourceAttributionResolved"])
         switched=rows[:2]+[{"sector":3+n,"classification":"UNIQUE_SOURCE_SUPPORTED","preferredSource":"other"} for n in range(2)]
         self.assertEqual("PIXEL_RECURRENCE_SOURCE_SWITCHING_OR_BLEND",interpret_sectors(switched,"target")["classification"])
+        self.assertNotIn("target",result["supportByCatalogSource"])
 
     def _catalog(self,tic_sources,gaia_sources):
         return freeze_catalog_hypotheses(tic_id=1,ra_deg=10.,dec_deg=20.,
