@@ -44,7 +44,7 @@ class TessWorkUnitSizingTests(IsolatedScienceRunTestCase):
                             7, "unused", tmp, provider=FakeProvider([product(1)]),
                             coordinator=FakeCoordinator(),
                             frequencies_per_work_unit=requested,
-                        )
+                            allow_temporary_state=True)
                     self.assertEqual(0, code)
                     effective = requested or 4096
                     self.assertIn(f"frequencies-per-work-unit={effective}", output.getvalue())

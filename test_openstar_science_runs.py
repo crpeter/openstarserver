@@ -9,6 +9,7 @@ from unittest.mock import Mock, patch
 
 from openstar_dashboard import DashboardApplication
 from openstar_science_runs import (
+    ScienceRun,
     ScienceRunCatalog,
     ScienceRunRecorder,
     backfill_science_runs,
@@ -16,6 +17,7 @@ from openstar_science_runs import (
     stable_run_id,
     catalog_path,
     recorded_science_run,
+    science_run_projection,
 )
 
 
@@ -253,6 +255,25 @@ class ScienceRunCatalogTests(unittest.TestCase):
             _, observation = DashboardApplication(coordinator, science_run_catalog=path).snapshot()
             self.assertEqual(3, observation["sectorSweeps"][0]["sector"])
             self.assertEqual("tess-sector-sweep", observation["scienceRuns"][0]["kind"])
+
+    def test_projection_marks_temporary_root_unsafe_without_mutation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            marker = root / "marker"
+            marker.write_bytes(b"unchanged")
+            before = marker.stat().st_mtime_ns
+            projection = science_run_projection(ScienceRun(
+                "id", "tess-autonomous", str(root), "FINISHED", 1.0, 2.0, {}))
+            self.assertEqual("degraded", projection["condition"])
+            self.assertIn("unsafe_temporary_state_root", projection["issues"])
+            self.assertEqual(b"unchanged", marker.read_bytes())
+            self.assertEqual(before, marker.stat().st_mtime_ns)
+
+    def test_projection_durable_root_has_no_temporary_issue(self):
+        root = Path.home() / "OpenStarScience" / "cataloged-state"
+        projection = science_run_projection(ScienceRun(
+            "id", "tess-autonomous", str(root), "FINISHED", 1.0, 2.0, {}))
+        self.assertNotIn("unsafe_temporary_state_root", projection["issues"])
 
 
 if __name__ == "__main__":

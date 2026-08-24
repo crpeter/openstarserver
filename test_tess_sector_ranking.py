@@ -25,7 +25,7 @@ class SectorRankingTests(IsolatedScienceRunTestCase):
 
     def _sweep(self, root, tics=(1, 2, 3)):
         run_tess_sector_sweep(7, "unused", root,
-            provider=FakeProvider([product(tic) for tic in tics]), coordinator=FakeCoordinator())
+            provider=FakeProvider([product(tic) for tic in tics]), coordinator=FakeCoordinator(), allow_temporary_state=True)
 
     def _ranking(self, root):
         inventory = TessSectorInventoryStore(Path(root) / "tess-sector-7-inventory.json").load()
@@ -182,7 +182,7 @@ class SectorRankingTests(IsolatedScienceRunTestCase):
         with tempfile.TemporaryDirectory() as tmp:
             self._sweep(tmp, (1, 2))
             shallow_before = {p: p.read_bytes() for p in Path(tmp).glob("investigations/*/investigation.json")}
-            self.assertEqual(0, run_tess_sector_ranking(7, tmp, promote_top=1))
+            self.assertEqual(0, run_tess_sector_ranking(7, tmp, promote_top=1, allow_temporary_state=True))
             promotion = Path(tmp) / "tess-sector-7-promoted-top-1.json"
             raw = json.loads(promotion.read_text())
             self.assertEqual(1, len(raw["datasets"]))
@@ -196,19 +196,19 @@ class SectorRankingTests(IsolatedScienceRunTestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             self._sweep(root, (1, 2))
-            self.assertEqual(0, run_tess_sector_ranking(7, root))
+            self.assertEqual(0, run_tess_sector_ranking(7, root, allow_temporary_state=True))
             self.assertTrue((root / "tess-sector-7-ranking.json").is_file())
-            self.assertEqual(0, run_tess_sector_ranking(7, root, promote_top=1))
+            self.assertEqual(0, run_tess_sector_ranking(7, root, promote_top=1, allow_temporary_state=True))
             self.assertTrue((root / "tess-sector-7-promoted-top-1.json").is_file())
 
             self.assertEqual(0, run_tess_sector_ranking(
                 7, root, output="derived/custom-ranking.json"
-            ))
+            , allow_temporary_state=True))
             self.assertTrue((root / "derived/custom-ranking.json").is_file())
             self.assertEqual(0, run_tess_sector_ranking(
                 7, root, promote_top=1,
                 promotion_output="derived/custom-promotion.json"
-            ))
+            , allow_temporary_state=True))
             self.assertTrue((root / "derived/custom-promotion.json").is_file())
 
     def test_outside_ranking_output_is_rejected_before_any_write(self):
@@ -218,7 +218,7 @@ class SectorRankingTests(IsolatedScienceRunTestCase):
             before = self._tree_bytes(root)
             outside = parent / "outside-ranking.json"
             with self.assertRaisesRegex(RuntimeError, "escapes sector-sweep"):
-                run_tess_sector_ranking(7, root, output=outside)
+                run_tess_sector_ranking(7, root, output=outside, allow_temporary_state=True)
             self.assertFalse(outside.exists())
             self.assertEqual(before, self._tree_bytes(root))
 
@@ -230,7 +230,7 @@ class SectorRankingTests(IsolatedScienceRunTestCase):
             outside = parent / "outside-promotion.json"
             with self.assertRaisesRegex(RuntimeError, "escapes sector-sweep"):
                 run_tess_sector_ranking(7, root, promote_top=1,
-                                        promotion_output=outside)
+                                        promotion_output=outside, allow_temporary_state=True)
             self.assertFalse(outside.exists())
             self.assertFalse((root / "tess-sector-7-ranking.json").exists())
             self.assertEqual(before, self._tree_bytes(root))
@@ -242,10 +242,10 @@ class SectorRankingTests(IsolatedScienceRunTestCase):
             self._sweep(root, (1,))
             before = self._tree_bytes(root)
             with self.assertRaisesRegex(RuntimeError, "escapes sector-sweep"):
-                run_tess_sector_ranking(7, root, output="../traversal.json")
+                run_tess_sector_ranking(7, root, output="../traversal.json", allow_temporary_state=True)
             (root / "escape-link").symlink_to(outside, target_is_directory=True)
             with self.assertRaisesRegex(RuntimeError, "escapes sector-sweep"):
-                run_tess_sector_ranking(7, root, output="escape-link/ranking.json")
+                run_tess_sector_ranking(7, root, output="escape-link/ranking.json", allow_temporary_state=True)
             self.assertFalse((parent / "traversal.json").exists())
             self.assertFalse((outside / "ranking.json").exists())
             self.assertEqual(before, {key: value for key, value in self._tree_bytes(root).items()
@@ -264,7 +264,7 @@ class SectorRankingTests(IsolatedScienceRunTestCase):
                 run_tess_sector_ranking(
                     7, root, promote_top=1,
                     promotion_output=blind_c / "promotion.json"
-                )
+                , allow_temporary_state=True)
             self.assertEqual(blind_before, self._tree_bytes(blind_c))
             self.assertEqual(sweep_before, self._tree_bytes(root))
 
@@ -273,7 +273,7 @@ class SectorRankingTests(IsolatedScienceRunTestCase):
             with self.subTest(legacy_name=legacy_name), tempfile.TemporaryDirectory() as tmp:
                 legacy = Path(tmp) / legacy_name; legacy.write_bytes(b"do not touch")
                 with self.assertRaisesRegex(RuntimeError, "refuses legacy"):
-                    run_tess_sector_ranking(7, tmp)
+                    run_tess_sector_ranking(7, tmp, allow_temporary_state=True)
                 self.assertEqual(b"do not touch", legacy.read_bytes())
                 self.assertEqual([legacy_name], [x.name for x in Path(tmp).iterdir()])
 

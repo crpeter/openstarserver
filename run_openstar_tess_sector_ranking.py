@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 from openstar_investigation import InvestigationStore
+from openstar_state_storage import require_durable_state_path
 from workflows.tess.tess_sector_archive import TessSectorInventoryStore
 from workflows.tess.tess_sector_ranking import (TessSectorRankingStore,
     aggregate_tess_sector_ranking, write_promotion_manifest)
@@ -24,8 +25,9 @@ def _sector_output_path(root: Path, requested: str | Path | None, default_name: 
 
 
 def run_tess_sector_ranking(sector: int, state_dir: str | Path, output: str | Path | None = None,
-                            promote_top: int | None = None, promotion_output: str | Path | None = None) -> int:
-    root = Path(state_dir).expanduser().resolve()
+                            promote_top: int | None = None, promotion_output: str | Path | None = None,
+                            *, allow_temporary_state: bool = False) -> int:
+    root = require_durable_state_path(state_dir, allow_temporary_state=allow_temporary_state)
     legacy = [name for name in ("lifecycle.json", "portfolio.json") if (root / name).exists()]
     if legacy:
         raise RuntimeError("TESS sector ranking refuses legacy single-lifecycle state: " + ", ".join(legacy))
@@ -55,6 +57,7 @@ def run_tess_sector_ranking(sector: int, state_dir: str | Path, output: str | Pa
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Rank durable shallow TESS sector scans.")
     parser.add_argument("--sector", required=True, type=int); parser.add_argument("--state-dir", required=True)
+    parser.add_argument("--allow-temporary-state", action="store_true")
     parser.add_argument("--output"); parser.add_argument("--promote-top", type=int); parser.add_argument("--promotion-output")
     args = parser.parse_args(argv)
     if args.sector < 1: parser.error("--sector must be positive")
@@ -65,7 +68,8 @@ def parse_args(argv=None):
 
 def main(argv=None):
     args = parse_args(argv)
-    try: return run_tess_sector_ranking(args.sector, args.state_dir, args.output, args.promote_top, args.promotion_output)
+    try: return run_tess_sector_ranking(args.sector, args.state_dir, args.output, args.promote_top, args.promotion_output,
+        allow_temporary_state=args.allow_temporary_state)
     except Exception as error:
         print(f"OpenStar TESS sector ranking: error={type(error).__name__}: {error}", file=sys.stderr); return 1
 

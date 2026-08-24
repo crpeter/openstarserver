@@ -18,6 +18,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
+from openstar_state_storage import is_temporary_state_path
+
 CATALOG_ENV = "OPENSTAR_SCIENCE_RUN_CATALOG"
 MODULE_ROOT = Path(__file__).resolve().parent
 DEFAULT_CATALOG = MODULE_ROOT / "data" / "science-runs.sqlite3"
@@ -280,6 +282,9 @@ def science_run_projection(run: ScienceRun) -> dict[str, Any]:
         "status": run.status, "createdAt": run.created_at, "updatedAt": run.updated_at,
         "metadata": run.metadata, "condition": "available", "issues": [],
     }
+    if is_temporary_state_path(root):
+        record["condition"] = "degraded"
+        record["issues"].append("unsafe_temporary_state_root")
     if not root.exists():
         record["condition"] = "degraded"
         record["issues"].append("state_root_missing")

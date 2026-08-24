@@ -59,7 +59,7 @@ class AutonomousTessEntryPointTests(IsolatedScienceRunTestCase):
         ):
             code = runner.run_autonomous_tess(
                 [self.project], "http://coordinator.test", self.root / "state"
-            )
+            , allow_temporary_state=True)
         return code, output.getvalue()
 
     def test_fresh_startup_selects_first_eligible_target(self):
@@ -265,7 +265,7 @@ class AutonomousTessEntryPointTests(IsolatedScienceRunTestCase):
                 "http://coordinator.test",
                 self.root / "multi-state",
                 multi_investigation=True,
-            )
+                allow_temporary_state=True)
         self.assertEqual(0, code)
         self.assertIn("OpenStar scheduler:", output.getvalue())
         self.assertFalse((self.root / "multi-state/lifecycle.json").exists())
@@ -284,7 +284,7 @@ class AutonomousTessEntryPointTests(IsolatedScienceRunTestCase):
                         "http://coordinator.test",
                         state,
                         multi_investigation=True,
-                    )
+                        allow_temporary_state=True)
                 self.assertEqual("legacy-state", legacy.read_text(encoding="utf-8"))
 
 
