@@ -315,6 +315,31 @@ class TargetResidualPixelRecurrenceTests(unittest.TestCase):
               {"catalog":"GaiaDR3","gaiaSourceID":33,"raDeg":10.02,"decDeg":20.,"separationArcsec":68.}]
         self.assertEqual(3,len(self._catalog([],gaia)["catalogHypotheses"]))
 
+    def test_target_collapses_but_close_non_target_tic_gaia_pair_is_retained_once(self):
+        tic=[{"catalog":"TIC","ticID":1,"isTargetTIC":True,"gaiaSourceID":11,"raDeg":10.,"decDeg":20.,"separationArcsec":0.},
+             {"catalog":"TIC","ticID":2,"isTargetTIC":False,"gaiaSourceID":22,"raDeg":10.0005,"decDeg":20.,"separationArcsec":1.7}]
+        gaia=[{"catalog":"GaiaDR3","gaiaSourceID":11,"raDeg":10.,"decDeg":20.,"separationArcsec":0.},
+              {"catalog":"GaiaDR3","gaiaSourceID":22,"raDeg":10.00051,"decDeg":20.,"separationArcsec":1.72}]
+        hypotheses=self._catalog(tic,gaia)["catalogHypotheses"]
+        self.assertEqual(["TIC-1","TIC-2"],[x["sourceID"] for x in hypotheses])
+        self.assertEqual(1,sum(x["isTarget"] for x in hypotheses)); self.assertEqual(22,hypotheses[1]["gaiaDR3SourceID"])
+
+    def test_two_distinct_sources_inside_old_exclusion_radius_remain_deterministic(self):
+        sources=[{"catalog":"GaiaDR3","gaiaSourceID":22,"raDeg":10.00030,"decDeg":20.,"separationArcsec":1.02},
+                 {"catalog":"GaiaDR3","gaiaSourceID":33,"raDeg":10.00085,"decDeg":20.,"separationArcsec":2.88}]
+        first=self._catalog([],sources)["catalogHypotheses"]
+        second=self._catalog([],list(reversed(sources)))["catalogHypotheses"]
+        self.assertEqual(["TIC-1","GaiaDR3-22","GaiaDR3-33"],[x["sourceID"] for x in first])
+        self.assertEqual([x["sourceID"] for x in first],[x["sourceID"] for x in second])
+
+    def test_very_close_companion_remains_in_pixel_hypotheses_and_blocks_forced_target(self):
+        tic=[{"catalog":"TIC","ticID":2,"isTargetTIC":False,"gaiaSourceID":22,"raDeg":10.0005,"decDeg":20.,"separationArcsec":1.7}]
+        frozen=self._catalog(tic,[])["catalogHypotheses"]
+        catalog_pixel_positions=[{**frozen[0],"x":5.,"y":5.},{**frozen[1],"x":5.08,"y":5.}]
+        result=classify_centroid((5.,5.),catalog_pixel_positions,.05,100.)
+        self.assertEqual(["TIC-1","TIC-2"],[x["sourceID"] for x in catalog_pixel_positions])
+        self.assertIsNone(result["preferredSource"]); self.assertEqual("AMBIGUOUS_OR_BLENDED",result["classification"])
+
     def test_catalog_transient_failure_does_not_freeze_incomplete_set(self):
         with self.assertRaises(CatalogInfrastructureError):
             freeze_catalog_hypotheses(tic_id=1,ra_deg=10.,dec_deg=20.,coordinate_factory=lambda *x:x,

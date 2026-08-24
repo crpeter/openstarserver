@@ -167,7 +167,12 @@ def freeze_catalog_hypotheses(*, tic_id:int, ra_deg:float, dec_deg:float,
         raise CatalogInfrastructureError(str(errors),{"catalogQueries":{"tic":tic,"gaiaDR3":gaia},"queryErrors":errors})
     target_sky={"raDeg":float(ra_deg),"decDeg":float(dec_deg)}
     candidates=_merge_catalog_candidates(tic_sources=list(tic.get("sources") or []),
-        gaia_sources=list(gaia.get("sources") or []),target_sky=target_sky)
+        gaia_sources=list(gaia.get("sources") or []),target_sky=target_sky,
+        exclude_target_neighborhood=False)
+    candidates.sort(key=lambda item:(float(item.get("targetSeparationArcsec") or 0.0),
+        str((item.get("catalogIDs") or {}).get("ticID") or ""),
+        str((item.get("catalogIDs") or {}).get("gaiaDR3SourceID") or ""),
+        float(item["raDeg"]),float(item["decDeg"])))
     target_tic=next((x for x in tic.get("sources") or [] if x.get("isTargetTIC") or x.get("ticID")==tic_id),{})
     target_gaia=target_tic.get("gaiaSourceID")
     hypotheses=[{"sourceID":f"TIC-{tic_id}","isTarget":True,"ticID":tic_id,
