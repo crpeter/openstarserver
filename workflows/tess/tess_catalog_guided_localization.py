@@ -8,6 +8,7 @@ on the training complement before scoring a contiguous held-out fold.
 from __future__ import annotations
 
 import math
+import itertools
 from pathlib import Path
 from typing import Any, Callable
 
@@ -43,6 +44,63 @@ MODEL_COMPONENTS = {
     "CANDIDATE_1_PLUS_CANDIDATE_2": (1, 2),
     "TARGET_PLUS_BOTH": (0, 1, 2),
 }
+
+
+def generate_source_hypotheses(component_ids: list[str] | tuple[str, ...]) -> dict[str, tuple[int, ...]]:
+    """Return every non-empty source subset in stable cardinality/input order.
+
+    The legacy three-source constants above intentionally remain untouched.  New
+    continuations may supply a bounded frozen catalog without changing serialized
+    model identifiers produced for old callers.
+    """
+    ids = tuple(str(value) for value in component_ids)
+    if not ids or len(ids) != len(set(ids)):
+        raise ValueError("component IDs must be a non-empty unique sequence")
+    return {
+        "SOURCE_SUBSET_" + "__".join(ids[index] for index in indices): indices
+        for size in range(1, len(ids) + 1)
+        for indices in itertools.combinations(range(len(ids)), size)
+    }
+
+
+def compare_source_hypotheses(coefficients: np.ndarray, covariances: np.ndarray,
+                              templates: np.ndarray, component_ids: list[str] | tuple[str, ...]
+                              ) -> dict[str, Any]:
+    """Fit exhaustive hypotheses and require attribution in the complete model."""
+    ids = tuple(component_ids)
+    hypotheses = generate_source_hypotheses(ids)
+    observations = np.asarray(coefficients, dtype=float).reshape(-1)
+    template_array = np.asarray(templates, dtype=float)
+    if template_array.ndim != 2 or template_array.shape[1] != len(ids):
+        raise ValueError("template count must equal the supplied source count")
+    models = {}
+    for model_id, indices in hypotheses.items():
+        models[model_id] = _weighted_hypothesis(
+            observations=observations,
+            pixel_covariances=np.asarray(covariances, dtype=float),
+            templates=template_array[:, indices],
+            component_ids=[ids[index] for index in indices])
+        models[model_id]["sourceIDs"] = [ids[index] for index in indices]
+    winner = min(models, key=lambda key: models[key]["bic"])
+    for model in models.values():
+        model["deltaBIC"] = float(model["bic"] - models[winner]["bic"])
+    all_model_id = next(reversed(hypotheses))
+    complete = models[all_model_id]
+    conditional = {row["componentID"]: row for row in complete["sourceEstimates"]}
+    selected = models[winner]
+    selected_ids = selected["sourceIDs"]
+    identifiable = bool(
+        selected["fullRank"] and complete["fullRank"]
+        and all(row["individuallyIdentifiable"] for row in selected["sourceEstimates"])
+        and all(conditional[source_id]["individuallyIdentifiable"] for source_id in selected_ids))
+    return {"models": models, "bestModel": winner,
+            "bestModelSourceIDs": selected_ids,
+            "bestModelIdentifiable": identifiable,
+            "conditionalIdentifiabilityModel": all_model_id,
+            "completeModelFullRank": bool(complete["fullRank"]),
+            "conditionallyIdentifiableSources": sorted(
+                source_id for source_id, row in conditional.items()
+                if row["individuallyIdentifiable"])}
 
 
 def _compare_hypotheses(coefficients: np.ndarray, covariances: np.ndarray,

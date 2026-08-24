@@ -30,6 +30,31 @@ WORKFLOW_VERSION = "20.2"
 
 _V2017_HANDLER_PREFIX = "openstar.tess.target-residual-archival-baseline."
 _V2018_HANDLER_PREFIX = "openstar.tess.target-residual-pixel-recurrence."
+_V2019_HANDLER_PREFIX = "openstar.tess.target-residual-multisector-source."
+
+
+def _continue_finalized_v2018_multisector_source(store, investigation, control, *, historical_path_resolver):
+    """Admit only the exact, cryptographically verified unresolved v20.18 result."""
+    terminal = {"branchAssessments": [], "selectedExperiment": None,
+                "schedulerAction": "INVESTIGATION_COMPLETE"}
+    stale_finalizer = {"branchAssessments": [], "schedulerAction": "RUN_EXPERIMENT",
+        "selectedExperiment": {"id": "039-finalize", "handler_id": "openstar.tess.finalize",
+            "parameters": {"outputSuffix": "v20.18-target-residual-pixel-recurrence-validation"},
+            "triggered_by_stage_id": "038-target-residual-pixel-recurrence-interpret"}}
+    if (investigation.status != "COMPLETE" or control not in (terminal, stale_finalizer)
+            or any(stage.handler_id.startswith(_V2019_HANDLER_PREFIX) for stage in investigation.stages)):
+        return None
+    try:
+        from .tess_target_residual_multisector_source import verify_v2018_lineage
+        lineage = verify_v2018_lineage(investigation.stages, resolver=historical_path_resolver)
+    except (RuntimeError, ValueError, OSError, KeyError, TypeError):
+        return None
+    request = StageRequest("040-target-residual-multisector-source-prepare",
+        _V2019_HANDLER_PREFIX + "prepare", {}, lineage["finalizer"].id)
+    return store.set_control_state(investigation, status="RUNNING", control_state={
+        "branchAssessments": [], "selectedExperiment": asdict(request),
+        "schedulerAction": "RUN_EXPERIMENT",
+        "recovery": "TESS_V20_18_MULTISECTOR_SOURCE_LOCALIZATION_V20_19"})
 
 
 def _continue_finalized_v2017_pixel_recurrence(store, investigation, control, *, historical_path_resolver):
@@ -1410,6 +1435,10 @@ def repair_obsolete_terminal_wait(
         return investigation
 
     resolver = historical_path_resolver or NO_HISTORICAL_PATH_RELOCATION
+    multisector = _continue_finalized_v2018_multisector_source(
+        store, investigation, control, historical_path_resolver=resolver)
+    if multisector is not None:
+        return multisector
     pixel = _continue_finalized_v2017_pixel_recurrence(
         store, investigation, control, historical_path_resolver=resolver)
     if pixel is not None:
