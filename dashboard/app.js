@@ -10,8 +10,13 @@ const relative = timestamp => {
 const throughput = value => value == null ? "—" : `${fmt(value)} eval/s`;
 const advertisedBackends = capabilities => {
   const value = capabilities && (capabilities.computeBackends ?? capabilities.supportedComputeBackends ?? capabilities.backends ?? capabilities.computeBackend ?? capabilities.backend);
-  if (Array.isArray(value)) return value.length ? value.join(", ") : null;
-  return value == null || value === "" ? null : String(value);
+  const backendID = entry => typeof entry === "string" ? entry : entry && typeof entry === "object" && typeof entry.id === "string" ? entry.id : typeof entry === "number" ? String(entry) : null;
+  if (Array.isArray(value)) {
+    const ids = value.map(backendID).filter(id => id && id.trim());
+    return ids.length ? ids.join(", ") : null;
+  }
+  const id = backendID(value);
+  return id && id.trim() ? id : null;
 };
 function element(tag, options = {}, children = []) {
   const node = document.createElement(tag);

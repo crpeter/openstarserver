@@ -6,6 +6,7 @@ import unittest
 import urllib.error
 import urllib.request
 import sqlite3
+import subprocess
 from pathlib import Path
 
 from dashboard import build_snapshot, history_snapshot
@@ -260,6 +261,32 @@ class ProjectionTests(unittest.TestCase):
         self.assertIn('"Fleet worker throughput", throughput(snapshot.summary.measuredThroughput)', script)
         self.assertIn('"Fleet Metal throughput", throughput(snapshot.summary.metalThroughput)', script)
         self.assertIn("snapshot.summary.metalThroughput != null", script)
+
+    def test_advertised_backends_supports_real_capability_objects(self):
+        script = Path("dashboard/app.js").read_text(encoding="utf-8")
+        helpers = script.split("function element", 1)[0]
+        cases = [
+            {"computeBackends": [{"id": "cpu"}, {"id": "metal"}]},
+            {"computeBackends": [{"id": "vulkan"}]},
+            {"computeBackends": ["cpu", "metal"]},
+            {"computeBackends": [None, {}, {"name": "metal"}, {"id": ""}]},
+        ]
+        expression = (
+            helpers
+            + "\nprocess.stdout.write(JSON.stringify("
+            + json.dumps(cases)
+            + ".map(advertisedBackends)));"
+        )
+        result = subprocess.run(
+            ["node", "-e", expression],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        rendered = json.loads(result.stdout)
+        self.assertEqual(["cpu, metal", "vulkan", "cpu, metal", None], rendered)
+        self.assertNotIn("[object Object]", result.stdout)
+        self.assertNotIn("undefined", result.stdout)
 
     def test_snapshot_keeps_worker_and_accelerator_rates_distinct(self):
         coordinator = FakeCoordinator()
