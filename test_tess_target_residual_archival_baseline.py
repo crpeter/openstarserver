@@ -16,7 +16,7 @@ from workflows.tess.tess_target_residual_archival_baseline import (
     FREQUENCIES_PER_WORK_UNIT, HARMONIC_ORDERS, TOTAL_FREQUENCIES,
     adjudicate_sector, adjudicate_target, frozen_search_grid,
     prewhiten_established_family, previously_consumed_tess_sectors,
-    MAX_ARCHIVAL_BASELINE_SECTORS, WORKLOAD_ID, CONSUMED_SECTOR_SCHEMAS, verify_frozen_science_lineage,
+    MAX_ARCHIVAL_BASELINE_SECTORS, WORKLOAD_ID, CONSUMED_SECTOR_SCHEMAS, verify_frozen_science_lineage, build_archival_baseline_project,
 )
 
 class TessTargetResidualArchivalBaselineTests(unittest.TestCase):
@@ -273,5 +273,48 @@ class TessTargetResidualArchivalBaselineTests(unittest.TestCase):
                             inv,StageRequest("032-target-residual-archival-baseline-prepare","openstar.tess.target-residual-archival-baseline.prepare",{}))
                     self.assertEqual(error.diagnostics,caught.exception.result)
                     self.assertIn("artifact:v20.16",caught.exception.input_hashes)
+            empty={"available":False,"projectID":None,"projectPath":None,"preparedSectors":[],"errors":[],"frequencySearch":frozen_search_grid(.1),"frozenResidualReferenceFrequency":.1,"frozenResidualReferencePeriodDays":10.,"historicalFrequencyEnvelope":{"minimum":.095,"maximum":.105}}
+            with mock.patch("workflows.tess.tess_investigation.verify_frozen_science_lineage",return_value=lineage), mock.patch("workflows.tess.tess_investigation.build_archival_baseline_project",return_value=empty):
+                outcome=engine.handlers["openstar.tess.target-residual-archival-baseline.prepare"](inv,StageRequest("032-target-residual-archival-baseline-prepare","openstar.tess.target-residual-archival-baseline.prepare",{}))
+            self.assertEqual("034-target-residual-archival-baseline-interpret",outcome.next_stage.id)
+            self.assertTrue(outcome.next_stage.parameters["noProject"])
+            prepare_stage=SimpleNamespace(handler_id="openstar.tess.target-residual-archival-baseline.prepare",status="COMPLETE",result=empty)
+            interpreted=engine.handlers["openstar.tess.target-residual-archival-baseline.interpret"](replace(inv,stages=(prepare_stage,)),outcome.next_stage)
+            self.assertEqual("ARCHIVAL_TARGET_RESIDUAL_BASELINE_INSUFFICIENT",interpreted.result["classification"])
+            self.assertEqual("035-finalize",interpreted.next_stage.id)
+
+    @unittest.skipIf(np is None or not hasattr(np, "asarray"), "NumPy is required for archive builder integration")
+    def test_actual_builder_zero_and_selected_download_failure_semantics(self):
+        from workflows.tess import tess_multisector as archive
+        with tempfile.TemporaryDirectory() as directory:
+            project=Path(directory)/"source.json"; project.write_text(json.dumps({"id":"p","workloadID":"openstar.lomb-scargle.v1"}))
+            with mock.patch.object(archive,"_search_lightcurves",return_value=SimpleNamespace(table=[])) as search:
+                result=build_archival_baseline_project(source_project_path=project,source_dataset_entry={"id":"d"},tic_id=1,candidate_sectors=[],previously_consumed={},residual_reference_frequency=.1,established_frequency=.2,historical_frequency_envelope=(.09,.11),output_dir=directory,investigation_id="i")
+            search.assert_called_once()
+            self.assertEqual((False,None,None,0),(result["available"],result["projectID"],result["projectPath"],result["totalWorkUnits"]))
+        with tempfile.TemporaryDirectory() as directory:
+            project=Path(directory)/"source.json"; project.write_text(json.dumps({"id":"p","workloadID":"openstar.lomb-scargle.v1"}))
+            selected=SimpleNamespace(download=lambda **kwargs: None,table=SimpleNamespace(colnames=[]))
+            with mock.patch.object(archive,"_search_lightcurves",return_value=object()), mock.patch.object(
+                archive,"_select_product_from_search",return_value=(selected,"SPOC",120.)):
+                with self.assertRaises(archive.TessArchiveInfrastructureError) as caught:
+                    build_archival_baseline_project(source_project_path=project,source_dataset_entry={"id":"d"},tic_id=1,candidate_sectors=[2],previously_consumed={},residual_reference_frequency=.1,established_frequency=.2,historical_frequency_envelope=(.09,.11),output_dir=directory,investigation_id="i")
+            diagnostic=caught.exception.diagnostics["errors"][0]
+            self.assertEqual((2,"archive-materialization"),(diagnostic["sector"],diagnostic["operation"]))
+            self.assertEqual("SPOC",diagnostic["selectedProduct"]["author"])
+
+    @unittest.skipIf(np is None or not hasattr(np, "asarray"), "NumPy is required for archive builder integration")
+    def test_short_downloaded_curve_is_data_ineligible_not_retryable(self):
+        from workflows.tess import tess_multisector as archive
+        with tempfile.TemporaryDirectory() as directory:
+            project=Path(directory)/"source.json"; project.write_text(json.dumps({"id":"p","workloadID":"openstar.lomb-scargle.v1"}))
+            selected=SimpleNamespace(table=SimpleNamespace(colnames=[]))
+            with mock.patch.object(archive,"_search_lightcurves",return_value=object()), mock.patch.object(
+                archive,"_select_product_from_search",return_value=(selected,"SPOC",120.)), mock.patch.object(
+                archive,"_download_selected_sector",return_value=(object(),{})), mock.patch.object(
+                archive,"_prepare_samples_float64",side_effect=RuntimeError("too few finite samples")):
+                result=build_archival_baseline_project(source_project_path=project,source_dataset_entry={"id":"d"},tic_id=1,candidate_sectors=[2],previously_consumed={},residual_reference_frequency=.1,established_frequency=.2,historical_frequency_envelope=(.09,.11),output_dir=directory,investigation_id="i")
+            self.assertFalse(result["available"]); self.assertEqual(1,len(result["errors"]))
+            self.assertIn("too few finite samples",result["errors"][0]["error"])
 
 if __name__ == "__main__": unittest.main()

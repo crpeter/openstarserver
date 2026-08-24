@@ -368,6 +368,7 @@ def build_archival_baseline_project(*, source_project_path: str|Path,
         output_dir: str|Path, investigation_id: str) -> dict[str,Any]:
     """Query once and materialize every unseen official sector, without a science cap."""
     from .tess_multisector import (TessArchiveInfrastructureError,
+        TessSelectedProductDownloadError,
         _MAST_LIGHTKURVE_LOCK, _archive_io_failure, _download_selected_sector,
         _prepare_samples_float64, _safe, _search_lightcurves, _select_product_from_search)
     grid=frozen_search_grid(residual_reference_frequency)  # freeze before archive I/O
@@ -389,6 +390,7 @@ def build_archival_baseline_project(*, source_project_path: str|Path,
             if len(eligible)>MAX_ARCHIVAL_BASELINE_SECTORS:
                 raise RuntimeError("eligible official sectors exceed MAX_ARCHIVAL_BASELINE_SECTORS; refusing to truncate")
             for sector in eligible:
+                product = None
                 try:
                     selected,author,cadence=_select_product_from_search(search,sector)
                     product = _product_provenance(selected, author=author,
@@ -401,8 +403,10 @@ def build_archival_baseline_project(*, source_project_path: str|Path,
                     times=np.asarray(times64-times64[0],dtype=np.float32); times[0]=np.float32(0)
                     materialized.append((sector,author,cadence,product,times,residual,prep,prewhite))
                 except Exception as error:
-                    diagnostic={"sector":sector,"operation":"archive-materialization","error":f"{type(error).__name__}: {error}"}
-                    if _archive_io_failure(error):
+                    diagnostic={"sector":sector,"operation":"archive-materialization",
+                        "selectedProduct":product,
+                        "error":f"{type(error).__name__}: {error}"}
+                    if _archive_io_failure(error) or isinstance(error, TessSelectedProductDownloadError):
                         raise TessArchiveInfrastructureError("TESS archive materialization is temporarily unavailable",{"errors":[diagnostic]}) from error
                     errors.append(diagnostic)
     except TessArchiveInfrastructureError: raise
@@ -425,13 +429,20 @@ def build_archival_baseline_project(*, source_project_path: str|Path,
             "selectedProduct":product,
             "productSelectionRule":"official-author-priority-SPOC-then-TESS-SPOC; shortest-cadence; catalog-order",
             "prewhitening":prewhite,"frozenResidualReferenceFrequency":residual_reference_frequency,"frequencySearch":dict(grid)})
-    project_id=f"{source_project['id']}.investigation.{_safe(investigation_id)}.archival-residual-v1"
-    manifest={"id":project_id,"name":"Archival target-residual recurrence screen","workloadID":WORKLOAD_ID,"datasets":entries,
-        "investigation":{"purpose":"frozen-target-residual-archival-recurrence","sourceProjectID":source_project["id"]}}
-    manifest_path=root/f"{_safe(project_id)}.json"; manifest_path.write_text(json.dumps(manifest,indent=2,allow_nan=False)+"\n",encoding="utf-8")
-    return {"available":bool(entries),"projectID":project_id,"projectPath":str(manifest_path.resolve()),"preparedSectors":prepared,"errors":errors,
+    common = {"preparedSectors":prepared,"errors":errors,
         "previouslyConsumedTessSectors":[{"sector":sector,"exclusionReasons":reasons} for sector,reasons in sorted(previously_consumed.items())],
         "candidateSectors":sectors,"eligibleSectors":eligible,"frequencySearch":grid,"frozenResidualReferenceFrequency":residual_reference_frequency,
         "frozenResidualReferencePeriodDays":1/residual_reference_frequency,"historicalFrequencyEnvelope":{"minimum":historical_frequency_envelope[0],"maximum":historical_frequency_envelope[1]},
         "frozenEstablishedPhysicalFrequency":established_frequency,"frozenEstablishedPhysicalPeriodDays":1/established_frequency,
-        "crossSectorPhaseUsed":False,"historicalResidualDriftExtrapolated":False,"totalWorkUnits":len(entries)*math.ceil(TOTAL_FREQUENCIES/FREQUENCIES_PER_WORK_UNIT)}
+        "crossSectorPhaseUsed":False,"historicalResidualDriftExtrapolated":False}
+    if not entries:
+        return {"available":False,"projectID":None,"projectPath":None,
+            "totalWorkUnits":0,**common}
+    root.mkdir(parents=True, exist_ok=True)
+    project_id=f"{source_project['id']}.investigation.{_safe(investigation_id)}.archival-residual-v1"
+    manifest={"id":project_id,"name":"Archival target-residual recurrence screen","workloadID":WORKLOAD_ID,"datasets":entries,
+        "investigation":{"purpose":"frozen-target-residual-archival-recurrence","sourceProjectID":source_project["id"]}}
+    manifest_path=root/f"{_safe(project_id)}.json"; manifest_path.write_text(json.dumps(manifest,indent=2,allow_nan=False)+"\n",encoding="utf-8")
+    return {"available":True,"projectID":project_id,
+        "projectPath":str(manifest_path.resolve()),**common,
+        "totalWorkUnits":len(entries)*math.ceil(TOTAL_FREQUENCIES/FREQUENCIES_PER_WORK_UNIT)}

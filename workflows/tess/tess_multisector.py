@@ -33,6 +33,10 @@ class TessArchiveInfrastructureError(RuntimeError):
         self.diagnostics = diagnostics
 
 
+class TessSelectedProductDownloadError(RuntimeError):
+    """An official selected product could not be retrieved from MAST."""
+
+
 def _archive_io_failure(error: Exception) -> bool:
     """Classify I/O only while executing an archive lifecycle operation."""
     return isinstance(error, (OSError, ConnectionError, TimeoutError)) or (
@@ -195,7 +199,7 @@ def _download_selected_sector(
 ) -> tuple[Any, dict[str, Any]]:
     light_curve = selected.download(quality_bitmask="default")
     if light_curve is None:
-        raise RuntimeError(
+        raise TessSelectedProductDownloadError(
             f"MAST download returned no light curve for Sector {sector}."
         )
 
