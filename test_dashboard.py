@@ -247,6 +247,32 @@ class ProjectionTests(unittest.TestCase):
         self.assertIn("history.completedByDeviceModel", script)
         self.assertNotIn("contributions.slice(0, 8)", script)
 
+    def test_frontend_presents_worker_and_accelerator_throughput(self):
+        markup = Path("dashboard/index.html").read_text(encoding="utf-8")
+        script = Path("dashboard/app.js").read_text(encoding="utf-8")
+        self.assertIn(">Worker throughput</th>", markup)
+        self.assertIn(">Accelerator throughput</th>", markup)
+        self.assertIn("throughput(worker.measuredThroughput)", script)
+        self.assertIn("throughput(worker.metalThroughput)", script)
+        self.assertIn('"Worker throughput": throughput(worker.measuredThroughput)', script)
+        self.assertIn('"Accelerator throughput": throughput(worker.metalThroughput)', script)
+        self.assertIn('"Advertised compute backend(s)"', script)
+        self.assertIn('"Fleet worker throughput", throughput(snapshot.summary.measuredThroughput)', script)
+        self.assertIn('"Fleet Metal throughput", throughput(snapshot.summary.metalThroughput)', script)
+        self.assertIn("snapshot.summary.metalThroughput != null", script)
+
+    def test_snapshot_keeps_worker_and_accelerator_rates_distinct(self):
+        coordinator = FakeCoordinator()
+        snapshot = build_snapshot(
+            coordinator.observed["nodes"], coordinator.observed["contributions"],
+            coordinator.observed["projects"], {}, now=100,
+        )
+        mac = next(worker for worker in snapshot["workers"] if worker["id"] == "mac-1")
+        self.assertEqual(20, mac["measuredThroughput"])
+        self.assertEqual(25, mac["metalThroughput"])
+        self.assertEqual(30, snapshot["summary"]["measuredThroughput"])
+        self.assertEqual(25, snapshot["summary"]["metalThroughput"])
+
     def test_workers_are_sorted_by_measured_throughput(self):
         coordinator = FakeCoordinator()
         coordinator.observed["contributions"]["allTime"]["nodes"].append({
