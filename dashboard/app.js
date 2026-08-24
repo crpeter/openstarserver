@@ -7,6 +7,17 @@ const relative = timestamp => {
   const seconds = Math.max(0, Date.now() / 1000 - timestamp);
   return seconds < 60 ? `${Math.floor(seconds)}s ago` : seconds < 3600 ? `${Math.floor(seconds / 60)}m ${Math.floor(seconds % 60)}s ago` : seconds < 86400 ? `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m ago` : `${Math.floor(seconds / 86400)}d ago`;
 };
+const throughput = value => value == null ? "—" : `${fmt(value)} eval/s`;
+const advertisedBackends = capabilities => {
+  const value = capabilities && (capabilities.computeBackends ?? capabilities.supportedComputeBackends ?? capabilities.backends ?? capabilities.computeBackend ?? capabilities.backend);
+  const backendID = entry => typeof entry === "string" ? entry : entry && typeof entry === "object" && typeof entry.id === "string" ? entry.id : typeof entry === "number" ? String(entry) : null;
+  if (Array.isArray(value)) {
+    const ids = value.map(backendID).filter(id => id && id.trim());
+    return ids.length ? ids.join(", ") : null;
+  }
+  const id = backendID(value);
+  return id && id.trim() ? id : null;
+};
 function element(tag, options = {}, children = []) {
   const node = document.createElement(tag);
   if (options.className) node.className = options.className;
@@ -55,7 +66,7 @@ function renderWorkers() {
     } else assignment.textContent = "—";
     const seen = element("td", {text: relative(worker.lastSeenAt), title: worker.lastSeenAt ? new Date(worker.lastSeenAt * 1000).toISOString() : "Unavailable"});
     const row = current || element("tr");
-    row.replaceChildren(identity, element("td", {}, [badge]), assignment, element("td", {text: count(worker.completedWorkUnits)}), element("td", {text: duration(worker.cumulativeRuntimeSeconds)}), element("td", {text: worker.measuredThroughput == null ? "—" : `${fmt(worker.measuredThroughput)} eval/s`}), seen);
+    row.replaceChildren(identity, element("td", {}, [badge]), assignment, element("td", {text: count(worker.completedWorkUnits)}), element("td", {text: duration(worker.cumulativeRuntimeSeconds)}), element("td", {text: throughput(worker.measuredThroughput)}), element("td", {text: throughput(worker.metalThroughput)}), seen);
     if (!current) row.addEventListener("click", () => openDetail(worker.id));
     return row;
   });
@@ -89,7 +100,7 @@ async function openDetail(id) {
     const response = await fetch(`/api/dashboard/workers/${encodeURIComponent(id)}`);
     if (!response.ok) throw new Error(`Worker request failed (${response.status})`);
     const worker = await response.json();
-    const fields = {Status: `${worker.connectionState} / ${worker.computeState}`, Platform: worker.platform, "Hardware model": worker.hardwareModel, "OS version": worker.osVersion, "Worker version": worker.workerVersion, GPU: worker.gpuName, "CPU cores": worker.processorCount, Memory: worker.memoryGB && `${worker.memoryGB} GB`, Battery: worker.batteryLevel, Power: worker.powerState, Thermal: worker.thermalState, "Low power": worker.lowPowerMode, Network: worker.network, Completed: worker.completedWorkUnits, Failed: worker.failedWorkUnits, "Cumulative runtime": duration(worker.cumulativeRuntimeSeconds), "Metal runtime": duration(worker.metalSeconds), "Last seen": worker.lastSeenAt && new Date(worker.lastSeenAt * 1000).toISOString(), "Latest error": worker.latestError};
+    const fields = {Status: `${worker.connectionState} / ${worker.computeState}`, Platform: worker.platform, "Hardware model": worker.hardwareModel, "OS version": worker.osVersion, "Worker version": worker.workerVersion, GPU: worker.gpuName, "Advertised compute backend(s)": advertisedBackends(worker.capabilities), "Worker throughput": throughput(worker.measuredThroughput), "Accelerator throughput": throughput(worker.metalThroughput), "CPU cores": worker.processorCount, Memory: worker.memoryGB && `${worker.memoryGB} GB`, Battery: worker.batteryLevel, Power: worker.powerState, Thermal: worker.thermalState, "Low power": worker.lowPowerMode, Network: worker.network, Completed: worker.completedWorkUnits, Failed: worker.failedWorkUnits, "Cumulative runtime": duration(worker.cumulativeRuntimeSeconds), "Metal runtime": duration(worker.metalSeconds), "Last seen": worker.lastSeenAt && new Date(worker.lastSeenAt * 1000).toISOString(), "Latest error": worker.latestError};
     replace(body, [element("h2", {text: worker.name || worker.id}), element("p", {text: worker.id}), element("h3", {text: "Telemetry"}), element("div", {className: "detailgrid"}, labelledRows(fields)), element("h3", {text: `Current assignments (${worker.currentAssignments.length})`}), jsonBlock(worker.currentAssignments), element("h3", {text: "Recent completed work"}), jsonBlock(worker.recentCompleted.length ? worker.recentCompleted : "No retained completed work"), element("h3", {text: "Recent errors"}), jsonBlock(worker.recentFailures.length ? worker.recentFailures : "No retained errors"), element("h3", {text: "Advertised capabilities"}), jsonBlock(worker.capabilities)]);
   } catch (error) { replace(body, [element("h2", {text: "Worker unavailable"}), element("p", {text: error.message})]); }
 }
@@ -98,8 +109,9 @@ async function refreshFleet() {
   try {
     const [snapshot, history] = await Promise.all(["/api/dashboard/summary", "/api/dashboard/history"].map(url => fetch(url).then(response => response.json())));
     workers = snapshot.workers.slice().sort((a, b) => (b.measuredThroughput ?? -1) - (a.measuredThroughput ?? -1) || a.id.localeCompare(b.id));
-    const cards = [["Known workers", snapshot.summary.knownWorkers], ["Connected", snapshot.summary.connectedWorkers], ["Computing", snapshot.summary.activeWorkers], ["Running units", snapshot.summary.runningWorkUnits], ["Completed", snapshot.summary.completedWorkUnits], ["Compute time", duration(snapshot.summary.workerComputeSeconds)]];
-    refreshSection($("#stats"), cards, cards.map(([label, value]) => element("div", {className: "stat"}, [element("span", {text: label}), element("b", {text: typeof value === "number" && label !== "Compute time" ? count(value) : value})])));
+    const cards = [["Known workers", count(snapshot.summary.knownWorkers)], ["Connected", count(snapshot.summary.connectedWorkers)], ["Computing", count(snapshot.summary.activeWorkers)], ["Running units", count(snapshot.summary.runningWorkUnits)], ["Completed", count(snapshot.summary.completedWorkUnits)], ["Compute time", duration(snapshot.summary.workerComputeSeconds)], ["Fleet worker throughput", throughput(snapshot.summary.measuredThroughput), "Total sample-frequency evaluations divided by total worker compute seconds; intended for backend-neutral comparison."]];
+    if (snapshot.summary.metalThroughput != null) cards.push(["Fleet Metal throughput", throughput(snapshot.summary.metalThroughput), "Metal execution throughput only; excludes broader worker overhead."]);
+    refreshSection($("#stats"), cards, cards.map(([label, value, title]) => element("div", {className: "stat", title}, [element("span", {text: label}), element("b", {text: value})])));
     renderWorkers();
     $("#updated").textContent = `${snapshot.summary.health.toUpperCase()} · updated ${relative(snapshot.summary.updatedAt)}`;
     const contributions = Object.entries(history.completedByDeviceModel || {}).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
