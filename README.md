@@ -51,6 +51,18 @@ it must not be used for authoritative or production science state. Durable
 paths remain user-selected—this example is guidance, not a required application
 directory.
 
+### Immutable historical path relocation
+
+An investigation copied from an old or unsafe location can explicitly redirect
+historical reads with repeatable `--relocate-historical-root OLD=NEW` options.
+This runtime facility does not migrate files or rewrite science history:
+persisted paths, provenance, and expected artifact hashes remain authoritative,
+and bytes at each mapped durable destination must pass the original SHA-256
+checks. Relocation is explicit and performs no filesystem search or fallback to
+the old root. It is intended for recovery or movement of authoritative science
+state between durable locations; new science should start in durable storage
+and normally needs no relocation mapping.
+
 Historical roots can be indexed explicitly without changing their science
 files. The bounded scan examines only each configured root and its direct
 children; by default it checks `/tmp`, `/private/tmp`, and repository `data`:

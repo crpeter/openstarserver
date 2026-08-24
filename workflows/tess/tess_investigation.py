@@ -15,6 +15,7 @@ from openstar_investigation import (
     sha256_file,
     sha256_json,
 )
+from openstar_path_relocation import HistoricalPathResolver
 from openstar_workflow import (
     RetryableExecutionError,
     StageOutcome,
@@ -1727,6 +1728,7 @@ def build_engine(
     *,
     poll_interval: float,
     timeout: float | None,
+    historical_path_resolver: HistoricalPathResolver | None = None,
 ) -> WorkflowEngine:
     engine = WorkflowEngine(store)
 
@@ -4242,7 +4244,8 @@ def build_engine(
     def archival_baseline_prepare_stage(investigation, request):
         if any(s.handler_id.startswith("openstar.tess.target-residual-archival-baseline.") and s.id != request.id for s in investigation.stages):
             raise RuntimeError("an existing v20.17 archival-baseline attempt already exists")
-        lineage=verify_frozen_science_lineage(investigation.stages)
+        lineage=verify_frozen_science_lineage(
+            investigation.stages, resolver=historical_path_resolver)
         prep=lineage["v20.12Preparation"]; decomposition=lineage["v20.12Interpretation"]
         v13=lineage["v20.13"]
         target=[x for x in decomposition.result.get("componentSummaries") or [] if x.get("componentID")=="target" and x.get("componentType")=="TARGET"]
@@ -4260,7 +4263,9 @@ def build_engine(
             "morphologyPhysicalPeriodResult":sha256_json(lineage["morphology"].result),
             **{f"artifact:{key}":value for key,value in lineage["verifiedArtifactSHA256"].items()}}
         try:
-            spec=build_archival_baseline_project(source_project_path=primary["sourceProjectPath"],source_dataset_entry=primary["sourceDatasetEntry"],
+            historical_source_project = (historical_path_resolver.resolve(primary["sourceProjectPath"])
+                if historical_path_resolver else primary["sourceProjectPath"])
+            spec=build_archival_baseline_project(source_project_path=historical_source_project,source_dataset_entry=primary["sourceDatasetEntry"],
                 tic_id=int(primary["ticID"]),candidate_sectors=None,previously_consumed=exclusions,residual_reference_frequency=reference,
                 established_frequency=1/established_period,historical_frequency_envelope=(min(frequencies),max(frequencies)),
                 output_dir=store.directory_for(investigation.id)/"artifacts",investigation_id=investigation.id)

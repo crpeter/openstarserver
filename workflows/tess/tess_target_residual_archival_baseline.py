@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from openstar_investigation import sha256_file, sha256_json
+from openstar_path_relocation import HistoricalPathResolver, NO_HISTORICAL_PATH_RELOCATION
 
 OFFICIAL_AUTHORS = ("SPOC", "TESS-SPOC")
 
@@ -204,10 +205,11 @@ def adjudicate_target(sectors: Iterable[dict[str, Any]]) -> dict[str, Any]:
         "crossSectorPhaseUsed":False,"historicalResidualDriftExtrapolated":False}
 
 
-def verified_json_result(stage: Any, filenames: str|tuple[str,...]) -> tuple[str,dict[str,Any]]:
+def verified_json_result(stage: Any, filenames: str|tuple[str,...], *,
+        resolver: HistoricalPathResolver = NO_HISTORICAL_PATH_RELOCATION) -> tuple[str,dict[str,Any]]:
     names=(filenames,) if isinstance(filenames,str) else filenames
     for ref in stage.artifacts:
-        path=Path(ref.path); expected=str(ref.sha256)
+        path=resolver.resolve(ref.path); expected=str(ref.sha256)
         if path.name in names and expected and path.is_file() and sha256_file(path)==expected:
             frozen=json.loads(path.read_text(encoding="utf-8"))
             if frozen != stage.result: raise RuntimeError("persisted result and frozen artifact JSON differ")
@@ -215,10 +217,10 @@ def verified_json_result(stage: Any, filenames: str|tuple[str,...]) -> tuple[str
     raise RuntimeError(f"artifact SHA verification failed for {names[0]}")
 
 
-def _all_artifacts_verified(stage: Any) -> dict[str, str]:
+def _all_artifacts_verified(stage: Any, resolver: HistoricalPathResolver) -> dict[str, str]:
     verified = {}
     for ref in stage.artifacts:
-        path = Path(ref.path)
+        path = resolver.resolve(ref.path)
         if not ref.sha256 or not path.is_file() or sha256_file(path) != ref.sha256:
             raise RuntimeError(f"artifact SHA verification failed for {path.name}")
         verified[str(path.resolve())] = ref.sha256
@@ -227,9 +229,11 @@ def _all_artifacts_verified(stage: Any) -> dict[str, str]:
     return verified
 
 
-def verify_frozen_science_lineage(stages: Iterable[Any]) -> dict[str, Any]:
+def verify_frozen_science_lineage(stages: Iterable[Any], *,
+        resolver: HistoricalPathResolver | None = None) -> dict[str, Any]:
     """Verify the connected v20.12--v20.16 chain before any archive I/O."""
     rows = list(stages)
+    resolver = resolver or NO_HISTORICAL_PATH_RELOCATION
     def latest(handler: str) -> Any:
         stage = next((s for s in reversed(rows) if s.handler_id == handler and
                       s.status == "COMPLETE" and isinstance(s.result, dict)), None)
@@ -254,23 +258,23 @@ def verify_frozen_science_lineage(stages: Iterable[Any]) -> dict[str, Any]:
     v16 = latest("openstar.tess.target-residual-mechanism-predictive-validation.analyze")
     final = latest("openstar.tess.finalize")
 
-    artifact_hashes = {"prepareTargetArtifacts": _all_artifacts_verified(prepare_target),
-        "v20.12PreparationArtifacts": _all_artifacts_verified(v12_prepare)}
+    artifact_hashes = {"prepareTargetArtifacts": _all_artifacts_verified(prepare_target, resolver),
+        "v20.12PreparationArtifacts": _all_artifacts_verified(v12_prepare, resolver)}
     for item in v12_prepare.result.get("preparedSeries") or []:
         for key in ("coefficientSeriesPath", "datasetPath"):
             path = item.get(key)
-            if path and str(Path(path).resolve()) not in artifact_hashes["v20.12PreparationArtifacts"]:
+            if path and str(resolver.resolve(path)) not in artifact_hashes["v20.12PreparationArtifacts"]:
                 raise RuntimeError(f"v20.12 preparedSeries {key} lacks an authoritative ArtifactReference")
     target_hashes = prepare_target.provenance.input_hashes if prepare_target.provenance else {}
-    source_project = Path(str(prepare_target.result.get("sourceProjectPath") or ""))
-    source_dataset = Path(str(prepare_target.result.get("datasetPath") or ""))
-    primary_project_path = str(Path(str(prepare_target.result.get("projectPath") or "")).resolve())
+    source_project = resolver.resolve(str(prepare_target.result.get("sourceProjectPath") or ""))
+    source_dataset = resolver.resolve(str(prepare_target.result.get("datasetPath") or ""))
+    primary_project_path = str(resolver.resolve(str(prepare_target.result.get("projectPath") or "")))
     if not (primary_project_path in artifact_hashes["prepareTargetArtifacts"]
             and source_project.is_file() and source_dataset.is_file()
             and target_hashes.get("sourceProjectManifest") == sha256_file(source_project)
             and target_hashes.get("sourceDataset") == sha256_file(source_dataset)):
         raise RuntimeError("prepare-target source project/dataset provenance is not authoritative")
-    morphology_sha, _ = verified_json_result(morphology, "morphology-v20.4.json")
+    morphology_sha, _ = verified_json_result(morphology, "morphology-v20.4.json", resolver=resolver)
     morphology_hashes = morphology.provenance.input_hashes if morphology.provenance else {}
     exact_family = (family_stage.result.get("harmonicFamily") or {})
     if morphology_hashes.get("periodFamily") != sha256_json(exact_family):
@@ -279,18 +283,18 @@ def verify_frozen_science_lineage(stages: Iterable[Any]) -> dict[str, Any]:
         raise RuntimeError("morphology primary-dataset lineage is inconsistent")
     for item in independent_prepare.result.get("preparedSectors") or []:
         sector, raw_path = item.get("sector"), item.get("datasetPath")
-        path = Path(str(raw_path or ""))
+        path = resolver.resolve(str(raw_path or ""))
         if (not path.is_file() or morphology_hashes.get(f"independentSector{sector}")
                 != sha256_file(path)):
             raise RuntimeError(f"morphology independent Sector {sector} lineage is inconsistent")
-    v12_interpret_sha, _ = verified_json_result(v12_interpret, "multi-source-residual-v20.12.json")
+    v12_interpret_sha, _ = verified_json_result(v12_interpret, "multi-source-residual-v20.12.json", resolver=resolver)
     v13_sha, _ = verified_json_result(v13, ("intrinsic-nonstationary-v20.13.json",
-                                             "intrinsic-nonstationary-v20.31.json"))
-    v14_sha, _ = verified_json_result(v14, "target-residual-mechanism-v20.14.json")
+                                             "intrinsic-nonstationary-v20.31.json"), resolver=resolver)
+    v14_sha, _ = verified_json_result(v14, "target-residual-mechanism-v20.14.json", resolver=resolver)
     v16_sha, _ = verified_json_result(v16,
-        "target-residual-mechanism-predictive-validation-v20.16.json")
+        "target-residual-mechanism-predictive-validation-v20.16.json", resolver=resolver)
     final_sha, _ = verified_json_result(final,
-        "conclusion-v20.16-target-residual-predictive-validation.json")
+        "conclusion-v20.16-target-residual-predictive-validation.json", resolver=resolver)
 
     from .tess_target_residual_mechanism_predictive_validation import v2013_lineage_matches
     v12_interpret_hashes = (v12_interpret.provenance.input_hashes
@@ -313,7 +317,7 @@ def verify_frozen_science_lineage(stages: Iterable[Any]) -> dict[str, Any]:
     if source_handler == "openstar.tess.target-residual-mechanism-adjudication.analyze":
         v15 = latest(source_handler)
         v15_sha, _ = verified_json_result(v15,
-            "target-residual-mechanism-adjudication-v20.15.json")
+            "target-residual-mechanism-adjudication-v20.15.json", resolver=resolver)
         v15_hashes = v15.provenance.input_hashes if v15.provenance else {}
         v15_input = v15.result.get("inputProvenance") or {}
         if not (v15_hashes.get("v20.14Result") == sha256_json(v14.result)
