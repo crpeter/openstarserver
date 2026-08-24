@@ -24,6 +24,51 @@ from .tess_source_pair_lineage import frozen_source_pair_evidence
 WORKFLOW_ID = "openstar.workflow.tess-investigation.v1"
 WORKFLOW_VERSION = "20.2"
 
+_V2017_HANDLER_PREFIX = "openstar.tess.target-residual-archival-baseline."
+
+
+def _verified_stage_json(stage, expected_filename: str) -> bool:
+    if not isinstance(stage.result, dict): return False
+    for reference in stage.artifacts:
+        path=Path(reference.path)
+        try:
+            if path.name == expected_filename and path.is_file() and reference.sha256 == sha256_file(path):
+                with path.open(encoding="utf-8") as handle:
+                    if json.load(handle) == stage.result: return True
+        except (OSError, ValueError, json.JSONDecodeError):
+            pass
+    return False
+
+
+def _continue_finalized_v2016_archival_baseline(store: InvestigationStore,
+        investigation: Investigation, control: dict) -> Investigation | None:
+    """Narrow, idempotent admission of the exact finalized v20.16 boundary."""
+    expected_terminal_control = {"branchAssessments": [], "selectedExperiment": None,
+                                 "schedulerAction": "INVESTIGATION_COMPLETE"}
+    if (investigation.status != "COMPLETE" or control != expected_terminal_control
+            or any(s.handler_id.startswith(_V2017_HANDLER_PREFIX) for s in investigation.stages)):
+        return None
+    science=next((s for s in investigation.stages if s.id=="030-target-residual-mechanism-predictive-validation"),None)
+    final=next((s for s in investigation.stages if s.id=="031-finalize"),None)
+    if not (science and science.status=="COMPLETE" and science.handler_id=="openstar.tess.target-residual-mechanism-predictive-validation.analyze"
+            and science.result and science.result.get("classification")=="TARGET_RESIDUAL_MECHANISM_PREDICTIVE_VALIDATION_UNRESOLVED"
+            and science.result.get("recommendedNextTest")=="ADDITIONAL_TEMPORAL_BASELINE_OR_MECHANISM_DISCRIMINATION"
+            and science.result.get("physicalMechanismResolved") is False and _verified_stage_json(
+                science, "target-residual-mechanism-predictive-validation-v20.16.json")
+            and final and final.status=="COMPLETE" and final.handler_id=="openstar.tess.finalize"
+            and final.parameters == {"outputSuffix":"v20.16-target-residual-predictive-validation"}
+            and final.triggered_by_stage_id==science.id and final is investigation.stages[-1]
+            and final.result and final.result.get("targetResidualMechanismPredictiveValidation")==science.result
+            and final.result.get("recommendedNextTest")=="ADDITIONAL_TEMPORAL_BASELINE_OR_MECHANISM_DISCRIMINATION"
+            and _verified_stage_json(final,
+                "conclusion-v20.16-target-residual-predictive-validation.json")):
+        return None
+    request=StageRequest("032-target-residual-archival-baseline-prepare",
+        "openstar.tess.target-residual-archival-baseline.prepare",{},final.id)
+    return store.set_control_state(investigation,status="RUNNING",control_state={
+        "branchAssessments":[],"selectedExperiment":asdict(request),"schedulerAction":"RUN_EXPERIMENT",
+        "recovery":"TESS_V20_16_ARCHIVAL_BASELINE_EXTENSION_V20_17"})
+
 
 def _stable_id(value: object) -> str:
     normalized = re.sub(r"[^a-z0-9._-]+", "-", str(value).lower()).strip("-")
@@ -1299,6 +1344,10 @@ def repair_obsolete_terminal_wait(
     control = investigation.metadata.get("controlState")
     if investigation.workflow_id != WORKFLOW_ID or not isinstance(control, dict):
         return investigation
+
+    archival = _continue_finalized_v2016_archival_baseline(store, investigation, control)
+    if archival is not None:
+        return archival
 
     old_mechanism = _old_target_residual_adjudication_boundary(investigation)
     if old_mechanism is not None:

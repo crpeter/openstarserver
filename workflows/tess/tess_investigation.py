@@ -81,6 +81,10 @@ from .tess_target_residual_mechanism_predictive_validation import (
     analyze_predictive_validation,
     v2013_lineage_matches,
 )
+from .tess_target_residual_archival_baseline import (
+    adjudicate_target, adjudicate_sector, build_archival_baseline_project,
+    previously_consumed_tess_sectors, verify_frozen_science_lineage,
+)
 from .tess_offset_source import identify_offset_residual_source
 from .tess_offset_variability import (
     build_offset_source_variability_project,
@@ -197,7 +201,7 @@ from .tess_multisector import (
 WORKFLOW_ID = "openstar.workflow.tess-investigation.v1"
 WORKFLOW_VERSION = "20.2"
 SOFTWARE_ID = "openstar.tess-investigation-plugin"
-SOFTWARE_VERSION = "20.33"
+SOFTWARE_VERSION = "20.34"
 
 
 def _stage(investigation: Investigation, stage_id: str):
@@ -1699,6 +1703,21 @@ def _render_report(conclusion: dict[str, Any]) -> str:
         "This report is produced by deterministic OpenStar rules. It never automatically emits `DISCOVERY`.",
         "",
     ])
+    archival = conclusion.get("targetResidualArchivalBaselineExtension")
+    if archival is not None:
+        envelope = archival.get("historicalFrequencyEnvelope") or {}
+        lines.extend(["", "## Archival target-residual baseline extension", "",
+            f"- Classification: {archival.get('classification')}",
+            f"- Recommended next test: {archival.get('recommendedNextTest')}",
+            f"- Frozen residual reference: {archival.get('frozenResidualReferencePeriodDays')} days / {archival.get('frozenResidualReferenceFrequency')} cycles/day",
+            f"- Historical frequency envelope: {envelope.get('minimum')}–{envelope.get('maximum')} cycles/day",
+            f"- Eligible/supporting/resolution-limited/non-supporting sectors: {archival.get('eligibleSectorCount')}/{archival.get('supportingSectorCount')}/{archival.get('resolutionLimitedSectorCount')}/{archival.get('nonSupportingSectorCount')}",
+            f"- Supporting temporal span: {archival.get('supportingTemporalSpanDays')} days",
+            f"- Future pixel-followup sectors: {archival.get('selectedFuturePixelFollowupSectors')}",
+            f"- Archive/materialization limitations: {archival.get('archiveMaterializationLimitations') or []}",
+            "", "### Archival sector recurrence", ""])
+        for item in archival.get("sectorEvidence") or []:
+            lines.append(f"- Sector {item.get('sector')}: author={item.get('author')}, cadence={item.get('cadenceSeconds')} s, baseline={item.get('baselineDays')} d, candidatePeriod={item.get('candidatePeriodDays')} d, candidateFrequency={item.get('candidateFrequency')}, CI={item.get('candidateFrequencyConfidenceInterval')}, classification={item.get('recurrenceClassification')}, supports={item.get('supportsHistoricalResidualFamily')}")
     return "\n".join(lines)
 
 
@@ -4219,6 +4238,70 @@ def build_engine(
                    summary["frozenV20.12ArtifactsByDataset"].items()
                    for kind in ("coefficientSeriesSHA256", "datasetSHA256")}},
             artifacts=(_artifact(artifact_path, "application/json"),))
+
+    def archival_baseline_prepare_stage(investigation, request):
+        if any(s.handler_id.startswith("openstar.tess.target-residual-archival-baseline.") and s.id != request.id for s in investigation.stages):
+            raise RuntimeError("an existing v20.17 archival-baseline attempt already exists")
+        lineage=verify_frozen_science_lineage(investigation.stages)
+        prep=lineage["v20.12Preparation"]; decomposition=lineage["v20.12Interpretation"]
+        v13=lineage["v20.13"]
+        target=[x for x in decomposition.result.get("componentSummaries") or [] if x.get("componentID")=="target" and x.get("componentType")=="TARGET"]
+        if len(target)!=1: raise RuntimeError("v20.17 requires exactly one frozen TARGET component")
+        reference=float(target[0]["combinedFrequency"])
+        frequencies=[float(x["frequency"]) for x in v13.result.get("temporalModelEvidence") or [] if x.get("frequency") is not None]
+        if not frequencies: raise RuntimeError("v20.17 has no lineage-verified historical frequency envelope")
+        morphology=lineage["morphology"].result
+        established_period=float(morphology["resolvedPhysicalPeriodDays"])
+        primary=lineage["prepareTarget"].result
+        exclusions=previously_consumed_tess_sectors(investigation.stages)
+        frozen_input_hashes={**{f"predecessor:{key}":sha256_json(stage.result)
+            for key,stage in lineage.items() if hasattr(stage,"result")},
+            "prepareTargetResult":sha256_json(lineage["prepareTarget"].result),
+            "morphologyPhysicalPeriodResult":sha256_json(lineage["morphology"].result),
+            **{f"artifact:{key}":value for key,value in lineage["verifiedArtifactSHA256"].items()}}
+        try:
+            spec=build_archival_baseline_project(source_project_path=primary["sourceProjectPath"],source_dataset_entry=primary["sourceDatasetEntry"],
+                tic_id=int(primary["ticID"]),candidate_sectors=None,previously_consumed=exclusions,residual_reference_frequency=reference,
+                established_frequency=1/established_period,historical_frequency_envelope=(min(frequencies),max(frequencies)),
+                output_dir=store.directory_for(investigation.id)/"artifacts",investigation_id=investigation.id)
+        except TessArchiveInfrastructureError as error:
+            raise RetryableExecutionError(str(error), result=error.diagnostics,
+                input_hashes=frozen_input_hashes) from error
+        artifact_path=store.directory_for(investigation.id)/"artifacts"/"target-residual-archival-baseline"/"target-residual-archival-baseline-prepare-v20.17.json"
+        _write_json(artifact_path,spec)
+        next_stage=StageRequest("033-target-residual-archival-baseline-run",
+            "openstar.tess.target-residual-archival-baseline.run",{"projectPath":spec["projectPath"]},request.id) if spec["available"] else StageRequest(
+            "034-target-residual-archival-baseline-interpret",
+            "openstar.tess.target-residual-archival-baseline.interpret",{"noProject":True},request.id)
+        return StageOutcome(result=spec,next_stage=next_stage,
+            input_hashes=frozen_input_hashes,
+            artifacts=(_artifact(artifact_path,"application/json"),))
+
+    def archival_baseline_run_stage(investigation, request):
+        run=coordinator.run_project(request.parameters["projectPath"],poll_interval=poll_interval,timeout=timeout)
+        return StageOutcome(result=run.status,next_stage=StageRequest("034-target-residual-archival-baseline-interpret",
+            "openstar.tess.target-residual-archival-baseline.interpret",{},request.id),node_contributions=run.node_contributions,project_ids=(run.project_id,))
+
+    def archival_baseline_interpret_stage(investigation, request):
+        spec=_required_latest_result_for_handler(investigation,"openstar.tess.target-residual-archival-baseline.prepare")
+        run=_latest_result_for_handler(investigation,"openstar.tess.target-residual-archival-baseline.run")
+        if run is None:
+            if request.parameters.get("noProject") is not True or spec.get("available") is not False:
+                raise RuntimeError("v20.17 interpretation is missing its generic run")
+            run={"datasets":[]}
+        prepared={x["datasetID"]:x for x in spec.get("preparedSectors") or []}; evidence=[]
+        grid=spec["frequencySearch"]
+        for row in run.get("datasets") or []:
+            item=dict(prepared.get(str(row.get("datasetID") or row.get("id"))) or {}); item.update(row)
+            f=item.get("candidateFrequency"); guard=max(grid["frequencyStep"]*4,(grid["maximumFrequency"]-grid["minimumFrequency"])*.002)
+            item["boundaryHit"]=bool(isinstance(f,(int,float)) and (f<=grid["minimumFrequency"]+guard or f>=grid["maximumFrequency"]-guard))
+            evidence.append(adjudicate_sector(item,(spec["historicalFrequencyEnvelope"]["minimum"],spec["historicalFrequencyEnvelope"]["maximum"])))
+        summary=adjudicate_target(evidence); summary.update({key:spec[key] for key in ("frozenResidualReferenceFrequency","frozenResidualReferencePeriodDays","historicalFrequencyEnvelope")})
+        summary["archiveMaterializationLimitations"]=spec.get("errors") or []
+        artifact_path=store.directory_for(investigation.id)/"artifacts"/"target-residual-archival-baseline"/"target-residual-archival-baseline-v20.17.json"; _write_json(artifact_path,summary)
+        return StageOutcome(result=summary,next_stage=StageRequest("035-finalize","openstar.tess.finalize",
+            {"outputSuffix":"v20.17-target-residual-archival-baseline"},request.id),
+            input_hashes={"preparation":sha256_json(spec),"distributedResult":sha256_json(run)},artifacts=(_artifact(artifact_path,"application/json"),))
 
     def prf_deblending_prepare_stage(investigation, request):
         required_handlers = {
@@ -7738,6 +7821,9 @@ def build_engine(
             investigation,
             "openstar.tess.target-residual-mechanism-predictive-validation.analyze",
         )
+        target_residual_archival_baseline_extension = _latest_result_for_handler(
+            investigation, "openstar.tess.target-residual-archival-baseline.interpret",
+        )
 
         if harmonic_family_interpretation is not None:
             claim_decision = harmonic_family_interpretation["claimDecision"]
@@ -8662,7 +8748,18 @@ def build_engine(
                 "OFF_TARGET_VARIABLE_SOURCE_SUPPORTED",
             }
 
-        if (catalog_counterpart_identification is not None
+        archival_stage_index = max((index for index, stage in enumerate(investigation.stages)
+            if stage.status == "COMPLETE" and stage.handler_id ==
+            "openstar.tess.target-residual-archival-baseline.interpret"), default=-1)
+        later_unrelated_science = any(index > archival_stage_index and stage.status == "COMPLETE"
+            and stage.handler_id != "openstar.tess.finalize" and not stage.handler_id.startswith(
+                "openstar.tess.target-residual-archival-baseline.")
+            for index, stage in enumerate(investigation.stages))
+        if target_residual_archival_baseline_extension is not None and not later_unrelated_science:
+            # This branch is appended after v20.16. Genuinely later unrelated
+            # evidence remains above it when introduced in the precedence list.
+            recommended_next_test = target_residual_archival_baseline_extension.get("recommendedNextTest")
+        elif (catalog_counterpart_identification is not None
                 and offset_source_variability is not None):
             # This validation is appended after historical finalization, so
             # its recommendation supersedes stale pre-catalog conclusions.
@@ -8769,6 +8866,7 @@ def build_engine(
             "targetResidualMechanismPredictiveValidation": (
                 target_residual_mechanism_predictive_validation
             ),
+            "targetResidualArchivalBaselineExtension": target_residual_archival_baseline_extension,
             "offsetResidualSourceIdentification": offset_source_identification,
             "offsetSourceVariabilityValidation": offset_source_variability,
             "calibratedPrfSourceDeblending": calibrated_prf_deblending,
@@ -9288,6 +9386,9 @@ def build_engine(
         "openstar.tess.target-residual-mechanism-predictive-validation.analyze",
         target_residual_mechanism_predictive_validation_stage,
     )
+    engine.register_handler("openstar.tess.target-residual-archival-baseline.prepare", archival_baseline_prepare_stage)
+    engine.register_handler("openstar.tess.target-residual-archival-baseline.run", archival_baseline_run_stage)
+    engine.register_handler("openstar.tess.target-residual-archival-baseline.interpret", archival_baseline_interpret_stage)
     engine.register_handler(
         "openstar.tess.offset-source-identification.analyze",
         offset_source_identification_stage,
