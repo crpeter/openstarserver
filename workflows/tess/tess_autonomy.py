@@ -12,7 +12,7 @@ from openstar_autonomy import (
     ExternalDataDependency,
     ScientificBranch,
 )
-from openstar_investigation import Investigation, InvestigationStore
+from openstar_investigation import Investigation, InvestigationStore, sha256_file, sha256_json
 from openstar_targets import InvestigationTarget
 from openstar_workflow import StageRequest, WorkflowEngine
 from .tess_localization_evidence import frozen_residual_localization_family
@@ -175,6 +175,63 @@ def _old_target_residual_adjudication_boundary(investigation: Investigation):
             or not isinstance(stage.next_stage, dict)
             or stage.next_stage != expected_next_stage
             or selected != stage.next_stage):
+        return None
+    return stage
+
+
+def _v2015_predictive_validation_boundary(investigation: Investigation):
+    """Match only the known stage-029 v20.15 pending-finalizer boundary."""
+    stage = next((item for item in investigation.stages
+        if item.id == "029-target-residual-mechanism-adjudication"
+        and item.handler_id == "openstar.tess.target-residual-mechanism-adjudication.analyze"
+        and item.status == "COMPLETE" and item.result is not None), None)
+    if stage is None or any(item.handler_id ==
+            "openstar.tess.target-residual-mechanism-predictive-validation.analyze"
+            for item in investigation.stages):
+        return None
+    result = stage.result
+    artifacts = [ref for ref in stage.artifacts
+        if Path(ref.path).name == "target-residual-mechanism-adjudication-v20.15.json"]
+    if len(artifacts) != 1:
+        return None
+    artifact = artifacts[0]
+    try:
+        if (not artifact.sha256 or not Path(artifact.path).is_file()
+                or sha256_file(artifact.path) != artifact.sha256):
+            return None
+        with Path(artifact.path).open(encoding="utf-8") as handle:
+            frozen_result = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if frozen_result != result:
+        return None
+    v14_stage = next((item for item in reversed(investigation.stages)
+        if item.handler_id == "openstar.tess.target-residual-mechanism.analyze"
+        and item.status == "COMPLETE" and item.result is not None), None)
+    if v14_stage is None:
+        return None
+    v14_artifacts = [ref for ref in v14_stage.artifacts
+        if Path(ref.path).name == "target-residual-mechanism-v20.14.json"]
+    if len(v14_artifacts) != 1:
+        return None
+    v14_artifact = v14_artifacts[0]
+    provenance = result.get("inputProvenance") or {}
+    if (not v14_artifact.sha256 or not Path(v14_artifact.path).is_file()
+            or sha256_file(v14_artifact.path) != v14_artifact.sha256
+            or provenance.get("frozenV20.14ResultHash") != sha256_json(v14_stage.result)
+            or provenance.get("frozenV20.14ArtifactSHA256") != v14_artifact.sha256):
+        return None
+    if (result.get("classification") != "TARGET_RESIDUAL_MECHANISM_UNRESOLVED"
+            or result.get("recommendedNextTest") != "TARGET_RESIDUAL_PHYSICAL_MECHANISM_FOLLOWUP"
+            or result.get("physicalMechanismResolved") is not False
+            or result.get("failClosedReasons")):
+        return None
+    expected = {"id": "030-finalize", "handler_id": "openstar.tess.finalize",
+        "parameters": {"outputSuffix": "v20.15-intrinsic-corrective-adjudication"},
+        "triggered_by_stage_id": stage.id}
+    control = investigation.metadata.get("controlState") or {}
+    if (investigation.status != "RUNNING" or control.get("schedulerAction") != "RUN_EXPERIMENT"
+            or stage.next_stage != expected or control.get("selectedExperiment") != expected):
         return None
     return stage
 
@@ -1256,6 +1313,16 @@ def repair_obsolete_terminal_wait(
                            "schedulerAction": "RUN_EXPERIMENT",
                            "recovery": "TESS_V20_14_ROUTE_ADJUDICATION_V20_15"},
         )
+
+    adjudication = _v2015_predictive_validation_boundary(investigation)
+    if adjudication is not None:
+        request = StageRequest(id="030-target-residual-mechanism-predictive-validation",
+            handler_id="openstar.tess.target-residual-mechanism-predictive-validation.analyze",
+            parameters={}, triggered_by_stage_id=adjudication.id)
+        return store.set_control_state(investigation, status="RUNNING", control_state={
+            "branchAssessments": [], "selectedExperiment": asdict(request),
+            "schedulerAction": "RUN_EXPERIMENT",
+            "recovery": "TESS_V20_15_PREDICTIVE_VALIDATION_V20_16"})
 
     mechanism = _target_residual_mechanism_boundary(investigation)
     if (mechanism is not None and investigation.status == "COMPLETE"
