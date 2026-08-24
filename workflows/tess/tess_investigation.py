@@ -7989,9 +7989,14 @@ def build_engine(
                     + "; ".join(str(reason) for reason in limitations)
                     + ". These limitations are not positive evidence for a mechanism."
                 )
+            branch_recommendation = (
+                target_residual_mechanism_predictive_validation.get(
+                    "recommendedNextTest"
+                )
+            )
             existing_rationale.append(
-                "The next recommended test is additional independent temporal baseline "
-                "or another genuinely discriminating experiment."
+                "v20.16 recommends the next target-residual test: "
+                f"{branch_recommendation}."
             )
             claim_decision = {
                 "claim": claim_decision["claim"],

@@ -274,7 +274,10 @@ class TessTargetResidualMechanismPredictiveValidationTests(unittest.TestCase):
         )
         return store.complete_current_stage(investigation, terminal)
 
-    def _finalization_history(self, store, include_predictive=True):
+    def _finalization_history(
+        self, store, include_predictive=True, *, predictive_overrides=None,
+        later_unrelated_recommendation=None,
+    ):
         investigation = store.create("predictive-finalization", WORKFLOW_ID, WORKFLOW_VERSION)
         stages = [
             ("001-prepare-target", "openstar.tess.prepare-target", {
@@ -315,11 +318,21 @@ class TessTargetResidualMechanismPredictiveValidationTests(unittest.TestCase):
                 "modelEvidence": [{"coefficients": [1.0, 2.0, 3.0]}],
             }],
         }
+        predictive.update(predictive_overrides or {})
         if include_predictive:
             stages.append((
                 "030-target-residual-mechanism-predictive-validation",
                 "openstar.tess.target-residual-mechanism-predictive-validation.analyze",
                 predictive,
+            ))
+        if later_unrelated_recommendation is not None:
+            stages.append((
+                "032-offset-source-identification",
+                "openstar.tess.offset-source-identification.analyze",
+                {
+                    "classification": "CATALOG_COUNTERPART_IDENTIFIED",
+                    "recommendedNextTest": later_unrelated_recommendation,
+                },
             ))
         for stage in stages:
             investigation = self._complete(store, investigation, *stage)
@@ -362,7 +375,72 @@ class TessTargetResidualMechanismPredictiveValidationTests(unittest.TestCase):
             self.assertIn("Sector 69", report)
             self.assertIn("deltaLogLikelihood=1.75", report)
             self.assertIn("no distributed work or archive query", report)
+            self.assertIn(
+                "v20.16 recommends the next target-residual test: "
+                "ADDITIONAL_TEMPORAL_BASELINE_OR_MECHANISM_DISCRIMINATION.",
+                report,
+            )
             self.assertNotIn("coefficients", report)
+
+    def test_validated_v2016_reports_its_persisted_branch_recommendation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = InvestigationStore(Path(directory) / "investigations")
+            investigation, _ = self._finalization_history(store, predictive_overrides={
+                "classification":
+                    "SMOOTH_TARGET_MODE_AMPLITUDE_MODULATION_PREDICTIVELY_VALIDATED",
+                "recommendedNextTest": "ASTROPHYSICAL_MECHANISM_INTERPRETATION",
+                "replicatedPredictiveMechanisms": ["SMOOTH_AMPLITUDE_MODULATION"],
+                "replicatedPredictiveMechanismSupportingSectorIDs": {
+                    "SMOOTH_AMPLITUDE_MODULATION": [10, 69],
+                },
+                "failClosedReasons": [],
+            })
+            engine = build_engine(store, coordinator=types.SimpleNamespace(),
+                                  poll_interval=0.0, timeout=None)
+            engine.chain_stages = False
+            completed, _ = engine.run_stage(
+                investigation,
+                StageRequest("031-finalize", "openstar.tess.finalize", {},
+                             "030-target-residual-mechanism-predictive-validation"),
+                software_id="integration", software_version="20.33",
+            )
+            conclusion = completed.stages[-1].result
+            report = Path(conclusion["reportPath"]).read_text(encoding="utf-8")
+            self.assertEqual("ASTROPHYSICAL_MECHANISM_INTERPRETATION",
+                             conclusion["recommendedNextTest"])
+            self.assertIn(
+                "v20.16 recommends the next target-residual test: "
+                "ASTROPHYSICAL_MECHANISM_INTERPRETATION.", report,
+            )
+            self.assertNotIn("additional independent temporal baseline", report)
+
+    def test_later_unrelated_recommendation_keeps_v2016_branch_rationale(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = InvestigationStore(Path(directory) / "investigations")
+            later = "DIRECT_COUNTERPART_VARIABILITY_VALIDATION"
+            investigation, predictive = self._finalization_history(
+                store, later_unrelated_recommendation=later,
+            )
+            engine = build_engine(store, coordinator=types.SimpleNamespace(),
+                                  poll_interval=0.0, timeout=None)
+            engine.chain_stages = False
+            completed, _ = engine.run_stage(
+                investigation,
+                StageRequest("033-finalize", "openstar.tess.finalize", {},
+                             "032-offset-source-identification"),
+                software_id="integration", software_version="20.33",
+            )
+            conclusion = completed.stages[-1].result
+            report = Path(conclusion["reportPath"]).read_text(encoding="utf-8")
+            self.assertEqual(later, conclusion["recommendedNextTest"])
+            self.assertIn(
+                "v20.16 recommends the next target-residual test: "
+                f"{predictive['recommendedNextTest']}.", report,
+            )
+            self.assertNotIn(
+                f"The investigation-wide next step is {predictive['recommendedNextTest']}",
+                report,
+            )
 
     def test_history_without_v2016_keeps_existing_recommendation(self):
         with tempfile.TemporaryDirectory() as directory:
