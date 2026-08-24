@@ -37,10 +37,12 @@ def _continue_finalized_v2018_multisector_source(store, investigation, control, 
     """Admit only the exact, cryptographically verified unresolved v20.18 result."""
     terminal = {"branchAssessments": [], "selectedExperiment": None,
                 "schedulerAction": "INVESTIGATION_COMPLETE"}
-    stale_finalizer = {"branchAssessments": [], "schedulerAction": "RUN_EXPERIMENT",
-        "selectedExperiment": {"id": "039-finalize", "handler_id": "openstar.tess.finalize",
-            "parameters": {"outputSuffix": "v20.18-target-residual-pixel-recurrence-validation"},
-            "triggered_by_stage_id": "038-target-residual-pixel-recurrence-interpret"}}
+    stale_finalizer = {"branchAssessments": [],
+        "recovery": "TESS_V20_17_PIXEL_RECURRENCE_LOCALIZATION_V20_18",
+        "schedulerAction": "RUN_EXPERIMENT", "selectedExperiment": {
+            "handler_id": "openstar.tess.target-residual-pixel-recurrence.prepare",
+            "id": "036-target-residual-pixel-recurrence-prepare", "parameters": {},
+            "triggered_by_stage_id": "035-finalize"}}
     if (investigation.status != "COMPLETE" or control not in (terminal, stale_finalizer)
             or any(stage.handler_id.startswith(_V2019_HANDLER_PREFIX) for stage in investigation.stages)):
         return None

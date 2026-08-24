@@ -1,6 +1,22 @@
 import unittest
+from unittest import mock
+import copy, json, tempfile
+from types import SimpleNamespace
+from openstar_workflow import StageRequest
+from dataclasses import replace
+from pathlib import Path
+from openstar_investigation import ArtifactReference, InvestigationStage, StageProvenance, sha256_file, sha256_json
+from workflows.tess.tess_autonomy import repair_obsolete_terminal_wait
+import test_tess_target_residual_pixel_recurrence as v2018_tests
 
-from workflows.tess.tess_catalog_guided_localization import generate_source_hypotheses
+try:
+    import numpy as np
+    from workflows.tess.tess_catalog_guided_localization import (
+        COMPONENT_IDS, MODEL_COMPONENTS, compare_source_hypotheses,
+        generate_source_hypotheses)
+    NUMPY_AVAILABLE = True
+except ModuleNotFoundError:
+    np = None; NUMPY_AVAILABLE = False
 from workflows.tess.tess_target_residual_multisector_source import (
     MAX_COMPETING_SOURCES, V2018_SECTOR_IDS, derive_additional_sectors,
     derive_competing_sources, interpret_multisector,
@@ -24,6 +40,111 @@ def sector(sector_id, sources=(), *, available=True, identifiable=True):
 
 
 class MultisectorSourceTests(unittest.TestCase):
+    STALE = {"branchAssessments": [],
+        "recovery": "TESS_V20_17_PIXEL_RECURRENCE_LOCALIZATION_V20_18",
+        "schedulerAction": "RUN_EXPERIMENT", "selectedExperiment": {
+            "handler_id": "openstar.tess.target-residual-pixel-recurrence.prepare",
+            "id": "036-target-residual-pixel-recurrence-prepare", "parameters": {},
+            "triggered_by_stage_id": "035-finalize"}}
+
+    def _boundary(self, directory, control=None):
+        fixture = v2018_tests.TargetResidualPixelRecurrenceTests(methodName="test_unique_target_and_catalog_localizations")
+        store, inv = fixture._boundary(directory)
+        def artifact(name, value):
+            path = Path(directory) / name; path.write_text(json.dumps(value) + "\n")
+            return ArtifactReference(str(path), sha256_file(path), "application/json")
+        stages = list(inv.stages); v17 = copy.deepcopy(stages[-2].result)
+        v17["sectorEvidence"].append(evidence(100))
+        v17_path = Path(stages[-2].artifacts[0].path); v17_path.write_text(json.dumps(v17) + "\n")
+        stages[-2] = replace(stages[-2], result=v17,
+            artifacts=(replace(stages[-2].artifacts[0], sha256=sha256_file(v17_path)),))
+        v17_final = {**stages[-1].result, "targetResidualArchivalBaselineExtension": v17}
+        final_path = Path(stages[-1].artifacts[0].path); final_path.write_text(json.dumps(v17_final) + "\n")
+        stages[-1] = replace(stages[-1], result=v17_final,
+            artifacts=(replace(stages[-1].artifacts[0], sha256=sha256_file(final_path)),))
+        inv = replace(inv, stages=tuple(stages))
+        prep = {"ticID": 1, "targetSourceID": "TIC-1", "targetSky": {"raDeg": 10., "decDeg": 20.},
+            "catalogHypotheses": [{"sourceID": "TIC-1", "raDeg": 10., "decDeg": 20.}],
+            "selectedSectorEvidence": [{"sector": value} for value in V2018_SECTOR_IDS],
+            "frozenEstablishedPhysicalFrequency": .1}
+        run = {"sectorResults": [{"sector": 2, "classification": "AMBIGUOUS_OR_BLENDED",
+            "distancesPixels": {"TIC-1": .1}}]}
+        science = {"classification": "PIXEL_RECURRENCE_LOCALIZATION_UNRESOLVED",
+            "recommendedNextTest": "ADDITIONAL_SOURCE_LOCALIZATION_DATA", "sourceAttributionResolved": False,
+            "physicalMechanismResolved": False, "crossSectorPhaseUsed": False,
+            "historicalResidualDriftExtrapolated": False}
+        s36 = InvestigationStage("036-target-residual-pixel-recurrence-prepare",
+            "openstar.tess.target-residual-pixel-recurrence.prepare", "COMPLETE", "035-finalize", {}, result=prep,
+            artifacts=(artifact("target-residual-pixel-recurrence-prepare-v20.18.json", prep),),
+            provenance=StageProvenance("test", "1", {"v20.17": sha256_json(inv.stages[-2].result)}))
+        s37 = InvestigationStage("037-target-residual-pixel-recurrence-run",
+            "openstar.tess.target-residual-pixel-recurrence.run", "COMPLETE", s36.id, {}, result=run,
+            artifacts=(artifact("target-residual-pixel-recurrence-run-v20.18.json", run),))
+        s38 = InvestigationStage("038-target-residual-pixel-recurrence-interpret",
+            "openstar.tess.target-residual-pixel-recurrence.interpret", "COMPLETE", s37.id, {}, result=science,
+            artifacts=(artifact("target-residual-pixel-recurrence-v20.18.json", science),),
+            provenance=StageProvenance("test", "1", {"preparation": sha256_json(prep), "run": sha256_json(run)}))
+        conclusion = {"targetResidualPixelRecurrenceValidation": science,
+                      "recommendedNextTest": "ADDITIONAL_SOURCE_LOCALIZATION_DATA"}
+        s39 = InvestigationStage("039-finalize", "openstar.tess.finalize", "COMPLETE", s38.id,
+            {"outputSuffix": "v20.18-target-residual-pixel-recurrence-validation"}, result=conclusion,
+            artifacts=(artifact("conclusion-v20.18-target-residual-pixel-recurrence-validation.json", conclusion),), stop=True)
+        inv = replace(inv, stages=inv.stages + (s36, s37, s38, s39))
+        return store, store.set_control_state(inv, status="COMPLETE", control_state=copy.deepcopy(control or {
+            "branchAssessments": [], "selectedExperiment": None, "schedulerAction": "INVESTIGATION_COMPLETE"}))
+
+    def test_terminal_and_exact_real_stale_controls_admit_idempotently(self):
+        for control in (None, self.STALE):
+            with tempfile.TemporaryDirectory() as directory:
+                store, inv = self._boundary(directory, control); before = inv.stages
+                admitted = repair_obsolete_terminal_wait(store, inv)
+                self.assertEqual("040-target-residual-multisector-source-prepare",
+                    admitted.metadata["controlState"]["selectedExperiment"]["id"])
+                self.assertIs(before, admitted.stages)
+                self.assertEqual(admitted, repair_obsolete_terminal_wait(store, admitted))
+
+    def test_stale_control_near_misses_refuse(self):
+        for key in ("recovery", "schedulerAction"):
+            with tempfile.TemporaryDirectory() as directory:
+                control = copy.deepcopy(self.STALE); control[key] = "WRONG"
+                store, inv = self._boundary(directory, control)
+                self.assertEqual(inv, repair_obsolete_terminal_wait(store, inv))
+
+    @unittest.skipUnless(NUMPY_AVAILABLE, "NumPy required for full public-handler lifecycle")
+    def test_public_040_through_043_lifecycle_acquires_without_sector_input_injection(self):
+        from workflows.tess.tess_investigation import build_engine
+        with tempfile.TemporaryDirectory() as directory:
+            store, inv = self._boundary(directory); historical = copy.deepcopy(inv.stages)
+            inv = repair_obsolete_terminal_wait(store, inv)
+            engine = build_engine(store, SimpleNamespace(), poll_interval=0, timeout=None)
+            engine.chain_stages = False
+            request = StageRequest(**inv.metadata["controlState"]["selectedExperiment"])
+            class WCS:
+                def world_to_pixel(self, coordinate): return 1., 1.
+            tpf = SimpleNamespace(time=SimpleNamespace(value=np.linspace(0., 27., 120)),
+                flux=SimpleNamespace(value=np.ones((120, 3, 3))), wcs=WCS())
+            analyzed = {"sector": 100, "scientificallyValid": False,
+                "fullDataComparison": {"bestModel": None, "bestModelIdentifiable": False,
+                    "completeModelFullRank": False},
+                "temporalPredictiveValidation": {"predictiveModel": None, "predictiveSupport": False}}
+            with mock.patch("workflows.tess.tess_residual_localization._download_tpf",
+                    return_value=(tpf, {"sourceType": "OFFICIAL_TPF", "author": "SPOC"})), mock.patch(
+                    "workflows.tess.tess_spoc_prf._tpf_detector_geometry", return_value=(1, 1, 0., 0.)), mock.patch(
+                    "workflows.tess.tess_spoc_prf._list_official_prf_grid", return_value=[]), mock.patch(
+                    "workflows.tess.tess_spoc_prf._official_prf_at_detector_position",
+                    return_value=(np.ones((3, 3)), {}, ["official-prf.fits"])), mock.patch(
+                    "workflows.tess.tess_catalog_guided_localization.analyze_generalized_catalog_guided_sector",
+                    return_value=analyzed):
+                for _ in range(4):
+                    inv, request = engine.run_stage(inv, request, software_id="test", software_version="20.36")
+            self.assertEqual(historical, inv.stages[:len(historical)])
+            self.assertEqual(["040-target-residual-multisector-source-prepare",
+                "041-target-residual-multisector-source-run",
+                "042-target-residual-multisector-source-interpret", "043-finalize"],
+                [stage.id for stage in inv.stages[len(historical):]])
+            self.assertIsNone(request); self.assertFalse(any(stage.id.startswith("044-") for stage in inv.stages))
+
+    @unittest.skipUnless(NUMPY_AVAILABLE, "NumPy required for generalized model tests")
     def test_hypotheses_are_all_nonempty_subsets_in_deterministic_order(self):
         self.assertEqual(255, len(generate_source_hypotheses([f"s{i}" for i in range(8)])))
         self.assertEqual(list(generate_source_hypotheses(("a", "b", "c"))), [
@@ -52,6 +173,34 @@ class MultisectorSourceTests(unittest.TestCase):
                 "distancesPixels": {row["sourceID"]: 0.5 for row in too_many}}])
         self.assertEqual(8, MAX_COMPETING_SOURCES)
 
+    def test_unresolved_old_sector_cannot_contribute_competitors(self):
+        with self.assertRaises(RuntimeError):
+            derive_competing_sources([{"sourceID": "bad"}], [{"classification": "UNRESOLVED",
+                "distancesPixels": {"bad": 0.0}}])
+
+    @unittest.skipUnless(NUMPY_AVAILABLE, "NumPy required for generalized model tests")
+    def test_identifiable_omitted_competitor_blocks_unique_winner(self):
+        def weighted(**kwargs):
+            ids = kwargs["component_ids"]
+            return {"bic": 0.0 if ids == ["A"] else 10.0, "fullRank": True,
+                "parameterEstimates": [0.0] * (2 * len(ids)),
+                "sourceEstimates": [{"componentID": source, "individuallyIdentifiable": True,
+                    "sinA": 1.0, "cosB": 0.0, "covariance": [[1, 0], [0, 1]]} for source in ids]}
+        with mock.patch("workflows.tess.tess_catalog_guided_localization._weighted_hypothesis",
+                        side_effect=weighted):
+            result = compare_source_hypotheses(np.zeros((2, 2)), np.repeat(np.eye(2)[None], 2, 0),
+                                               np.eye(2), ("A", "B"))
+        self.assertEqual(["A"], result["bestModelSourceIDs"])
+        self.assertFalse(result["bestModelIdentifiable"])
+        self.assertEqual({"A", "B"}, set(result["completeModelSourceIdentifiability"]))
+
+    @unittest.skipUnless(NUMPY_AVAILABLE, "NumPy required for generalized model tests")
+    def test_legacy_three_source_serialized_comparison_is_unchanged(self):
+        self.assertEqual(("target", "candidate-1", "candidate-2"), COMPONENT_IDS)
+        self.assertEqual(["TARGET_ONLY", "CANDIDATE_1_ONLY", "CANDIDATE_2_ONLY",
+            "TARGET_PLUS_CANDIDATE_1", "TARGET_PLUS_CANDIDATE_2",
+            "CANDIDATE_1_PLUS_CANDIDATE_2", "TARGET_PLUS_BOTH"], list(MODEL_COMPONENTS))
+
     def test_target_catalog_blend_switching_unavailable_and_unresolved(self):
         target = interpret_multisector([sector(i, ("target",)) for i in range(3)], "target")
         self.assertEqual("TARGET_SUPPORTED", target["classification"])
@@ -59,6 +208,8 @@ class MultisectorSourceTests(unittest.TestCase):
         self.assertEqual("CATALOG_SOURCE_SUPPORTED", catalog["classification"])
         blend = interpret_multisector([sector(i, ("target", "other")) for i in range(2)], "target")
         self.assertEqual("SOURCE_SWITCHING_OR_BLEND", blend["classification"])
+        self.assertFalse(blend["sourceAttributionResolved"])
+        self.assertTrue(blend["sourceSwitchingOrBlendDetected"])
         switching = interpret_multisector([sector(1, ("target",)), sector(2, ("target",)),
             sector(3, ("other",)), sector(4, ("other",))], "target")
         self.assertEqual("SOURCE_SWITCHING_OR_BLEND", switching["classification"])

@@ -93,7 +93,7 @@ from .tess_target_residual_pixel_recurrence import (
 )
 from .tess_target_residual_multisector_source import (
     verify_v2018_lineage, derive_competing_sources, derive_additional_sectors,
-    interpret_multisector, run_multisector_source_localization,
+    eligible_additional_sectors, interpret_multisector, run_multisector_source_localization,
 )
 from .tess_offset_source import identify_offset_residual_source
 from .tess_offset_variability import (
@@ -4402,18 +4402,22 @@ def build_engine(
         old_run = lineage["run"].result
         v17_science = lineage["v20.17"]["science"].result
         sources = derive_competing_sources(old_prepare["catalogHypotheses"], old_run["sectorResults"])
-        sectors = derive_additional_sectors(v17_science["sectorEvidence"],
-                                            [row["sector"] for row in old_prepare["selectedSectorEvidence"]])
+        excluded = [row["sector"] for row in old_prepare["selectedSectorEvidence"]]
+        eligible = eligible_additional_sectors(v17_science["sectorEvidence"], excluded)
+        sectors = derive_additional_sectors(v17_science["sectorEvidence"], excluded)
+        artifact_root = store.directory_for(investigation.id)/"artifacts"/"target-residual-multisector-source"
         result = {"version": "openstar.tess-target-residual-multisector-source-preparation.v1",
             "ticID": old_prepare["ticID"], "targetSourceID": old_prepare["targetSourceID"],
             "targetSky": copy.deepcopy(old_prepare["targetSky"]),
+            "artifactRoot": str(artifact_root.resolve()),
             "catalogHypotheses": sources, "additionalSectorEvidence": sectors,
             "establishedPhysicalFamilyFrequency": old_prepare["frozenEstablishedPhysicalFrequency"],
             "excludedV2018SectorIDs": [int(row["sector"]) for row in old_prepare["selectedSectorEvidence"]],
             "sourceSelectionProvenance": {"rule": "distancePixels <= SOURCE_MATCH_MAX_PIXELS in any v20.18 quality sector",
                 "catalogRequeried": False},
             "sectorSelectionProvenance": {"rule": "unused supporting v20.17 sectors with finite positive frozen frequency",
-                "maximum": 12, "allEligibleUsed": len(sectors) <= 12},
+                "maximum": 12, "eligibleSectorCount": len(eligible), "selectedSectorCount": len(sectors),
+                "selectionTruncated": len(sectors) < len(eligible), "allEligibleUsed": len(sectors) == len(eligible)},
             "crossSectorPhaseUsed": False, "historicalResidualDriftExtrapolated": False}
         path = store.directory_for(investigation.id)/"artifacts"/"target-residual-multisector-source"/"target-residual-multisector-source-prepare-v20.19.json"
         _write_json(path, result)
@@ -4426,7 +4430,11 @@ def build_engine(
     def multisector_source_run_stage(investigation, request):
         prep = _required_latest_result_for_handler(investigation,
             "openstar.tess.target-residual-multisector-source.prepare")
-        result = run_multisector_source_localization(prep)
+        try:
+            result = run_multisector_source_localization(prep)
+        except TessArchiveTransientError as error:
+            raise RetryableExecutionError(str(error), result={
+                "operation": "v20.19-pixel-prf-acquisition"}) from error
         path = store.directory_for(investigation.id)/"artifacts"/"target-residual-multisector-source"/"target-residual-multisector-source-run-v20.19.json"
         _write_json(path, result)
         return StageOutcome(result=result, next_stage=StageRequest(
