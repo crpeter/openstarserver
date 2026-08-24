@@ -13,6 +13,7 @@ from openstar_coordinator_client import OpenStarCoordinatorClient
 from openstar_dispatch import InvestigationDispatcher
 from openstar_investigation import InvestigationStore
 from openstar_scheduler import InvestigationScheduler
+from openstar_state_storage import require_durable_state_path
 from openstar_science_runs import recorded_science_run
 from workflows.tess.tess_sector_archive import MastTessSectorArchiveProvider, TessSectorInventoryStore
 from workflows.tess.tess_sector_scan import (
@@ -46,13 +47,14 @@ def run_tess_sector_sweep(sector: int, coordinator_url: str, state_dir: str | Pa
                           max_targets: int | None = None, provider=None,
                           coordinator=None, poll_interval: float = 1.0,
                           timeout: float | None = None,
-                          frequencies_per_work_unit: int | None = None) -> int:
+                          frequencies_per_work_unit: int | None = None,
+                          allow_temporary_state: bool = False) -> int:
+    root = require_durable_state_path(state_dir, allow_temporary_state=allow_temporary_state)
     if frequencies_per_work_unit is not None and frequencies_per_work_unit <= 0:
         raise ValueError("frequencies_per_work_unit must be positive")
     scan_profile = broad_tess_frequency_search()
     if frequencies_per_work_unit is not None:
         scan_profile["frequenciesPerWorkUnit"] = frequencies_per_work_unit
-    root = Path(state_dir).expanduser().resolve()
     legacy = [
         name for name in ("lifecycle.json", "portfolio.json")
         if (root / name).exists()
@@ -94,6 +96,7 @@ def parse_args(argv=None):
     parser.add_argument("--sector", type=int, required=True)
     parser.add_argument("--coordinator-url", required=True)
     parser.add_argument("--state-dir", required=True)
+    parser.add_argument("--allow-temporary-state", action="store_true")
     parser.add_argument("--max-concurrent-investigations", type=int)
     parser.add_argument("--max-targets", type=int)
     parser.add_argument("--poll-interval", type=float, default=1.0)
@@ -115,7 +118,8 @@ def main(argv=None):
         return run_tess_sector_sweep(args.sector, args.coordinator_url, args.state_dir,
             max_concurrent_investigations=args.max_concurrent_investigations,
             max_targets=args.max_targets, poll_interval=args.poll_interval, timeout=args.timeout,
-            frequencies_per_work_unit=args.frequencies_per_work_unit)
+            frequencies_per_work_unit=args.frequencies_per_work_unit,
+            allow_temporary_state=args.allow_temporary_state)
     except KeyboardInterrupt: return 130
     except Exception as error:
         print(f"OpenStar TESS sector sweep: error={type(error).__name__}: {error}", file=sys.stderr); return 1

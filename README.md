@@ -32,6 +32,25 @@ both runners and the dashboard (or pass `--science-run-catalog` to the
 dashboard) to keep the catalog elsewhere.  Catalog failures affect visibility
 only and never determine or repair science execution.
 
+### Durable science-state locations
+
+Production science state must be placed on a durable filesystem. Do **not** use
+OS cleanup locations such as `/tmp/...` or `/private/tmp/...`. Select an
+appropriate durable location explicitly, for example:
+
+```bash
+python run_openstar_tess_sector_sweep.py --sector 4 \
+  --coordinator-url http://127.0.0.1:8080 \
+  --state-dir ~/Documents/OpenStarScience/tess-sector-4
+```
+
+The production TESS runners reject temporary state roots by default, including
+temporary paths reached through aliases or symlinks. `--allow-temporary-state`
+is an explicit escape hatch intended **only** for disposable smoke/test runs;
+it must not be used for authoritative or production science state. Durable
+paths remain user-selected—this example is guidance, not a required application
+directory.
+
 Historical roots can be indexed explicitly without changing their science
 files. The bounded scan examines only each configured root and its direct
 children; by default it checks `/tmp`, `/private/tmp`, and repository `data`:

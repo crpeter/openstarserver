@@ -12,6 +12,7 @@ from openstar_external_jobs import ExternalJobMonitor, ExternalJobStore, apply_e
 from openstar_investigation import InvestigationStore
 from openstar_scheduler import InvestigationScheduler
 from openstar_science_runs import recorded_science_run
+from openstar_state_storage import require_durable_state_path
 from workflows.tess.tess_autonomy import (
     WORKFLOW_ID,
     plan_tess_branches,
@@ -30,9 +31,12 @@ SOFTWARE_ID = "openstar.tess-ranked-followup-runner"
 SOFTWARE_VERSION = "1"
 
 
-def validate_state_roots(sector_state_dir: str | Path, deep_state_dir: str | Path) -> tuple[Path, Path]:
-    sector_root = Path(sector_state_dir).expanduser().resolve()
-    deep_root = Path(deep_state_dir).expanduser().resolve()
+def validate_state_roots(sector_state_dir: str | Path, deep_state_dir: str | Path, *,
+                         allow_temporary_state: bool = False) -> tuple[Path, Path]:
+    sector_root = require_durable_state_path(sector_state_dir,
+        allow_temporary_state=allow_temporary_state, label="sector state directory")
+    deep_root = require_durable_state_path(deep_state_dir,
+        allow_temporary_state=allow_temporary_state, label="deep state directory")
     if sector_root == deep_root or sector_root.is_relative_to(deep_root) or deep_root.is_relative_to(sector_root):
         raise RuntimeError("Sector and deep state directories must be separate non-overlapping trees")
     for root in (sector_root, deep_root):
@@ -71,7 +75,7 @@ def run_tess_ranked_followup(sector: int, sector_state_dir: str | Path,
                              known_period_validation_quota: int = 0,
                              max_concurrent_investigations: int | None = None,
                              poll_interval: float = 1.0, timeout: float | None = None,
-                             coordinator=None) -> int:
+                             coordinator=None, allow_temporary_state: bool = False) -> int:
     if sector < 1: raise ValueError("sector must be positive")
     if (promote_top is None) == (promote_novel is None):
         raise ValueError("select exactly one of promote_top or promote_novel")
@@ -80,7 +84,8 @@ def run_tess_ranked_followup(sector: int, sector_state_dir: str | Path,
     if known_period_validation_quota < 0: raise ValueError("known quota cannot be negative")
     if promote_top is not None and known_period_validation_quota:
         raise ValueError("known quota is only valid with promote_novel")
-    sector_root, deep_root = validate_state_roots(sector_state_dir, deep_state_dir)
+    sector_root, deep_root = validate_state_roots(sector_state_dir, deep_state_dir,
+        allow_temporary_state=allow_temporary_state)
     inventory = TessSectorInventoryStore(sector_root / f"tess-sector-{sector}-inventory.json").load()
     if inventory.sector != sector: raise RuntimeError("Inventory sector does not match requested sector")
     ranking = aggregate_tess_sector_ranking(inventory, InvestigationStore(sector_root / "investigations"))
@@ -158,6 +163,7 @@ def parse_args(argv=None):
     parser.add_argument("--sector", type=int, required=True)
     parser.add_argument("--sector-state-dir", required=True); parser.add_argument("--deep-state-dir", required=True)
     parser.add_argument("--coordinator-url", required=True)
+    parser.add_argument("--allow-temporary-state", action="store_true")
     promotion = parser.add_mutually_exclusive_group(required=True)
     promotion.add_argument("--promote-top", type=int)
     promotion.add_argument("--promote-novel", type=int)
@@ -181,7 +187,8 @@ def main(argv=None):
         args.coordinator_url, args.promote_top, promote_novel=args.promote_novel,
         known_period_validation_quota=args.known_period_validation_quota,
         max_concurrent_investigations=args.max_concurrent_investigations,
-        poll_interval=args.poll_interval, timeout=args.timeout)
+        poll_interval=args.poll_interval, timeout=args.timeout,
+        allow_temporary_state=args.allow_temporary_state)
     except KeyboardInterrupt: return 130
     except Exception as error:
         print(f"OpenStar ranked TESS follow-up: error={type(error).__name__}: {error}", file=sys.stderr); return 1

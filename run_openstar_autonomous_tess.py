@@ -20,6 +20,7 @@ from openstar_investigation import InvestigationStore
 from openstar_lifecycle import InvestigationLifecycleLoop, LifecycleResult
 from openstar_scheduler import InvestigationScheduler
 from openstar_science_runs import recorded_science_run
+from openstar_state_storage import require_durable_state_path
 from openstar_targets import InvestigationTargetPortfolio, NoEligibleTargetError
 from workflows.tess.tess_autonomy import (
     WORKFLOW_ID,
@@ -69,9 +70,10 @@ def run_autonomous_tess(
     timeout: float | None = None,
     multi_investigation: bool = False,
     max_concurrent_investigations: int | None = None,
+    allow_temporary_state: bool = False,
 ) -> int:
     """Construct and run the existing lifecycle, returning a process exit code."""
-    root = Path(state_dir).expanduser().resolve()
+    root = require_durable_state_path(state_dir, allow_temporary_state=allow_temporary_state)
     if multi_investigation:
         legacy = [
             name
@@ -190,6 +192,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--coordinator-url", required=True)
     parser.add_argument("--state-dir", required=True)
+    parser.add_argument("--allow-temporary-state", action="store_true")
     parser.add_argument("--poll-interval", type=float, default=1.0)
     parser.add_argument("--timeout", type=float)
     parser.add_argument("--multi-investigation", action="store_true")
@@ -218,6 +221,7 @@ def main(argv: list[str] | None = None) -> int:
             timeout=args.timeout,
             multi_investigation=args.multi_investigation,
             max_concurrent_investigations=args.max_concurrent_investigations,
+            allow_temporary_state=args.allow_temporary_state,
         )
     except KeyboardInterrupt:
         print("OpenStar lifecycle: disposition=SHUTDOWN", file=sys.stderr)

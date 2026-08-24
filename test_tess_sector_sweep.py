@@ -522,7 +522,7 @@ class SweepTests(IsolatedScienceRunTestCase):
             tess_sector_scan.read_and_prepare_tess_light_curve = lambda path: Prepared()
             try:
                 self.assertEqual(1, run_tess_sector_sweep(
-                    7, "unused", root, provider=provider, coordinator=coordinator))
+                    7, "unused", root, provider=provider, coordinator=coordinator, allow_temporary_state=True))
                 store = InvestigationStore(root / "investigations")
                 investigation_id = "tess-sector-scan-7-tic-1"
                 failed_path = store.stage_path_for(
@@ -546,7 +546,7 @@ class SweepTests(IsolatedScienceRunTestCase):
                     recording_repair,
                 ):
                     self.assertEqual(0, run_tess_sector_sweep(
-                        7, "unused", root, provider=provider, coordinator=coordinator))
+                        7, "unused", root, provider=provider, coordinator=coordinator, allow_temporary_state=True))
                 self.assertEqual(1, len(recovered_controls))
                 self.assertEqual([False], repeated_repair_results)
                 self.assertEqual(
@@ -567,7 +567,7 @@ class SweepTests(IsolatedScienceRunTestCase):
 
                 snapshot = store.path_for(investigation_id).read_bytes()
                 self.assertEqual(0, run_tess_sector_sweep(
-                    7, "unused", root, provider=provider, coordinator=coordinator))
+                    7, "unused", root, provider=provider, coordinator=coordinator, allow_temporary_state=True))
                 self.assertEqual(snapshot, store.path_for(investigation_id).read_bytes())
                 self.assertEqual(2, provider.downloads.count(1))
                 self.assertEqual([1], coordinator.calls)
@@ -607,7 +607,7 @@ class SweepTests(IsolatedScienceRunTestCase):
             ):
                 run_tess_sector_sweep(
                     7, "unused", root, provider=provider, coordinator=coordinator
-                )
+                , allow_temporary_state=True)
 
             self.assertEqual(original, legacy_path.read_bytes())
             self.assertEqual([], provider.calls)
@@ -634,7 +634,7 @@ class SweepTests(IsolatedScienceRunTestCase):
                     0,
                     run_tess_sector_sweep(
                         7, "unused", tmp, provider=provider, coordinator=coordinator
-                    ),
+                    , allow_temporary_state=True),
                 )
             finally:
                 tess_sector_scan.read_and_prepare_tess_light_curve = original
@@ -735,7 +735,7 @@ class SweepTests(IsolatedScienceRunTestCase):
             tess_sector_scan.read_and_prepare_tess_light_curve = lambda path: Prepared()
             try:
                 code = run_tess_sector_sweep(7, "unused", tmp, max_targets=2,
-                    max_concurrent_investigations=2, provider=provider, coordinator=coordinator)
+                    max_concurrent_investigations=2, provider=provider, coordinator=coordinator, allow_temporary_state=True)
                 self.assertEqual(0, code); self.assertGreaterEqual(coordinator.maximum_active, 2)
                 self.assertEqual([1, 2], sorted(coordinator.calls))
                 inventory = json.loads((Path(tmp)/"tess-sector-7-inventory.json").read_text())
@@ -752,7 +752,7 @@ class SweepTests(IsolatedScienceRunTestCase):
                     dataset = json.loads(Path(evidence["datasetArtifact"]).read_text())
                     self.assertEqual(dataset["coordinates"], dataset["times"]); self.assertEqual(dataset["values"], dataset["flux"])
                 calls = list(coordinator.calls)
-                run_tess_sector_sweep(7, "unused", tmp, max_targets=2, provider=provider, coordinator=coordinator)
+                run_tess_sector_sweep(7, "unused", tmp, max_targets=2, provider=provider, coordinator=coordinator, allow_temporary_state=True)
                 self.assertEqual(calls, coordinator.calls); self.assertEqual([7], provider.calls)
             finally: tess_sector_scan.read_and_prepare_tess_light_curve = original
 
@@ -767,7 +767,7 @@ class SweepTests(IsolatedScienceRunTestCase):
             with tempfile.TemporaryDirectory() as temporary:
                 state_root = Path(temporary) / "state"
                 self.assertEqual(0, run_tess_sector_sweep(
-                    7, "unused", state_root, provider=provider, coordinator=coordinator))
+                    7, "unused", state_root, provider=provider, coordinator=coordinator, allow_temporary_state=True))
                 run_id = stable_run_id("tess-sector-sweep", state_root, 7)
                 runs = {run.run_id: run for run in
                         ScienceRunCatalog(self.science_run_catalog_path).list_runs()}
@@ -786,7 +786,7 @@ class SweepTests(IsolatedScienceRunTestCase):
             original = tess_sector_scan.read_and_prepare_tess_light_curve; tess_sector_scan.read_and_prepare_tess_light_curve = lambda path: Prepared()
             try:
                 self.assertEqual(1, run_tess_sector_sweep(7, "unused", tmp, provider=provider, coordinator=coordinator,
-                                                         max_concurrent_investigations=3))
+                                                         max_concurrent_investigations=3, allow_temporary_state=True))
                 states = [json.loads(p.read_text())["status"] for p in (Path(tmp)/"investigations").glob("*/investigation.json")]
                 self.assertEqual(3, len(states)); self.assertEqual(2, states.count("COMPLETE")); self.assertEqual(1, states.count("FAILED"))
             finally: tess_sector_scan.read_and_prepare_tess_light_curve = original

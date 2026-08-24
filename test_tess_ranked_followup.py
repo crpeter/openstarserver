@@ -36,13 +36,13 @@ class RankedFollowupTests(IsolatedScienceRunTestCase):
 
     def _ranking(self, root):
         run_tess_sector_sweep(7, "unused", root,
-            provider=FakeProvider([product(1), product(2)]), coordinator=FakeCoordinator())
+            provider=FakeProvider([product(1), product(2)]), coordinator=FakeCoordinator(), allow_temporary_state=True)
         inventory = TessSectorInventoryStore(Path(root) / "tess-sector-7-inventory.json").load()
         return aggregate_tess_sector_ranking(inventory, InvestigationStore(Path(root) / "investigations"))
 
     def _sweep(self, root, tics=(1, 2)):
         run_tess_sector_sweep(7, "unused", root,
-            provider=FakeProvider([product(tic) for tic in tics]), coordinator=FakeCoordinator())
+            provider=FakeProvider([product(tic) for tic in tics]), coordinator=FakeCoordinator(), allow_temporary_state=True)
 
     def _direct_primary(self, root, *, mutate_shallow=None, mutate_after_prepare=None):
         shallow, deep = Path(root) / "shallow", Path(root) / "deep"
@@ -135,7 +135,7 @@ class RankedFollowupTests(IsolatedScienceRunTestCase):
         with patch("run_openstar_tess_ranked_followup.register_tess_workflow_handlers", register), \
              patch("run_openstar_tess_ranked_followup.plan_tess_branches", planner or default_planner):
             code = run_tess_ranked_followup(7, shallow, deep, "unused", top,
-                max_concurrent_investigations=2, coordinator=coordinator)
+                max_concurrent_investigations=2, coordinator=coordinator, allow_temporary_state=True)
         return code, coordinator
 
     @staticmethod
@@ -210,13 +210,13 @@ class RankedFollowupTests(IsolatedScienceRunTestCase):
             for sector, deep in ((root, root), (root, child), (child, root)):
                 with self.subTest(sector=sector, deep=deep), self.assertRaisesRegex(
                         RuntimeError, "non-overlapping"):
-                    validate_state_roots(sector, deep)
+                    validate_state_roots(sector, deep, allow_temporary_state=True)
             sibling = root / "sibling"
             sibling.mkdir()
             link = sibling / "linked-child"
             link.symlink_to(child, target_is_directory=True)
             with self.assertRaisesRegex(RuntimeError, "non-overlapping"):
-                validate_state_roots(root, link)
+                validate_state_roots(root, link, allow_temporary_state=True)
 
     def test_direct_and_nested_legacy_roots_are_rejected_without_writes(self):
         for nested in (False, True):
@@ -233,7 +233,7 @@ class RankedFollowupTests(IsolatedScienceRunTestCase):
                 before = self._tree_bytes(legacy)
                 with patch("run_openstar_tess_ranked_followup.OpenStarCoordinatorClient") as coordinator:
                     with self.assertRaisesRegex(RuntimeError, "legacy state"):
-                        run_tess_ranked_followup(7, sector, requested, "unused", 1)
+                        run_tess_ranked_followup(7, sector, requested, "unused", 1, allow_temporary_state=True)
                     coordinator.assert_not_called()
                 self.assertEqual(before, self._tree_bytes(legacy))
                 self.assertEqual({}, self._tree_bytes(sector))
@@ -247,7 +247,7 @@ class RankedFollowupTests(IsolatedScienceRunTestCase):
             sector = base / "sector"; sector.mkdir()
             before = self._tree_bytes(legacy)
             with self.assertRaisesRegex(RuntimeError, "legacy state"):
-                validate_state_roots(sector, link)
+                validate_state_roots(sector, link, allow_temporary_state=True)
             self.assertEqual(before, self._tree_bytes(legacy))
 
     def test_runner_persists_before_dispatch_completed_rerun_and_top_growth(self):
