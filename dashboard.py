@@ -140,9 +140,12 @@ def build_snapshot(
                 "cumulativeRuntimeSeconds": contribution.get("workerComputeSeconds"),
                 "metalSeconds": contribution.get("metalSeconds"),
                 "measuredThroughput": contribution.get(
+                    "sampleFrequencyEvaluationsPerWorkerComputeSecond"
+                ),
+                "metalThroughput": contribution.get(
                     "sampleFrequencyEvaluationsPerMetalSecond"
                 ),
-                "throughputUnit": "sample-frequency evaluations / Metal second",
+                "throughputUnit": "sample-frequency evaluations / worker second",
                 "gpuName": _value(node, telemetry, "gpuName"),
                 "processorCount": _value(node, telemetry, "processorCount"),
                 "memoryGB": _value(node, telemetry, "memoryGB", "memoryGb"),
@@ -183,9 +186,12 @@ def build_snapshot(
             current.get("totalWorkerComputeSeconds") or 0
         ),
         "measuredThroughput": current.get(
+            "aggregateSampleFrequencyEvaluationsPerWorkerComputeSecond"
+        ),
+        "metalThroughput": current.get(
             "aggregateSampleFrequencyEvaluationsPerMetalSecond"
         ),
-        "throughputUnit": "sample-frequency evaluations / Metal second",
+        "throughputUnit": "sample-frequency evaluations / worker second",
         "failureCount": failures,
         "health": "healthy" if connected else "quiet",
         "updatedAt": now,

@@ -102,8 +102,8 @@ async function refreshFleet() {
     refreshSection($("#stats"), cards, cards.map(([label, value]) => element("div", {className: "stat"}, [element("span", {text: label}), element("b", {text: typeof value === "number" && label !== "Compute time" ? count(value) : value})])));
     renderWorkers();
     $("#updated").textContent = `${snapshot.summary.health.toUpperCase()} · updated ${relative(snapshot.summary.updatedAt)}`;
-    const contributions = history.contributionByWorker.slice().sort((a, b) => (b.acceptedWorkUnits || 0) - (a.acceptedWorkUnits || 0));
-    const contributionRows = contributions.length ? contributions.slice(0, 8).map(node => element("div", {className: "row"}, [element("span", {text: node.nodeID}), element("b", {text: `${count(node.acceptedWorkUnits)} units`})])) : [element("p", {text: "Contributions will appear after accepted work."})];
+    const contributions = Object.entries(history.completedByDeviceModel || {}).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+    const contributionRows = contributions.length ? contributions.map(([model, acceptedWorkUnits]) => element("div", {className: "row"}, [element("span", {text: model}), element("b", {text: `${count(acceptedWorkUnits)} units`})])) : [element("p", {text: "Contributions will appear after accepted work."})];
     refreshSection($("#contribution"), contributions, [element("div", {className: "rows"}, contributionRows)]);
   } catch (_) { $("#updated").textContent = "CONNECTION LOST"; }
 }

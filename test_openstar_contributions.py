@@ -147,6 +147,41 @@ class ContributionStoreTests(unittest.TestCase):
             14, summary["allTime"]["aggregateSampleFrequencyEvaluationsPerMetalSecond"]
         )
 
+    def test_worker_and_metal_throughput_are_accounted_independently(self):
+        cpu = {
+            "nodeID": "linux-cpu",
+            "capabilities": {
+                "platform": "linux",
+                "hardwareIdentifier": "x86_64 Linux CPU",
+                "gpuName": "none",
+                "processorCount": 8,
+            },
+        }
+        zero = {"nodeID": "zero-duration", "capabilities": {}}
+        self.store.upsert_node(cpu, 11)
+        self.store.upsert_node(zero, 12)
+        self.record(
+            work_unit=self.work("cpu-work"), node_id="linux-cpu",
+            timing_metrics={"workerTotalSeconds": 7.0, "metalSeconds": 0.0},
+        )
+        self.record(
+            work_unit=self.work("zero-work"), node_id="zero-duration",
+            timing_metrics={"workerTotalSeconds": 0.0, "metalSeconds": 0.0},
+        )
+        self.record(work_unit=self.work("metal-work"))
+
+        summary = self.store.summary("session-1")["currentSession"]
+        nodes = {node["nodeID"]: node for node in summary["nodes"]}
+        self.assertEqual(28, nodes["linux-cpu"]["sampleFrequencyEvaluations"])
+        self.assertEqual(7, nodes["linux-cpu"]["workerComputeSeconds"])
+        self.assertEqual(0, nodes["linux-cpu"]["metalSeconds"])
+        self.assertEqual(4, nodes["linux-cpu"]["sampleFrequencyEvaluationsPerWorkerComputeSecond"])
+        self.assertIsNone(nodes["linux-cpu"]["sampleFrequencyEvaluationsPerMetalSecond"])
+        self.assertEqual(5.6, nodes["device-a"]["sampleFrequencyEvaluationsPerWorkerComputeSecond"])
+        self.assertEqual(14, nodes["device-a"]["sampleFrequencyEvaluationsPerMetalSecond"])
+        self.assertIsNone(nodes["zero-duration"]["sampleFrequencyEvaluationsPerWorkerComputeSecond"])
+        self.assertEqual(7, summary["aggregateSampleFrequencyEvaluationsPerWorkerComputeSecond"])
+
     def test_concurrent_writes_are_safe(self):
         errors = []
 
