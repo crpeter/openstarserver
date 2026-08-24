@@ -42,6 +42,7 @@ class FakeCoordinator:
             "contributions": {
                 "currentSession": {
                     "totalWorkerComputeSeconds": 8,
+                    "aggregateSampleFrequencyEvaluationsPerWorkerComputeSecond": 30,
                     "aggregateSampleFrequencyEvaluationsPerMetalSecond": 25,
                 },
                 "allTime": {
@@ -54,6 +55,7 @@ class FakeCoordinator:
                             "acceptedWorkUnits": 4,
                             "workerComputeSeconds": 12,
                             "metalSeconds": 10,
+                            "sampleFrequencyEvaluationsPerWorkerComputeSecond": 20,
                             "sampleFrequencyEvaluationsPerMetalSecond": 25,
                         }
                     ],
@@ -242,16 +244,37 @@ class ProjectionTests(unittest.TestCase):
         self.assertIn("setInterval(refreshScience, 3000)", script)
         self.assertIn("setInterval(refreshFleet, 10000)", script)
         self.assertIn('$("#scienceRuns")', script)
+        self.assertIn("history.completedByDeviceModel", script)
+        self.assertNotIn("contributions.slice(0, 8)", script)
 
     def test_workers_are_sorted_by_measured_throughput(self):
         coordinator = FakeCoordinator()
         coordinator.observed["contributions"]["allTime"]["nodes"].append({
             "nodeID": "phone-1", "acceptedWorkUnits": 1,
-            "sampleFrequencyEvaluationsPerMetalSecond": 100,
+            "sampleFrequencyEvaluationsPerWorkerComputeSecond": 100,
         })
         snapshot = build_snapshot(coordinator.observed["nodes"],
             coordinator.observed["contributions"], coordinator.observed["projects"], {}, now=100)
         self.assertEqual(["phone-1", "mac-1"], [worker["id"] for worker in snapshot["workers"]])
+
+    def test_cpu_worker_uses_backend_neutral_throughput(self):
+        coordinator = FakeCoordinator()
+        coordinator.observed["nodes"].append({
+            "nodeID": "linux-1", "platform": "linux",
+            "hardwareIdentifier": "x86_64 Linux CPU",
+        })
+        coordinator.observed["contributions"]["allTime"]["nodes"].append({
+            "nodeID": "linux-1", "acceptedWorkUnits": 2,
+            "workerComputeSeconds": 4, "metalSeconds": 0,
+            "sampleFrequencyEvaluationsPerWorkerComputeSecond": 50,
+            "sampleFrequencyEvaluationsPerMetalSecond": None,
+        })
+        snapshot = build_snapshot(coordinator.observed["nodes"],
+            coordinator.observed["contributions"], [], {}, now=100)
+        linux = next(worker for worker in snapshot["workers"] if worker["id"] == "linux-1")
+        self.assertEqual(50, linux["measuredThroughput"])
+        self.assertIsNone(linux["metalThroughput"])
+        self.assertEqual("sample-frequency evaluations / worker second", linux["throughputUnit"])
 
     def test_contributions_are_sorted_by_exact_accepted_count(self):
         history = history_snapshot({"allTime": {"nodes": [
@@ -259,6 +282,13 @@ class ProjectionTests(unittest.TestCase):
             {"nodeID": "high", "acceptedWorkUnits": 1001},
         ]}})
         self.assertEqual(["high", "low"], [item["nodeID"] for item in history["contributionByWorker"]])
+
+    def test_device_models_aggregate_accepted_work(self):
+        history = history_snapshot({"allTime": {"nodes": [
+            {"nodeID": "linux-1", "hardwareIdentifier": "x86_64 Linux CPU", "acceptedWorkUnits": 2},
+            {"nodeID": "linux-2", "hardwareIdentifier": "x86_64 Linux CPU", "acceptedWorkUnits": 3},
+        ]}})
+        self.assertEqual({"x86_64 Linux CPU": 5}, history["completedByDeviceModel"])
 
 
 class CoordinatorClientTests(unittest.TestCase):

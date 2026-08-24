@@ -158,6 +158,7 @@ class CoordinatorRuntime:
                 "totalWorkerComputeSeconds": 0.0,
                 "totalMetalSeconds": 0.0,
                 "totalSampleFrequencyEvaluations": 0,
+                "aggregateSampleFrequencyEvaluationsPerWorkerComputeSecond": None,
                 "aggregateSampleFrequencyEvaluationsPerMetalSecond": None,
                 "nodes": [],
             }

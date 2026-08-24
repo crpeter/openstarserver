@@ -318,14 +318,18 @@ class ContributionStore:
         devices = []
         for row in rows:
             metal = float(row["metal_seconds"] or 0)
+            worker = float(row["worker_seconds"] or 0)
             evaluations = int(row["evaluations"] or 0)
             device = self._public_node(row)
             device.update(
                 {
                     "acceptedWorkUnits": int(row["accepted_work_units"] or 0),
-                    "workerComputeSeconds": float(row["worker_seconds"] or 0),
+                    "workerComputeSeconds": worker,
                     "metalSeconds": metal,
                     "sampleFrequencyEvaluations": evaluations,
+                    "sampleFrequencyEvaluationsPerWorkerComputeSecond": (
+                        evaluations / worker if worker > 0 else None
+                    ),
                     "sampleFrequencyEvaluationsPerMetalSecond": (
                         evaluations / metal if metal > 0 else None
                     ),
@@ -333,16 +337,18 @@ class ContributionStore:
             )
             devices.append(device)
         total_metal = sum(item["metalSeconds"] for item in devices)
+        total_worker = sum(item["workerComputeSeconds"] for item in devices)
         total_evaluations = sum(item["sampleFrequencyEvaluations"] for item in devices)
         return {
             "totalAcceptedWorkUnits": sum(
                 item["acceptedWorkUnits"] for item in devices
             ),
-            "totalWorkerComputeSeconds": sum(
-                item["workerComputeSeconds"] for item in devices
-            ),
+            "totalWorkerComputeSeconds": total_worker,
             "totalMetalSeconds": total_metal,
             "totalSampleFrequencyEvaluations": total_evaluations,
+            "aggregateSampleFrequencyEvaluationsPerWorkerComputeSecond": (
+                total_evaluations / total_worker if total_worker > 0 else None
+            ),
             "aggregateSampleFrequencyEvaluationsPerMetalSecond": (
                 total_evaluations / total_metal if total_metal > 0 else None
             ),
