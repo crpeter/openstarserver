@@ -21,7 +21,10 @@ class StateStorageSafetyTests(unittest.TestCase):
         self.assertFalse(is_temporary_state_path(sibling))
 
     def test_rejects_standard_temporary_roots_and_children(self):
-        candidates = [Path("/tmp"), Path("/private/tmp"), Path(tempfile.gettempdir())]
+        candidates = [
+            Path("/tmp"), Path("/private/tmp"), Path("/var/tmp"), Path("/dev/shm"),
+            Path(tempfile.gettempdir()),
+        ]
         for root in candidates:
             if root.exists():
                 with self.subTest(root=root):
@@ -29,6 +32,20 @@ class StateStorageSafetyTests(unittest.TestCase):
                         require_durable_state_path(root)
                     with self.assertRaises(RuntimeError):
                         require_durable_state_path(root / "openstar-new-state")
+
+    def test_nonexistent_environment_temporary_roots_are_rejected_without_creation(self):
+        with tempfile.TemporaryDirectory(dir=Path.home()) as durable_parent:
+            for name in ("TMPDIR", "TMP", "TEMP"):
+                root = Path(durable_parent) / f"not-yet-created-{name.lower()}"
+                child = root / "openstar-sector"
+                self.assertFalse(root.exists())
+                with self.subTest(name=name), patch.dict(
+                    os.environ, {name: str(root)}, clear=False
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "Refusing durable OpenStar"):
+                        require_durable_state_path(child)
+                self.assertFalse(root.exists())
+                self.assertFalse(child.exists())
 
     def test_environment_temporary_roots(self):
         with tempfile.TemporaryDirectory() as temporary:

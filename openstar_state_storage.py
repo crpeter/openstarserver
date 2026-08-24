@@ -12,18 +12,25 @@ def _resolved(path: str | Path) -> Path:
 
 
 def temporary_state_roots() -> tuple[Path, ...]:
-    """Return the distinct, existing OS temporary roots known to this process."""
-    candidates: list[str | Path] = [
+    """Return distinct OS and environment-configured temporary roots."""
+    standard_candidates: list[str | Path] = [
         "/tmp", "/private/tmp", "/var/tmp", "/dev/shm", tempfile.gettempdir(),
     ]
-    candidates.extend(
+    environment_candidates = [
         value for name in ("TMPDIR", "TMP", "TEMP")
         if (value := os.environ.get(name))
-    )
+    ]
     roots: list[Path] = []
-    for candidate in candidates:
+    for candidate in standard_candidates:
         root = _resolved(candidate)
         if root.exists() and root not in roots:
+            roots.append(root)
+    # Environment-configured roots are policy declarations, not observations
+    # about the current filesystem. Keep them even when they do not yet exist,
+    # so a caller cannot create one through the durable-state guard.
+    for candidate in environment_candidates:
+        root = _resolved(candidate)
+        if root not in roots:
             roots.append(root)
     return tuple(roots)
 
