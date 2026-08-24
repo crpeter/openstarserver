@@ -89,6 +89,7 @@ from .tess_target_residual_archival_baseline import (
 from .tess_target_residual_pixel_recurrence import (
     verify_v2017_lineage, interpret_sectors, freeze_catalog_hypotheses, measure_sector,
     CatalogInfrastructureError, NoPixelCoverageError, acquire_selected_sector,
+    tpf_flux_cube,
 )
 from .tess_offset_source import identify_offset_residual_source
 from .tess_offset_variability import (
@@ -4351,9 +4352,9 @@ def build_engine(
             try:
                 tpf,source=acquire_selected_sector(_download_tpf,tic_id=prep["ticID"],sector=sector,
                     ra_deg=prep["targetSky"]["raDeg"],dec_deg=prep["targetSky"]["decDeg"])
-                times=np.asarray(tpf.time.value,float); flux=np.asarray(getattr(tpf.flux,"value",tpf.flux),float)
-                keep=np.isfinite(times)&np.any(np.isfinite(flux.reshape(len(flux),-1)),axis=1); times=times[keep]; flux=flux[keep]
-                cube,background=_background_subtract_cube(flux); valid=np.any(np.isfinite(cube),axis=0)
+                times=np.asarray(tpf.time.value,float); cube=tpf_flux_cube(tpf)
+                keep=np.isfinite(times)&np.any(np.isfinite(cube.reshape(len(cube),-1)),axis=1); times=times[keep]; cube=cube[keep]
+                cube,background=_background_subtract_cube(cube); valid=np.any(np.isfinite(cube),axis=0)
                 hypotheses=[]
                 for item in prep["catalogHypotheses"]:
                     x,y=tpf.wcs.world_to_pixel(_skycoord(item["raDeg"],item["decDeg"]))

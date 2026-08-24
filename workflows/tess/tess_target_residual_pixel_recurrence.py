@@ -57,10 +57,14 @@ def verify_v2017_lineage(stages: Iterable[Any], *, resolver: HistoricalPathResol
         "physicalMechanismResolved":False,"crossSectorPhaseUsed":False,
         "historicalResidualDriftExtrapolated":False}
     if any(result.get(k) != v for k,v in required.items()): raise RuntimeError("altered v20.17 science boundary")
-    if final.parameters != {"outputSuffix":"v20.17-target-residual-archival-baseline"} or final.result.get("targetResidualArchivalBaselineExtension") != result:
+    if (final.parameters != {"outputSuffix":"v20.17-target-residual-archival-baseline"}
+            or final.result.get("targetResidualArchivalBaselineExtension") != result
+            or final.result.get("recommendedNextTest") != RECOMMENDATION):
         raise RuntimeError("altered v20.17 finalizer")
     selected=result.get("selectedFuturePixelFollowupSectors") or []
     if not 0 < len(selected) <= MAX_PIXEL_FOLLOWUP_SECTORS: raise RuntimeError("invalid selected sector list")
+    selected_ids=[int(x.get("sector") if isinstance(x,dict) else x) for x in selected]
+    if len(selected_ids) != len(set(selected_ids)): raise RuntimeError("selected sector IDs must be unique")
     evidence=result.get("sectorEvidence") or []; by_sector={}
     for item in evidence: by_sector.setdefault(item.get("sector"),[]).append(item)
     frozen=[]
@@ -186,3 +190,11 @@ def acquire_selected_sector(download, **kwargs):
         if type(error) is RuntimeError and _NO_COVERAGE.fullmatch(str(error)):
             raise NoPixelCoverageError(str(error)) from error
         raise
+
+
+def tpf_flux_cube(tpf):
+    """Convert TPF flux without converting masked samples into measurements."""
+    import numpy as np
+    flux=getattr(tpf.flux,"value",tpf.flux)
+    if np.ma.isMaskedArray(flux): flux=np.ma.filled(flux,np.nan)
+    return np.asarray(flux,dtype=np.float64)
