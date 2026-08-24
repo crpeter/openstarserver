@@ -35,7 +35,8 @@ class AutonomousTessEntryPointTests(IsolatedScienceRunTestCase):
         )
 
     @staticmethod
-    def workflow(store, coordinator, *, poll_interval, timeout):
+    def workflow(store, coordinator, *, poll_interval, timeout,
+                 historical_path_resolver=None):
         engine = WorkflowEngine(store)
 
         def execute(investigation, request):
@@ -50,7 +51,7 @@ class AutonomousTessEntryPointTests(IsolatedScienceRunTestCase):
     def complete_planner(investigation, target):
         return ()
 
-    def invoke(self, planner=None):
+    def invoke(self, planner=None, *, historical_path_resolver=None):
         output = io.StringIO()
         with (
             patch.object(runner, "register_tess_workflow_handlers", self.workflow),
@@ -61,7 +62,8 @@ class AutonomousTessEntryPointTests(IsolatedScienceRunTestCase):
         ):
             code = runner.run_autonomous_tess(
                 [self.project], "http://coordinator.test", self.root / "state"
-            , allow_temporary_state=True)
+            , allow_temporary_state=True,
+                historical_path_resolver=historical_path_resolver)
         return code, output.getvalue()
 
     def test_fresh_startup_selects_first_eligible_target(self):
@@ -90,6 +92,17 @@ class AutonomousTessEntryPointTests(IsolatedScienceRunTestCase):
         self.assertEqual(0, code)
         self.assertIn("disposition=RESUMING target=validation:first", output)
         self.assertNotIn("disposition=STARTED", output)
+
+    def test_restart_passes_historical_resolver_to_compatibility_repair(self):
+        self.invoke()
+        resolver = object()
+        with patch.object(
+            runner, "repair_obsolete_terminal_wait", wraps=runner.repair_obsolete_terminal_wait
+        ) as repair:
+            self.invoke(historical_path_resolver=resolver)
+        repair.assert_called_once()
+        self.assertIs(resolver,
+            repair.call_args.kwargs["historical_path_resolver"])
 
     def test_restart_repairs_legacy_terminal_wait_and_advances_once(self):
         def waiting(investigation, target):
