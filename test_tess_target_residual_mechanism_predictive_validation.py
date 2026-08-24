@@ -3,7 +3,9 @@ from __future__ import annotations
 import copy
 import json
 import math
+import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -14,7 +16,23 @@ from workflows.tess.tess_target_residual_mechanism_predictive_validation import 
     construct_folds, fit_training_model,
     freeze_model_domain, validate_sector, v2013_lineage_matches,
 )
-from openstar_investigation import ArtifactReference, sha256_file, sha256_json
+from openstar_investigation import (
+    ArtifactReference, InvestigationStage, InvestigationStore, sha256_file,
+    sha256_json,
+)
+from openstar_workflow import StageRequest
+from workflows.tess.tess_autonomy import WORKFLOW_ID, WORKFLOW_VERSION
+
+try:
+    import numpy as _real_numpy
+except ModuleNotFoundError:
+    _real_numpy = None
+_installed_numpy_stub = _real_numpy is None
+if _installed_numpy_stub:
+    sys.modules["numpy"] = types.ModuleType("numpy")
+from workflows.tess.tess_investigation import build_engine
+if _installed_numpy_stub:
+    sys.modules.pop("numpy", None)
 
 
 class TessTargetResidualMechanismPredictiveValidationTests(unittest.TestCase):
@@ -244,6 +262,125 @@ class TessTargetResidualMechanismPredictiveValidationTests(unittest.TestCase):
         result = adjudicate_predictive_sectors([self._supported_sector(1, label), unfair])
         self.assertEqual(UNRESOLVED, result["classification"])
         self.assertEqual([], result["replicatedPredictiveMechanisms"])
+
+    def _complete(self, store, investigation, stage_id, handler_id, result):
+        running = InvestigationStage(stage_id, handler_id, "RUNNING", None, {})
+        investigation = store.append_running_stage(investigation, running)
+        terminal = store.build_terminal_stage(
+            stage_id=stage_id, handler_id=handler_id, status="COMPLETE",
+            triggered_by_stage_id=None, parameters={}, result=result, error=None,
+            software_id="predictive-finalization-regression",
+            software_version="20.16", started_at=running.started_at,
+        )
+        return store.complete_current_stage(investigation, terminal)
+
+    def _finalization_history(self, store, include_predictive=True):
+        investigation = store.create("predictive-finalization", WORKFLOW_ID, WORKFLOW_VERSION)
+        stages = [
+            ("001-prepare-target", "openstar.tess.prepare-target", {
+                "datasetID": "tic-350519062", "ticID": 350519062,
+                "targetName": "TIC 350519062", "sector": 10,
+            }),
+            ("002-hypotheses", "openstar.tess.hypotheses", {
+                "rawCandidatePeriodDays": 1.25, "observedPeriodDays": 2.5,
+            }),
+            ("003-planner", "openstar.tess.planner", {
+                "claimDecision": {"claim": "CANDIDATE_PERIOD", "rationale": [
+                    "Established main periodic-family evidence is preserved."
+                ]},
+            }),
+            ("020-multisource", "openstar.tess.multi-source-residual.interpret", {
+                "classification": "TARGET_RESIDUAL_COMPONENT_DOMINANT",
+                "recommendedNextTest": "STALE_TEMPORAL_MECHANISM_TEST",
+            }),
+        ]
+        predictive = {
+            "classification": "TARGET_RESIDUAL_MECHANISM_PREDICTIVE_VALIDATION_UNRESOLVED",
+            "recommendedNextTest": "ADDITIONAL_TEMPORAL_BASELINE_OR_MECHANISM_DISCRIMINATION",
+            "replicatedPredictiveMechanisms": [],
+            "replicatedPredictiveMechanismSupportingSectorIDs": {},
+            "failClosedReasons": [
+                "sector 69 smooth-amplitude training fit failed conservatively"
+            ],
+            "sectorPredictiveEvidence": [{
+                "sector": 69,
+                "sectorClassification": "TARGET_RESIDUAL_MECHANISM_PREDICTIVE_VALIDATION_UNRESOLVED",
+                "bestPredictiveModel": "CONSTANT_AMPLITUDE",
+                "secondBestPredictiveModel": "COHERENT_TWO_MODE_BEATING",
+                "predictiveDeltaLogLikelihood": 1.75,
+                "foldWinsByModel": {"CONSTANT_AMPLITUDE": 4},
+                "fairAllModelComparisonCompleted": False,
+                "morphologyGateBlockedPromotion": False,
+                # Real results contain detailed fit payloads; the report must not dump them.
+                "modelEvidence": [{"coefficients": [1.0, 2.0, 3.0]}],
+            }],
+        }
+        if include_predictive:
+            stages.append((
+                "030-target-residual-mechanism-predictive-validation",
+                "openstar.tess.target-residual-mechanism-predictive-validation.analyze",
+                predictive,
+            ))
+        for stage in stages:
+            investigation = self._complete(store, investigation, *stage)
+        return investigation, predictive
+
+    def test_finalizer_reports_persisted_v2016_without_rerun_or_distributed_work(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = InvestigationStore(Path(directory) / "investigations")
+            investigation, predictive = self._finalization_history(store)
+            frozen_stages = copy.deepcopy(investigation.stages)
+            coordinator = types.SimpleNamespace(
+                create_project=lambda *args, **kwargs: self.fail("distributed work started")
+            )
+            engine = build_engine(store, coordinator=coordinator, poll_interval=0.0, timeout=None)
+            engine.chain_stages = False
+            with patch(
+                "workflows.tess.tess_investigation.analyze_predictive_validation",
+                side_effect=AssertionError("v20.16 was rerun"),
+            ):
+                completed, next_request = engine.run_stage(
+                    investigation,
+                    StageRequest("031-finalize", "openstar.tess.finalize", {},
+                                 "030-target-residual-mechanism-predictive-validation"),
+                    software_id="integration", software_version="20.33",
+                )
+
+            self.assertIsNone(next_request)
+            self.assertEqual("COMPLETE", completed.status)
+            self.assertEqual(frozen_stages, completed.stages[:-1])
+            conclusion = completed.stages[-1].result
+            self.assertEqual(predictive,
+                conclusion["targetResidualMechanismPredictiveValidation"])
+            self.assertEqual(predictive["recommendedNextTest"],
+                             conclusion["recommendedNextTest"])
+            self.assertEqual(2.5,
+                conclusion["periodEvidence"]["recurrentPhotometricPeriodDays"])
+            report = Path(conclusion["reportPath"]).read_text(encoding="utf-8")
+            self.assertIn("remains unresolved", report)
+            self.assertIn("Conservative predictive-validation limitations", report)
+            self.assertIn("Sector 69", report)
+            self.assertIn("deltaLogLikelihood=1.75", report)
+            self.assertIn("no distributed work or archive query", report)
+            self.assertNotIn("coefficients", report)
+
+    def test_history_without_v2016_keeps_existing_recommendation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = InvestigationStore(Path(directory) / "investigations")
+            investigation, _ = self._finalization_history(store, include_predictive=False)
+            engine = build_engine(store, coordinator=types.SimpleNamespace(),
+                                  poll_interval=0.0, timeout=None)
+            engine.chain_stages = False
+            completed, next_request = engine.run_stage(
+                investigation,
+                StageRequest("021-finalize", "openstar.tess.finalize", {}, "020-multisource"),
+                software_id="integration", software_version="20.33",
+            )
+            self.assertIsNone(next_request)
+            conclusion = completed.stages[-1].result
+            self.assertIsNone(conclusion["targetResidualMechanismPredictiveValidation"])
+            self.assertEqual("STALE_TEMPORAL_MECHANISM_TEST",
+                             conclusion["recommendedNextTest"])
 
 
 if __name__ == "__main__":
