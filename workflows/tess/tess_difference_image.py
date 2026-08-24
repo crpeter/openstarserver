@@ -8,6 +8,8 @@ from typing import Any
 import numpy as np
 
 from .tess_sector_archive import TessArchiveTransientError
+from .tess_difference_image_constants import (MIN_IMAGE_PEAK_SNR,
+    SOURCE_MATCH_MAX_PIXELS, SOURCE_MARGIN_FLOOR_PIXELS)
 
 from .tess_multisource_residual import MIN_COMPONENT_SAMPLES, _prewhiten_cube_raw
 from .tess_offset_variability import (
@@ -42,13 +44,10 @@ from .tess_residual_localization import (
 
 PHASE_EXTREME_FRACTION = 0.25
 MIN_PHASE_BIN_CADENCES = 80
-MIN_IMAGE_PEAK_SNR = 4.0
 CLUSTER_RELATIVE_SNR = 0.30
 CLUSTER_MIN_SNR = 2.0
 CLUSTER_RADIUS_PIXELS = 2.5
 CENTROID_UNCERTAINTY_FLOOR_PIXELS = 0.12
-SOURCE_MATCH_MAX_PIXELS = 1.10
-SOURCE_MARGIN_FLOOR_PIXELS = 0.30
 MIN_CROSS_SECTOR_SUPPORT = 3
 JACKKNIFE_GROUPS = 4
 

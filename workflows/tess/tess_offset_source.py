@@ -303,7 +303,14 @@ def _merge_catalog_candidates(
     tic_sources: list[dict[str, Any]],
     gaia_sources: list[dict[str, Any]],
     target_sky: dict[str, float],
+    exclude_target_neighborhood: bool = True,
 ) -> list[dict[str, Any]]:
+    """Associate TIC/Gaia records, optionally applying the offset-search cut.
+
+    The default preserves the historical offset-counterpart behavior.  Source
+    localization experiments may disable only the positional exclusion while
+    target TIC records themselves are still removed from the candidate list.
+    """
     groups: list[dict[str, Any]] = []
     for source in gaia_sources:
         group = _new_group(source, target_sky)
@@ -355,8 +362,9 @@ def _merge_catalog_candidates(
     groups = [
         group
         for group in groups
-        if float(group.get("targetSeparationArcsec") or 0.0) > TARGET_EXCLUSION_RADIUS_ARCSEC
-        and not bool(((group.get("tic") or {}).get("isTargetTIC")))
+        if not bool(((group.get("tic") or {}).get("isTargetTIC")))
+        and (not exclude_target_neighborhood or
+             float(group.get("targetSeparationArcsec") or 0.0) > TARGET_EXCLUSION_RADIUS_ARCSEC)
     ]
     groups.sort(key=lambda item: float(item["separationArcsec"]))
     for index, group in enumerate(groups, start=1):
