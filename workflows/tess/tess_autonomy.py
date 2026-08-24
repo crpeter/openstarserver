@@ -34,10 +34,21 @@ _V2018_HANDLER_PREFIX = "openstar.tess.target-residual-pixel-recurrence."
 
 def _continue_finalized_v2017_pixel_recurrence(store, investigation, control, *, historical_path_resolver):
     """Admit only the cryptographically verified v20.17 terminal boundary."""
-    expected_control={"branchAssessments":[],"selectedExperiment":None,
-                      "schedulerAction":"INVESTIGATION_COMPLETE"}
+    expected_terminal_control={"branchAssessments":[],"selectedExperiment":None,
+                               "schedulerAction":"INVESTIGATION_COMPLETE"}
+    expected_stale_admission = {
+        "branchAssessments": [],
+        "recovery": "TESS_V20_16_ARCHIVAL_BASELINE_EXTENSION_V20_17",
+        "schedulerAction": "RUN_EXPERIMENT",
+        "selectedExperiment": {
+            "handler_id": "openstar.tess.target-residual-archival-baseline.prepare",
+            "id": "032-target-residual-archival-baseline-prepare",
+            "parameters": {},
+            "triggered_by_stage_id": "031-finalize",
+        },
+    }
     if (investigation.status != "COMPLETE"
-            or control != expected_control
+            or control not in (expected_terminal_control, expected_stale_admission)
             or any(s.handler_id.startswith(_V2018_HANDLER_PREFIX) for s in investigation.stages)):
         return None
     try:
