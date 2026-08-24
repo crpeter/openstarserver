@@ -8,6 +8,7 @@ on the training complement before scoring a contiguous held-out fold.
 from __future__ import annotations
 
 import math
+import itertools
 from pathlib import Path
 from typing import Any, Callable
 
@@ -45,6 +46,67 @@ MODEL_COMPONENTS = {
 }
 
 
+def generate_source_hypotheses(component_ids: list[str] | tuple[str, ...]) -> dict[str, tuple[int, ...]]:
+    """Return every non-empty source subset in stable cardinality/input order.
+
+    The legacy three-source constants above intentionally remain untouched.  New
+    continuations may supply a bounded frozen catalog without changing serialized
+    model identifiers produced for old callers.
+    """
+    ids = tuple(str(value) for value in component_ids)
+    if not ids or len(ids) != len(set(ids)):
+        raise ValueError("component IDs must be a non-empty unique sequence")
+    return {
+        "SOURCE_SUBSET_" + "__".join(ids[index] for index in indices): indices
+        for size in range(1, len(ids) + 1)
+        for indices in itertools.combinations(range(len(ids)), size)
+    }
+
+
+def compare_source_hypotheses(coefficients: np.ndarray, covariances: np.ndarray,
+                              templates: np.ndarray, component_ids: list[str] | tuple[str, ...]
+                              ) -> dict[str, Any]:
+    """Fit exhaustive hypotheses and require attribution in the complete model."""
+    ids = tuple(component_ids)
+    hypotheses = generate_source_hypotheses(ids)
+    observations = np.asarray(coefficients, dtype=float).reshape(-1)
+    template_array = np.asarray(templates, dtype=float)
+    if template_array.ndim != 2 or template_array.shape[1] != len(ids):
+        raise ValueError("template count must equal the supplied source count")
+    models = {}
+    for model_id, indices in hypotheses.items():
+        models[model_id] = _weighted_hypothesis(
+            observations=observations,
+            pixel_covariances=np.asarray(covariances, dtype=float),
+            templates=template_array[:, indices],
+            component_ids=[ids[index] for index in indices])
+        models[model_id]["sourceIDs"] = [ids[index] for index in indices]
+    winner = min(models, key=lambda key: models[key]["bic"])
+    for model in models.values():
+        model["deltaBIC"] = float(model["bic"] - models[winner]["bic"])
+    all_model_id = next(reversed(hypotheses))
+    complete = models[all_model_id]
+    conditional = {row["componentID"]: row for row in complete["sourceEstimates"]}
+    selected = models[winner]
+    selected_ids = selected["sourceIDs"]
+    omitted_ids = set(ids) - set(selected_ids)
+    identifiable = bool(
+        selected["fullRank"] and complete["fullRank"]
+        and all(row["individuallyIdentifiable"] for row in selected["sourceEstimates"])
+        and all(conditional[source_id]["individuallyIdentifiable"] for source_id in selected_ids)
+        and all(not conditional[source_id]["individuallyIdentifiable"] for source_id in omitted_ids))
+    return {"models": models, "bestModel": winner,
+            "bestModelSourceIDs": selected_ids,
+            "bestModelIdentifiable": identifiable,
+            "conditionalIdentifiabilityModel": all_model_id,
+            "completeModelFullRank": bool(complete["fullRank"]),
+            "completeModelSourceIdentifiability": {
+                source_id: copy for source_id, copy in conditional.items()},
+            "conditionallyIdentifiableSources": sorted(
+                source_id for source_id, row in conditional.items()
+                if row["individuallyIdentifiable"])}
+
+
 def _compare_hypotheses(coefficients: np.ndarray, covariances: np.ndarray,
                         templates: np.ndarray) -> dict[str, Any]:
     observations = np.asarray(coefficients, dtype=float).reshape(-1)
@@ -78,13 +140,14 @@ def _compare_hypotheses(coefficients: np.ndarray, covariances: np.ndarray,
             "conditionalIdentifiabilityModel": "TARGET_PLUS_BOTH"}
 
 
-def _source_vector_compatibility(folds: list[dict[str, Any]], model_id: str) -> dict[str, Any]:
+def _source_vector_compatibility(folds: list[dict[str, Any]], model_id: str, *,
+                                 component_ids=COMPONENT_IDS, model_components=MODEL_COMPONENTS) -> dict[str, Any]:
     """Test whether each relevant source has one common coherent vector."""
-    relevant = MODEL_COMPONENTS[model_id]
+    relevant = model_components[model_id]
     by_source: dict[str, Any] = {}
     all_compatible = True
     for source_index in relevant:
-        component_id = COMPONENT_IDS[source_index]
+        component_id = component_ids[source_index]
         estimates = []
         for fold in folds:
             source = next((item for item in fold["independentHeldOutSourceEstimates"]
@@ -113,7 +176,7 @@ def _source_vector_compatibility(folds: list[dict[str, Any]], model_id: str) -> 
                       "pValue": p_value, "compatibilityLevel": 0.95}
         by_source[component_id] = record
         all_compatible = all_compatible and bool(record["compatible"])
-    return {"bySource": by_source, "relevantSources": [COMPONENT_IDS[i] for i in relevant],
+    return {"bySource": by_source, "relevantSources": [component_ids[i] for i in relevant],
             "compatible": all_compatible}
 
 
@@ -121,7 +184,8 @@ def _temporal_predictive_validation(*, times: np.ndarray, prewhitened: np.ndarra
                                     valid: np.ndarray, templates: np.ndarray,
                                     residual_frequency: float, time_reference: float,
                                     drift: float, block_count: int = 4,
-                                    coherent_basis: np.ndarray | None = None) -> dict[str, Any]:
+                                    coherent_basis: np.ndarray | None = None,
+                                    component_ids=COMPONENT_IDS, model_components=MODEL_COMPONENTS) -> dict[str, Any]:
     """Select from all seven hypotheses using aggregate frozen held-out evidence."""
     times = np.asarray(times, dtype=float)
     valid = np.asarray(valid, dtype=bool)
@@ -130,7 +194,7 @@ def _temporal_predictive_validation(*, times: np.ndarray, prewhitened: np.ndarra
                      if len(part) >= 10]
     if len(folds_indices) < 2:
         raise RuntimeError("Predictive validation requires at least two contiguous folds.")
-    totals = {model_id: 0.0 for model_id in MODEL_COMPONENTS}
+    totals = {model_id: 0.0 for model_id in model_components}
     folds = []
     for fold_index, held_out in enumerate(folds_indices):
         training = np.setdiff1d(np.arange(len(times)), held_out)
@@ -142,10 +206,11 @@ def _temporal_predictive_validation(*, times: np.ndarray, prewhitened: np.ndarra
         test_fit = _coherent_pixel_fit(
             times=times[held_out], cube=prewhitened[held_out][:, valid], **kwargs,
             coherent_basis=None if coherent_basis is None else coherent_basis[held_out])
-        train_models = _compare_hypotheses(train_fit["coefficients"],
-                                           train_fit["covariances"], templates)
-        held_out_models = _compare_hypotheses(test_fit["coefficients"],
-                                              test_fit["covariances"], templates)
+        comparator = (_compare_hypotheses if tuple(component_ids) == COMPONENT_IDS
+                      and model_components is MODEL_COMPONENTS else
+                      lambda c, v, t: compare_source_hypotheses(c, v, t, component_ids))
+        train_models = comparator(train_fit["coefficients"], train_fit["covariances"], templates)
+        held_out_models = comparator(test_fit["coefficients"], test_fit["covariances"], templates)
         observed = test_fit["coefficients"].reshape(-1)
         inverses = [np.linalg.pinv(item, hermitian=True) for item in test_fit["covariances"]]
         determinants = [np.linalg.slogdet(item) for item in test_fit["covariances"]]
@@ -154,7 +219,7 @@ def _temporal_predictive_validation(*, times: np.ndarray, prewhitened: np.ndarra
         constant = float(sum(value for _, value in determinants)
                          + observed.size * math.log(2.0 * math.pi))
         records = {}
-        for model_id, indices in MODEL_COMPONENTS.items():
+        for model_id, indices in model_components.items():
             parameters = np.asarray(train_models["models"][model_id]["parameterEstimates"])
             prediction = (templates[:, indices, None]
                           * parameters.reshape(len(indices), 2)[None, :, :]).sum(axis=1)
@@ -167,6 +232,8 @@ def _temporal_predictive_validation(*, times: np.ndarray, prewhitened: np.ndarra
                 "heldOutChiSquare": chi_square,
                 "heldOutLogLikelihood": log_likelihood,
             }
+            if tuple(component_ids) != COMPONENT_IDS or model_components is not MODEL_COMPONENTS:
+                records[model_id]["sourceIDs"] = [component_ids[i] for i in indices]
             totals[model_id] += log_likelihood
         folds.append({
             "foldIndex": fold_index,
@@ -178,11 +245,19 @@ def _temporal_predictive_validation(*, times: np.ndarray, prewhitened: np.ndarra
             # This refit is diagnostic only and never enters predictive selection.
             "independentHeldOutBestModel": held_out_models["bestModel"],
             "independentHeldOutSourceEstimates": held_out_models["models"]
-                ["TARGET_PLUS_BOTH"]["sourceEstimates"],
+                [next(reversed(model_components))]["sourceEstimates"],
         })
+        if tuple(component_ids) != COMPONENT_IDS or model_components is not MODEL_COMPONENTS:
+            folds[-1]["trainingTimeRanges"] = [
+                {"start": float(times[part[0]]), "end": float(times[part[-1]])}
+                for part in np.split(training, np.where(np.diff(training) != 1)[0] + 1) if len(part)]
+            folds[-1]["completeModelConditionalIdentifiability"] = {
+                "model": next(reversed(model_components)),
+                "sourceEstimates": train_models["models"][next(reversed(model_components))]["sourceEstimates"]}
     winner = max(totals, key=totals.get)
-    compatibility = _source_vector_compatibility(folds, winner)
-    return {
+    compatibility = _source_vector_compatibility(folds, winner,
+        component_ids=component_ids, model_components=model_components)
+    result = {
         "method": "aggregate contiguous-fold frozen-training-parameter Gaussian predictive likelihood",
         "folds": folds,
         "totalHeldOutLogLikelihoodByModel": totals,
@@ -193,23 +268,32 @@ def _temporal_predictive_validation(*, times: np.ndarray, prewhitened: np.ndarra
             "The predictive model is selected from summed held-out evidence; it need not win "
             "every independently refitted fold."),
     }
+    if tuple(component_ids) != COMPONENT_IDS or model_components is not MODEL_COMPONENTS:
+        result["predictiveModelSourceIDs"] = [component_ids[i] for i in model_components[winner]]
+        result["completeModelConditionalIdentifiability"] = {
+            "model": next(reversed(model_components)),
+            "sourceEstimates": train_models["models"][next(reversed(model_components))]["sourceEstimates"]}
+    return result
 
 
 def _fit_shared_astrometric_shift(*, calibration_image: np.ndarray,
                                   background_columns: list[np.ndarray],
                                   render_templates: Callable[[float, float], np.ndarray],
-                                  shift_grid: tuple[float, ...] = SHARED_ASTROMETRIC_SHIFT_GRID
+                                  shift_grid: tuple[float, ...] = SHARED_ASTROMETRIC_SHIFT_GRID,
+                                  component_ids=COMPONENT_IDS
                                   ) -> dict[str, Any]:
     """Calibrate one shared dx/dy from the static sector image, independently of attribution."""
     trials = []
     for dx in shift_grid:
         for dy in shift_grid:
             templates = np.asarray(render_templates(float(dx), float(dy)), dtype=float)
-            if templates.ndim != 2 or templates.shape[1] != 3:
-                raise ValueError("PRF renderer must return target + two candidate templates.")
+            if templates.ndim != 2 or templates.shape[1] != len(component_ids):
+                if tuple(component_ids) == COMPONENT_IDS:
+                    raise ValueError("PRF renderer must return target + two candidate templates.")
+                raise ValueError("PRF renderer template count disagrees with frozen sources.")
             design = np.column_stack([templates, *background_columns])
             objective, coefficients, explained = _fit_static_image(
-                design, np.asarray(calibration_image, dtype=float), len(COMPONENT_IDS))
+                design, np.asarray(calibration_image, dtype=float), len(component_ids))
             trials.append((objective, dx, dy, templates, coefficients, explained))
     finite = [item for item in trials if math.isfinite(float(item[0]))]
     if not finite:
@@ -226,10 +310,10 @@ def _fit_shared_astrometric_shift(*, calibration_image: np.ndarray,
                 "minimumExplainedVariance": MIN_OFFICIAL_PRF_EXPLAINED_VARIANCE}
     return {"available": True,
             "sharedAstrometricCalibration": {"dxPixels": float(dx), "dyPixels": float(dy),
-            "appliedToComponents": list(COMPONENT_IDS), "independentSourceMotion": False,
+            "appliedToComponents": list(component_ids), "independentSourceMotion": False,
             "objective": minimum, "explainedVariance": float(explained),
             "minimumExplainedVariance": MIN_OFFICIAL_PRF_EXPLAINED_VARIANCE,
-            "sourceFluxCoefficients": coefficients[:3].tolist()},
+            "sourceFluxCoefficients": coefficients[:len(component_ids)].tolist()},
             "templates": templates}
 
 
@@ -279,6 +363,47 @@ def analyze_catalog_guided_sector(*, sector: int, times: np.ndarray,
         "subtractedHarmonicOrders": list(HARMONIC_ORDERS),
         "physicalCycleResolved": False,
     }
+
+
+def analyze_generalized_catalog_guided_sector(*, sector: int, times: np.ndarray,
+        prewhitened: np.ndarray, valid: np.ndarray, calibration_image: np.ndarray,
+        background_columns: list[np.ndarray], render_templates: Callable[[float, float], np.ndarray],
+        candidate_frequency: float, original_time_origin: float, physical_frequency: float,
+        component_ids: list[str] | tuple[str, ...], block_count: int = 4) -> dict[str, Any]:
+    """Catalog-guided coherent PRF fit for an arbitrary bounded frozen source list."""
+    ids = tuple(component_ids)
+    models = generate_source_hypotheses(ids)
+    times = np.asarray(times, dtype=float); valid = np.asarray(valid, dtype=bool)
+    coherent_basis = _prewhitened_coherent_basis(times=times,
+        physical_frequency=float(physical_frequency), residual_frequency=float(candidate_frequency),
+        time_reference=float(original_time_origin), drift=0.0, harmonic_orders=(1, 2))
+    fit = _coherent_pixel_fit(times=times, cube=np.asarray(prewhitened, float)[:, valid],
+        frequency=float(candidate_frequency), time_reference=float(original_time_origin), drift=0.0,
+        coherent_basis=coherent_basis)
+    calibrated = _fit_shared_astrometric_shift(calibration_image=calibration_image,
+        background_columns=background_columns, render_templates=render_templates,
+        component_ids=ids)
+    if not calibrated.get("available"):
+        return {"sector": int(sector), "calibrationResolved": False,
+            "calibrationFailure": calibrated, "scientificallyValid": False,
+            "fullDataComparison": {"bestModel": None, "bestModelIdentifiable": False,
+                "completeModelFullRank": False},
+            "temporalPredictiveValidation": {"predictiveModel": None, "predictiveSupport": False}}
+    comparison = compare_source_hypotheses(fit["coefficients"], fit["covariances"],
+                                           calibrated["templates"], ids)
+    temporal = _temporal_predictive_validation(times=times, prewhitened=prewhitened,
+        valid=valid, templates=calibrated["templates"], residual_frequency=float(candidate_frequency),
+        time_reference=float(original_time_origin), drift=0.0, block_count=block_count,
+        coherent_basis=coherent_basis, component_ids=ids, model_components=models)
+    return {"sector": int(sector), "calibrationResolved": True,
+        "sharedAstrometricCalibration": calibrated["sharedAstrometricCalibration"],
+        "fullDataComparison": comparison, "temporalPredictiveValidation": temporal,
+        "scientificallyValid": bool(comparison["completeModelFullRank"]),
+        "candidateFrequencyUsed": float(candidate_frequency),
+        "originalTimeOriginDaysUsed": float(original_time_origin),
+        "establishedFamilyPrewhitening": {"frequency": float(physical_frequency),
+            "harmonicOrders": [1, 2], "sectorLocalIntercept": True, "sectorLocalTrend": True},
+        "crossSectorPhaseUsed": False, "historicalResidualDriftExtrapolated": False}
 
 
 def _prewhiten_production_cube(*, times: np.ndarray, corrected: np.ndarray,

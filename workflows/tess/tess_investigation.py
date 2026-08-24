@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+
 import json
 from functools import wraps
 from pathlib import Path
@@ -90,6 +92,10 @@ from .tess_target_residual_pixel_recurrence import (
     verify_v2017_lineage, interpret_sectors, freeze_catalog_hypotheses, measure_sector,
     CatalogInfrastructureError, NoPixelCoverageError, acquire_selected_sector,
     tpf_flux_cube,
+)
+from .tess_target_residual_multisector_source import (
+    verify_v2018_lineage, derive_competing_sources, derive_additional_sectors,
+    eligible_additional_sectors, interpret_multisector, run_multisector_source_localization,
 )
 from .tess_offset_source import identify_offset_residual_source
 from .tess_offset_variability import (
@@ -207,7 +213,7 @@ from .tess_multisector import (
 WORKFLOW_ID = "openstar.workflow.tess-investigation.v1"
 WORKFLOW_VERSION = "20.2"
 SOFTWARE_ID = "openstar.tess-investigation-plugin"
-SOFTWARE_VERSION = "20.35"
+SOFTWARE_VERSION = "20.36"
 
 
 def _stage(investigation: Investigation, stage_id: str):
@@ -4389,6 +4395,80 @@ def build_engine(
             {"outputSuffix":"v20.18-target-residual-pixel-recurrence-validation"},request.id),
             input_hashes={"preparation":sha256_json(prep),"run":sha256_json(run)},artifacts=(_artifact(path,"application/json"),))
 
+    def multisector_source_prepare_stage(investigation, request):
+        if any(stage.handler_id.startswith("openstar.tess.target-residual-multisector-source.")
+               and stage.id != request.id for stage in investigation.stages):
+            raise RuntimeError("an existing v20.19 attempt already exists")
+        current_stage = investigation.stages[-1] if investigation.stages else None
+        if (
+            current_stage is None
+            or current_stage.id != request.id
+            or current_stage.handler_id != "openstar.tess.target-residual-multisector-source.prepare"
+            or current_stage.status != "RUNNING"
+            or current_stage.triggered_by_stage_id != "039-finalize"
+        ):
+            raise RuntimeError("invalid active v20.19 prepare stage")
+        lineage = verify_v2018_lineage(
+            investigation.stages[:-1],
+            resolver=historical_path_resolver,
+        )
+        old_prepare = lineage["prepare"].result
+        old_run = lineage["run"].result
+        v17_science = lineage["v20.17"]["science"].result
+        sources = derive_competing_sources(old_prepare["catalogHypotheses"], old_run["sectorResults"])
+        excluded = [row["sector"] for row in old_prepare["selectedSectorEvidence"]]
+        eligible = eligible_additional_sectors(v17_science["sectorEvidence"], excluded)
+        sectors = derive_additional_sectors(v17_science["sectorEvidence"], excluded)
+        artifact_root = store.directory_for(investigation.id)/"artifacts"/"target-residual-multisector-source"
+        result = {"version": "openstar.tess-target-residual-multisector-source-preparation.v1",
+            "ticID": old_prepare["ticID"], "targetSourceID": old_prepare["targetSourceID"],
+            "targetSky": copy.deepcopy(old_prepare["targetSky"]),
+            "artifactRoot": str(artifact_root.resolve()),
+            "catalogHypotheses": sources, "additionalSectorEvidence": sectors,
+            "establishedPhysicalFamilyFrequency": old_prepare["frozenEstablishedPhysicalFrequency"],
+            "excludedV2018SectorIDs": [int(row["sector"]) for row in old_prepare["selectedSectorEvidence"]],
+            "sourceSelectionProvenance": {"rule": "distancePixels <= SOURCE_MATCH_MAX_PIXELS in any v20.18 quality sector",
+                "catalogRequeried": False},
+            "sectorSelectionProvenance": {"rule": "unused supporting v20.17 sectors with finite positive frozen frequency",
+                "maximum": 12, "eligibleSectorCount": len(eligible), "selectedSectorCount": len(sectors),
+                "selectionTruncated": len(sectors) < len(eligible), "allEligibleUsed": len(sectors) == len(eligible)},
+            "crossSectorPhaseUsed": False, "historicalResidualDriftExtrapolated": False}
+        path = store.directory_for(investigation.id)/"artifacts"/"target-residual-multisector-source"/"target-residual-multisector-source-prepare-v20.19.json"
+        _write_json(path, result)
+        return StageOutcome(result=result, next_stage=StageRequest(
+            "041-target-residual-multisector-source-run",
+            "openstar.tess.target-residual-multisector-source.run", {}, request.id),
+            input_hashes={"v20.18": sha256_json(lineage["science"].result)},
+            artifacts=(_artifact(path, "application/json"),))
+
+    def multisector_source_run_stage(investigation, request):
+        prep = _required_latest_result_for_handler(investigation,
+            "openstar.tess.target-residual-multisector-source.prepare")
+        try:
+            result = run_multisector_source_localization(prep)
+        except TessArchiveTransientError as error:
+            raise RetryableExecutionError(str(error), result={
+                "operation": "v20.19-pixel-prf-acquisition"}) from error
+        path = store.directory_for(investigation.id)/"artifacts"/"target-residual-multisector-source"/"target-residual-multisector-source-run-v20.19.json"
+        _write_json(path, result)
+        return StageOutcome(result=result, next_stage=StageRequest(
+            "042-target-residual-multisector-source-interpret",
+            "openstar.tess.target-residual-multisector-source.interpret", {}, request.id),
+            input_hashes={"preparation": sha256_json(prep)}, artifacts=(_artifact(path, "application/json"),))
+
+    def multisector_source_interpret_stage(investigation, request):
+        prep = _required_latest_result_for_handler(investigation,
+            "openstar.tess.target-residual-multisector-source.prepare")
+        run = _required_latest_result_for_handler(investigation,
+            "openstar.tess.target-residual-multisector-source.run")
+        result = interpret_multisector(run["sectorResults"], prep["targetSourceID"])
+        path = store.directory_for(investigation.id)/"artifacts"/"target-residual-multisector-source"/"target-residual-multisector-source-v20.19.json"
+        _write_json(path, result)
+        return StageOutcome(result=result, next_stage=StageRequest("043-finalize", "openstar.tess.finalize",
+            {"outputSuffix": "v20.19-target-residual-multisector-source-localization"}, request.id),
+            input_hashes={"preparation": sha256_json(prep), "run": sha256_json(run)},
+            artifacts=(_artifact(path, "application/json"),))
+
     def prf_deblending_prepare_stage(investigation, request):
         required_handlers = {
             "targetPreparation": "openstar.tess.prepare-target",
@@ -7835,6 +7915,8 @@ def build_engine(
             investigation,
             "openstar.tess.multi-source-residual.interpret",
         )
+        target_residual_multisector_source = _latest_result_for_handler(
+            investigation, "openstar.tess.target-residual-multisector-source.interpret")
         offset_source_identification = _latest_result_for_handler(
             investigation,
             "openstar.tess.offset-source-identification.analyze",
@@ -8844,7 +8926,9 @@ def build_engine(
             and stage.handler_id != "openstar.tess.finalize" and not stage.handler_id.startswith(
                 "openstar.tess.target-residual-archival-baseline.")
             for index, stage in enumerate(investigation.stages))
-        if target_residual_pixel_recurrence is not None:
+        if target_residual_multisector_source is not None:
+            recommended_next_test = target_residual_multisector_source.get("recommendedNextTest")
+        elif target_residual_pixel_recurrence is not None:
             recommended_next_test = target_residual_pixel_recurrence.get("recommendedNextTest")
         elif target_residual_archival_baseline_extension is not None and not later_unrelated_science:
             # This branch is appended after v20.16. Genuinely later unrelated
@@ -8959,6 +9043,7 @@ def build_engine(
             ),
             "targetResidualArchivalBaselineExtension": target_residual_archival_baseline_extension,
             "targetResidualPixelRecurrenceValidation": target_residual_pixel_recurrence,
+            "targetResidualMultisectorSourceLocalization": target_residual_multisector_source,
             "offsetResidualSourceIdentification": offset_source_identification,
             "offsetSourceVariabilityValidation": offset_source_variability,
             "calibratedPrfSourceDeblending": calibrated_prf_deblending,
@@ -9484,6 +9569,9 @@ def build_engine(
     engine.register_handler("openstar.tess.target-residual-pixel-recurrence.prepare", pixel_recurrence_prepare_stage)
     engine.register_handler("openstar.tess.target-residual-pixel-recurrence.run", pixel_recurrence_run_stage)
     engine.register_handler("openstar.tess.target-residual-pixel-recurrence.interpret", pixel_recurrence_interpret_stage)
+    engine.register_handler("openstar.tess.target-residual-multisector-source.prepare", multisector_source_prepare_stage)
+    engine.register_handler("openstar.tess.target-residual-multisector-source.run", multisector_source_run_stage)
+    engine.register_handler("openstar.tess.target-residual-multisector-source.interpret", multisector_source_interpret_stage)
     engine.register_handler(
         "openstar.tess.offset-source-identification.analyze",
         offset_source_identification_stage,
