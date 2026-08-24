@@ -34,8 +34,10 @@ _V2018_HANDLER_PREFIX = "openstar.tess.target-residual-pixel-recurrence."
 
 def _continue_finalized_v2017_pixel_recurrence(store, investigation, control, *, historical_path_resolver):
     """Admit only the cryptographically verified v20.17 terminal boundary."""
+    expected_control={"branchAssessments":[],"selectedExperiment":None,
+                      "schedulerAction":"INVESTIGATION_COMPLETE"}
     if (investigation.status != "COMPLETE"
-            or control.get("schedulerAction") != "INVESTIGATION_COMPLETE"
+            or control != expected_control
             or any(s.handler_id.startswith(_V2018_HANDLER_PREFIX) for s in investigation.stages)):
         return None
     try:

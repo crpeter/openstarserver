@@ -87,7 +87,8 @@ from .tess_target_residual_archival_baseline import (
     previously_consumed_tess_sectors, verify_frozen_science_lineage,
 )
 from .tess_target_residual_pixel_recurrence import (
-    verify_v2017_lineage, interpret_sectors, frozen_catalog_hypotheses, measure_sector,
+    verify_v2017_lineage, interpret_sectors, freeze_catalog_hypotheses, measure_sector,
+    CatalogInfrastructureError, NoPixelCoverageError, acquire_selected_sector,
 )
 from .tess_offset_source import identify_offset_residual_source
 from .tess_offset_variability import (
@@ -4320,13 +4321,16 @@ def build_engine(
         metadata=((identity.get("tic") or {}).get("metadata") or {})
         ra=primary.get("raDeg",metadata.get("raDeg")); dec=primary.get("decDeg",metadata.get("decDeg"))
         if ra is None or dec is None: raise RuntimeError("authoritative target sky position is absent")
-        hypotheses=frozen_catalog_hypotheses(identity,tic_id=int(primary["ticID"]),ra_deg=float(ra),dec_deg=float(dec))
+        try:
+            catalog=freeze_catalog_hypotheses(tic_id=int(primary["ticID"]),ra_deg=float(ra),dec_deg=float(dec))
+        except CatalogInfrastructureError as error:
+            raise RetryableExecutionError(str(error),result={"operation":"v20.18-catalog-freeze",**error.diagnostics}) from error
         morphology=lineage["science"]  # boundary hash anchors the sector list below
         old=lineage["frozenScienceLineage"]
         established=1/float(old["morphology"].result["resolvedPhysicalPeriodDays"])
         result={"version":"openstar.tess-target-residual-pixel-recurrence-preparation.v1",
             "ticID":int(primary["ticID"]),"targetSourceID":f"TIC-{int(primary['ticID'])}",
-            "targetSky":{"raDeg":float(ra),"decDeg":float(dec)},"catalogHypotheses":hypotheses,
+            "targetSky":{"raDeg":float(ra),"decDeg":float(dec)},**catalog,
             "catalogHypothesesFrozenBeforePixelAcquisition":True,
             "selectedSectorEvidence":lineage["selectedSectorEvidence"],
             "frozenEstablishedPhysicalFrequency":established,"crossSectorPhaseUsed":False,
@@ -4345,22 +4349,30 @@ def build_engine(
         for frozen in prep["selectedSectorEvidence"]:
             sector=int(frozen["sector"])
             try:
-                tpf,source=_download_tpf(tic_id=prep["ticID"],sector=sector,
+                tpf,source=acquire_selected_sector(_download_tpf,tic_id=prep["ticID"],sector=sector,
                     ra_deg=prep["targetSky"]["raDeg"],dec_deg=prep["targetSky"]["decDeg"])
                 times=np.asarray(tpf.time.value,float); flux=np.asarray(getattr(tpf.flux,"value",tpf.flux),float)
                 keep=np.isfinite(times)&np.any(np.isfinite(flux.reshape(len(flux),-1)),axis=1); times=times[keep]; flux=flux[keep]
-                cube,_=_background_subtract_cube(flux); valid=np.any(np.isfinite(cube),axis=0)
+                cube,background=_background_subtract_cube(flux); valid=np.any(np.isfinite(cube),axis=0)
                 hypotheses=[]
                 for item in prep["catalogHypotheses"]:
                     x,y=tpf.wcs.world_to_pixel(_skycoord(item["raDeg"],item["decDeg"]))
                     hypotheses.append({**item,"x":float(x),"y":float(y)})
                 measured=measure_sector(times,cube,valid,established_frequency=prep["frozenEstablishedPhysicalFrequency"],
                     candidate_frequency=frozen["candidateFrequency"],hypotheses=hypotheses)
+                centroid_sky=None
+                try:
+                    sky=tpf.wcs.pixel_to_world(measured["centroidX"],measured["centroidY"])
+                    centroid_sky={"raDeg":float(sky.ra.deg),"decDeg":float(sky.dec.deg)}
+                except (AttributeError,TypeError,ValueError): pass
                 rows.append({**frozen,**measured,"sector":sector,"pixelSourceType":source.get("sourceType"),
                     "author":source.get("author"),"cadenceSeconds":source.get("cadenceSeconds"),"usableCadenceCount":len(times),
-                    "catalogPixelPositions":hypotheses,"acquisitionProvenance":source,"acquisitionErrors":[]})
-            except FileNotFoundError as error:
+                    "catalogPixelPositions":hypotheses,"centroidSky":centroid_sky,
+                    "backgroundSubtraction":background,"acquisitionProvenance":source,"acquisitionErrors":[]})
+            except NoPixelCoverageError as error:
                 rows.append({**frozen,"sector":sector,"classification":"UNAVAILABLE","acquisitionErrors":[str(error)]})
+            except TessArchiveTransientError as error:
+                raise RetryableExecutionError(str(error),result={"sector":sector,"operation":"v20.18-pixel-acquisition"}) from error
         result={"version":"openstar.tess-target-residual-pixel-recurrence-run.v1","sectorResults":rows,
             "crossSectorPhaseUsed":False,"historicalResidualDriftExtrapolated":False}
         path=store.directory_for(investigation.id)/"artifacts"/"target-residual-pixel-recurrence"/"target-residual-pixel-recurrence-run-v20.18.json"; _write_json(path,result)
@@ -8831,7 +8843,9 @@ def build_engine(
             and stage.handler_id != "openstar.tess.finalize" and not stage.handler_id.startswith(
                 "openstar.tess.target-residual-archival-baseline.")
             for index, stage in enumerate(investigation.stages))
-        if target_residual_archival_baseline_extension is not None and not later_unrelated_science:
+        if target_residual_pixel_recurrence is not None:
+            recommended_next_test = target_residual_pixel_recurrence.get("recommendedNextTest")
+        elif target_residual_archival_baseline_extension is not None and not later_unrelated_science:
             # This branch is appended after v20.16. Genuinely later unrelated
             # evidence remains above it when introduced in the precedence list.
             recommended_next_test = target_residual_archival_baseline_extension.get("recommendedNextTest")

@@ -7,17 +7,16 @@ from __future__ import annotations
 
 import copy
 import math
+import re
 from typing import Any, Iterable
 
 from openstar_path_relocation import HistoricalPathResolver, NO_HISTORICAL_PATH_RELOCATION
 from .tess_target_residual_archival_baseline import (MAX_PIXEL_FOLLOWUP_SECTORS,
     verify_frozen_science_lineage, verified_json_result)
-
-# Public established thresholds mirrored here so lineage/admission remains
-# usable on installations without optional numerical astronomy packages.
-MIN_IMAGE_PEAK_SNR = 4.0
-SOURCE_MATCH_MAX_PIXELS = 1.10
-SOURCE_MARGIN_FLOOR_PIXELS = 0.30
+from .tess_offset_source import (CATALOG_MERGE_RADIUS_ARCSEC, GAIA_QUERY_RADIUS_ARCSEC,
+    TIC_QUERY_RADIUS_ARCSEC, _merge_catalog_candidates)
+from .tess_difference_image_constants import (MIN_IMAGE_PEAK_SNR,
+    SOURCE_MATCH_MAX_PIXELS, SOURCE_MARGIN_FLOOR_PIXELS)
 
 PREFIX = "openstar.tess.target-residual-pixel-recurrence."
 RECOMMENDATION = "PIXEL_LEVEL_SOURCE_RESOLVED_RESIDUAL_RECURRENCE_VALIDATION"
@@ -47,6 +46,11 @@ def verify_v2017_lineage(stages: Iterable[Any], *, resolver: HistoricalPathResol
     verified_json_result(science, "target-residual-archival-baseline-v20.17.json", resolver=resolver)
     verified_json_result(final, "conclusion-v20.17-target-residual-archival-baseline.json", resolver=resolver)
     result=science.result
+    hashes=science.provenance.input_hashes if science.provenance else {}
+    from openstar_investigation import sha256_json
+    if (hashes.get("preparation") != sha256_json(prepare.result)
+            or hashes.get("distributedResult") != sha256_json(run.result)):
+        raise RuntimeError("v20.17 interpretation is not bound to preparation and run")
     if result.get("classification") not in {"ARCHIVAL_TARGET_RESIDUAL_RECURRENCE_SUPPORTED", "ARCHIVAL_TARGET_RESIDUAL_RECURRENCE_SUGGESTIVE"}:
         raise RuntimeError("v20.17 recurrence does not admit localization")
     required={"recommendedNextTest":RECOMMENDATION,"sourceAttributionResolved":False,
@@ -66,9 +70,15 @@ def verify_v2017_lineage(stages: Iterable[Any], *, resolver: HistoricalPathResol
         item=by_sector[sector][0]
         if item.get("supportsHistoricalResidualFamily") is not True or item.get("recurrenceClassification") != "SUPPORTING_HISTORICAL_RESIDUAL_FAMILY":
             raise RuntimeError("selected sector is not supporting")
-        if item.get("candidateFrequency") is None: raise RuntimeError("selected sector lacks frozen frequency")
+        frequency=item.get("candidateFrequency")
+        if not isinstance(frequency,(int,float)) or not math.isfinite(float(frequency)) or float(frequency)<=0:
+            raise RuntimeError("selected sector lacks valid frozen frequency")
         selection = raw if isinstance(raw,dict) else next((x for x in result.get("selectedFuturePixelFollowupSectorEvidence",[]) if x.get("sector")==sector), {})
-        frozen.append({"sector":sector,"candidateFrequency":item["candidateFrequency"],
+        if (selection.get("originalTimeOriginDays") != item.get("originalTimeOriginDays")
+                or not isinstance(selection.get("selectionReason"),str)
+                or not selection.get("selectionReason").strip()):
+            raise RuntimeError("selected-sector metadata disagrees with sector evidence")
+        frozen.append({"sector":sector,"candidateFrequency":frequency,
             "candidateFrequencyConfidenceInterval":copy.deepcopy(item.get("candidateFrequencyConfidenceInterval")),
             "originalTimeOriginDays":item.get("originalTimeOriginDays"),
             "selectionReason":selection.get("selectionReason") or item.get("selectionReason")})
@@ -130,23 +140,49 @@ def interpret_sectors(sectors: list[dict[str,Any]], target_source_id: str) -> di
         "historicalResidualDriftExtrapolated":False,"recommendedNextTest":recommendation,"sectorResults":sectors}
 
 
-def frozen_catalog_hypotheses(identity: dict[str,Any], *, tic_id: int, ra_deg: float, dec_deg: float) -> list[dict[str,Any]]:
-    """Freeze all already-query-bounded TIC/Gaia records, with target explicit."""
-    result=[{"sourceID":f"TIC-{tic_id}","isTarget":True,"ticID":tic_id,
-             "gaiaDR3SourceID":None,"raDeg":float(ra_deg),"decDeg":float(dec_deg)}]
-    seen={(round(float(ra_deg),9),round(float(dec_deg),9))}
-    def visit(value):
-        if isinstance(value,dict):
-            ra=value.get("raDeg"); dec=value.get("decDeg")
-            if isinstance(ra,(int,float)) and isinstance(dec,(int,float)):
-                key=(round(float(ra),9),round(float(dec),9))
-                if key not in seen:
-                    tic=value.get("ticID"); gaia=value.get("gaiaDR3SourceID",value.get("gaiaSourceID"))
-                    source=f"TIC-{tic}" if tic is not None else f"GaiaDR3-{gaia}" if gaia is not None else f"sky-{ra:.9f}-{dec:.9f}"
-                    result.append({"sourceID":source,"isTarget":False,"ticID":tic,"gaiaDR3SourceID":gaia,
-                                   "raDeg":float(ra),"decDeg":float(dec)}); seen.add(key)
-            for child in value.values(): visit(child)
-        elif isinstance(value,list):
-            for child in value: visit(child)
-    visit(identity)
-    return result
+class CatalogInfrastructureError(RuntimeError):
+    def __init__(self,message,diagnostics=None):
+        super().__init__(message); self.diagnostics=diagnostics or {}
+class NoPixelCoverageError(RuntimeError): pass
+
+
+def freeze_catalog_hypotheses(*, tic_id:int, ra_deg:float, dec_deg:float,
+        query_tic=None, query_gaia=None, coordinate_factory=None) -> dict[str,Any]:
+    """Query the preregistered regions and freeze the complete merged catalog."""
+    from .tess_offset_source import _query_tic_region, _query_gaia_region, _skycoord
+    try:
+        coordinate=(coordinate_factory or _skycoord)(ra_deg,dec_deg)
+        tic=(query_tic or _query_tic_region)(coordinate,int(tic_id))
+        gaia=(query_gaia or _query_gaia_region)(coordinate)
+    except Exception as error:
+        raise CatalogInfrastructureError(f"catalog query failed: {type(error).__name__}: {error}") from error
+    errors=[{"catalog":name,"error":response.get("queryError")} for name,response in
+            (("TIC",tic),("GaiaDR3",gaia)) if response.get("queryError")]
+    if errors:
+        raise CatalogInfrastructureError(str(errors),{"catalogQueries":{"tic":tic,"gaiaDR3":gaia},"queryErrors":errors})
+    target_sky={"raDeg":float(ra_deg),"decDeg":float(dec_deg)}
+    candidates=_merge_catalog_candidates(tic_sources=list(tic.get("sources") or []),
+        gaia_sources=list(gaia.get("sources") or []),target_sky=target_sky)
+    target_tic=next((x for x in tic.get("sources") or [] if x.get("isTargetTIC") or x.get("ticID")==tic_id),{})
+    target_gaia=target_tic.get("gaiaSourceID")
+    hypotheses=[{"sourceID":f"TIC-{tic_id}","isTarget":True,"ticID":tic_id,
+        "gaiaDR3SourceID":target_gaia,"raDeg":float(ra_deg),"decDeg":float(dec_deg)}]
+    for item in candidates:
+        ids=item.get("catalogIDs") or {}; tic_value=ids.get("ticID"); gaia_value=ids.get("gaiaDR3SourceID")
+        source_id=f"TIC-{tic_value}" if tic_value is not None else f"GaiaDR3-{gaia_value}"
+        hypotheses.append({"sourceID":source_id,"isTarget":False,"ticID":tic_value,
+            "gaiaDR3SourceID":gaia_value,"raDeg":item["raDeg"],"decDeg":item["decDeg"]})
+    return {"catalogHypotheses":hypotheses,"catalogQueries":{"tic":tic,"gaiaDR3":gaia},
+        "queryProvenance":{"TIC":{"service":"MAST Catalogs","catalog":"TIC","radiusArcsec":TIC_QUERY_RADIUS_ARCSEC,"center":target_sky},
+        "GaiaDR3":{"service":"VizieR","catalog":"I/355/gaiadr3","radiusArcsec":GAIA_QUERY_RADIUS_ARCSEC,"center":target_sky},
+        "catalogMergeRadiusArcsec":CATALOG_MERGE_RADIUS_ARCSEC,"responsesPersistedVerbatim":True}}
+
+
+_NO_COVERAGE = re.compile(r"^No official TPF or TESScut coverage available for Sector [1-9][0-9]*\.$")
+def acquire_selected_sector(download, **kwargs):
+    """Narrowly translate only the established no-coverage downloader result."""
+    try: return download(**kwargs)
+    except RuntimeError as error:
+        if type(error) is RuntimeError and _NO_COVERAGE.fullmatch(str(error)):
+            raise NoPixelCoverageError(str(error)) from error
+        raise
