@@ -197,7 +197,7 @@ from .tess_multisector import (
 WORKFLOW_ID = "openstar.workflow.tess-investigation.v1"
 WORKFLOW_VERSION = "20.2"
 SOFTWARE_ID = "openstar.tess-investigation-plugin"
-SOFTWARE_VERSION = "20.32"
+SOFTWARE_VERSION = "20.33"
 
 
 def _stage(investigation: Investigation, stage_id: str):
@@ -1127,6 +1127,40 @@ def _render_report(conclusion: dict[str, Any]) -> str:
                 f"sectors={item.get('independentSupportingSectors')}, "
                 f"combinedPower={item.get('combinedPower')}, "
                 f"combinedPeriod={item.get('combinedPeriodDays')} d"
+            )
+
+    predictive_validation = conclusion.get(
+        "targetResidualMechanismPredictiveValidation"
+    )
+    if predictive_validation is not None:
+        lines.extend([
+            "",
+            "## Target-residual mechanism predictive validation (v20.16)",
+            "",
+            f"- Classification: {predictive_validation.get('classification')}",
+            f"- Recommended next test: {predictive_validation.get('recommendedNextTest')}",
+            "- Replicated predictive mechanisms: "
+            f"{predictive_validation.get('replicatedPredictiveMechanisms')}",
+            "- Supporting sectors by replicated mechanism: "
+            f"{predictive_validation.get('replicatedPredictiveMechanismSupportingSectorIDs')}",
+            "- Conservative validation limitations (fail-closed reasons): "
+            f"{predictive_validation.get('failClosedReasons')}",
+            "- Execution: deterministic held-out validation with local training-only refits; "
+            "no distributed work or archive query was performed by v20.16.",
+            "",
+            "### Compact per-sector predictive evidence",
+            "",
+        ])
+        for item in predictive_validation.get("sectorPredictiveEvidence") or []:
+            lines.append(
+                f"- Sector {item.get('sector')}: "
+                f"classification={item.get('sectorClassification')}, "
+                f"best={item.get('bestPredictiveModel')}, "
+                f"secondBest={item.get('secondBestPredictiveModel')}, "
+                f"deltaLogLikelihood={item.get('predictiveDeltaLogLikelihood')}, "
+                f"foldWins={item.get('foldWinsByModel')}, "
+                f"fairComparison={item.get('fairAllModelComparisonCompleted')}, "
+                f"morphologyGateBlocked={item.get('morphologyGateBlockedPromotion')}"
             )
 
     offset_source = conclusion.get("offsetResidualSourceIdentification")
@@ -7700,6 +7734,10 @@ def build_engine(
             investigation,
             "openstar.tess.targeted-observation-planning.generate",
         )
+        target_residual_mechanism_predictive_validation = _latest_result_for_handler(
+            investigation,
+            "openstar.tess.target-residual-mechanism-predictive-validation.analyze",
+        )
 
         if harmonic_family_interpretation is not None:
             claim_decision = harmonic_family_interpretation["claimDecision"]
@@ -7914,6 +7952,51 @@ def build_engine(
                 )
             existing_rationale.append(
                 f"Recommended next confirmation step: {multisource_residual.get('recommendedNextTest')}."
+            )
+            claim_decision = {
+                "claim": claim_decision["claim"],
+                "rationale": existing_rationale,
+            }
+
+        if target_residual_mechanism_predictive_validation is not None:
+            existing_rationale = list(claim_decision.get("rationale") or [])
+            classification = target_residual_mechanism_predictive_validation.get(
+                "classification"
+            )
+            existing_rationale.append(
+                "v20.16 performed deterministic held-out validation of the four "
+                "preregistered target-residual temporal model families using local "
+                "training-only refits; it performed no distributed work or archive query."
+            )
+            if classification == (
+                "TARGET_RESIDUAL_MECHANISM_PREDICTIVE_VALIDATION_UNRESOLVED"
+            ):
+                existing_rationale.append(
+                    "No temporal mechanism replicated predictively across the required "
+                    "independent sectors, so the target-residual mechanism remains unresolved."
+                )
+            else:
+                existing_rationale.append(
+                    f"The predictive-validation classification is {classification}."
+                )
+            limitations = (
+                target_residual_mechanism_predictive_validation.get("failClosedReasons")
+                or []
+            )
+            if limitations:
+                existing_rationale.append(
+                    "Conservative predictive-validation limitations: "
+                    + "; ".join(str(reason) for reason in limitations)
+                    + ". These limitations are not positive evidence for a mechanism."
+                )
+            branch_recommendation = (
+                target_residual_mechanism_predictive_validation.get(
+                    "recommendedNextTest"
+                )
+            )
+            existing_rationale.append(
+                "v20.16 recommends the next target-residual test: "
+                f"{branch_recommendation}."
             )
             claim_decision = {
                 "claim": claim_decision["claim"],
@@ -8618,6 +8701,10 @@ def build_engine(
             recommended_next_test = calibrated_prf_deblending.get("recommendedNextTest")
         elif offset_source_identification is not None:
             recommended_next_test = offset_source_identification.get("recommendedNextTest")
+        elif target_residual_mechanism_predictive_validation is not None:
+            recommended_next_test = target_residual_mechanism_predictive_validation.get(
+                "recommendedNextTest"
+            )
         elif multisource_residual is not None:
             recommended_next_test = multisource_residual.get("recommendedNextTest")
         elif residual_mode_localization_review is not None:
@@ -8679,6 +8766,9 @@ def build_engine(
             "residualModeLocalization": residual_mode_localization,
             "residualModeLocalizationReview": residual_mode_localization_review,
             "multiSourceResidualDecomposition": multisource_residual,
+            "targetResidualMechanismPredictiveValidation": (
+                target_residual_mechanism_predictive_validation
+            ),
             "offsetResidualSourceIdentification": offset_source_identification,
             "offsetSourceVariabilityValidation": offset_source_variability,
             "calibratedPrfSourceDeblending": calibrated_prf_deblending,
