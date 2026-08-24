@@ -13,6 +13,10 @@ from openstar_autonomy import (
     ScientificBranch,
 )
 from openstar_investigation import Investigation, InvestigationStore, sha256_file, sha256_json
+from openstar_path_relocation import (
+    HistoricalPathResolver,
+    NO_HISTORICAL_PATH_RELOCATION,
+)
 from openstar_targets import InvestigationTarget
 from openstar_workflow import StageRequest, WorkflowEngine
 from .tess_localization_evidence import frozen_residual_localization_family
@@ -27,11 +31,16 @@ WORKFLOW_VERSION = "20.2"
 _V2017_HANDLER_PREFIX = "openstar.tess.target-residual-archival-baseline."
 
 
-def _verified_stage_json(stage, expected_filename: str) -> bool:
+def _verified_stage_json(
+    stage,
+    expected_filename: str,
+    *,
+    resolver: HistoricalPathResolver = NO_HISTORICAL_PATH_RELOCATION,
+) -> bool:
     if not isinstance(stage.result, dict): return False
     for reference in stage.artifacts:
-        path=Path(reference.path)
         try:
+            path = resolver.resolve(reference.path)
             if path.name == expected_filename and path.is_file() and reference.sha256 == sha256_file(path):
                 with path.open(encoding="utf-8") as handle:
                     if json.load(handle) == stage.result: return True
@@ -41,7 +50,9 @@ def _verified_stage_json(stage, expected_filename: str) -> bool:
 
 
 def _continue_finalized_v2016_archival_baseline(store: InvestigationStore,
-        investigation: Investigation, control: dict) -> Investigation | None:
+        investigation: Investigation, control: dict, *,
+        historical_path_resolver: HistoricalPathResolver =
+        NO_HISTORICAL_PATH_RELOCATION) -> Investigation | None:
     """Narrow, idempotent admission of the exact finalized v20.16 boundary."""
     expected_terminal_control = {"branchAssessments": [], "selectedExperiment": None,
                                  "schedulerAction": "INVESTIGATION_COMPLETE"}
@@ -69,14 +80,16 @@ def _continue_finalized_v2016_archival_baseline(store: InvestigationStore,
             and science.result and science.result.get("classification")=="TARGET_RESIDUAL_MECHANISM_PREDICTIVE_VALIDATION_UNRESOLVED"
             and science.result.get("recommendedNextTest")=="ADDITIONAL_TEMPORAL_BASELINE_OR_MECHANISM_DISCRIMINATION"
             and science.result.get("physicalMechanismResolved") is False and _verified_stage_json(
-                science, "target-residual-mechanism-predictive-validation-v20.16.json")
+                science, "target-residual-mechanism-predictive-validation-v20.16.json",
+                resolver=historical_path_resolver)
             and final and final.status=="COMPLETE" and final.handler_id=="openstar.tess.finalize"
             and final.parameters == {"outputSuffix":"v20.16-target-residual-predictive-validation"}
             and final.triggered_by_stage_id==science.id and final is investigation.stages[-1]
             and final.result and final.result.get("targetResidualMechanismPredictiveValidation")==science.result
             and final.result.get("recommendedNextTest")=="ADDITIONAL_TEMPORAL_BASELINE_OR_MECHANISM_DISCRIMINATION"
             and _verified_stage_json(final,
-                "conclusion-v20.16-target-residual-predictive-validation.json")):
+                "conclusion-v20.16-target-residual-predictive-validation.json",
+                resolver=historical_path_resolver)):
         return None
     request=StageRequest("032-target-residual-archival-baseline-prepare",
         "openstar.tess.target-residual-archival-baseline.prepare",{},final.id)
@@ -1352,7 +1365,10 @@ def _repair_shifted_stage_lookup_independent_prepare(
 
 
 def repair_obsolete_terminal_wait(
-    store: InvestigationStore, investigation: Investigation
+    store: InvestigationStore,
+    investigation: Investigation,
+    *,
+    historical_path_resolver: HistoricalPathResolver | None = None,
 ) -> Investigation:
     """Repair only known obsolete terminal TESS decisions from older code."""
 
@@ -1360,7 +1376,9 @@ def repair_obsolete_terminal_wait(
     if investigation.workflow_id != WORKFLOW_ID or not isinstance(control, dict):
         return investigation
 
-    archival = _continue_finalized_v2016_archival_baseline(store, investigation, control)
+    resolver = historical_path_resolver or NO_HISTORICAL_PATH_RELOCATION
+    archival = _continue_finalized_v2016_archival_baseline(
+        store, investigation, control, historical_path_resolver=resolver)
     if archival is not None:
         return archival
 

@@ -132,7 +132,7 @@ class TessTargetResidualArchivalBaselineTests(unittest.TestCase):
         self.assertGreater(abs(np.dot(output,np.sin(2*np.pi*.1*local))),
                            20*abs(np.dot(output,np.sin(2*np.pi*.2*local))))
 
-    def _finalized_boundary(self, directory, historical_control=False):
+    def _finalized_boundary(self, directory, historical_control=False, artifact_directory=None):
         store = InvestigationStore(Path(directory)/"investigations")
         inv = store.create("archival-boundary", WORKFLOW_ID, WORKFLOW_VERSION)
         predictive = {"classification":"TARGET_RESIDUAL_MECHANISM_PREDICTIVE_VALIDATION_UNRESOLVED",
@@ -141,7 +141,9 @@ class TessTargetResidualArchivalBaselineTests(unittest.TestCase):
         conclusion = {"targetResidualMechanismPredictiveValidation":predictive,
             "recommendedNextTest":"ADDITIONAL_TEMPORAL_BASELINE_OR_MECHANISM_DISCRIMINATION"}
         def artifact(name, value):
-            path=Path(directory)/name; path.write_text(json.dumps(value)+"\n",encoding="utf-8")
+            path=Path(artifact_directory or directory)/name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(value)+"\n",encoding="utf-8")
             return ArtifactReference(str(path),sha256_file(path),"application/json")
         science=InvestigationStage("030-target-residual-mechanism-predictive-validation",
             "openstar.tess.target-residual-mechanism-predictive-validation.analyze","COMPLETE",None,{},
@@ -160,6 +162,75 @@ class TessTargetResidualArchivalBaselineTests(unittest.TestCase):
                     "triggered_by_stage_id":"030-target-residual-mechanism-predictive-validation"}}
         inv=store.set_control_state(inv,status="COMPLETE",control_state=control)
         return store,inv
+
+    def test_v2016_admission_reads_only_explicitly_relocated_artifacts(self):
+        durable = Path.cwd()/f".v2016-relocation-{uuid.uuid4().hex}"
+        self.addCleanup(shutil.rmtree, durable, True)
+        durable.mkdir()
+        with tempfile.TemporaryDirectory() as directory:
+            old = Path(directory)/"old"
+            store, inv = self._finalized_boundary(
+                Path(directory)/"state", historical_control=True,
+                artifact_directory=old)
+            new = durable/"new"
+            shutil.copytree(old, new)
+            shutil.rmtree(old)
+            resolver = HistoricalPathResolver({old: new})
+            stages_before = copy.deepcopy(inv.stages)
+            artifact_state_before = tuple(
+                (reference.path, reference.sha256)
+                for stage in inv.stages for reference in stage.artifacts)
+
+            reopened = repair_obsolete_terminal_wait(
+                store, inv, historical_path_resolver=resolver)
+
+            control = reopened.metadata["controlState"]
+            self.assertEqual("RUNNING", reopened.status)
+            self.assertEqual("032-target-residual-archival-baseline-prepare",
+                control["selectedExperiment"]["id"])
+            self.assertEqual("TESS_V20_16_ARCHIVAL_BASELINE_EXTENSION_V20_17",
+                control["recovery"])
+            self.assertEqual(stages_before, reopened.stages)
+            self.assertEqual(artifact_state_before, tuple(
+                (reference.path, reference.sha256)
+                for stage in reopened.stages for reference in stage.artifacts))
+            self.assertFalse(old.exists())
+
+    def test_v2016_relocated_admission_rejects_missing_or_invalid_artifacts(self):
+        mutations = ("no resolver", "science missing", "finalizer missing",
+            "sha mismatch", "json differs")
+        for mutation in mutations:
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as directory:
+                durable = Path.cwd()/f".v2016-relocation-{uuid.uuid4().hex}"
+                self.addCleanup(shutil.rmtree, durable, True)
+                durable.mkdir()
+                old = Path(directory)/"old"
+                store, inv = self._finalized_boundary(
+                    Path(directory)/"state", historical_control=True,
+                    artifact_directory=old)
+                new = durable/"new"
+                shutil.copytree(old, new)
+                shutil.rmtree(old)
+                resolver = HistoricalPathResolver({old: new})
+                if mutation == "science missing":
+                    (new/"target-residual-mechanism-predictive-validation-v20.16.json").unlink()
+                elif mutation == "finalizer missing":
+                    (new/"conclusion-v20.16-target-residual-predictive-validation.json").unlink()
+                elif mutation == "sha mismatch":
+                    (new/"target-residual-mechanism-predictive-validation-v20.16.json").write_text(
+                        '{"altered":true}\n', encoding="utf-8")
+                elif mutation == "json differs":
+                    path = new/"target-residual-mechanism-predictive-validation-v20.16.json"
+                    path.write_text('{"altered":true}\n', encoding="utf-8")
+                    science = inv.stages[0]
+                    reference = replace(science.artifacts[0], sha256=sha256_file(path))
+                    inv = replace(inv, stages=(replace(science, artifacts=(reference,)), inv.stages[1]))
+
+                repaired = repair_obsolete_terminal_wait(
+                    store, inv,
+                    historical_path_resolver=None if mutation == "no resolver" else resolver)
+                self.assertEqual(inv, repaired)
+                self.assertFalse(old.exists())
 
     def test_exact_post_031_boundary_reopens_once_and_altered_control_does_not(self):
         with tempfile.TemporaryDirectory() as directory:

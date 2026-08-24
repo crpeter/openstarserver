@@ -176,7 +176,11 @@ def run_autonomous_tess(
     # and leaves all other durable lifecycle actions untouched.
     if current_investigation_id:
         investigation = store.load(current_investigation_id)
-        repair_obsolete_terminal_wait(store, investigation)
+        repair_obsolete_terminal_wait(
+            store,
+            investigation,
+            historical_path_resolver=historical_path_resolver,
+        )
 
     while True:
         result = lifecycle.run()
