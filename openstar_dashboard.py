@@ -164,6 +164,11 @@ class DashboardApplication:
                         })
                         live_sectors.add(fallback.get("sector"))
                 for run in science_runs:
+                    # Reconstructions have stricter admission rules than generic
+                    # historical fallbacks.  The override pass above is their
+                    # only route into the logical sector projection.
+                    if run.get("kind") == "tess-sector-reconstruction":
+                        continue
                     fallback = run.get("metadata", {}).get("sectorSweep")
                     if not isinstance(fallback, dict) or fallback.get("sector") in live_sectors:
                         continue

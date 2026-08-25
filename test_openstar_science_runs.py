@@ -86,6 +86,13 @@ class ScienceRunCatalogTests(unittest.TestCase):
             with self.assertRaisesRegex(ReconstructionManifestError, "inventoryPath SHA-256"):
                 register_sector_reconstruction(manifest, root / "catalog.sqlite3")
 
+    def test_reconstruction_registration_rejects_ranking_hash_mismatch(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); manifest = reconstruction_fixture(root)
+            (root / "ranking.json").write_bytes(b"changed")
+            with self.assertRaisesRegex(ReconstructionManifestError, "rankingPath SHA-256"):
+                register_sector_reconstruction(manifest, root / "catalog.sqlite3")
+
     def test_reconstruction_missing_component_is_degraded(self):
         with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temporary:
             root = Path(temporary); manifest = reconstruction_fixture(root)
