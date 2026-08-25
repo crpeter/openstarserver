@@ -8,6 +8,7 @@ import urllib.request
 import sqlite3
 import subprocess
 from pathlib import Path
+from unittest.mock import patch
 
 from dashboard import build_snapshot, history_snapshot
 from openstar_dashboard import (
@@ -81,6 +82,69 @@ class FakeCoordinator:
 
 
 class ProjectionTests(unittest.TestCase):
+    def dashboard_observation(self, science_runs, physical):
+        coordinator = FakeCoordinator()
+        with patch("openstar_dashboard.discover_science_runs", return_value=science_runs), \
+             patch("openstar_dashboard.sector_sweeps_projection", return_value=physical):
+            return DashboardApplication(coordinator, contribution_ledger=None).observation()
+
+    @staticmethod
+    def reconstruction_run(*, condition="available", sector=17):
+        sweep = {"sector": sector, "inventory": 10, "complete": 10, "remaining": 0,
+            "progress": 1.0, "status": "COMPLETE", "historical": True,
+            "reconstructed": True, "originalComplete": 7, "recoveredComplete": 3}
+        return {"runID": "reconstruction", "kind": "tess-sector-reconstruction",
+            "stateRoot": "/durable/reconstruction", "condition": condition,
+            "issues": [] if condition == "available" else ["reconstruction_component_missing"],
+            "metadata": {"sectorSweep": sweep}}
+
+    @staticmethod
+    def physical_sector(sector=17, inventory=10, complete=7):
+        return {"sector": sector, "inventory": inventory, "complete": complete,
+            "remaining": inventory - complete, "progress": complete / inventory,
+            "status": "RUNNING", "admitted": complete, "runnable": 0,
+            "inFlightOrRecovery": 0}
+
+    def test_available_reconstruction_overrides_damaged_physical_sector(self):
+        component = {"runID": "original", "kind": "tess-sector-sweep",
+            "stateRoot": "/missing/original", "condition": "degraded", "metadata": {}}
+        recovery = {"runID": "recovery", "kind": "tess-sector-sweep",
+            "stateRoot": "/durable/recovery", "condition": "available", "metadata": {}}
+        observation = self.dashboard_observation(
+            [self.reconstruction_run(), component, recovery], [self.physical_sector(complete=7)])
+        self.assertEqual([(17, 10, True)], [(row["sector"], row["complete"],
+            row.get("reconstructed")) for row in observation["sectorSweeps"]])
+        self.assertEqual({"reconstruction", "original", "recovery"},
+            {run["runID"] for run in observation["scienceRuns"]})
+
+    def test_available_reconstruction_overrides_recovery_only_component(self):
+        observation = self.dashboard_observation(
+            [self.reconstruction_run()], [self.physical_sector(inventory=3, complete=3)])
+        self.assertEqual(10, observation["sectorSweeps"][0]["inventory"])
+        self.assertEqual(10, observation["sectorSweeps"][0]["admitted"])
+        self.assertEqual(0, observation["sectorSweeps"][0]["recoveryRequired"])
+
+    def test_degraded_reconstruction_does_not_override_healthy_physical_sector(self):
+        physical = self.physical_sector(complete=9)
+        observation = self.dashboard_observation(
+            [self.reconstruction_run(condition="degraded")], [physical])
+        self.assertEqual([physical], observation["sectorSweeps"])
+        self.assertEqual("degraded", observation["scienceRuns"][0]["condition"])
+
+    def test_degraded_reconstruction_without_physical_sector_is_not_a_fallback(self):
+        observation = self.dashboard_observation(
+            [self.reconstruction_run(condition="degraded")], [])
+        self.assertEqual([], observation["sectorSweeps"])
+        self.assertEqual(1, len(observation["scienceRuns"]))
+
+    def test_reconstruction_does_not_change_unrelated_normal_sector(self):
+        unrelated = self.physical_sector(sector=22, complete=4)
+        observation = self.dashboard_observation(
+            [self.reconstruction_run()], [self.physical_sector(), unrelated])
+        by_sector = {row["sector"]: row for row in observation["sectorSweeps"]}
+        self.assertEqual(unrelated, by_sector[22])
+        self.assertTrue(by_sector[17]["reconstructed"])
+
     def test_coordinator_and_telemetry_join_only_by_node_id(self):
         coordinator = FakeCoordinator()
         store = TelemetryStore()

@@ -1,4 +1,5 @@
 import json
+import hashlib
 import os
 import sqlite3
 import tempfile
@@ -18,10 +19,90 @@ from openstar_science_runs import (
     catalog_path,
     recorded_science_run,
     science_run_projection,
+    load_reconstruction_manifest,
+    register_sector_reconstruction,
+    ReconstructionManifestError,
 )
 
 
+def reconstruction_fixture(root: Path, sector: int = 7) -> Path:
+    original = root / "original"; original.mkdir()
+    recovery = root / "recovery"; recovery.mkdir()
+    inventory = root / "inventory.json"; inventory.write_bytes(b"inventory\n")
+    ranking = root / "ranking.json"; ranking.write_bytes(b"ranking\n")
+    manifest = root / f"sector-{sector}-reconstruction-manifest.json"
+    manifest.write_text(json.dumps({
+        "schemaVersion": "openstar.tess-sector-reconstruction.v1", "sector": sector,
+        "inventoryCount": 3, "originalCompleteCount": 2,
+        "recoveryCompleteCount": 1, "combinedCompleteCount": 3,
+        "originalRoot": str(original), "recoveryRoot": str(recovery),
+        "inventoryPath": str(inventory),
+        "inventorySHA256": hashlib.sha256(inventory.read_bytes()).hexdigest(),
+        "rankingPath": str(ranking),
+        "rankingSHA256": hashlib.sha256(ranking.read_bytes()).hexdigest(),
+        "originalInvestigationIDs": ["a", "b"], "recoveredInvestigationIDs": ["c"],
+        "coverageComplete": True, "originalHistoryModified": False,
+        "recoveryHistoryModified": False,
+    }), encoding="utf-8")
+    return manifest
+
+
 class ScienceRunCatalogTests(unittest.TestCase):
+    def test_reconstruction_registration_is_idempotent_read_only_and_projected(self):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temporary:
+            root = Path(temporary)
+            manifest = reconstruction_fixture(root, sector=12)
+            sources = [manifest, root / "inventory.json", root / "ranking.json"]
+            before = {item: item.read_bytes() for item in sources}
+            catalog = root / "catalog.sqlite3"
+            first = register_sector_reconstruction(manifest, catalog)
+            second = register_sector_reconstruction(manifest, catalog)
+            self.assertEqual(first, second)
+            self.assertEqual(1, len(ScienceRunCatalog(catalog).list_runs()))
+            self.assertEqual(before, {item: item.read_bytes() for item in sources})
+            projection = discover_science_runs(catalog)[0]
+            self.assertEqual("available", projection["condition"])
+            self.assertEqual(3, projection["reconstruction"]["complete"])
+            self.assertTrue(projection["metadata"]["sectorSweep"]["reconstructed"])
+
+    def test_reconstruction_strict_validation_rejects_overlap_flags_and_counts(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest = reconstruction_fixture(Path(temporary))
+            baseline = json.loads(manifest.read_text())
+            for update in (
+                {"schemaVersion": "wrong"},
+                {"combinedCompleteCount": 2},
+                {"recoveredInvestigationIDs": ["a"]},
+                {"originalHistoryModified": True},
+            ):
+                manifest.write_text(json.dumps({**baseline, **update}))
+                with self.assertRaises(ReconstructionManifestError):
+                    load_reconstruction_manifest(manifest)
+
+    def test_reconstruction_registration_rejects_artifact_hash_mismatch(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); manifest = reconstruction_fixture(root)
+            (root / "inventory.json").write_bytes(b"changed")
+            with self.assertRaisesRegex(ReconstructionManifestError, "inventoryPath SHA-256"):
+                register_sector_reconstruction(manifest, root / "catalog.sqlite3")
+
+    def test_reconstruction_registration_rejects_ranking_hash_mismatch(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); manifest = reconstruction_fixture(root)
+            (root / "ranking.json").write_bytes(b"changed")
+            with self.assertRaisesRegex(ReconstructionManifestError, "rankingPath SHA-256"):
+                register_sector_reconstruction(manifest, root / "catalog.sqlite3")
+
+    def test_reconstruction_missing_component_is_degraded(self):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temporary:
+            root = Path(temporary); manifest = reconstruction_fixture(root)
+            run = ScienceRun("id", "tess-sector-reconstruction", str(root),
+                "COMPLETE", 1, 2, {"manifestPath": str(manifest)})
+            (root / "recovery").rmdir()
+            projection = science_run_projection(run)
+            self.assertEqual("degraded", projection["condition"])
+            self.assertTrue(any("recoveryRoot" in issue for issue in projection["issues"]))
+
     def test_identity_and_resume_are_stable_and_idempotent(self):
         with tempfile.TemporaryDirectory() as temporary:
             catalog = ScienceRunCatalog(Path(temporary) / "catalog.sqlite3")

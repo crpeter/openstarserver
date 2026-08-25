@@ -7,12 +7,14 @@ module creates, repairs, or decides whether an investigation should run.
 from __future__ import annotations
 
 import json
+import hashlib
 import functools
 import inspect
 import os
 import sqlite3
 import time
 import uuid
+import re
 from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,6 +25,106 @@ from openstar_state_storage import is_temporary_state_path
 CATALOG_ENV = "OPENSTAR_SCIENCE_RUN_CATALOG"
 MODULE_ROOT = Path(__file__).resolve().parent
 DEFAULT_CATALOG = MODULE_ROOT / "data" / "science-runs.sqlite3"
+RECONSTRUCTION_SCHEMA = "openstar.tess-sector-reconstruction.v1"
+RECONSTRUCTION_KIND = "tess-sector-reconstruction"
+_SHA256 = re.compile(r"^[0-9a-fA-F]{64}$")
+
+
+class ReconstructionManifestError(ValueError):
+    """A reconstruction manifest is not valid authoritative metadata."""
+
+
+def load_reconstruction_manifest(manifest_path: str | Path,
+                                 *, verify_artifacts: bool = False) -> dict[str, Any]:
+    """Strictly validate reconstruction metadata, without writing any source file."""
+    path = Path(manifest_path).expanduser().resolve()
+    match = re.fullmatch(r"sector-(\d+)-reconstruction-manifest\.json", path.name)
+    if not match:
+        raise ReconstructionManifestError("invalid reconstruction manifest filename")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ReconstructionManifestError(f"unable to read reconstruction manifest: {error}") from error
+    if not isinstance(payload, dict):
+        raise ReconstructionManifestError("reconstruction manifest must be an object")
+    if payload.get("schemaVersion") != RECONSTRUCTION_SCHEMA:
+        raise ReconstructionManifestError("unsupported reconstruction schemaVersion")
+
+    def integer(name: str, *, positive: bool = False) -> int:
+        value = payload.get(name)
+        if isinstance(value, bool) or not isinstance(value, int) or value < (1 if positive else 0):
+            raise ReconstructionManifestError(f"{name} must be a {'positive' if positive else 'nonnegative'} integer")
+        return value
+
+    sector = integer("sector", positive=True)
+    if sector != int(match.group(1)):
+        raise ReconstructionManifestError("manifest filename sector does not match sector")
+    inventory = integer("inventoryCount")
+    original = integer("originalCompleteCount")
+    recovery = integer("recoveryCompleteCount")
+    combined = integer("combinedCompleteCount")
+    if payload.get("coverageComplete") is not True:
+        raise ReconstructionManifestError("coverageComplete must be true")
+    if combined != inventory:
+        raise ReconstructionManifestError("combinedCompleteCount must equal inventoryCount")
+    if original + recovery != combined:
+        raise ReconstructionManifestError("component counts do not equal combinedCompleteCount")
+    original_ids = payload.get("originalInvestigationIDs")
+    recovered_ids = payload.get("recoveredInvestigationIDs")
+    if not isinstance(original_ids, list) or len(original_ids) != original:
+        raise ReconstructionManifestError("originalInvestigationIDs length mismatch")
+    if not isinstance(recovered_ids, list) or len(recovered_ids) != recovery:
+        raise ReconstructionManifestError("recoveredInvestigationIDs length mismatch")
+    try:
+        original_set, recovered_set = set(original_ids), set(recovered_ids)
+    except TypeError as error:
+        raise ReconstructionManifestError("investigation IDs must be scalar and unique") from error
+    if len(original_set) != original or len(recovered_set) != recovery:
+        raise ReconstructionManifestError("investigation IDs must be unique within each component")
+    if original_set & recovered_set:
+        raise ReconstructionManifestError("original and recovered investigation IDs overlap")
+    if len(original_set | recovered_set) != combined:
+        raise ReconstructionManifestError("investigation ID union count mismatch")
+    for name in ("originalHistoryModified", "recoveryHistoryModified"):
+        if payload.get(name) is not False:
+            raise ReconstructionManifestError(f"{name} must be false")
+    for name in ("originalRoot", "recoveryRoot", "inventoryPath", "rankingPath"):
+        if not isinstance(payload.get(name), str) or not payload[name].strip():
+            raise ReconstructionManifestError(f"{name} must be present")
+    for name in ("inventorySHA256", "rankingSHA256"):
+        if not isinstance(payload.get(name), str) or not _SHA256.fullmatch(payload[name]):
+            raise ReconstructionManifestError(f"{name} must be a SHA-256 hex string")
+    if verify_artifacts:
+        for name in ("originalRoot", "recoveryRoot"):
+            if not _manifest_reference(path, payload[name]).is_dir():
+                raise ReconstructionManifestError(f"{name} does not exist")
+        for path_name, hash_name in (("inventoryPath", "inventorySHA256"),
+                                     ("rankingPath", "rankingSHA256")):
+            artifact = _manifest_reference(path, payload[path_name])
+            try:
+                digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+            except OSError as error:
+                raise ReconstructionManifestError(f"unable to read {path_name}: {error}") from error
+            if digest.lower() != payload[hash_name].lower():
+                raise ReconstructionManifestError(f"{path_name} SHA-256 mismatch")
+    return payload
+
+
+def _manifest_reference(manifest: Path, value: str) -> Path:
+    reference = Path(value).expanduser()
+    return reference if reference.is_absolute() else manifest.parent / reference
+
+
+def register_sector_reconstruction(manifest_path: str | Path,
+                                   catalog: str | Path | None = None) -> str:
+    """Validate and idempotently index one immutable sector reconstruction."""
+    manifest = Path(manifest_path).expanduser().resolve()
+    payload = load_reconstruction_manifest(manifest, verify_artifacts=True)
+    sector = payload["sector"]
+    return ScienceRunCatalog(catalog).record(
+        RECONSTRUCTION_KIND, manifest.parent, status="COMPLETE", logical_identity=sector,
+        metadata={"sector": sector, "manifestPath": str(manifest)},
+    )
 
 
 def catalog_path(value: str | Path | None = None) -> Path:
@@ -280,7 +382,7 @@ def science_run_projection(run: ScienceRun) -> dict[str, Any]:
     record = {
         "runID": run.run_id, "kind": run.kind, "stateRoot": run.state_root,
         "status": run.status, "createdAt": run.created_at, "updatedAt": run.updated_at,
-        "metadata": run.metadata, "condition": "available", "issues": [],
+        "metadata": dict(run.metadata), "condition": "available", "issues": [],
     }
     if is_temporary_state_path(root):
         record["condition"] = "degraded"
@@ -288,6 +390,47 @@ def science_run_projection(run: ScienceRun) -> dict[str, Any]:
     if not root.exists():
         record["condition"] = "degraded"
         record["issues"].append("state_root_missing")
+        return record
+    if run.kind == RECONSTRUCTION_KIND:
+        configured = run.metadata.get("manifestPath")
+        manifests = ([Path(configured)] if isinstance(configured, str) and configured
+                     else list(root.glob("sector-*-reconstruction-manifest.json")))
+        if len(manifests) != 1:
+            record["condition"] = "degraded"
+            record["issues"].append("reconstruction_manifest_missing_or_ambiguous")
+            return record
+        manifest_path = manifests[0].expanduser().resolve()
+        try:
+            payload = load_reconstruction_manifest(manifest_path)
+        except ReconstructionManifestError as error:
+            record["condition"] = "degraded"
+            record["issues"].append(f"reconstruction_manifest_invalid: {error}")
+            return record
+        missing = [name for name in ("originalRoot", "recoveryRoot")
+                   if not _manifest_reference(manifest_path, payload[name]).is_dir()]
+        if missing:
+            record["condition"] = "degraded"
+            record["issues"].extend(f"reconstruction_component_missing: {name}"
+                                    for name in missing)
+        complete = payload["combinedCompleteCount"]
+        inventory = payload["inventoryCount"]
+        reconstruction = {
+            "sector": payload["sector"], "inventory": inventory, "complete": complete,
+            "originalComplete": payload["originalCompleteCount"],
+            "recoveredComplete": payload["recoveryCompleteCount"],
+            "coverageComplete": payload["coverageComplete"],
+            "originalRoot": payload["originalRoot"], "recoveryRoot": payload["recoveryRoot"],
+            "manifestPath": str(manifest_path),
+        }
+        record["reconstruction"] = reconstruction
+        record["metadata"]["sectorSweep"] = {
+            "sector": payload["sector"], "inventory": inventory, "complete": complete,
+            "remaining": inventory - complete,
+            "progress": complete / inventory if inventory else 1.0,
+            "status": "COMPLETE", "historical": True, "reconstructed": True,
+            "originalComplete": payload["originalCompleteCount"],
+            "recoveredComplete": payload["recoveryCompleteCount"],
+        }
         return record
     if run.kind == "tess-sector-sweep":
         sector = run.metadata.get("sector")
