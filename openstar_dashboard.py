@@ -140,6 +140,29 @@ class DashboardApplication:
                 except (OSError, ValueError, TypeError):
                     observation["sectorSweeps"] = []
                 live_sectors = {item.get("sector") for item in observation["sectorSweeps"]}
+                # Historical physical components remain in scienceRuns, while a
+                # valid reconstruction is the authoritative logical-sector view.
+                reconstructions = {}
+                for run in science_runs:
+                    fallback = run.get("metadata", {}).get("sectorSweep")
+                    if (run.get("kind") == "tess-sector-reconstruction"
+                            and run.get("condition") == "available"
+                            and isinstance(fallback, dict)
+                            and fallback.get("reconstructed") is True):
+                        reconstructions[fallback.get("sector")] = fallback
+                if reconstructions:
+                    observation["sectorSweeps"] = [item for item in observation["sectorSweeps"]
+                        if item.get("sector") not in reconstructions]
+                    live_sectors.difference_update(reconstructions)
+                    for fallback in reconstructions.values():
+                        observation["sectorSweeps"].append({
+                            **fallback,
+                            "admitted": fallback.get("complete", 0),
+                            "runnable": 0, "inFlightOrRecovery": 0,
+                            "recoveryRequired": 0, "waitingExternalData": 0,
+                            "blockedPrerequisites": 0, "failed": 0, "unclassified": 0,
+                        })
+                        live_sectors.add(fallback.get("sector"))
                 for run in science_runs:
                     fallback = run.get("metadata", {}).get("sectorSweep")
                     if not isinstance(fallback, dict) or fallback.get("sector") in live_sectors:
