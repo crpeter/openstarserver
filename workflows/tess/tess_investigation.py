@@ -135,6 +135,12 @@ from .tess_time_resolved_frequency_localization import (
     run_time_resolved_frequency_localization,
     interpret_time_resolved_frequency_localization,
 )
+from .tess_additional_sector_source_localization import (
+    prepare_additional_sector_source_localization,
+    run_additional_sector_source_localization,
+    interpret_additional_sector_source_localization,
+    unused_official_sectors,
+)
 from .tess_frequency_localized_pixel import (
     build_frequency_localized_pixel_project,
     interpret_frequency_localized_pixel_project,
@@ -4630,13 +4636,19 @@ def build_engine(
             result.get("sourceAttributionResolved") is True and justified
             and result.get("recommendedNextTest")
             == "INDEPENDENT_COUNTERPART_PHOTOMETRIC_VARIABILITY_VALIDATION")
-        unresolved = not continue_validation
+        continue_imaging = (result.get("classification") == "UNRESOLVED"
+            and result.get("sourceAttributionResolved") is False
+            and result.get("recommendedNextTest") == "ADDITIONAL_SOURCE_LOCALIZATION_DATA")
+        unresolved = not continue_validation and not continue_imaging
         return StageOutcome(
             result=result,
             next_stage=(StageRequest(
                 _next_stage_id(request.id, "prepare-offset-source-variability"),
                 "openstar.tess.offset-source-variability.prepare", {}, request.id)
-                if continue_validation else None),
+                if continue_validation else StageRequest(
+                _next_stage_id(request.id, "prepare-residual-phase-difference-imaging"),
+                "openstar.tess.residual-phase-difference-imaging.prepare", {}, request.id)
+                if continue_imaging else None),
             stop=unresolved,
             final_status="QUIESCENT_AWAITING_DATA" if unresolved else "COMPLETE",
             input_hashes={"preparation": sha256_json(preparation), "run": sha256_json(run)},
@@ -4880,12 +4892,43 @@ def build_engine(
         path = Path(preparation["artifactRoot"]) / "interpretation.json"; _write_json(path, result)
         candidate = (result.get("classification") in {"STABLE_CANDIDATE_1_LOCALIZATION", "STABLE_CANDIDATE_2_LOCALIZATION"}
             and result.get("recommendedNextTest") == "INDEPENDENT_COUNTERPART_PHOTOMETRIC_VARIABILITY_VALIDATION")
+        bridge = _latest_result_for_handler(investigation,
+            "openstar.tess.time-resolved-frequency-localization.prepare")
+        identity = _latest_result_for_handler(investigation, "openstar.tess.catalog-identity")
+        additional = (result.get("classification") == "UNRESOLVED"
+            and result.get("recommendedNextTest") == "ADDITIONAL_INDEPENDENT_SOURCE_LOCALIZATION_DATA"
+            and result.get("sourceAttributionResolved") is False
+            and result.get("physicalMechanismResolved") is False
+            and bridge is not None and identity is not None
+            and bool(unused_official_sectors(identity, bridge)))
         return StageOutcome(result=result, next_stage=StageRequest(
             _next_stage_id(request.id, "prepare-offset-source-variability"),
-            "openstar.tess.offset-source-variability.prepare", {}, request.id) if candidate else None,
-            stop=not candidate, final_status="QUIESCENT_AWAITING_DATA",
+            "openstar.tess.offset-source-variability.prepare", {}, request.id) if candidate else StageRequest(
+            _next_stage_id(request.id, "prepare-additional-sector-source-localization"),
+            "openstar.tess.additional-sector-source-localization.prepare", {}, request.id) if additional else None,
+            stop=not candidate and not additional, final_status="QUIESCENT_AWAITING_DATA",
             input_hashes={"preparation": sha256_json(preparation), "run": sha256_json(run)},
             artifacts=(_artifact(path, "application/json"),))
+
+    def additional_sector_prepare_stage(investigation, request):
+        interpretation = _latest_result_for_handler(investigation, "openstar.tess.time-resolved-frequency-localization.interpret")
+        bridge = _latest_result_for_handler(investigation, "openstar.tess.time-resolved-frequency-localization.prepare")
+        identity = _latest_result_for_handler(investigation, "openstar.tess.catalog-identity")
+        if interpretation is None or bridge is None or identity is None: raise RuntimeError("Additional-sector localization requires persisted stage-052, frozen bridge, and identity.")
+        result = prepare_additional_sector_source_localization(interpretation=interpretation, localization_bridge=bridge, identity=identity, output_dir=store.directory_for(investigation.id)/"artifacts", investigation_id=investigation.id)
+        return StageOutcome(result=result, next_stage=StageRequest(_next_stage_id(request.id,"run-additional-sector-source-localization"), "openstar.tess.additional-sector-source-localization.run", {}, request.id), input_hashes={"interpretation":sha256_json(interpretation),"bridge":sha256_json(bridge),"identity":sha256_json(identity)}, artifacts=(_artifact(Path(result["preparationPath"]),"application/json"),))
+
+    def additional_sector_run_stage(investigation, request):
+        preparation = _latest_result_for_handler(investigation, "openstar.tess.additional-sector-source-localization.prepare")
+        if preparation is None: raise RuntimeError("Additional-sector run requires preparation.")
+        result=run_additional_sector_source_localization(preparation,sector_inputs=request.parameters.get("sectorInputs")); path=Path(preparation["artifactRoot"])/"run.json"; _write_json(path,result)
+        return StageOutcome(result=result,next_stage=StageRequest(_next_stage_id(request.id,"interpret-additional-sector-source-localization"),"openstar.tess.additional-sector-source-localization.interpret",{},request.id),input_hashes={"preparation":sha256_json(preparation)},artifacts=(_artifact(path,"application/json"),))
+
+    def additional_sector_interpret_stage(investigation, request):
+        preparation=_latest_result_for_handler(investigation,"openstar.tess.additional-sector-source-localization.prepare"); run=_latest_result_for_handler(investigation,"openstar.tess.additional-sector-source-localization.run")
+        if preparation is None or run is None: raise RuntimeError("Additional-sector interpretation requires prepare and run.")
+        result=interpret_additional_sector_source_localization(preparation,run); path=Path(preparation["artifactRoot"])/"interpretation.json"; _write_json(path,result)
+        return StageOutcome(result=result,stop=True,final_status="QUIESCENT_AWAITING_DATA",input_hashes={"preparation":sha256_json(preparation),"run":sha256_json(run)},artifacts=(_artifact(path,"application/json"),))
 
     def offset_source_identification_stage(investigation, request):
         prepared = _latest_result_for_handler(investigation, "openstar.tess.prepare-target")
@@ -9640,6 +9683,12 @@ def build_engine(
         "openstar.tess.time-resolved-frequency-localization.interpret",
         time_resolved_frequency_interpret_stage,
     )
+    engine.register_handler("openstar.tess.additional-sector-source-localization.prepare",
+                            additional_sector_prepare_stage)
+    engine.register_handler("openstar.tess.additional-sector-source-localization.run",
+                            additional_sector_run_stage)
+    engine.register_handler("openstar.tess.additional-sector-source-localization.interpret",
+                            additional_sector_interpret_stage)
     engine.register_handler(
         "openstar.tess.offset-source-variability.prepare",
         offset_source_variability_prepare_stage,

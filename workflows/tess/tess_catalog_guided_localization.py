@@ -369,14 +369,18 @@ def analyze_generalized_catalog_guided_sector(*, sector: int, times: np.ndarray,
         prewhitened: np.ndarray, valid: np.ndarray, calibration_image: np.ndarray,
         background_columns: list[np.ndarray], render_templates: Callable[[float, float], np.ndarray],
         candidate_frequency: float, original_time_origin: float, physical_frequency: float,
-        component_ids: list[str] | tuple[str, ...], block_count: int = 4) -> dict[str, Any]:
+        component_ids: list[str] | tuple[str, ...], block_count: int = 4,
+        harmonic_orders: tuple[int, ...] = (1, 2)) -> dict[str, Any]:
     """Catalog-guided coherent PRF fit for an arbitrary bounded frozen source list."""
     ids = tuple(component_ids)
+    orders = tuple(int(order) for order in harmonic_orders)
+    if not orders or any(order < 1 for order in orders) or len(set(orders)) != len(orders):
+        raise ValueError("harmonic orders must be a non-empty unique positive sequence")
     models = generate_source_hypotheses(ids)
     times = np.asarray(times, dtype=float); valid = np.asarray(valid, dtype=bool)
     coherent_basis = _prewhitened_coherent_basis(times=times,
         physical_frequency=float(physical_frequency), residual_frequency=float(candidate_frequency),
-        time_reference=float(original_time_origin), drift=0.0, harmonic_orders=(1, 2))
+        time_reference=float(original_time_origin), drift=0.0, harmonic_orders=orders)
     fit = _coherent_pixel_fit(times=times, cube=np.asarray(prewhitened, float)[:, valid],
         frequency=float(candidate_frequency), time_reference=float(original_time_origin), drift=0.0,
         coherent_basis=coherent_basis)
@@ -402,7 +406,7 @@ def analyze_generalized_catalog_guided_sector(*, sector: int, times: np.ndarray,
         "candidateFrequencyUsed": float(candidate_frequency),
         "originalTimeOriginDaysUsed": float(original_time_origin),
         "establishedFamilyPrewhitening": {"frequency": float(physical_frequency),
-            "harmonicOrders": [1, 2], "sectorLocalIntercept": True, "sectorLocalTrend": True},
+            "harmonicOrders": list(orders), "sectorLocalIntercept": True, "sectorLocalTrend": True},
         "crossSectorPhaseUsed": False, "historicalResidualDriftExtrapolated": False}
 
 
