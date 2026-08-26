@@ -138,9 +138,10 @@ class MixedPortfolioSupervisorSoakTests(unittest.TestCase):
             workflow = WorkflowEngine(investigations)
             dispatcher = InvestigationDispatcher(investigations, workflow)
             executions = {name: [] for name in (
-                "healthy", "transient", "external", "hard", "orphan"
+                "healthy", "transient", "external", "hard", "orphan", "planner-bug"
             )}
             external_handler_control_actions = []
+            planner_bug_attempts = []
 
             def healthy(investigation, request):
                 executions["healthy"].append(request.id)
@@ -200,13 +201,18 @@ class MixedPortfolioSupervisorSoakTests(unittest.TestCase):
                     ),)
                 elif target.id == "hard":
                     request = StageRequest("001-hard", "soak.hard", {})
+                elif target.id == "planner-bug":
+                    planner_bug_attempts.append(target.id)
+                    raise RuntimeError("planner bug")
                 else:
                     return ()
                 return (ScientificBranch(target.id, request),)
 
             targets = tuple(
                 InvestigationTarget(name, name, "soak.workflow", "1")
-                for name in ("healthy", "transient", "external", "hard", "orphan")
+                for name in (
+                    "healthy", "transient", "external", "hard", "orphan", "planner-bug"
+                )
             )
             scheduler = InvestigationScheduler(
                 investigations,
@@ -232,7 +238,9 @@ class MixedPortfolioSupervisorSoakTests(unittest.TestCase):
             ))
             external_jobs.save(replace(job, remoteTaskURL="task://one"))
 
-            orphan = scheduler.driver.attach(targets[-1])
+            orphan = scheduler.driver.attach(
+                next(target for target in targets if target.id == "orphan")
+            )
             investigations.append_running_stage(orphan, InvestigationStage(
                 "001-orphan", "soak.orphan", "RUNNING", None, {}
             ))
@@ -272,6 +280,7 @@ class MixedPortfolioSupervisorSoakTests(unittest.TestCase):
             external_record = investigations.load("external")
             hard_record = investigations.load("hard")
             orphan_record = investigations.load("orphan")
+            planner_bug_record = investigations.load("planner-bug")
             self.assertEqual("COMPLETE", healthy_record.status)
             self.assertEqual(
                 ["001-healthy-first", "002-healthy-second"],
@@ -305,18 +314,32 @@ class MixedPortfolioSupervisorSoakTests(unittest.TestCase):
             self.assertEqual("RUNNING", orphan_record.status)
             self.assertEqual(["001-orphan"], [stage.id for stage in orphan_record.stages])
             self.assertEqual([], executions["orphan"])
+            self.assertEqual("RUNNING", planner_bug_record.status)
+            self.assertEqual((), planner_bug_record.stages)
+            self.assertEqual(["planner-bug"], planner_bug_attempts)
 
             heartbeat = json.loads(heartbeat_path.read_text())
             self.assertEqual(
-                ["hard", "orphan"], heartbeat["quarantinedInvestigationIDs"]
+                ["hard", "orphan", "planner-bug"],
+                heartbeat["quarantinedInvestigationIDs"],
             )
             self.assertEqual(3, heartbeat["countsBySchedulerState"]["COMPLETE"])
-            self.assertEqual(1, heartbeat["countsBySchedulerState"]["FAILED"])
+            self.assertEqual(2, heartbeat["countsBySchedulerState"]["FAILED"])
             self.assertEqual(1, heartbeat["countsBySchedulerState"]["RECOVERY_REQUIRED"])
+            planner_summary = next(
+                item for item in heartbeat["investigations"]
+                if item["investigationID"] == "planner-bug"
+            )
+            self.assertEqual("RUNNING", planner_summary["status"])
+            self.assertEqual("FAILED", planner_summary["schedulerState"])
+            self.assertEqual("RuntimeError: planner bug", planner_summary["error"])
+            self.assertIsNone(planner_summary["latestStageID"])
 
             stage_snapshots = {
                 name: [stage.id for stage in investigations.load(name).stages]
-                for name in ("healthy", "transient", "external", "hard", "orphan")
+                for name in (
+                    "healthy", "transient", "external", "hard", "orphan", "planner-bug"
+                )
             }
             heartbeat_path.write_text(
                 '{"quarantinedInvestigationIDs": ["healthy"], "cycleNumber": 999}'
@@ -355,6 +378,7 @@ class MixedPortfolioSupervisorSoakTests(unittest.TestCase):
             self.assertEqual(first_failed_evidence, first_failed_path.read_bytes())
             self.assertEqual(1, len(restarted_jobs.list()))
             self.assertEqual([job.id, job.id], provider.calls)
+            self.assertEqual(["planner-bug", "planner-bug"], planner_bug_attempts)
             self.assertEqual(
                 stage_snapshots,
                 {
@@ -364,10 +388,10 @@ class MixedPortfolioSupervisorSoakTests(unittest.TestCase):
             )
             restarted_heartbeat = json.loads(heartbeat_path.read_text())
             self.assertEqual(
-                ["hard", "orphan"],
+                ["hard", "orphan", "planner-bug"],
                 restarted_heartbeat["quarantinedInvestigationIDs"],
             )
-            self.assertEqual(1, restarted_heartbeat["countsBySchedulerState"]["FAILED"])
+            self.assertEqual(2, restarted_heartbeat["countsBySchedulerState"]["FAILED"])
             self.assertEqual(
                 1,
                 restarted_heartbeat["countsBySchedulerState"]["RECOVERY_REQUIRED"],
