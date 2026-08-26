@@ -57,6 +57,10 @@ def _continue_finalized_v2014_astrophysical_interpretation(store, investigation,
             and result.get("adjudicationVersion") == "route-independent-all-models-v1"
             and result.get("crossSectorPhaseUsed") is False
             and result.get("failClosedReasons") == []
+            and result.get("replicatedMechanisms") ==
+                ["SMOOTH_TARGET_MODE_AMPLITUDE_MODULATION"]
+            and (result.get("replicatedMechanismSupportingSectorIDs") or {}).get(
+                "SMOOTH_TARGET_MODE_AMPLITUDE_MODULATION") == [68, 95]
             and _verified_stage_json(science, "target-residual-mechanism-v20.14.json",
                                      resolver=historical_path_resolver)
             and final and final is investigation.stages[-1] and final.status == "COMPLETE"

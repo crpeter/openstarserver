@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 
 import json
+from dataclasses import asdict
 from functools import wraps
 from pathlib import Path
 from typing import Any
@@ -39,6 +40,7 @@ from .tess_hypotheses import (
     interpret_independent_sectors,
     plan,
     plan_independent_contradiction_resolution,
+    rotational_sanity,
 )
 from .tess_identity import collect_identity, transient_required_catalog_failures
 from .tess_morphology import analyze_morphology
@@ -78,7 +80,7 @@ from .tess_multisource_residual import (
 from .tess_intrinsic_nonstationary import classify_target_component
 from .tess_target_residual_mechanism import analyze_target_residual_mechanism
 from .tess_target_residual_astrophysical_interpretation import (
-    UnavailableAstrophysicalEvidenceProvider,
+    FrozenCatalogAstrophysicalEvidenceProvider,
     interpret_target_residual_astrophysics,
     newest_authoritative_recommendation,
 )
@@ -1756,7 +1758,7 @@ def build_engine(
 ) -> WorkflowEngine:
     engine = WorkflowEngine(store)
     astrophysical_evidence_provider = (astrophysical_evidence_provider or
-        UnavailableAstrophysicalEvidenceProvider())
+        FrozenCatalogAstrophysicalEvidenceProvider())
 
     def prepare_target(investigation, request):
         source_project = Path(request.parameters["projectPath"]).expanduser().resolve()
@@ -4193,28 +4195,74 @@ def build_engine(
         attribution = next((s for s in reversed(investigation.stages)
             if s.status == "COMPLETE" and s.handler_id ==
             "openstar.tess.multi-source-residual.interpret"), None)
-        physical = next((s for s in reversed(investigation.stages)
+        mode = next((s for s in reversed(investigation.stages)
             if s.status == "COMPLETE" and s.handler_id ==
-            "openstar.tess.physical.interpret"), None)
+            "openstar.tess.mode-identification.analyze"), None)
+        hypotheses = next((s for s in reversed(investigation.stages)
+            if s.status == "COMPLETE" and s.handler_id ==
+            "openstar.tess.hypotheses"), None)
+        family_stage = next((s for s in reversed(investigation.stages)
+            if s.status == "COMPLETE" and s.handler_id ==
+            "openstar.tess.independent.harmonic-family.interpret"), None)
+        if family_stage is None:
+            family_stage = next((s for s in reversed(investigation.stages)
+                if s.status == "COMPLETE" and s.handler_id ==
+                "openstar.tess.independent.broad.interpret"), None)
         identity = next((s for s in reversed(investigation.stages)
             if s.status == "COMPLETE" and s.handler_id ==
             "openstar.tess.catalog-identity"), None)
-        if not all((mechanism, attribution, physical, identity)):
-            raise RuntimeError("astrophysical interpretation requires frozen mechanism, attribution, stellar, and identity evidence")
+        if not all((mechanism, attribution, mode, hypotheses, identity)):
+            raise RuntimeError("astrophysical interpretation requires frozen mechanism, attribution, mode, rotation-sanity, and identity evidence")
+        resolver = historical_path_resolver or HistoricalPathResolver()
+        def verified_hash(stage):
+            if not isinstance(stage.result, dict): return None
+            for ref in stage.artifacts:
+                try:
+                    path = resolver.resolve(ref.path)
+                    if (path.is_file() and ref.sha256 == sha256_file(path)
+                            and _load_json(path) == stage.result): return ref.sha256
+                except (OSError, ValueError, json.JSONDecodeError):
+                    pass
+            # Some early server-local stages predate per-result artifacts. Their
+            # immutable terminal stage ledger is the authoritative frozen record.
+            ledger = store.stage_path_for(investigation.id, stage.id)
+            try:
+                if ledger.is_file() and _load_json(ledger) == asdict(stage):
+                    return sha256_file(ledger)
+            except (OSError, ValueError, json.JSONDecodeError):
+                pass
+            return None
+        verified_hashes = {stage.id: verified_hash(stage) for stage in
+            (mechanism, attribution, mode, hypotheses, identity)}
+        if not all(verified_hashes.values()):
+            raise RuntimeError("astrophysical interpretation frozen lineage artifact verification failed")
+        mode_candidate = (mode.result or {}).get("modeCandidate") or {}
+        residual_period = mode_candidate.get("periodDays")
+        if residual_period is None:
+            raise RuntimeError("authoritative mode-identification residual period is unavailable")
+        family = ((family_stage.result or {}).get("harmonicFamily") or {}) if family_stage else {}
+        main_family = ({"available": True,
+            "representativeRawPeriodDays": family.get("representativeRawPeriodDays"),
+            "possibleDoubleCycleDays": family.get("possibleDoubleCycleDays"),
+            "physicalCycleResolved": family.get("physicalCycleResolved") is True}
+            if family else {"available": False, "physicalCycleResolved": False})
+        family_hash = verified_hash(family_stage) if family_stage is not None else None
+        if family_stage is not None and not family_hash:
+            raise RuntimeError("main recurrent-family artifact verification failed")
         object_identity = {"ticID": (identity.result or {}).get("ticID") or
             (investigation.metadata or {}).get("ticID"),
             "gaiaDR3SourceID": (identity.result or {}).get("gaiaDR3SourceID"),
-            "simbadMainID": (identity.result or {}).get("simbadMainID")}
+            "simbadMainID": (identity.result or {}).get("simbadMainID"),
+            "catalogEvidenceFrozenAt": identity.completed_at,
+            "frozenCatalogIdentity": identity.result}
         external = astrophysical_evidence_provider.fetch(object_identity)
         if not isinstance(external, dict):
             raise TypeError("astrophysical evidence provider must return a mapping")
-        stellar = dict(physical.result or {})
-        if "rotationPhysicallyAllowed" not in stellar:
-            sanity = stellar.get("rotationSanity") or {}
-            stellar["rotationPhysicallyAllowed"] = sanity.get("physicallyAllowed") is True
         summary = interpret_target_residual_astrophysics(
             mechanism=mechanism.result or {}, target_attribution=attribution.result or {},
-            stellar_context=stellar, external_evidence=external)
+            stellar_context=rotational_sanity(identity.result, float(residual_period)),
+            external_evidence=external, residual_period_days=float(residual_period),
+            main_photometric_family=main_family)
         artifact_path = (store.directory_for(investigation.id) / "artifacts" /
             "target-residual-astrophysical-interpretation" /
             "target-residual-astrophysical-interpretation-v20.14.1.json")
@@ -4225,9 +4273,16 @@ def build_engine(
             triggered_by_stage_id=request.id), input_hashes={
                 "v20.14Result": sha256_json(mechanism.result),
                 "targetAttribution": sha256_json(attribution.result),
-                "stellarContext": sha256_json(physical.result),
+                "modeIdentification": sha256_json(mode.result),
+                "rotationSanity": sha256_json(hypotheses.result),
+                **({"mainPhotometricFamily": sha256_json(family_stage.result)}
+                   if family_stage else {}),
                 "catalogIdentity": sha256_json(identity.result),
-                "externalEvidence": sha256_json(external)},
+                "externalEvidence": sha256_json(external),
+                **{f"frozenRecord:{stage_id}": digest
+                   for stage_id, digest in verified_hashes.items()},
+                **({"frozenRecord:mainPhotometricFamily": family_hash}
+                   if family_hash else {})},
             artifacts=(_artifact(artifact_path, "application/json"),))
 
     def target_residual_mechanism_adjudication_stage(investigation, request):
