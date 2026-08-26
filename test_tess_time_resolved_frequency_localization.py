@@ -247,5 +247,40 @@ class TimeResolvedFrequencyLocalizationTests(unittest.TestCase):
                     builder.call_args.kwargs["offset_source_identification"]["preferredCandidate"])
                 self.assertEqual("061-run-offset-source-variability",next_request.id)
 
+    def test_interpret_admission_rejects_unsafe_additional_sector_bridges(self):
+        authorization={"classification":"UNRESOLVED","sourceAttributionResolved":False,
+            "physicalMechanismResolved":False,"recommendedNextTest":
+            "ADDITIONAL_INDEPENDENT_SOURCE_LOCALIZATION_DATA"}
+        valid={**self.base,"referenceFamilyPeriodDays":10.30084080080649,
+            "residualReferenceFrequency":1/2.2071724078510457,
+            "subtractedHarmonicOrders":[1,2,3,4],"fractionalFrequencyDriftPerDay":0.0,
+            "artifactRoot":"unused"}
+        variants=({**valid,"fractionalFrequencyDriftPerDay":.001},
+            {**valid,"subtractedHarmonicOrders":[1,2]},
+            {**valid,"catalogCandidates":valid["catalogCandidates"][:1]},
+            {key:value for key,value in valid.items() if key != "targetSky"})
+        for index,bridge in enumerate(variants):
+            with self.subTest(index=index), tempfile.TemporaryDirectory() as root:
+                store=InvestigationStore(Path(root)/"store")
+                investigation=store.create(f"unsafe-{index}","workflow","1")
+                bridge={**bridge,"artifactRoot":str(Path(root)/"artifacts")}
+                investigation=replace(investigation,stages=(
+                    InvestigationStage("002-identity","openstar.tess.catalog-identity","COMPLETE",None,{},
+                        result={"tess":{"officialSectors":[1,27,28,67,68,94,95,102,103]}}),
+                    InvestigationStage("050-prepare-time-resolved-frequency-localization",
+                        "openstar.tess.time-resolved-frequency-localization.prepare","COMPLETE",None,{},result=bridge),
+                    InvestigationStage("051-run-time-resolved-frequency-localization",
+                        "openstar.tess.time-resolved-frequency-localization.run","COMPLETE",None,{},result={})))
+                store.save(investigation); engine=build_engine(store,SimpleNamespace(),poll_interval=0,timeout=0)
+                engine.chain_stages=False
+                with mock.patch("workflows.tess.tess_investigation.interpret_time_resolved_frequency_localization",
+                                return_value=authorization):
+                    completed,next_request=engine.run_stage(investigation,StageRequest(
+                        "052-interpret-time-resolved-frequency-localization",
+                        "openstar.tess.time-resolved-frequency-localization.interpret",{}),
+                        software_id="test",software_version="1")
+                self.assertIsNone(next_request)
+                self.assertEqual("QUIESCENT_AWAITING_DATA",completed.status)
+
 
 if __name__ == "__main__": unittest.main()

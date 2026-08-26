@@ -31,6 +31,36 @@ WORKFLOW_VERSION = "20.2"
 _V2017_HANDLER_PREFIX = "openstar.tess.target-residual-archival-baseline."
 _V2018_HANDLER_PREFIX = "openstar.tess.target-residual-pixel-recurrence."
 _V2019_HANDLER_PREFIX = "openstar.tess.target-residual-multisector-source."
+_ADDITIONAL_SECTOR_PREFIX = "openstar.tess.additional-sector-source-localization."
+
+
+def _recover_stage052_additional_sectors(store, investigation, control):
+    """Narrow append-only admission for the already-persisted real stage 052."""
+    expected_control={"branchAssessments":[],"selectedExperiment":None,
+                      "schedulerAction":"ADVANCE_TO_NEXT_TARGET"}
+    if (investigation.status != "QUIESCENT_AWAITING_DATA"
+            or control != expected_control
+            or any(s.handler_id.startswith(_ADDITIONAL_SECTOR_PREFIX) for s in investigation.stages)):
+        return None
+    boundary = next((s for s in reversed(investigation.stages)
+        if s.handler_id == "openstar.tess.time-resolved-frequency-localization.interpret"), None)
+    bridge = next((s for s in reversed(investigation.stages)
+        if s.handler_id == "openstar.tess.time-resolved-frequency-localization.prepare" and s.status == "COMPLETE"), None)
+    identity = next((s for s in reversed(investigation.stages)
+        if s.handler_id == "openstar.tess.catalog-identity" and s.status == "COMPLETE"), None)
+    if not (boundary and boundary is investigation.stages[-1] and boundary.status == "COMPLETE"
+            and boundary.id == "052-interpret-time-resolved-frequency-localization"
+            and boundary.stop is True and boundary.next_stage is None
+            and bridge and identity): return None
+    from .tess_additional_sector_source_localization import boundary_authorized, bridge_is_complete, unused_official_sectors
+    if (not boundary_authorized(boundary.result or {}) or not bridge_is_complete(bridge.result or {})
+            or not unused_official_sectors(identity.result or {}, bridge.result or {})): return None
+    request = StageRequest("053-prepare-additional-sector-source-localization",
+        _ADDITIONAL_SECTOR_PREFIX + "prepare", {}, boundary.id)
+    return store.set_control_state(investigation, status="RUNNING", control_state={
+        "branchAssessments": [], "selectedExperiment": asdict(request),
+        "schedulerAction": "RUN_EXPERIMENT",
+        "recovery": "TESS_STAGE_052_ADDITIONAL_SECTOR_SOURCE_LOCALIZATION"})
 
 
 def _continue_finalized_v2018_multisector_source(store, investigation, control, *, historical_path_resolver):
@@ -1438,6 +1468,9 @@ def repair_obsolete_terminal_wait(
         return investigation
 
     resolver = historical_path_resolver or NO_HISTORICAL_PATH_RELOCATION
+    recovered = _recover_stage052_additional_sectors(store, investigation, control)
+    if recovered is not None:
+        return recovered
     multisector = _continue_finalized_v2018_multisector_source(
         store, investigation, control, historical_path_resolver=resolver)
     if multisector is not None:
@@ -1803,6 +1836,10 @@ def plan_tess_branches(
     time_resolved_frequency = _latest_complete(
         investigation, "openstar.tess.time-resolved-frequency-localization.interpret"
     )
+    time_resolved_frequency_bridge = _latest_complete(
+        investigation, "openstar.tess.time-resolved-frequency-localization.prepare"
+    )
+    catalog_identity = _latest_complete(investigation, "openstar.tess.catalog-identity")
     variability_interpretation = _latest_complete(
         investigation, "openstar.tess.offset-source-variability.interpret"
     )
@@ -2011,6 +2048,20 @@ def plan_tess_branches(
                     "prepare-offset-source-variability"),
                     handler_id="openstar.tess.offset-source-variability.prepare", parameters={},
                     triggered_by_stage_id=time_resolved_frequency.id)),)
+        additional_started = any(stage.handler_id.startswith(_ADDITIONAL_SECTOR_PREFIX)
+                                 for stage in investigation.stages)
+        if (not additional_started and time_resolved_frequency_bridge is not None
+                and catalog_identity is not None):
+            from .tess_additional_sector_source_localization import boundary_authorized, bridge_is_complete, unused_official_sectors
+            if (boundary_authorized(result)
+                    and bridge_is_complete(time_resolved_frequency_bridge.result or {})
+                    and unused_official_sectors(
+                    catalog_identity.result or {}, time_resolved_frequency_bridge.result or {})):
+                return (ScientificBranch(id=f"continue-additional-sectors-after-{time_resolved_frequency.id}",
+                    experiment=StageRequest(id=_continuation_stage_id(time_resolved_frequency,
+                        "prepare-additional-sector-source-localization"),
+                        handler_id=_ADDITIONAL_SECTOR_PREFIX + "prepare", parameters={},
+                        triggered_by_stage_id=time_resolved_frequency.id)),)
         return ()
     if time_resolved_localization is not None:
         localization_result = time_resolved_localization.result or {}
