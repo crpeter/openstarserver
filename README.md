@@ -152,3 +152,20 @@ to choose the exposure durations without changing the already-frozen cadence/fil
 
 Generated plan artifacts live under each investigation's
 `artifacts/targeted-observation-plan/` directory in its durable deep-state root.
+
+## Unattended autonomous TESS portfolios
+
+`run_openstar_autonomous_tess.py --multi-investigation` retains its one-shot
+semantics: it drains all work that is currently runnable and then exits. Add
+`--daemon` to keep the multi-investigation supervisor alive. The daemon polls
+only due durable external jobs, applies durable dependency wakeups, drains the
+scheduler to idle, atomically writes `autonomy-heartbeat.json` beneath the state
+directory, sleeps for `--daemon-interval-seconds` (60 seconds by default), and
+repeats until SIGINT or SIGTERM.
+
+FAILED and RECOVERY_REQUIRED investigations are reported and quarantined while
+healthy targets continue. BLOCKED_PREREQUISITES and WAITING_EXTERNAL_DATA are
+reported without being repeatedly dispatched. RECOVERY_REQUIRED remains a
+fail-closed condition needing a human decision or a narrow workflow-specific
+recovery adapter with an explicit replay-safety contract. The heartbeat is
+observability only and is never used to reconstruct scientific state.

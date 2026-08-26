@@ -4,7 +4,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 
 from openstar_dispatch import InvestigationDispatcher
-from openstar_investigation import Investigation, InvestigationStore
+from openstar_investigation import Investigation, InvestigationStore, utc_now_iso
 from openstar_lifecycle import (
     InvestigationLifecycleDriver,
     InvestigationPreparation,
@@ -73,6 +73,10 @@ class InvestigationScheduler:
             software_id=software_id,
             software_version=software_version,
         )
+        # Operational, process-lifetime quarantine only.  This is deliberately
+        # not persisted as scientific state and is rebuilt by evaluation after
+        # a process restart.
+        self._preparation_quarantine: dict[str, InvestigationScheduleOutcome] = {}
 
     def admit_targets(self) -> tuple[InvestigationTarget, ...]:
         targets = tuple(self.target_source.enumerate_targets())
@@ -97,9 +101,39 @@ class InvestigationScheduler:
                 key=lambda target: (target.priority, target.id),
             )
         )
-        for target in eligible:
-            self.driver.attach(target)
         return eligible
+
+    def _investigation_after_preparation_error(
+        self, target: InvestigationTarget
+    ) -> Investigation:
+        """Load authoritative state, or return an unsaved operational projection."""
+        if self.store.path_for(target.investigation_id).exists():
+            try:
+                return self.store.load(target.investigation_id)
+            except Exception:
+                pass
+        now = utc_now_iso()
+        return Investigation(
+            id=target.investigation_id,
+            workflow_id=target.workflow_id,
+            workflow_version=target.workflow_version,
+            status="UNAVAILABLE",
+            created_at=now,
+            updated_at=now,
+            metadata={"operationalProjection": True},
+        )
+
+    def _quarantine_preparation_error(
+        self, target: InvestigationTarget, error: Exception
+    ) -> InvestigationScheduleOutcome:
+        outcome = InvestigationScheduleOutcome(
+            target,
+            self._investigation_after_preparation_error(target),
+            InvestigationSchedulingState.FAILED,
+            error,
+        )
+        self._preparation_quarantine[target.investigation_id] = outcome
+        return outcome
 
     @staticmethod
     def _outcome(
@@ -116,7 +150,20 @@ class InvestigationScheduler:
     ) -> SchedulingRoundResult:
         deferred = deferred_investigation_ids or set()
         targets = self.admit_targets()
-        prepared = [(target, self.driver.prepare(target)) for target in targets]
+        prepared: list[tuple[InvestigationTarget, InvestigationPreparation]] = []
+        preparation_outcomes: dict[str, InvestigationScheduleOutcome] = {}
+        for target in targets:
+            quarantined = self._preparation_quarantine.get(target.investigation_id)
+            if quarantined is not None:
+                preparation_outcomes[target.id] = quarantined
+                continue
+            try:
+                prepared.append((target, self.driver.prepare(target)))
+            except Exception as error:
+                preparation_outcomes[target.id] = self._quarantine_preparation_error(
+                    target, error
+                )
+        prepared_by_id = {target.id: item for target, item in prepared}
         runnable = [
             (target, item)
             for target, item in prepared
@@ -125,7 +172,12 @@ class InvestigationScheduler:
         ]
         if not runnable:
             return SchedulingRoundResult(
-                tuple(self._outcome(target, item) for target, item in prepared), ()
+                tuple(
+                    preparation_outcomes.get(target.id)
+                    or self._outcome(target, prepared_by_id[target.id])
+                    for target in targets
+                ),
+                (),
             )
 
         workers = self.max_concurrent_investigations or len(runnable)
@@ -141,14 +193,24 @@ class InvestigationScheduler:
                 try:
                     results[target.id] = self._outcome(target, future.result())
                 except BaseException as error:
-                    prepared_after_error = self.driver.prepare(target)
-                    raised.append(target.investigation_id)
-                    results[target.id] = self._outcome(
-                        target, prepared_after_error, error
-                    )
+                    try:
+                        prepared_after_error = self.driver.prepare(target)
+                    except Exception as preparation_error:
+                        results[target.id] = self._quarantine_preparation_error(
+                            target, preparation_error
+                        )
+                    else:
+                        raised.append(target.investigation_id)
+                        results[target.id] = self._outcome(
+                            target, prepared_after_error, error
+                        )
 
         outcomes = []
-        for target, item in prepared:
+        for target in targets:
+            if target.id in preparation_outcomes:
+                outcomes.append(preparation_outcomes[target.id])
+                continue
+            item = prepared_by_id[target.id]
             outcomes.append(results.get(target.id, self._outcome(target, item)))
         return SchedulingRoundResult(
             tuple(outcomes),
@@ -159,8 +221,10 @@ class InvestigationScheduler:
     def run_until_idle(self) -> SchedulingRoundResult:
         deferred: set[str] = set()
         deferred_outcomes: dict[str, InvestigationScheduleOutcome] = {}
+        dispatched: list[str] = []
         while True:
             result = self.run_round(deferred)
+            dispatched.extend(result.dispatched_investigation_ids)
             deferred.update(result.raised_investigation_ids)
             for outcome in result.outcomes:
                 if outcome.error is not None:
@@ -172,7 +236,7 @@ class InvestigationScheduler:
                 )
                 return SchedulingRoundResult(
                     outcomes,
-                    result.dispatched_investigation_ids,
+                    tuple(dict.fromkeys(dispatched)),
                     tuple(deferred),
                 )
 
