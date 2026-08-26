@@ -113,6 +113,11 @@ def test_conservative_cross_sector_rules():
         },
     )
     assert one["classification"] == "UNRESOLVED"
+    assert one["multipleSourceSupportCount"] == 0
+    assert [row["sourceSupportClassification"] for row in one["sectorResults"]] == [
+        "UNIQUE_SOURCE_SUPPORTED", "UNRESOLVED", "UNRESOLVED", "UNRESOLVED",
+        "UNRESOLVED",
+    ]
     candidate = interpret_additional_sector_source_localization(
         prep,
         {

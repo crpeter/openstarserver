@@ -248,7 +248,7 @@ class CatalogGuidedLocalizationTests(unittest.TestCase):
             self.assertEqual("openstar.tess.residual-phase-difference-imaging.prepare",
                              next_stage.handler_id)
             self.assertEqual("UNRESOLVED", investigation.stages[-1].result["classification"])
-            self.assertEqual("COMPLETE", investigation.status)
+            self.assertEqual("RUNNING", investigation.status)
 
     def test_generalized_fitter_explicit_orders_and_legacy_default(self):
         common={"sector":1,"times":np.arange(20.),"prewhitened":np.ones((20,2,1)),

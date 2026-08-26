@@ -186,9 +186,11 @@ def _sector_classification(sector):
     )
     if not valid:
         return "UNRESOLVED", []
-    return (
-        "UNIQUE_SOURCE_SUPPORTED" if len(sources) == 1 else "MULTIPLE_SOURCES_SUPPORTED"
-    ), sources
+    if not sources:
+        return "UNRESOLVED", []
+    if len(sources) == 1:
+        return "UNIQUE_SOURCE_SUPPORTED", sources
+    return "MULTIPLE_SOURCES_SUPPORTED", sources
 
 
 def interpret_additional_sector_source_localization(preparation, run):
