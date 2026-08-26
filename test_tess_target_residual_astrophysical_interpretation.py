@@ -147,6 +147,46 @@ class AstrophysicalDecisionTests(unittest.TestCase):
 
 
 class V2014AdmissionTests(unittest.TestCase):
+    def test_normal_forward_workflow_routes_smooth_result_directly(self):
+        sys.modules.setdefault("numpy", MagicMock())
+        from workflows.tess.tess_investigation import (
+            target_residual_mechanism_continuation)
+        summary = {"classification": "SMOOTH_TARGET_MODE_AMPLITUDE_MODULATION",
+            "physicalMechanismResolved": False,
+            "recommendedNextTest": "ASTROPHYSICAL_MECHANISM_INTERPRETATION",
+            "failClosedReasons": [], "replicatedMechanisms": [
+                "SMOOTH_TARGET_MODE_AMPLITUDE_MODULATION"],
+            "replicatedMechanismSupportingSectorIDs": {
+                "SMOOTH_TARGET_MODE_AMPLITUDE_MODULATION": [12, 44]}}
+        request = target_residual_mechanism_continuation(
+            summary, request_id="041-target-residual-mechanism")
+        self.assertEqual("042-target-residual-astrophysical-interpretation", request.id)
+        self.assertEqual(
+            "openstar.tess.target-residual-astrophysical-interpretation.analyze",
+            request.handler_id)
+        self.assertNotEqual("openstar.tess.finalize", request.handler_id)
+
+    def test_normal_forward_workflow_preserves_other_routes(self):
+        sys.modules.setdefault("numpy", MagicMock())
+        from workflows.tess.tess_investigation import (
+            target_residual_mechanism_continuation)
+        corrected = {"adjudicationVersion": "route-independent-all-models-v1",
+            "classification": "TARGET_RESIDUAL_MECHANISM_UNRESOLVED",
+            "recommendedNextTest": "TARGET_RESIDUAL_PHYSICAL_MECHANISM_FOLLOWUP",
+            "physicalMechanismResolved": False, "failClosedReasons": []}
+        predictive = target_residual_mechanism_continuation(
+            corrected, request_id="028-target-residual-mechanism")
+        self.assertEqual(
+            "openstar.tess.target-residual-mechanism-predictive-validation.analyze",
+            predictive.handler_id)
+        terminal = target_residual_mechanism_continuation({
+            "classification": "EPISODIC_TARGET_MODE_ACTIVATION",
+            "physicalMechanismResolved": False,
+            "recommendedNextTest": "ADDITIONAL_TEMPORAL_BASELINE",
+            "failClosedReasons": []}, request_id="028-target-residual-mechanism")
+        self.assertEqual("openstar.tess.finalize", terminal.handler_id)
+        self.assertEqual({"outputSuffix": "v20.14-intrinsic"}, terminal.parameters)
+
     def test_future_finalizer_uses_newest_science_recommendation(self):
         stages = tuple(InvestigationStage(f"{number:03d}-science", handler,
             "COMPLETE", None, {}, result={"recommendedNextTest": recommendation})

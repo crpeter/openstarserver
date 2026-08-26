@@ -407,6 +407,38 @@ def mode_identification_continuation(summary: dict[str, Any], *, request_id: str
     )
 
 
+def target_residual_mechanism_continuation(summary: dict[str, Any], *,
+        request_id: str) -> StageRequest:
+    """Route a newly computed v20.14 result without target-specific evidence."""
+    corrected_unresolved = (
+        summary.get("adjudicationVersion") == "route-independent-all-models-v1"
+        and summary.get("classification") == "TARGET_RESIDUAL_MECHANISM_UNRESOLVED"
+        and summary.get("recommendedNextTest") ==
+            "TARGET_RESIDUAL_PHYSICAL_MECHANISM_FOLLOWUP"
+        and summary.get("physicalMechanismResolved") is False
+        and not summary.get("failClosedReasons"))
+    astrophysical = (
+        summary.get("classification") == "SMOOTH_TARGET_MODE_AMPLITUDE_MODULATION"
+        and summary.get("physicalMechanismResolved") is False
+        and summary.get("recommendedNextTest") ==
+            "ASTROPHYSICAL_MECHANISM_INTERPRETATION"
+        and not summary.get("failClosedReasons"))
+    if corrected_unresolved:
+        label = "target-residual-mechanism-predictive-validation"
+        handler = "openstar.tess.target-residual-mechanism-predictive-validation.analyze"
+        parameters = {}
+    elif astrophysical:
+        label = "target-residual-astrophysical-interpretation"
+        handler = "openstar.tess.target-residual-astrophysical-interpretation.analyze"
+        parameters = {}
+    else:
+        label = "finalize"
+        handler = "openstar.tess.finalize"
+        parameters = {"outputSuffix": "v20.14-intrinsic"}
+    return StageRequest(id=_next_stage_id(request_id, label), handler_id=handler,
+        parameters=parameters, triggered_by_stage_id=request_id)
+
+
 def _dynamic_mode_localization_evidence(
     dynamic: dict[str, Any] | None,
     time_frequency_prepare: dict[str, Any] | None,
@@ -4165,17 +4197,8 @@ def build_engine(
                          "target-residual-mechanism" /
                          "target-residual-mechanism-v20.14.json")
         _write_json(artifact_path, summary)
-        corrected_unresolved = (summary.get("adjudicationVersion") == "route-independent-all-models-v1"
-            and summary.get("classification") == "TARGET_RESIDUAL_MECHANISM_UNRESOLVED"
-            and summary.get("recommendedNextTest") == "TARGET_RESIDUAL_PHYSICAL_MECHANISM_FOLLOWUP"
-            and summary.get("physicalMechanismResolved") is False
-            and not summary.get("failClosedReasons"))
-        next_request = StageRequest(
-            id=_next_stage_id(request.id, "target-residual-mechanism-predictive-validation"),
-            handler_id="openstar.tess.target-residual-mechanism-predictive-validation.analyze",
-            parameters={}, triggered_by_stage_id=request.id) if corrected_unresolved else StageRequest(
-                id=_next_stage_id(request.id, "finalize"), handler_id="openstar.tess.finalize",
-                parameters={"outputSuffix": "v20.14-intrinsic"}, triggered_by_stage_id=request.id)
+        next_request = target_residual_mechanism_continuation(
+            summary, request_id=request.id)
         return StageOutcome(
             result=summary,
             next_stage=next_request,
@@ -4189,8 +4212,12 @@ def build_engine(
         if any(s.handler_id == request.handler_id and s.id != request.id
                for s in investigation.stages):
             raise RuntimeError("an astrophysical-mechanism interpretation was already attempted")
+        trigger = next((s for s in investigation.stages
+            if s.id == request.triggered_by_stage_id and s.status == "COMPLETE"), None)
+        mechanism_id = (trigger.triggered_by_stage_id if trigger is not None
+            and trigger.handler_id == "openstar.tess.finalize" else request.triggered_by_stage_id)
         mechanism = next((s for s in reversed(investigation.stages)
-            if s.id == "028-target-residual-mechanism" and s.status == "COMPLETE"
+            if s.id == mechanism_id and s.status == "COMPLETE"
             and s.handler_id == "openstar.tess.target-residual-mechanism.analyze"), None)
         attribution = next((s for s in reversed(investigation.stages)
             if s.status == "COMPLETE" and s.handler_id ==
