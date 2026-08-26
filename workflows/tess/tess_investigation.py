@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 
 import json
+from dataclasses import asdict
 from functools import wraps
 from pathlib import Path
 from typing import Any
@@ -39,6 +40,7 @@ from .tess_hypotheses import (
     interpret_independent_sectors,
     plan,
     plan_independent_contradiction_resolution,
+    rotational_sanity,
 )
 from .tess_identity import collect_identity, transient_required_catalog_failures
 from .tess_morphology import analyze_morphology
@@ -77,6 +79,11 @@ from .tess_multisource_residual import (
 )
 from .tess_intrinsic_nonstationary import classify_target_component
 from .tess_target_residual_mechanism import analyze_target_residual_mechanism
+from .tess_target_residual_astrophysical_interpretation import (
+    FrozenCatalogAstrophysicalEvidenceProvider,
+    interpret_target_residual_astrophysics,
+    newest_authoritative_recommendation,
+)
 from .tess_target_residual_mechanism_adjudication import (
     adjudicate_frozen_target_residual_mechanism,
 )
@@ -398,6 +405,38 @@ def mode_identification_continuation(summary: dict[str, Any], *, request_id: str
         parameters={} if (localize or dynamic) else {"outputSuffix": "v20.9-mode-identification"},
         triggered_by_stage_id=request_id,
     )
+
+
+def target_residual_mechanism_continuation(summary: dict[str, Any], *,
+        request_id: str) -> StageRequest:
+    """Route a newly computed v20.14 result without target-specific evidence."""
+    corrected_unresolved = (
+        summary.get("adjudicationVersion") == "route-independent-all-models-v1"
+        and summary.get("classification") == "TARGET_RESIDUAL_MECHANISM_UNRESOLVED"
+        and summary.get("recommendedNextTest") ==
+            "TARGET_RESIDUAL_PHYSICAL_MECHANISM_FOLLOWUP"
+        and summary.get("physicalMechanismResolved") is False
+        and not summary.get("failClosedReasons"))
+    astrophysical = (
+        summary.get("classification") == "SMOOTH_TARGET_MODE_AMPLITUDE_MODULATION"
+        and summary.get("physicalMechanismResolved") is False
+        and summary.get("recommendedNextTest") ==
+            "ASTROPHYSICAL_MECHANISM_INTERPRETATION"
+        and not summary.get("failClosedReasons"))
+    if corrected_unresolved:
+        label = "target-residual-mechanism-predictive-validation"
+        handler = "openstar.tess.target-residual-mechanism-predictive-validation.analyze"
+        parameters = {}
+    elif astrophysical:
+        label = "target-residual-astrophysical-interpretation"
+        handler = "openstar.tess.target-residual-astrophysical-interpretation.analyze"
+        parameters = {}
+    else:
+        label = "finalize"
+        handler = "openstar.tess.finalize"
+        parameters = {"outputSuffix": "v20.14-intrinsic"}
+    return StageRequest(id=_next_stage_id(request_id, label), handler_id=handler,
+        parameters=parameters, triggered_by_stage_id=request_id)
 
 
 def _dynamic_mode_localization_evidence(
@@ -1747,8 +1786,11 @@ def build_engine(
     poll_interval: float,
     timeout: float | None,
     historical_path_resolver: HistoricalPathResolver | None = None,
+    astrophysical_evidence_provider=None,
 ) -> WorkflowEngine:
     engine = WorkflowEngine(store)
+    astrophysical_evidence_provider = (astrophysical_evidence_provider or
+        FrozenCatalogAstrophysicalEvidenceProvider())
 
     def prepare_target(investigation, request):
         source_project = Path(request.parameters["projectPath"]).expanduser().resolve()
@@ -4155,17 +4197,8 @@ def build_engine(
                          "target-residual-mechanism" /
                          "target-residual-mechanism-v20.14.json")
         _write_json(artifact_path, summary)
-        corrected_unresolved = (summary.get("adjudicationVersion") == "route-independent-all-models-v1"
-            and summary.get("classification") == "TARGET_RESIDUAL_MECHANISM_UNRESOLVED"
-            and summary.get("recommendedNextTest") == "TARGET_RESIDUAL_PHYSICAL_MECHANISM_FOLLOWUP"
-            and summary.get("physicalMechanismResolved") is False
-            and not summary.get("failClosedReasons"))
-        next_request = StageRequest(
-            id=_next_stage_id(request.id, "target-residual-mechanism-predictive-validation"),
-            handler_id="openstar.tess.target-residual-mechanism-predictive-validation.analyze",
-            parameters={}, triggered_by_stage_id=request.id) if corrected_unresolved else StageRequest(
-                id=_next_stage_id(request.id, "finalize"), handler_id="openstar.tess.finalize",
-                parameters={"outputSuffix": "v20.14-intrinsic"}, triggered_by_stage_id=request.id)
+        next_request = target_residual_mechanism_continuation(
+            summary, request_id=request.id)
         return StageOutcome(
             result=summary,
             next_stage=next_request,
@@ -4174,6 +4207,108 @@ def build_engine(
                           "v20.13Result": sha256_json(v2013_stage.result)},
             artifacts=(_artifact(artifact_path, "application/json"),),
         )
+
+    def target_residual_astrophysical_interpretation_stage(investigation, request):
+        if any(s.handler_id == request.handler_id and s.id != request.id
+               for s in investigation.stages):
+            raise RuntimeError("an astrophysical-mechanism interpretation was already attempted")
+        trigger = next((s for s in investigation.stages
+            if s.id == request.triggered_by_stage_id and s.status == "COMPLETE"), None)
+        mechanism_id = (trigger.triggered_by_stage_id if trigger is not None
+            and trigger.handler_id == "openstar.tess.finalize" else request.triggered_by_stage_id)
+        mechanism = next((s for s in reversed(investigation.stages)
+            if s.id == mechanism_id and s.status == "COMPLETE"
+            and s.handler_id == "openstar.tess.target-residual-mechanism.analyze"), None)
+        attribution = next((s for s in reversed(investigation.stages)
+            if s.status == "COMPLETE" and s.handler_id ==
+            "openstar.tess.multi-source-residual.interpret"), None)
+        mode = next((s for s in reversed(investigation.stages)
+            if s.status == "COMPLETE" and s.handler_id ==
+            "openstar.tess.mode-identification.analyze"), None)
+        family_stage = next((s for s in reversed(investigation.stages)
+            if s.status == "COMPLETE" and s.handler_id ==
+            "openstar.tess.independent.harmonic-family.interpret"), None)
+        if family_stage is None:
+            family_stage = next((s for s in reversed(investigation.stages)
+                if s.status == "COMPLETE" and s.handler_id ==
+                "openstar.tess.independent.broad.interpret"), None)
+        identity = next((s for s in reversed(investigation.stages)
+            if s.status == "COMPLETE" and s.handler_id ==
+            "openstar.tess.catalog-identity"), None)
+        if not all((mechanism, attribution, mode, identity)):
+            raise RuntimeError("astrophysical interpretation requires frozen mechanism, attribution, mode, and identity evidence")
+        resolver = historical_path_resolver or HistoricalPathResolver()
+        def verified_hash(stage):
+            if not isinstance(stage.result, dict): return None
+            for ref in stage.artifacts:
+                try:
+                    path = resolver.resolve(ref.path)
+                    if (path.is_file() and ref.sha256 == sha256_file(path)
+                            and _load_json(path) == stage.result): return ref.sha256
+                except (OSError, ValueError, json.JSONDecodeError):
+                    pass
+            # Some early server-local stages predate per-result artifacts. Their
+            # immutable terminal stage ledger is the authoritative frozen record.
+            ledger = store.stage_path_for(investigation.id, stage.id)
+            try:
+                if ledger.is_file() and _load_json(ledger) == asdict(stage):
+                    return sha256_file(ledger)
+            except (OSError, ValueError, json.JSONDecodeError):
+                pass
+            return None
+        verified_hashes = {stage.id: verified_hash(stage) for stage in
+            (mechanism, attribution, mode, identity)}
+        if not all(verified_hashes.values()):
+            raise RuntimeError("astrophysical interpretation frozen lineage artifact verification failed")
+        mode_candidate = (mode.result or {}).get("modeCandidate") or {}
+        residual_period = mode_candidate.get("periodDays")
+        if residual_period is None:
+            raise RuntimeError("authoritative mode-identification residual period is unavailable")
+        family = ((family_stage.result or {}).get("harmonicFamily") or {}) if family_stage else {}
+        main_family = ({"available": True,
+            "representativeRawPeriodDays": family.get("representativeRawPeriodDays"),
+            "possibleDoubleCycleDays": family.get("possibleDoubleCycleDays"),
+            "physicalCycleResolved": family.get("physicalCycleResolved") is True}
+            if family else {"available": False, "physicalCycleResolved": False})
+        family_hash = verified_hash(family_stage) if family_stage is not None else None
+        if family_stage is not None and not family_hash:
+            raise RuntimeError("main recurrent-family artifact verification failed")
+        object_identity = {"ticID": (identity.result or {}).get("ticID") or
+            (investigation.metadata or {}).get("ticID"),
+            "gaiaDR3SourceID": (identity.result or {}).get("gaiaDR3SourceID"),
+            "simbadMainID": (identity.result or {}).get("simbadMainID"),
+            "catalogEvidenceFrozenAt": identity.completed_at,
+            "frozenCatalogIdentity": identity.result}
+        external = astrophysical_evidence_provider.fetch(object_identity)
+        if not isinstance(external, dict):
+            raise TypeError("astrophysical evidence provider must return a mapping")
+        computed_rotation_sanity = rotational_sanity(identity.result, float(residual_period))
+        summary = interpret_target_residual_astrophysics(
+            mechanism=mechanism.result or {}, target_attribution=attribution.result or {},
+            stellar_context=computed_rotation_sanity,
+            external_evidence=external, residual_period_days=float(residual_period),
+            main_photometric_family=main_family)
+        artifact_path = (store.directory_for(investigation.id) / "artifacts" /
+            "target-residual-astrophysical-interpretation" /
+            "target-residual-astrophysical-interpretation-v20.14.1.json")
+        _write_json(artifact_path, summary)
+        return StageOutcome(result=summary, next_stage=StageRequest(
+            id=_next_stage_id(request.id, "finalize"), handler_id="openstar.tess.finalize",
+            parameters={"outputSuffix": "v20.14.1-astrophysical-interpretation"},
+            triggered_by_stage_id=request.id), input_hashes={
+                "v20.14Result": sha256_json(mechanism.result),
+                "targetAttribution": sha256_json(attribution.result),
+                "modeIdentification": sha256_json(mode.result),
+                "computedRotationSanity": sha256_json(computed_rotation_sanity),
+                **({"mainPhotometricFamily": sha256_json(family_stage.result)}
+                   if family_stage else {}),
+                "catalogIdentity": sha256_json(identity.result),
+                "externalEvidence": sha256_json(external),
+                **{f"frozenRecord:{stage_id}": digest
+                   for stage_id, digest in verified_hashes.items()},
+                **({"frozenRecord:mainPhotometricFamily": family_hash}
+                   if family_hash else {})},
+            artifacts=(_artifact(artifact_path, "application/json"),))
 
     def target_residual_mechanism_adjudication_stage(investigation, request):
         v2014_stage = next((stage for stage in reversed(investigation.stages)
@@ -8034,6 +8169,10 @@ def build_engine(
             investigation,
             "openstar.tess.target-residual-mechanism-predictive-validation.analyze",
         )
+        target_residual_astrophysical_interpretation = _latest_result_for_handler(
+            investigation,
+            "openstar.tess.target-residual-astrophysical-interpretation.analyze",
+        )
         target_residual_archival_baseline_extension = _latest_result_for_handler(
             investigation, "openstar.tess.target-residual-archival-baseline.interpret",
         )
@@ -8971,7 +9110,9 @@ def build_engine(
             and stage.handler_id != "openstar.tess.finalize" and not stage.handler_id.startswith(
                 "openstar.tess.target-residual-archival-baseline.")
             for index, stage in enumerate(investigation.stages))
-        if target_residual_multisector_source is not None:
+        if target_residual_astrophysical_interpretation is not None:
+            recommended_next_test = target_residual_astrophysical_interpretation.get("recommendedNextTest")
+        elif target_residual_multisector_source is not None:
             recommended_next_test = target_residual_multisector_source.get("recommendedNextTest")
         elif target_residual_pixel_recurrence is not None:
             recommended_next_test = target_residual_pixel_recurrence.get("recommendedNextTest")
@@ -9045,6 +9186,14 @@ def build_engine(
         else:
             recommended_next_test = (physical_interpretation or {}).get("recommendedNextTest")
 
+        # Finalizers summarize an append-only history.  The newest completed
+        # science stage carrying an explicit recommendation is authoritative;
+        # handler-specific variables above only preserve report compatibility.
+        # This prevents an older branch (notably v20.12) from leaking through
+        # after a newer v20.13/v20.14 result superseded it.
+        recommended_next_test = newest_authoritative_recommendation(
+            investigation.stages[:-1], recommended_next_test)
+
         conclusion = {
             "investigationID": investigation.id,
             "workflowID": WORKFLOW_ID,
@@ -9086,6 +9235,7 @@ def build_engine(
             "targetResidualMechanismPredictiveValidation": (
                 target_residual_mechanism_predictive_validation
             ),
+            "targetResidualAstrophysicalInterpretation": target_residual_astrophysical_interpretation,
             "targetResidualArchivalBaselineExtension": target_residual_archival_baseline_extension,
             "targetResidualPixelRecurrenceValidation": target_residual_pixel_recurrence,
             "targetResidualMultisectorSourceLocalization": target_residual_multisector_source,
@@ -9896,6 +10046,10 @@ def build_engine(
         period_semantics_stage,
     )
     engine.register_handler("openstar.tess.finalize", finalize_stage)
+    engine.register_handler(
+        "openstar.tess.target-residual-astrophysical-interpretation.analyze",
+        target_residual_astrophysical_interpretation_stage,
+    )
     # All TESS handlers share this provider-to-workflow adapter.  Localization
     # builders call _download_tpf indirectly, so a centralized boundary also
     # protects new experiments from persisting MAST outages as NON_RETRYABLE.

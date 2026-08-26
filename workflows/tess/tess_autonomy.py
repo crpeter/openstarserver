@@ -32,6 +32,50 @@ _V2017_HANDLER_PREFIX = "openstar.tess.target-residual-archival-baseline."
 _V2018_HANDLER_PREFIX = "openstar.tess.target-residual-pixel-recurrence."
 _V2019_HANDLER_PREFIX = "openstar.tess.target-residual-multisector-source."
 _ADDITIONAL_SECTOR_PREFIX = "openstar.tess.additional-sector-source-localization."
+_ASTROPHYSICAL_INTERPRETATION_HANDLER = (
+    "openstar.tess.target-residual-astrophysical-interpretation.analyze")
+
+
+def _continue_finalized_v2014_astrophysical_interpretation(store, investigation,
+        control, *, historical_path_resolver):
+    """Admit only the exact immutable stage-028/029 v20.14 compatibility boundary."""
+    terminal = {"branchAssessments": [], "selectedExperiment": None,
+                "schedulerAction": "INVESTIGATION_COMPLETE"}
+    if (investigation.status != "COMPLETE" or control != terminal
+            or any(s.handler_id == _ASTROPHYSICAL_INTERPRETATION_HANDLER
+                   for s in investigation.stages)):
+        return None
+    science = next((s for s in investigation.stages
+        if s.id == "028-target-residual-mechanism"), None)
+    final = next((s for s in investigation.stages if s.id == "029-finalize"), None)
+    result = science.result if science else {}
+    if not (science and science.status == "COMPLETE"
+            and science.handler_id == "openstar.tess.target-residual-mechanism.analyze"
+            and result.get("classification") == "SMOOTH_TARGET_MODE_AMPLITUDE_MODULATION"
+            and result.get("physicalMechanismResolved") is False
+            and result.get("recommendedNextTest") == "ASTROPHYSICAL_MECHANISM_INTERPRETATION"
+            and result.get("adjudicationVersion") == "route-independent-all-models-v1"
+            and result.get("crossSectorPhaseUsed") is False
+            and result.get("failClosedReasons") == []
+            and result.get("replicatedMechanisms") ==
+                ["SMOOTH_TARGET_MODE_AMPLITUDE_MODULATION"]
+            and (result.get("replicatedMechanismSupportingSectorIDs") or {}).get(
+                "SMOOTH_TARGET_MODE_AMPLITUDE_MODULATION") == [68, 95]
+            and _verified_stage_json(science, "target-residual-mechanism-v20.14.json",
+                                     resolver=historical_path_resolver)
+            and final and final is investigation.stages[-1] and final.status == "COMPLETE"
+            and final.stop is True and final.handler_id == "openstar.tess.finalize"
+            and final.parameters == {"outputSuffix": "v20.14-intrinsic"}
+            and final.triggered_by_stage_id == science.id
+            and _verified_stage_json(final, "conclusion-v20.14-intrinsic.json",
+                                     resolver=historical_path_resolver)):
+        return None
+    request = StageRequest("030-target-residual-astrophysical-interpretation",
+        _ASTROPHYSICAL_INTERPRETATION_HANDLER, {}, final.id)
+    return store.set_control_state(investigation, status="RUNNING", control_state={
+        "branchAssessments": [], "selectedExperiment": asdict(request),
+        "schedulerAction": "RUN_EXPERIMENT",
+        "recovery": "TESS_V20_14_ASTROPHYSICAL_MECHANISM_INTERPRETATION"})
 
 
 def _recover_stage052_additional_sectors(store, investigation, control):
@@ -1468,6 +1512,10 @@ def repair_obsolete_terminal_wait(
         return investigation
 
     resolver = historical_path_resolver or NO_HISTORICAL_PATH_RELOCATION
+    astrophysical = _continue_finalized_v2014_astrophysical_interpretation(
+        store, investigation, control, historical_path_resolver=resolver)
+    if astrophysical is not None:
+        return astrophysical
     recovered = _recover_stage052_additional_sectors(store, investigation, control)
     if recovered is not None:
         return recovered
