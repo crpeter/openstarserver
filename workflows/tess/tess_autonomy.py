@@ -2052,8 +2052,10 @@ def plan_tess_branches(
                                  for stage in investigation.stages)
         if (not additional_started and time_resolved_frequency_bridge is not None
                 and catalog_identity is not None):
-            from .tess_additional_sector_source_localization import boundary_authorized, unused_official_sectors
-            if (boundary_authorized(result) and unused_official_sectors(
+            from .tess_additional_sector_source_localization import boundary_authorized, bridge_is_complete, unused_official_sectors
+            if (boundary_authorized(result)
+                    and bridge_is_complete(time_resolved_frequency_bridge.result or {})
+                    and unused_official_sectors(
                     catalog_identity.result or {}, time_resolved_frequency_bridge.result or {})):
                 return (ScientificBranch(id=f"continue-additional-sectors-after-{time_resolved_frequency.id}",
                     experiment=StageRequest(id=_continuation_stage_id(time_resolved_frequency,

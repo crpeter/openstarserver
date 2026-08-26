@@ -179,3 +179,8 @@ def test_run_propagates_contract_errors_but_records_pixel_unavailability():
     ):
         result = run_additional_sector_source_localization(preparation)
     assert result["sectorResults"][0]["availability"] == "UNAVAILABLE"
+    with mock.patch(
+        "workflows.tess.tess_additional_sector_source_localization._production_sector_inputs",
+        side_effect=OSError("generic filesystem failure"),
+    ), pytest.raises(OSError, match="generic filesystem failure"):
+        run_additional_sector_source_localization(preparation)

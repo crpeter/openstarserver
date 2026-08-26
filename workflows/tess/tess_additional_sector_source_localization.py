@@ -135,7 +135,6 @@ def run_additional_sector_source_localization(preparation, *, sector_inputs=None
             result["acquisitionProvenance"] = item.get("acquisitionProvenance")
         except (
             TessArchiveTransientError,
-            OSError,
             ConnectionError,
             TimeoutError,
         ) as exc:

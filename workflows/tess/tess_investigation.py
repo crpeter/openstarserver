@@ -140,6 +140,7 @@ from .tess_additional_sector_source_localization import (
     run_additional_sector_source_localization,
     interpret_additional_sector_source_localization,
     unused_official_sectors,
+    bridge_is_complete,
 )
 from .tess_frequency_localized_pixel import (
     build_frequency_localized_pixel_project,
@@ -4900,6 +4901,7 @@ def build_engine(
             and result.get("sourceAttributionResolved") is False
             and result.get("physicalMechanismResolved") is False
             and bridge is not None and identity is not None
+            and bridge_is_complete(bridge)
             and bool(unused_official_sectors(identity, bridge)))
         return StageOutcome(result=result, next_stage=StageRequest(
             _next_stage_id(request.id, "prepare-offset-source-variability"),

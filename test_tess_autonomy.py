@@ -143,6 +143,23 @@ class TessAutonomyIntegrationTests(unittest.TestCase):
             with self.subTest(investigation=investigation.id):
                 self.assertEqual(investigation,repair_obsolete_terminal_wait(self.store,investigation))
 
+    def test_branch_planning_rejects_unsafe_additional_sector_bridges(self):
+        target=self.source.enumerate_targets()[0]
+        valid=self._stage052_boundary()
+        self.assertEqual("openstar.tess.additional-sector-source-localization.prepare",
+            plan_tess_branches(valid,target)[0].experiment.handler_id)
+        bridge_index=next(index for index,stage in enumerate(valid.stages)
+            if stage.handler_id=="openstar.tess.time-resolved-frequency-localization.prepare")
+        bridge=valid.stages[bridge_index]
+        variants=({**bridge.result,"fractionalFrequencyDriftPerDay":.001},
+            {**bridge.result,"subtractedHarmonicOrders":[1,2]},
+            {**bridge.result,"catalogCandidates":bridge.result["catalogCandidates"][:1]},
+            {key:value for key,value in bridge.result.items() if key!="targetSky"})
+        for result in variants:
+            changed=replace(valid,stages=valid.stages[:bridge_index]+(
+                replace(bridge,result=result),)+valid.stages[bridge_index+1:])
+            self.assertEqual((),plan_tess_branches(changed,target))
+
     def _historical_blocked_prf(self, errors=None, **interpret_overrides):
         target = self.source.enumerate_targets()[0]
         investigation = self.store.create(
