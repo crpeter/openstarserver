@@ -102,6 +102,47 @@ class TessAutonomyIntegrationTests(unittest.TestCase):
         )
         self.assertEqual("blind-c", branches[0].experiment.parameters["datasetID"])
 
+    def _stage052_boundary(self, *, drift=0.0, candidate_count=2, later=False, stop=True):
+        investigation=self.store.create(f"stage052-{drift}-{candidate_count}-{later}-{stop}",WORKFLOW_ID,WORKFLOW_VERSION)
+        candidates=[{"componentID":f"candidate-{i+1}","raDeg":89.+i,"decDeg":-65.-i,
+                     "catalogIDs":{"ticID":100+i}} for i in range(candidate_count)]
+        bridge={"ticID":277940827,"referenceFamilyPeriodDays":10.30084080080649,
+            "residualReferenceFrequency":1/2.2071724078510457,"residualTimeReferenceDays":2500.,
+            "fractionalFrequencyDriftPerDay":drift,"subtractedHarmonicOrders":[1,2,3,4],
+            "catalogCandidates":candidates,"targetSky":{"raDeg":89.1,"decDeg":-65.2},
+            "sectors":[94,95,102,103]}
+        investigation=self._complete(investigation,"002-identity","openstar.tess.catalog-identity",
+            {"tess":{"officialSectors":[1,27,28,67,68,94,95,102,103]}})
+        investigation=self._complete(investigation,"050-prepare-time-resolved-frequency-localization",
+            "openstar.tess.time-resolved-frequency-localization.prepare",bridge)
+        investigation=self._complete(investigation,"052-interpret-time-resolved-frequency-localization",
+            "openstar.tess.time-resolved-frequency-localization.interpret",
+            {"classification":"UNRESOLVED","sourceAttributionResolved":False,
+             "physicalMechanismResolved":False,"recommendedNextTest":
+             "ADDITIONAL_INDEPENDENT_SOURCE_LOCALIZATION_DATA"},stop=stop)
+        if later:
+            investigation=self._complete(investigation,"053-unrelated","openstar.tess.unrelated.interpret",{},stop=True)
+        return self.store.set_control_state(investigation,status="QUIESCENT_AWAITING_DATA",
+            control_state={"branchAssessments":[],"selectedExperiment":None,
+                           "schedulerAction":"ADVANCE_TO_NEXT_TARGET"})
+
+    def test_exact_stage052_recovery_is_append_only_and_idempotent(self):
+        investigation=self._stage052_boundary()
+        paths={p:p.read_bytes() for p in (self.store.directory_for(investigation.id)/"stages").iterdir()}
+        repaired=repair_obsolete_terminal_wait(self.store,investigation)
+        request=repaired.metadata["controlState"]["selectedExperiment"]
+        self.assertEqual("053-prepare-additional-sector-source-localization",request["id"])
+        self.assertEqual("052-interpret-time-resolved-frequency-localization",request["triggered_by_stage_id"])
+        self.assertEqual(investigation.stages,repaired.stages)
+        self.assertEqual(paths,{p:p.read_bytes() for p in paths})
+        self.assertEqual(repaired,repair_obsolete_terminal_wait(self.store,repaired))
+
+    def test_stage052_recovery_leaves_later_and_unsafe_boundaries_untouched(self):
+        for investigation in (self._stage052_boundary(later=True),self._stage052_boundary(stop=False),
+                self._stage052_boundary(drift=.001),self._stage052_boundary(candidate_count=1)):
+            with self.subTest(investigation=investigation.id):
+                self.assertEqual(investigation,repair_obsolete_terminal_wait(self.store,investigation))
+
     def _historical_blocked_prf(self, errors=None, **interpret_overrides):
         target = self.source.enumerate_targets()[0]
         investigation = self.store.create(

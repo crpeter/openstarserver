@@ -36,7 +36,10 @@ _ADDITIONAL_SECTOR_PREFIX = "openstar.tess.additional-sector-source-localization
 
 def _recover_stage052_additional_sectors(store, investigation, control):
     """Narrow append-only admission for the already-persisted real stage 052."""
+    expected_control={"branchAssessments":[],"selectedExperiment":None,
+                      "schedulerAction":"ADVANCE_TO_NEXT_TARGET"}
     if (investigation.status != "QUIESCENT_AWAITING_DATA"
+            or control != expected_control
             or any(s.handler_id.startswith(_ADDITIONAL_SECTOR_PREFIX) for s in investigation.stages)):
         return None
     boundary = next((s for s in reversed(investigation.stages)
@@ -45,10 +48,13 @@ def _recover_stage052_additional_sectors(store, investigation, control):
         if s.handler_id == "openstar.tess.time-resolved-frequency-localization.prepare" and s.status == "COMPLETE"), None)
     identity = next((s for s in reversed(investigation.stages)
         if s.handler_id == "openstar.tess.catalog-identity" and s.status == "COMPLETE"), None)
-    if not (boundary and boundary.status == "COMPLETE" and boundary.id == "052-interpret-time-resolved-frequency-localization"
+    if not (boundary and boundary is investigation.stages[-1] and boundary.status == "COMPLETE"
+            and boundary.id == "052-interpret-time-resolved-frequency-localization"
+            and boundary.stop is True and boundary.next_stage is None
             and bridge and identity): return None
-    from .tess_additional_sector_source_localization import boundary_authorized, unused_official_sectors
-    if not boundary_authorized(boundary.result or {}) or not unused_official_sectors(identity.result or {}, bridge.result or {}): return None
+    from .tess_additional_sector_source_localization import boundary_authorized, bridge_is_complete, unused_official_sectors
+    if (not boundary_authorized(boundary.result or {}) or not bridge_is_complete(bridge.result or {})
+            or not unused_official_sectors(identity.result or {}, bridge.result or {})): return None
     request = StageRequest("053-prepare-additional-sector-source-localization",
         _ADDITIONAL_SECTOR_PREFIX + "prepare", {}, boundary.id)
     return store.set_control_state(investigation, status="RUNNING", control_state={

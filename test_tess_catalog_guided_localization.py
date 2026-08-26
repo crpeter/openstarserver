@@ -15,6 +15,7 @@ from workflows.tess.tess_catalog_guided_localization import (
     _temporal_predictive_validation,
     interpret_catalog_guided_localization,
     prepare_catalog_guided_localization,
+    analyze_generalized_catalog_guided_sector,
 )
 from openstar_investigation import InvestigationStage, InvestigationStore
 from openstar_workflow import StageRequest
@@ -244,9 +245,27 @@ class CatalogGuidedLocalizationTests(unittest.TestCase):
                              interpret_request.id)
             investigation, next_stage = engine.run_stage(
                 investigation, interpret_request, software_id="test", software_version="1")
-            self.assertIsNone(next_stage)
+            self.assertEqual("openstar.tess.residual-phase-difference-imaging.prepare",
+                             next_stage.handler_id)
             self.assertEqual("UNRESOLVED", investigation.stages[-1].result["classification"])
-            self.assertEqual("QUIESCENT_AWAITING_DATA", investigation.status)
+            self.assertEqual("COMPLETE", investigation.status)
+
+    def test_generalized_fitter_explicit_orders_and_legacy_default(self):
+        common={"sector":1,"times":np.arange(20.),"prewhitened":np.ones((20,2,1)),
+            "valid":np.ones((2,1),bool),"calibration_image":np.ones(2),
+            "background_columns":[],"render_templates":lambda _x,_y:np.ones((2,3)),
+            "candidate_frequency":.45,"original_time_origin":2500.,
+            "physical_frequency":1/10.30084080080649,"component_ids":COMPONENT_IDS}
+        with mock.patch("workflows.tess.tess_catalog_guided_localization._prewhitened_coherent_basis",
+                return_value=np.ones((20,4))) as basis, mock.patch(
+                "workflows.tess.tess_catalog_guided_localization._coherent_pixel_fit",
+                return_value={}), mock.patch(
+                "workflows.tess.tess_catalog_guided_localization._fit_shared_astrometric_shift",
+                return_value={"available":False,"reason":"test"}):
+            analyze_generalized_catalog_guided_sector(**common,harmonic_orders=(1,2,3,4))
+            self.assertEqual((1,2,3,4),basis.call_args.kwargs["harmonic_orders"])
+            analyze_generalized_catalog_guided_sector(**common)
+            self.assertEqual((1,2),basis.call_args.kwargs["harmonic_orders"])
 
     def test_stage_048_uses_unresolved_family_bridge_without_obsolete_evidence(self):
         candidate = {"raDeg": 10.1, "decDeg": -20.1,
