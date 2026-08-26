@@ -159,8 +159,10 @@ class InvestigationScheduler:
     def run_until_idle(self) -> SchedulingRoundResult:
         deferred: set[str] = set()
         deferred_outcomes: dict[str, InvestigationScheduleOutcome] = {}
+        dispatched: list[str] = []
         while True:
             result = self.run_round(deferred)
+            dispatched.extend(result.dispatched_investigation_ids)
             deferred.update(result.raised_investigation_ids)
             for outcome in result.outcomes:
                 if outcome.error is not None:
@@ -172,7 +174,7 @@ class InvestigationScheduler:
                 )
                 return SchedulingRoundResult(
                     outcomes,
-                    result.dispatched_investigation_ids,
+                    tuple(dict.fromkeys(dispatched)),
                     tuple(deferred),
                 )
 

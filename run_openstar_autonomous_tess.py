@@ -8,6 +8,7 @@ import json
 import sys
 from dataclasses import replace
 from pathlib import Path
+from typing import Callable
 
 from openstar_coordinator_client import OpenStarCoordinatorClient
 from openstar_external_jobs import (
@@ -20,6 +21,7 @@ from openstar_investigation import InvestigationStore
 from openstar_lifecycle import InvestigationLifecycleLoop, LifecycleResult
 from openstar_path_relocation import HistoricalPathResolver
 from openstar_scheduler import InvestigationScheduler
+from openstar_autonomy_supervisor import AutonomySupervisor
 from openstar_science_runs import recorded_science_run
 from openstar_state_storage import require_durable_state_path
 from openstar_targets import InvestigationTargetPortfolio, NoEligibleTargetError
@@ -73,9 +75,16 @@ def run_autonomous_tess(
     max_concurrent_investigations: int | None = None,
     allow_temporary_state: bool = False,
     historical_path_resolver: HistoricalPathResolver | None = None,
+    daemon: bool = False,
+    daemon_interval_seconds: float = 60.0,
+    daemon_max_cycles: int | None = None,
+    daemon_sleep: Callable[[float], None] | None = None,
+    external_job_monitor: ExternalJobMonitor | None = None,
 ) -> int:
     """Construct and run the existing lifecycle, returning a process exit code."""
     root = require_durable_state_path(state_dir, allow_temporary_state=allow_temporary_state)
+    if daemon and not multi_investigation:
+        raise ValueError("daemon mode requires multi-investigation mode")
     if multi_investigation:
         legacy = [
             name
@@ -90,18 +99,18 @@ def run_autonomous_tess(
     root.mkdir(parents=True, exist_ok=True)
     store = InvestigationStore(root / "investigations")
     external_jobs = ExternalJobStore(root / "external-jobs")
-    if external_jobs.pending():
+    external_monitor = external_job_monitor
+    if external_monitor is None and (daemon or external_jobs.pending()):
         from workflows.tess.tess_atlas_forced_photometry import ATLASExternalJobProvider
-
-        ExternalJobMonitor(
-            external_jobs,
-            {
-                "atlas-forced-photometry": ATLASExternalJobProvider(),
-            },
-        ).poll_due()
+        external_monitor = ExternalJobMonitor(
+            external_jobs, {"atlas-forced-photometry": ATLASExternalJobProvider()}
+        )
+    if not daemon and external_monitor is not None:
+        external_monitor.poll_due()
     # Reconstruct from durable terminal records even if a process crashed
-    # after the last job completed but before its investigation was awakened.
-    apply_external_job_wakeups(store, external_jobs.ready_dependencies())
+    # after completion but before its investigation was awakened.
+    if not daemon:
+        apply_external_job_wakeups(store, external_jobs.ready_dependencies())
     coordinator = OpenStarCoordinatorClient(coordinator_url)
     workflow_options = {"poll_interval": poll_interval, "timeout": timeout}
     if historical_path_resolver is not None:
@@ -119,6 +128,20 @@ def run_autonomous_tess(
             software_version=SOFTWARE_VERSION,
             max_concurrent_investigations=max_concurrent_investigations,
         )
+        if daemon:
+            assert external_monitor is not None
+            options = {}
+            if daemon_sleep is not None:
+                options["sleep"] = daemon_sleep
+            supervisor = AutonomySupervisor(
+                scheduler=scheduler,
+                external_jobs=external_jobs,
+                monitor=external_monitor,
+                heartbeat_path=root / "autonomy-heartbeat.json",
+                interval_seconds=daemon_interval_seconds,
+                **options,
+            )
+            return supervisor.run(max_cycles=daemon_max_cycles)
         result = scheduler.run_until_idle()
         for outcome in result.outcomes:
             fields = [
@@ -207,6 +230,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--poll-interval", type=float, default=1.0)
     parser.add_argument("--timeout", type=float)
     parser.add_argument("--multi-investigation", action="store_true")
+    parser.add_argument(
+        "--daemon", action="store_true",
+        help=("Keep multi-investigation supervision alive: repoll external jobs, "
+              "drain runnable work, quarantine unhealthy investigations, and repeat."),
+    )
+    parser.add_argument(
+        "--daemon-interval-seconds", type=float, default=60.0, metavar="SECONDS",
+        help="Positive delay between daemon cycles (default: 60).",
+    )
+    parser.add_argument(
+        "--daemon-max-cycles", type=int, metavar="COUNT",
+        help="Stop after COUNT cycles (intended for tests and bounded soak runs).",
+    )
     parser.add_argument("--max-concurrent-investigations", type=int)
     args = parser.parse_args(argv)
     if args.poll_interval <= 0:
@@ -218,6 +254,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         and args.max_concurrent_investigations <= 0
     ):
         parser.error("--max-concurrent-investigations must be positive")
+    if args.daemon and not args.multi_investigation:
+        parser.error("--daemon requires --multi-investigation")
+    if args.daemon_interval_seconds <= 0:
+        parser.error("--daemon-interval-seconds must be positive")
+    if args.daemon_max_cycles is not None and args.daemon_max_cycles <= 0:
+        parser.error("--daemon-max-cycles must be positive")
     mappings = []
     for entry in args.relocate_historical_root:
         if entry.count("=") != 1 or not all(part.strip() for part in entry.split("=", 1)):
@@ -243,6 +285,9 @@ def main(argv: list[str] | None = None) -> int:
             max_concurrent_investigations=args.max_concurrent_investigations,
             allow_temporary_state=args.allow_temporary_state,
             historical_path_resolver=args.historical_path_resolver,
+            daemon=args.daemon,
+            daemon_interval_seconds=args.daemon_interval_seconds,
+            daemon_max_cycles=args.daemon_max_cycles,
         )
     except KeyboardInterrupt:
         print("OpenStar lifecycle: disposition=SHUTDOWN", file=sys.stderr)

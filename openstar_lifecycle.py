@@ -211,6 +211,10 @@ class InvestigationLifecycleDriver:
         investigation = self.attach(target)
         transitions = 0
         if any(stage.status == "RUNNING" for stage in investigation.stages):
+            # Fail closed: a crashed process may have performed handler side
+            # effects before persisting its result.  Automatic orphan recovery
+            # requires a narrow per-handler replay-safety/idempotency contract;
+            # the portfolio supervisor merely quarantines this investigation.
             return InvestigationPreparation(
                 investigation, InvestigationSchedulingState.RECOVERY_REQUIRED
             )
