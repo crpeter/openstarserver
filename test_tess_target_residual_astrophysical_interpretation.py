@@ -46,7 +46,9 @@ class AstrophysicalDecisionTests(unittest.TestCase):
             "queryParameters": {"object": "HIP 1113"},
             "citation": {"doi": "10.1051/0004-6361/200913644"},
             "retrievalTimestamp": "2026-01-01T00:00:00+00:00",
-            "mechanism": "STARSPOT_ROTATION", "periodRangeDays": [3.58, 3.75]}
+            "mechanism": "STARSPOT_ROTATION", "periodRangeDays": [3.58, 3.75],
+            "targetAssociation": {"method": "SIMBAD_IDENTIFIER_CROSSMATCH",
+                "associated": True, "matchedIdentifier": "HIP 1113"}}
 
     def decide(self, external):
         return interpret_target_residual_astrophysics(mechanism=self.mechanism,
@@ -93,6 +95,55 @@ class AstrophysicalDecisionTests(unittest.TestCase):
             "ticID": 266997586, "frozenCatalogIdentity": identity})
         self.assertTrue(evidence["available"])
         self.assertEqual("ROTATIONAL_MODULATION", evidence["records"][0]["mechanism"])
+        self.assertTrue(evidence["records"][0]["targetAssociation"]["associated"])
+        self.assertEqual(1.0, evidence["records"][0]["targetAssociation"]["thresholdArcsec"])
+        self.assertIn("active-region evolution", evidence["periodTolerance"]["basis"])
+
+    def _catalog_decision(self, *, nearest, matches=None, identifiers=()):
+        identity = {"retrievedAt": "2025-01-01T00:00:00Z",
+            "simbad": {"identifiers": list(identifiers)},
+            "vsx": {"found": True, "nearest": nearest,
+                "matches": list(matches or [nearest]), "queryProvenance": {
+                    "service": "VizieR", "catalog": "B/vsx/vsx",
+                    "ticID": 266997586, "radiusArcsec": 10.0}}}
+        evidence = FrozenCatalogAstrophysicalEvidenceProvider().fetch({
+            "ticID": 266997586, "frozenCatalogIdentity": identity})
+        return self.decide(evidence), evidence
+
+    def test_unrelated_rot_neighbor_inside_query_cone_fails_closed(self):
+        result, evidence = self._catalog_decision(nearest={"name": "UNRELATED",
+            "type": "ROT", "periodDays": 3.61, "separationArcsec": 4.2})
+        self.assertFalse(evidence["records"][0]["targetAssociation"]["associated"])
+        self.assertEqual(UNRESOLVED, result["classification"])
+        self.assertFalse(result["decisionGates"]
+                         ["independentRotationEvidenceAssociatedWithTarget"])
+
+    def test_identifier_confirmed_vsx_target_passes(self):
+        result, evidence = self._catalog_decision(nearest={"name": "NSV 15055",
+            "type": "TTS/ROT", "periodDays": 3.721, "separationArcsec": 2.0},
+            identifiers=["HD 987", "NSV 15055"])
+        association = evidence["records"][0]["targetAssociation"]
+        self.assertEqual("SIMBAD_IDENTIFIER_CROSSMATCH", association["method"])
+        self.assertEqual("NSV 15055", association["matchedIdentifier"])
+        self.assertEqual(ROTATION, result["classification"])
+
+    def test_nearest_without_association_and_non_rot_nearest_cannot_promote(self):
+        unassociated, _ = self._catalog_decision(nearest={"name": "NEARBY",
+            "type": "ROT", "periodDays": 3.604, "separationArcsec": None})
+        non_rot, _ = self._catalog_decision(nearest={"name": "TARGET",
+            "type": "EA", "periodDays": 3.604, "separationArcsec": .1})
+        self.assertEqual(UNRESOLVED, unassociated["classification"])
+        self.assertEqual(UNRESOLVED, non_rot["classification"])
+
+    def test_multiple_matches_do_not_select_unrelated_rot_source(self):
+        nearest = {"name": "TARGET", "type": "EA", "periodDays": 3.604,
+                   "separationArcsec": .1}
+        unrelated = {"name": "NEIGHBOR", "type": "ROT", "periodDays": 3.604,
+                     "separationArcsec": 3.0}
+        result, evidence = self._catalog_decision(nearest=nearest,
+            matches=[nearest, unrelated], identifiers=["TARGET"])
+        self.assertEqual("TARGET", evidence["records"][0]["stableObjectID"])
+        self.assertEqual(UNRESOLVED, result["classification"])
 
 
 class V2014AdmissionTests(unittest.TestCase):
@@ -234,18 +285,7 @@ class RealBoundaryHandlerIntegrationTests(unittest.TestCase):
             immutable_bytes = {ref.path: Path(ref.path).read_bytes()
                 for old_stage in stages for ref in old_stage.artifacts}
 
-            class FixtureProvider:
-                def fetch(self, object_identity):
-                    return {"available": True, "provider": "fixture", "records": [{
-                        "provider": "literature-fixture", "stableObjectID": "HIP 1113",
-                        "queryParameters": {"object": "HIP 1113"},
-                        "citation": {"doi": "10.1051/0004-6361/200913644"},
-                        "retrievalTimestamp": "2026-01-01T00:00:00+00:00",
-                        "mechanism": "STARSPOT_ROTATION",
-                        "periodRangeDays": [3.58, 3.75]}]}
-
-            engine = build_engine(store, SimpleNamespace(), poll_interval=0, timeout=None,
-                                  astrophysical_evidence_provider=FixtureProvider())
+            engine = build_engine(store, SimpleNamespace(), poll_interval=0, timeout=None)
             engine.chain_stages = False
             completed, next_request = engine.run_stage(investigation, StageRequest(
                 "030-target-residual-astrophysical-interpretation",
@@ -256,6 +296,8 @@ class RealBoundaryHandlerIntegrationTests(unittest.TestCase):
             self.assertEqual(3.604, result["targetResidualPeriodDays"])
             self.assertEqual([68, 95], result["smoothAmplitudeSupportingSectorIDs"])
             self.assertTrue(result["decisionGates"]["rotationPhysicallyAllowed"])
+            self.assertTrue(result["decisionGates"]
+                            ["independentRotationEvidenceAssociatedWithTarget"])
             self.assertFalse(result["mainPhotometricFamily"]["physicalCycleResolved"])
             self.assertEqual(7.546428731,
                 result["mainPhotometricFamily"]["representativeRawPeriodDays"])

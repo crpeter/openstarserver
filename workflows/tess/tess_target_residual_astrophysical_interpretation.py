@@ -12,6 +12,12 @@ from typing import Any, Protocol
 
 UNRESOLVED = "ASTROPHYSICAL_MECHANISM_UNRESOLVED"
 ROTATION = "ROTATIONAL_ACTIVE_REGION_MODULATION_SUPPORTED"
+VSX_TARGET_ASSOCIATION_MAX_SEPARATION_ARCSEC = 1.0
+INDEPENDENT_ROTATION_PERIOD_TOLERANCE_RELATIVE = 0.05
+INDEPENDENT_ROTATION_PERIOD_TOLERANCE_BASIS = (
+    "Preregistered allowance for independent long-baseline spot-modulation periods: "
+    "active-region evolution and measurement-window differences can shift the dominant "
+    "photometric rotation peak; this tolerance establishes consistency, not differential rotation.")
 
 
 class AstrophysicalEvidenceProvider(Protocol):
@@ -28,7 +34,7 @@ class FrozenCatalogAstrophysicalEvidenceProvider:
     not scrape prose or silently issue a second, untracked query.
     """
     provider_id: str = "openstar-frozen-vsx"
-    relative_period_tolerance: float = 0.05
+    relative_period_tolerance: float = INDEPENDENT_ROTATION_PERIOD_TOLERANCE_RELATIVE
 
     def fetch(self, object_identity: dict[str, Any]) -> dict[str, Any]:
         identity = object_identity.get("frozenCatalogIdentity") or {}
@@ -39,6 +45,24 @@ class FrozenCatalogAstrophysicalEvidenceProvider:
         retrieved_at = (identity.get("retrievedAt") or
                         object_identity.get("catalogEvidenceFrozenAt"))
         record = None
+        stable_id = str(nearest.get("name") or "").strip()
+        simbad_identifiers = [str(value).strip() for value in
+                              (identity.get("simbad") or {}).get("identifiers") or []]
+        matched_identifier = next((value for value in simbad_identifiers
+            if value.casefold() == stable_id.casefold()), None) if stable_id else None
+        separation = nearest.get("separationArcsec")
+        if matched_identifier is not None:
+            association = {"method": "SIMBAD_IDENTIFIER_CROSSMATCH", "associated": True,
+                "separationArcsec": separation, "matchedIdentifier": matched_identifier}
+        else:
+            try:
+                associated = (separation is not None and float(separation) <=
+                              VSX_TARGET_ASSOCIATION_MAX_SEPARATION_ARCSEC)
+            except (TypeError, ValueError):
+                associated = False
+            association = {"method": "ANGULAR_SEPARATION", "associated": associated,
+                "separationArcsec": separation,
+                "thresholdArcsec": VSX_TARGET_ASSOCIATION_MAX_SEPARATION_ARCSEC}
         if vsx.get("found") is True and period is not None:
             record = {
                 "provider": "AAVSO VSX via VizieR",
@@ -50,12 +74,16 @@ class FrozenCatalogAstrophysicalEvidenceProvider:
                 "mechanism": "ROTATIONAL_MODULATION" if "ROT" in type_text else None,
                 "catalogPeriodDays": float(period),
                 "maximumRelativePeriodDifference": self.relative_period_tolerance,
+                "periodToleranceBasis": INDEPENDENT_ROTATION_PERIOD_TOLERANCE_BASIS,
+                "targetAssociation": association,
             }
         return {"available": record is not None, "provider": self.provider_id,
             "objectIdentity": {key: value for key, value in object_identity.items()
                 if key != "frozenCatalogIdentity"},
             "queryParameters": dict(vsx.get("queryProvenance") or {}),
             "retrievedAt": retrieved_at,
+            "periodTolerance": {"relative": self.relative_period_tolerance,
+                "basis": INDEPENDENT_ROTATION_PERIOD_TOLERANCE_BASIS},
             "records": [record] if record else []}
 
 
@@ -98,6 +126,7 @@ def interpret_target_residual_astrophysics(*, mechanism: dict[str, Any],
     """Apply preregistered, mechanism-neutral guards to independent evidence."""
     period = float(residual_period_days) if residual_period_days is not None else None
     records = external_evidence.get("records") or []
+    period_consistent_rotation_records = []
     consistent_rotation_records = []
     contradictions = []
     for record in records:
@@ -117,7 +146,9 @@ def interpret_target_residual_astrophysics(*, mechanism: dict[str, Any],
             and abs(float(catalog_period) - period) / period <= float(tolerance))
         if mechanism_name in {"ROTATION", "ROTATIONAL_MODULATION",
                               "STARSPOT_ROTATION"} and (range_match or catalog_match):
-            consistent_rotation_records.append(record)
+            period_consistent_rotation_records.append(record)
+            if (record.get("targetAssociation") or {}).get("associated") is True:
+                consistent_rotation_records.append(record)
         if record.get("contradictsRotation") is True:
             contradictions.append(record)
 
@@ -134,7 +165,8 @@ def interpret_target_residual_astrophysics(*, mechanism: dict[str, Any],
         "authoritativeResidualPeriodAvailable": period is not None and period > 0,
         "rotationPhysicallyAllowed": (period is not None and
             rotation_sanity_allows(stellar_context, period)),
-        "independentRotationPeriodConsistent": len(consistent_rotation_records) >= 1,
+        "independentRotationPeriodConsistent": len(period_consistent_rotation_records) >= 1,
+        "independentRotationEvidenceAssociatedWithTarget": len(consistent_rotation_records) >= 1,
         # The frozen TESS morphology and physical-radius guard are constraints
         # independent of the cited historical rotation measurement.
         "multipleIndependentConstraints": len(consistent_rotation_records) >= 1,
@@ -162,6 +194,7 @@ def interpret_target_residual_astrophysics(*, mechanism: dict[str, Any],
         "decisionGates": gates,
         "rotationSanity": dict(stellar_context),
         "consistentIndependentRotationRecords": consistent_rotation_records,
+        "periodConsistentRotationRecords": period_consistent_rotation_records,
         "contradictions": contradictions,
         "externalEvidence": external_evidence,
         "retrievedAt": retrieved_at or datetime.now(timezone.utc).isoformat(),

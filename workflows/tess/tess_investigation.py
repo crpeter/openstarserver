@@ -4198,9 +4198,6 @@ def build_engine(
         mode = next((s for s in reversed(investigation.stages)
             if s.status == "COMPLETE" and s.handler_id ==
             "openstar.tess.mode-identification.analyze"), None)
-        hypotheses = next((s for s in reversed(investigation.stages)
-            if s.status == "COMPLETE" and s.handler_id ==
-            "openstar.tess.hypotheses"), None)
         family_stage = next((s for s in reversed(investigation.stages)
             if s.status == "COMPLETE" and s.handler_id ==
             "openstar.tess.independent.harmonic-family.interpret"), None)
@@ -4211,8 +4208,8 @@ def build_engine(
         identity = next((s for s in reversed(investigation.stages)
             if s.status == "COMPLETE" and s.handler_id ==
             "openstar.tess.catalog-identity"), None)
-        if not all((mechanism, attribution, mode, hypotheses, identity)):
-            raise RuntimeError("astrophysical interpretation requires frozen mechanism, attribution, mode, rotation-sanity, and identity evidence")
+        if not all((mechanism, attribution, mode, identity)):
+            raise RuntimeError("astrophysical interpretation requires frozen mechanism, attribution, mode, and identity evidence")
         resolver = historical_path_resolver or HistoricalPathResolver()
         def verified_hash(stage):
             if not isinstance(stage.result, dict): return None
@@ -4233,7 +4230,7 @@ def build_engine(
                 pass
             return None
         verified_hashes = {stage.id: verified_hash(stage) for stage in
-            (mechanism, attribution, mode, hypotheses, identity)}
+            (mechanism, attribution, mode, identity)}
         if not all(verified_hashes.values()):
             raise RuntimeError("astrophysical interpretation frozen lineage artifact verification failed")
         mode_candidate = (mode.result or {}).get("modeCandidate") or {}
@@ -4258,9 +4255,10 @@ def build_engine(
         external = astrophysical_evidence_provider.fetch(object_identity)
         if not isinstance(external, dict):
             raise TypeError("astrophysical evidence provider must return a mapping")
+        computed_rotation_sanity = rotational_sanity(identity.result, float(residual_period))
         summary = interpret_target_residual_astrophysics(
             mechanism=mechanism.result or {}, target_attribution=attribution.result or {},
-            stellar_context=rotational_sanity(identity.result, float(residual_period)),
+            stellar_context=computed_rotation_sanity,
             external_evidence=external, residual_period_days=float(residual_period),
             main_photometric_family=main_family)
         artifact_path = (store.directory_for(investigation.id) / "artifacts" /
@@ -4274,7 +4272,7 @@ def build_engine(
                 "v20.14Result": sha256_json(mechanism.result),
                 "targetAttribution": sha256_json(attribution.result),
                 "modeIdentification": sha256_json(mode.result),
-                "rotationSanity": sha256_json(hypotheses.result),
+                "computedRotationSanity": sha256_json(computed_rotation_sanity),
                 **({"mainPhotometricFamily": sha256_json(family_stage.result)}
                    if family_stage else {}),
                 "catalogIdentity": sha256_json(identity.result),
