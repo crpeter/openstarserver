@@ -970,6 +970,7 @@ def _repair_unresolved_dynamic_localization_review_failure(
             or failed.error not in {
                 "RuntimeError: v20.11 requires the morphology-resolved physical period.",
                 "RuntimeError: v20.11 requires the completed v20.9 nonstationary model.",
+                "RuntimeError: v20.11 requires a complete frozen residual-mode family.",
             }):
         return None
     scheduler_action = control.get("schedulerAction")

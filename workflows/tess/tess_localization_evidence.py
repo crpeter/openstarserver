@@ -52,12 +52,49 @@ def frozen_residual_localization_family(
             adapted_dynamic_orders = tuple(int(value) for value in dynamic_orders)
         except (TypeError, ValueError):
             return None
-        # When both persisted representations exist they must describe the same
-        # frozen family; disagreement is not evidence that may be guessed through.
-        if (not math.isclose(adapted_dynamic_period, family_period, rel_tol=1e-9)
-                or adapted_dynamic_orders != orders):
+        if (
+            not math.isfinite(adapted_dynamic_period)
+            or adapted_dynamic_period <= 0
+            or not adapted_dynamic_orders
+            or any(value <= 0 for value in adapted_dynamic_orders)
+            or len(set(adapted_dynamic_orders)) != len(adapted_dynamic_orders)
+            or not math.isclose(
+                adapted_dynamic_period,
+                family_period,
+                rel_tol=1e-9,
+            )
+        ):
             return None
-        family_period, orders = adapted_dynamic_period, adapted_dynamic_orders
+
+        if adapted_dynamic_orders != orders:
+            relation = (mode or {}).get("harmonicRelation") or {}
+            try:
+                tested_order = int(relation["testedOrder"])
+            except (KeyError, TypeError, ValueError):
+                return None
+
+            expected_mode_orders = (1, 2, tested_order)
+
+            if not (
+                (mode or {}).get("classification")
+                == "INDEPENDENT_STABLE_MODE"
+                and (mode or {}).get(
+                    "independentModeEvidenceSurvived"
+                ) is True
+                and relation.get(
+                    "commensurateWithinResolution"
+                ) is False
+                and tested_order >= 3
+                and orders == expected_mode_orders
+                and 1 in adapted_dynamic_orders
+                and 2 in adapted_dynamic_orders
+            ):
+                return None
+
+        family_period, orders = (
+            adapted_dynamic_period,
+            adapted_dynamic_orders,
+        )
         path = "DYNAMIC_HARMONIC_ESTABLISHED_PERIOD_FAMILY"
 
     resolved = (morphology or {}).get("physicalCycleResolved") is True
