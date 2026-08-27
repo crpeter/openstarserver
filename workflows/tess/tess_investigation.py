@@ -56,6 +56,15 @@ from .tess_eclipse_event_localization import (
     authoritative_binary_gate,
     localize_eclipse_events,
 )
+from .tess_external_companion_evidence import (
+    ExternalEvidenceTransientError,
+    FREEZE_HANDLER_ID as EXTERNAL_EVIDENCE_FREEZE_HANDLER_ID,
+    INTERPRET_HANDLER_ID as EXTERNAL_EVIDENCE_INTERPRET_HANDLER_ID,
+    REVIEW_HANDLER_ID as SOURCE_ATTRIBUTION_REVIEW_HANDLER_ID,
+    acquire_external_evidence,
+    interpret_external_evidence,
+    review_source_attribution,
+)
 from .tess_localization import localize_periodic_source
 from .tess_sector_archive import TessArchiveTransientError
 from .tess_multimode import (
@@ -2921,13 +2930,61 @@ def build_engine(
         _write_json(artifact_path, result)
         return StageOutcome(
             result=result,
-            next_stage=StageRequest(id=_next_stage_id(request.id, "finalize"),
-                                    handler_id="openstar.tess.finalize",
-                                    parameters={"outputSuffix": "eclipse-event-source-localization-v1"},
+            next_stage=StageRequest(id=_next_stage_id(request.id, "source-attribution-review" if result.get("recommendedNextTest") == "SOURCE_ATTRIBUTION_REVIEW" else "finalize"),
+                                    handler_id=(SOURCE_ATTRIBUTION_REVIEW_HANDLER_ID if result.get("recommendedNextTest") == "SOURCE_ATTRIBUTION_REVIEW" else "openstar.tess.finalize"),
+                                    parameters={} if result.get("recommendedNextTest") == "SOURCE_ATTRIBUTION_REVIEW" else {"outputSuffix": "eclipse-event-source-localization-v1"},
                                     triggered_by_stage_id=request.id),
             input_hashes=localization_input_hashes,
             artifacts=(_artifact(artifact_path, "application/json"),),
         )
+
+    def source_attribution_review_stage(investigation, request):
+        localization = _required_latest_result_for_handler(investigation, ECLIPSE_LOCALIZATION_HANDLER_ID)
+        result = review_source_attribution(localization)
+        path = (store.directory_for(investigation.id) / "artifacts" /
+                "external-companion-evidence" / "source-attribution-review-v1.json")
+        _write_json(path, result)
+        proceed = result["recommendedNextTest"] == "EXTERNAL_COMPANION_EVIDENCE_FREEZE"
+        return StageOutcome(result=result,
+            next_stage=StageRequest(_next_stage_id(request.id, "external-evidence-freeze" if proceed else "finalize"),
+                EXTERNAL_EVIDENCE_FREEZE_HANDLER_ID if proceed else "openstar.tess.finalize",
+                {} if proceed else {"outputSuffix": "source-attribution-review-v1"}, request.id),
+            input_hashes={"sourceLocalization": sha256_json(localization)},
+            artifacts=(_artifact(path, "application/json"),))
+
+    def external_evidence_freeze_stage(investigation, request):
+        review = _required_latest_result_for_handler(investigation, SOURCE_ATTRIBUTION_REVIEW_HANDLER_ID)
+        input_hashes = {"sourceAttributionReview": sha256_json(review),
+                        "sourceLocalization": review["sourceLocalizationSHA256"]}
+        try:
+            result = acquire_external_evidence(review)
+        except ExternalEvidenceTransientError as error:
+            raise RetryableExecutionError(str(error),
+                result={"operation": "external-companion-evidence-freeze"},
+                input_hashes=input_hashes) from error
+        path = (store.directory_for(investigation.id) / "artifacts" /
+                "external-companion-evidence" / "external-response-v1.json")
+        _write_json(path, result)
+        return StageOutcome(result=result,
+            next_stage=StageRequest(_next_stage_id(request.id, "interpret-external-evidence"),
+                EXTERNAL_EVIDENCE_INTERPRET_HANDLER_ID, {}, request.id),
+            input_hashes=input_hashes, artifacts=(_artifact(path, "application/json"),))
+
+    def external_evidence_interpret_stage(investigation, request):
+        frozen = _required_latest_result_for_handler(investigation, EXTERNAL_EVIDENCE_FREEZE_HANDLER_ID)
+        result = interpret_external_evidence(frozen)
+        path = (store.directory_for(investigation.id) / "artifacts" /
+                "external-companion-evidence" / "external-companion-evidence-v1.json")
+        _write_json(path, result)
+        print("🔭 Published external companion confirmation evidence")
+        print(f"   external classification: {result['classification']}")
+        print("   OpenStar photometric/spatial evidence remains software-blind")
+        print("   final physical mechanism and companion nature remain unresolved")
+        return StageOutcome(result=result,
+            next_stage=StageRequest(_next_stage_id(request.id, "finalize"), "openstar.tess.finalize",
+                {"outputSuffix": "external-companion-evidence-v1"}, request.id),
+            input_hashes={"externalEvidenceFreeze": sha256_json(frozen)},
+            artifacts=(_artifact(path, "application/json"),))
 
     def source_localization_stage(investigation, request):
         prepared = _result(investigation, "001-prepare-target")
@@ -10400,6 +10457,9 @@ def build_engine(
     engine.register_handler(ECLIPSE_LOCALIZATION_PREPARE_HANDLER_ID,
                             eclipse_event_localization_prepare_stage)
     engine.register_handler(ECLIPSE_LOCALIZATION_HANDLER_ID, eclipse_event_localization_stage)
+    engine.register_handler(SOURCE_ATTRIBUTION_REVIEW_HANDLER_ID, source_attribution_review_stage)
+    engine.register_handler(EXTERNAL_EVIDENCE_FREEZE_HANDLER_ID, external_evidence_freeze_stage)
+    engine.register_handler(EXTERNAL_EVIDENCE_INTERPRET_HANDLER_ID, external_evidence_interpret_stage)
     engine.register_handler(
         "openstar.tess.source-localization.analyze",
         source_localization_stage,
