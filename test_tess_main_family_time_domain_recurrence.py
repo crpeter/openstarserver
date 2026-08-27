@@ -1,5 +1,10 @@
 import math
+import json
+import tempfile
 import unittest
+from dataclasses import asdict
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 np = pytest.importorskip("numpy", reason="numpy scientific runtime is not installed")
@@ -9,6 +14,9 @@ from workflows.tess.tess_main_family_time_domain_recurrence import (
     analyze_time_domain_recurrence, combine_sector_results,
 )
 from workflows.tess.tess_investigation import astrophysical_interpretation_continuation
+from workflows.tess.tess_autonomy import repair_obsolete_terminal_wait
+from openstar_investigation import ArtifactReference, Investigation, InvestigationStage, InvestigationStore, sha256_file
+from openstar_workflow import StageRequest
 
 
 class MainFamilyTimeDomainRecurrenceTests(unittest.TestCase):
@@ -73,6 +81,67 @@ class MainFamilyTimeDomainRecurrenceTests(unittest.TestCase):
         self.assertEqual("032-main-family-time-domain-recurrence",request.id)
         self.assertNotEqual("openstar.tess.finalize",request.handler_id)
         self.assertEqual([1.0,18.0],METHOD["lagSearchDays"])
+
+    def test_real_shaped_historical_auto_discovery_returns_unexecuted_034(self):
+        from workflows.tess.tess_investigation import build_engine
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td); store=InvestigationStore(root/"state")
+            def complete(stage_id,handler,result,name,trigger=None,parameters=None,stop=False):
+                path=root/name; path.write_text(json.dumps(result),encoding="utf-8")
+                return InvestigationStage(stage_id,handler,"COMPLETE",trigger,parameters or {},
+                    result=result,artifacts=(ArtifactReference(str(path),sha256_file(path),"application/json"),),stop=stop)
+            prepared=[]
+            for sector in (94,95):
+                times=np.arange(0,18,.04)
+                flux=np.sin(2*np.pi*times/self.P)+.5*np.sin(np.pi*times/self.P)
+                path=root/f"sector-{sector}.json"
+                path.write_text(json.dumps({"times":times.tolist(),"flux":flux.tolist(),
+                    "source":{"sector":sector,"originalTimeOriginDays":2459000.0}}))
+                prepared.append({"sector":sector,"datasetPath":str(path)})
+            family_value={"representativeRawPeriodDays":self.FAMILY["representativeRawPeriodDays"],
+                "possibleDoubleCycleDays":self.FAMILY["possibleDoubleCycleDays"],
+                "physicalCycleResolved":False,"supportingSectors":[94,95]}
+            source={"classification":"ROTATIONAL_ACTIVE_REGION_MODULATION_SUPPORTED",
+                "physicalMechanismResolved":True,"targetResidualMechanismResolved":True,
+                "targetResidualPeriodDays":self.P,"smoothAmplitudeSupportingSectorIDs":[68,95],
+                "mainPhotometricFamily":dict(self.FAMILY)}
+            stages=(
+                complete("001-prepare-target","openstar.tess.prepare-target",
+                    {"preparedSectors":prepared},"prepare.json"),
+                complete("009-family","openstar.tess.independent.broad.interpret",
+                    {"harmonicFamily":family_value},"family.json"),
+                complete("018-mode-identification","openstar.tess.mode-identification.analyze",
+                    {"modeCandidate":{"periodDays":self.P}},"mode.json"),
+                complete("031-target-residual-astrophysical-interpretation",
+                    "openstar.tess.target-residual-astrophysical-interpretation.analyze",source,
+                    "target-residual-astrophysical-interpretation-v20.14.1.json"),
+                complete("032-finalize","openstar.tess.finalize",
+                    {"targetResidualAstrophysicalInterpretation":source},
+                    "conclusion-v20.14.1-astrophysical-interpretation.json",
+                    "031-target-residual-astrophysical-interpretation",
+                    {"outputSuffix":"v20.14.1-astrophysical-interpretation"},True))
+            terminal={"branchAssessments":[],"selectedExperiment":None,
+                "schedulerAction":"INVESTIGATION_COMPLETE"}
+            investigation=Investigation("historical-recurrence","openstar.workflow.tess-investigation.v1",
+                "20.2","COMPLETE","now","now",{"controlState":terminal},stages)
+            store.save(investigation)
+            for item in stages:
+                store._atomic_write_json(store.stage_path_for(investigation.id,item.id),asdict(item),replace=False)
+            immutable={store.stage_path_for(investigation.id,s.id):store.stage_path_for(investigation.id,s.id).read_bytes() for s in stages}
+            admitted=repair_obsolete_terminal_wait(store,investigation)
+            selected=admitted.metadata["controlState"]["selectedExperiment"]
+            self.assertEqual("033-main-family-time-domain-recurrence",selected["id"])
+            engine=build_engine(store,SimpleNamespace(),poll_interval=0,timeout=None); engine.chain_stages=False
+            completed,next_request=engine.run_stage(admitted,StageRequest(**selected),software_id="test",software_version="1")
+            result=completed.stages[-1].result
+            self.assertEqual([94,95],result["sectorsEvaluated"])
+            self.assertTrue(all(x["rotationRecurrencePeak"] for x in result["acfSectorResults"]))
+            self.assertTrue(all("rawFamilyCandidateEvidence" in x and "possibleDoubleCandidateEvidence" in x for x in result["acfSectorResults"]))
+            self.assertTrue(all(not x["possibleDoubleCandidateEvidence"]["coverageSufficient"] for x in result["acfSectorResults"]))
+            self.assertFalse(result["physicalCycleResolved"])
+            self.assertEqual("034-finalize",next_request.id)
+            self.assertFalse(any(s.id=="034-finalize" for s in completed.stages))
+            self.assertTrue(all(path.read_bytes()==value for path,value in immutable.items()))
 
 
 if __name__ == "__main__": unittest.main()

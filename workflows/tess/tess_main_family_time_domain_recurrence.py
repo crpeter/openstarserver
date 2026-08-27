@@ -19,6 +19,7 @@ METHOD = {
     "lagSearchDays": [1.0, 18.0],
     "lagGridStepDays": 0.05,
     "minimumPairSupport": 40,
+    "minimumCandidateLagOverlapDays": 5.0,
     "minimumPeakCorrelation": 0.20,
     "minimumPeakProminence": 0.08,
     "jackknifeBlocks": 6,
@@ -31,6 +32,7 @@ METHOD = {
         "minimumPeakCorrelation": "positive temporal recurrence large enough to be scientifically useful",
         "minimumPeakProminence": "peak rise above its local ACF shoulders",
         "minimumPairSupport": "prevents sparse-lag correlations from masquerading as recurrence",
+        "minimumCandidateLagOverlapDays": "requires a substantive observed time span after applying the candidate lag",
         "replicatedSectorCount": "independent-sector replication requirement",
     },
 }
@@ -94,28 +96,66 @@ def _nearest(peaks, target, window):
     return max(eligible, key=lambda p:p["peakCorrelation"], default=None)
 
 
+def _jackknife_peak(time, flux, peak, method):
+    samples=[]
+    if peak is not None and len(time):
+        edges=np.linspace(time.min(),time.max(),method["jackknifeBlocks"]+1)
+        for block in range(method["jackknifeBlocks"]):
+            keep=~((time>=edges[block])&(time<=edges[block+1]))
+            jl,ja,js,_,_=gap_aware_acf(time[keep],flux[keep],method)
+            candidate=_nearest(_peaks(jl,ja,js,method),peak["lagDays"],
+                max(peak["localPeakWidthDays"],method["lagGridStepDays"]*2))
+            samples.append(None if candidate is None else candidate["lagDays"])
+    detected=np.asarray([x for x in samples if x is not None],float)
+    return {"method":"deterministic-delete-one-contiguous-time-block-jackknife",
+        "numberOfBlocks":method["jackknifeBlocks"],"perResamplePeakLocationsDays":samples,
+        "medianLagDays":float(np.median(detected)) if len(detected) else None,
+        "meanLagDays":float(np.mean(detected)) if len(detected) else None,
+        "intervalDays":[float(np.min(detected)),float(np.max(detected))] if len(detected) else None,
+        "successfulResamples":int(len(detected))}
+
+
+def _candidate_evidence(name,target,lags,acf,support,peaks,time,flux,rotation,method):
+    grid=int(np.argmin(np.abs(lags-target)))
+    overlap_days=max(0.0,float(time.max()-time.min()-lags[grid])) if len(time) else 0.0
+    coverage=(support[grid]>=method["minimumPairSupport"] and
+              overlap_days>=method["minimumCandidateLagOverlapDays"])
+    nearest=min(peaks,key=lambda p:abs(p["lagDays"]-target),default=None) if coverage else None
+    uncertainty=_jackknife_peak(time,flux,nearest,method) if nearest else None
+    empirical_half_width=(nearest["localPeakWidthDays"]/2 if nearest else 0)
+    if uncertainty and uncertainty["intervalDays"]:
+        low,high=uncertainty["intervalDays"]
+    elif nearest:
+        low=high=nearest["lagDays"]
+    else: low=high=None
+    associated=bool(nearest and uncertainty["successfulResamples"]>=method["minimumJackknifeDetections"]
+        and low-empirical_half_width<=target<=high+empirical_half_width)
+    multiple=None
+    if nearest and rotation:
+        candidates={2:abs(nearest["lagDays"]-2*rotation["lagDays"]),
+                    4:abs(nearest["lagDays"]-4*rotation["lagDays"])}
+        order=min(candidates,key=candidates.get)
+        rotation_interval=(rotation.get("uncertaintyEstimate") or {}).get("intervalDays")
+        rotation_spread=((rotation_interval[1]-rotation_interval[0])/2 if rotation_interval else 0)
+        tolerance=empirical_half_width+order*rotation_spread
+        multiple={"order":order,"expectedLagDays":order*rotation["lagDays"],
+            "absoluteDifferenceDays":candidates[order],"empiricalToleranceDays":tolerance,
+            "consistent":candidates[order]<=tolerance}
+    return {"candidate":name,"persistedLagDays":target,"coverageSufficient":coverage,
+        "coverage":{"laggedPairSupport":int(support[grid]),"laggedTemporalOverlapDays":overlap_days,
+            "minimumPairSupport":method["minimumPairSupport"],
+            "minimumCandidateLagOverlapDays":method["minimumCandidateLagOverlapDays"]},
+        "nearestQualifyingPeak":({**nearest,"uncertaintyEstimate":uncertainty} if nearest else None),
+        "candidateWithinEmpiricalPeakUncertainty":associated,
+        "sectorLocalRotationMultipleConsistency":multiple}
+
+
 def analyze_sector(time, flux, *, sector_id, rotation_period_days,
-                   possible_double_days=None, method=METHOD):
+                   family_period_days=None, possible_double_days=None, method=METHOD):
     lags, acf, support, time, flux = gap_aware_acf(time, flux, method)
     peaks = _peaks(lags, acf, support, method)
     rotation = _nearest(peaks, rotation_period_days, max(.5, 2*method["lagGridStepDays"]))
-    # Delete contiguous time blocks, recompute the continuous search, and retain
-    # the peak nearest the full-sample peak (not a preselected physical lag).
-    samples = []
-    if rotation and len(time):
-        edges = np.linspace(time.min(), time.max(), method["jackknifeBlocks"]+1)
-        for block in range(method["jackknifeBlocks"]):
-            keep = ~((time >= edges[block]) & (time <= edges[block+1]))
-            jl, ja, js, _, _ = gap_aware_acf(time[keep], flux[keep], method)
-            candidate = _nearest(_peaks(jl, ja, js, method), rotation["lagDays"],
-                                 max(rotation["localPeakWidthDays"], .5))
-            samples.append(None if candidate is None else candidate["lagDays"])
-    detected = np.asarray([x for x in samples if x is not None], float)
-    uncertainty = {"method":"deterministic-delete-one-contiguous-time-block-jackknife",
-        "numberOfBlocks":method["jackknifeBlocks"], "perResamplePeakLocationsDays":samples,
-        "medianLagDays":float(np.median(detected)) if len(detected) else None,
-        "meanLagDays":float(np.mean(detected)) if len(detected) else None,
-        "intervalDays":[float(np.min(detected)),float(np.max(detected))] if len(detected) else None}
+    uncertainty = _jackknife_peak(time,flux,rotation,method)
     if rotation: rotation["uncertaintyEstimate"] = uncertainty
     # Cycle profiles and correlations.
     cycle = np.floor((time-time.min())/rotation_period_days).astype(int)
@@ -138,10 +178,14 @@ def analyze_sector(time, flux, *, sector_id, rotation_period_days,
         "deleteOnePairJackknifeMedians":[float(np.median([y["correlation"] for j,y in enumerate(v) if j!=i])) for i in range(len(v))] if len(v)>1 else []}
         for k,v in pairs.items()}
     baseline=float(time.max()-time.min()) if len(time) else 0
+    raw=_candidate_evidence("RAW_FAMILY",float(family_period_days),lags,acf,support,
+        peaks,time,flux,rotation,method) if family_period_days else None
+    double=_candidate_evidence("POSSIBLE_DOUBLE",float(possible_double_days),lags,acf,support,
+        peaks,time,flux,rotation,method) if possible_double_days else None
     return {"sectorID":sector_id,"timeBaselineDays":baseline,"acfPeaks":peaks,
         "rotationRecurrencePeak":rotation,"rotationJackknife":uncertainty,
-        "canConstrainPossibleDouble":(possible_double_days is not None and
-            baseline >= 2*float(possible_double_days)),
+        "rawFamilyCandidateEvidence":raw,"possibleDoubleCandidateEvidence":double,
+        "canConstrainPossibleDouble":bool(double and double["coverageSufficient"]),
         "cyclePairMeasurements":pairs,"cycleSeparationSummaries":summaries,
         "cyclesAccepted":sorted(profiles),"coverageCriteria":{k:method[k] for k in
         ("phaseBins","minimumPopulatedPhaseBinFraction","minimumCyclePairsPerSeparation")}}
@@ -149,19 +193,24 @@ def analyze_sector(time, flux, *, sector_id, rotation_period_days,
 
 def combine_sector_results(results, *, rotation_period_days, family_period_days,
                            possible_double_days, method=METHOD):
-    related=[]; independent=[]; long_detected=[]; morphology=[]
+    related=[]; independent=[]; morphology=[]; raw_ids=[]; double_ids=[]; double_covered=[]
     for result in results:
         rotation=result.get("rotationRecurrencePeak")
         if not rotation: continue
         interval=(rotation.get("uncertaintyEstimate") or {}).get("intervalDays")
         sigma=max((interval[1]-interval[0])/2 if interval else 0, rotation["localPeakWidthDays"]/2,
                   method["lagGridStepDays"])
-        long_peak=_nearest(result["acfPeaks"], family_period_days,
-                           max(sigma, method["lagGridStepDays"]*2))
-        if long_peak:
-            long_detected.append(result["sectorID"])
-            distance=min(abs(long_peak["lagDays"]-2*rotation["lagDays"]),abs(long_peak["lagDays"]-4*rotation["lagDays"]))
-            (related if distance <= sigma + long_peak["localPeakWidthDays"]/2 else independent).append(result["sectorID"])
+        raw=result.get("rawFamilyCandidateEvidence") or {}
+        double=result.get("possibleDoubleCandidateEvidence") or {}
+        if double.get("coverageSufficient"): double_covered.append(result["sectorID"])
+        associated=[]
+        for evidence,bucket in ((raw,raw_ids),(double,double_ids)):
+            if evidence.get("candidateWithinEmpiricalPeakUncertainty"):
+                bucket.append(result["sectorID"]); associated.append(evidence)
+        if associated:
+            multiples=[e.get("sectorLocalRotationMultipleConsistency") or {} for e in associated]
+            if any(m.get("consistent") for m in multiples): related.append(result["sectorID"])
+            elif all(m and not m.get("consistent") for m in multiples): independent.append(result["sectorID"])
         s=result["cycleSeparationSummaries"]
         valid=[(int(k),v["medianCorrelation"]) for k,v in s.items() if v["pairCount"]>=method["minimumCyclePairsPerSeparation"] and v["medianCorrelation"] is not None]
         if valid:
@@ -170,10 +219,12 @@ def combine_sector_results(results, *, rotation_period_days, family_period_days,
     n=method["replicatedSectorCount"]
     if len(related)>=n and len(morphology)>=n: classification=ROTATION_MULTICYCLE
     elif len(independent)>=n: classification=INDEPENDENT_LONG
-    elif len(results)>=n and len(long_detected)==0: classification=NOT_REPLICATED
+    elif len(results)>=n and not raw_ids and not double_ids: classification=NOT_REPLICATED
     else: classification=UNRESOLVED
     relationship=classification in (ROTATION_MULTICYCLE,INDEPENDENT_LONG)
-    exact=False
+    exact=(classification==ROTATION_MULTICYCLE and
+        ((len(raw_ids)>=n and len(double_covered)>=n and len(double_ids)==0) or
+         (len(double_ids)>=n and len(raw_ids)==0)))
     next_test={ROTATION_MULTICYCLE:"LONG_BASELINE_ACTIVE_REGION_RECURRENCE_CONFIRMATION",
         INDEPENDENT_LONG:"INDEPENDENT_LONG_PERIOD_ASTROPHYSICAL_INTERPRETATION",
         NOT_REPLICATED:"MAIN_FAMILY_FREQUENCY_DOMAIN_REASSESSMENT",
@@ -181,13 +232,17 @@ def combine_sector_results(results, *, rotation_period_days, family_period_days,
     gates={"authoritativeRotationMechanismResolved":True,"authoritativeRotationPeriodAvailable":rotation_period_days>0,
         "frozenMainFamilyAvailable":family_period_days>0,"sufficientTimeDomainCoverage":len(results)>=n,
         "acfRotationRecurrenceDetected":sum(bool(r.get("rotationRecurrencePeak")) for r in results)>=n,
-        "replicatedLongLagRecurrence":len(long_detected)>=n,"rotationMultipleConsistency":len(related)>=n,
+        "replicatedLongLagRecurrence":max(len(raw_ids),len(double_ids))>=n,"rotationMultipleConsistency":len(related)>=n,
         "cycleMorphologySupportsSameRelation":len(morphology)>=n,"independentLongPeriodEvidence":len(independent)>=n,
         "noStrongerContradiction":not (related and independent)}
     return {"classification":classification,"mainFamilyRelationshipToRotationResolved":relationship,
         "mainFamilyRelationshipClassification":classification,"physicalCycleResolved":exact,
         "exactPhysicalCycleResolved":exact,"recommendedNextTest":next_test,"decisionGates":gates,
-        "relatedSectorIDs":related,"independentSectorIDs":independent,"longLagSectorIDs":long_detected,
+        "relatedSectorIDs":related,"independentSectorIDs":independent,
+        "rawFamilyRecurrenceSectorIDs":raw_ids,
+        "possibleDoubleRecurrenceSectorIDs":double_ids,
+        "possibleDoubleCoverageSectorIDs":double_covered,
+        "rawVsPossibleDoubleDistinguished":exact,
         "morphologySupportingSectorIDs":morphology}
 
 
@@ -195,7 +250,7 @@ def analyze_time_domain_recurrence(sectors, *, rotation_period_days, rotation_cl
                                    main_photometric_family, method=METHOD):
     double=float(main_photometric_family["possibleDoubleCycleDays"])
     results=[analyze_sector(s["time"],s["flux"],sector_id=s["sectorID"],
-        rotation_period_days=rotation_period_days,possible_double_days=double,
+        rotation_period_days=rotation_period_days,family_period_days=float(main_photometric_family["representativeRawPeriodDays"]),possible_double_days=double,
         method=method) for s in sectors]
     family=float(main_photometric_family["representativeRawPeriodDays"])
     combined=combine_sector_results(results,rotation_period_days=rotation_period_days,
