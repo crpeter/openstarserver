@@ -16,8 +16,12 @@ from typing import Any, Iterable
 from openstar_science_runs import ScienceRunCatalog
 
 EXCLUDED_KINDS = {"tess-sector-sweep", "tess-sector-reconstruction"}
-MEANINGFUL = ("classification", "claim", "conclusion", "recommendation",
-              "sourceAttribution", "physicalMechanism", "companionNature")
+DECISION_ENVELOPES = {"interpretation", "scientificInterpretation",
+                      "investigationInterpretation", "finalInterpretation", "conclusion",
+                      "investigationConclusion",
+                      "finalConclusion", "decision"}
+ANSWER_KEY_FIELDS = {"catalogAnswerKeyUsed", "answerKeyUsed", "usedAnswerKey",
+                     "answerKeyUse"}
 
 
 def _walk(value: Any):
@@ -127,7 +131,7 @@ def _latest_fields(stages: list[dict[str, Any]]) -> dict[str, Any]:
     for stage in stages:
         if stage["status"] not in {"COMPLETE", "COMPLETED", "SUCCEEDED"}:
             continue
-        objects = list(_authoritative_objects(stage["result"]))
+        objects = list(_decision_objects(stage["result"]))
         for output, names in aliases.items():
             value = _first(objects, *names)
             # _first deliberately preserves False because it is authoritative.
@@ -136,22 +140,35 @@ def _latest_fields(stages: list[dict[str, Any]]) -> dict[str, Any]:
     return latest
 
 
-def _authoritative_objects(value: Any):
-    """Walk a result while excluding catalog/model alternatives from decisions."""
+def _decision_objects(value: Any):
+    """Yield only the result root and explicitly supported decision envelopes."""
     if not isinstance(value, dict):
         return
     yield value
     for key, child in value.items():
-        lowered = key.lower()
-        if any(term in lowered for term in ("candidate", "catalogsource", "neighbor",
-                                             "modelcomponent", "comparisonobject")):
-            continue
-        if isinstance(child, dict):
-            yield from _authoritative_objects(child)
-        elif isinstance(child, (list, tuple)):
-            for item in child:
-                if isinstance(item, dict):
-                    yield from _authoritative_objects(item)
+        if key in DECISION_ENVELOPES and isinstance(child, dict):
+            yield child
+
+
+def _claim(value: Any, classification: Any) -> tuple[str | None, list[str]]:
+    if isinstance(value, str) and value.strip():
+        return value, []
+    if isinstance(value, dict):
+        claim = value.get("claim")
+        rationale = value.get("rationale")
+        reasons = ([item for item in rationale if isinstance(item, str)]
+                   if isinstance(rationale, list) else [])
+        if isinstance(claim, str) and claim.strip():
+            return claim, reasons
+    return (classification if isinstance(classification, str) else None), []
+
+
+def _explicit_answer_key_used(snapshot: dict[str, Any]) -> bool:
+    for obj in _walk(snapshot):
+        for key in ANSWER_KEY_FIELDS:
+            if obj.get(key) is True:
+                return True
+    return False
 
 
 def project_investigation(snapshot: dict[str, Any], *, catalog_run: Any = None,
@@ -195,7 +212,7 @@ def project_investigation(snapshot: dict[str, Any], *, catalog_run: Any = None,
     updated = _epoch(snapshot.get("updated_at") or snapshot.get("updatedAt"), record_mtime or getattr(catalog_run, "updated_at", None))
     workflow_id = snapshot.get("workflow_id") or snapshot.get("workflowID")
     workflow_version = snapshot.get("workflow_version") or snapshot.get("workflowVersion")
-    claim = latest.get("currentClaim") or latest.get("classification")
+    claim, claim_rationale = _claim(latest.get("currentClaim"), latest.get("classification"))
     return {
         "targetID": target_id, "identityKey": identity, "targetName": str(name),
         "ticID": str(tic) if tic is not None else None, "gaiaID": str(gaia) if gaia is not None else None,
@@ -212,7 +229,8 @@ def project_investigation(snapshot: dict[str, Any], *, catalog_run: Any = None,
         "detectedPeriod": latest.get("detectedPeriodDays"),
         "resolvedPhysicalPeriod": latest.get("resolvedPhysicalPeriodDays"),
         "physicalCycleResolved": latest.get("physicalCycleResolved"),
-        "currentClaim": claim, "classification": latest.get("classification"),
+        "currentClaim": claim, "claimRationale": claim_rationale,
+        "classification": latest.get("classification"),
         "sourceAttribution": latest.get("sourceAttribution"),
         "sourceAttributionResolved": latest.get("sourceAttributionResolved"),
         "physicalMechanism": latest.get("physicalMechanism"),
@@ -223,9 +241,15 @@ def project_investigation(snapshot: dict[str, Any], *, catalog_run: Any = None,
         "reportAvailable": bool(artifacts), "artifacts": artifacts,
         "degraded": failed > 0 or status in {"FAILED", "BLOCKED", "RECOVERY_REQUIRED", "DEGRADED"},
         "recoveryRequired": status == "RECOVERY_REQUIRED",
-        "answerKeyUsed": bool(_first([metadata], "answerKeyUsed", "usedAnswerKey", "answerKeyUse")),
+        "answerKeyUsed": _explicit_answer_key_used(snapshot),
         "provenanceHashes": hashes,
     }
+
+
+def _is_unresolved(row: dict[str, Any]) -> bool:
+    flags = [row.get(name) for name in ("sourceAttributionResolved",
+        "companionNatureResolved", "physicalMechanismResolved", "physicalCycleResolved")]
+    return any(value is False for value in flags) or not any(value is True for value in flags)
 
 
 class TargetProjectionStore:
@@ -266,7 +290,9 @@ class TargetProjectionStore:
             for target_id, history in grouped.items():
                 history.sort(key=lambda row: (row.get("updatedAt") or 0, row["investigationID"]), reverse=True)
                 latest = history[0]
-                targets[target_id] = {**latest, "runCount": len(history), "runs": history}
+                targets[target_id] = {**latest,
+                    "answerKeyUsed": any(run["answerKeyUsed"] for run in history),
+                    "runCount": len(history), "runs": history}
             self._targets, self._until = targets, now + self.ttl
 
     def list(self, params: dict[str, list[str]]) -> dict[str, Any]:
@@ -308,10 +334,7 @@ class TargetProjectionStore:
         stats = {"totalTargets": len(all_rows),
                  "activeInvestigations": sum(r["status"] in {"RUNNING", "ACTIVE"} for r in all_rows),
                  "completedInvestigations": sum(r["status"] in {"COMPLETE", "COMPLETED", "FINISHED"} for r in all_rows),
-                 "unresolvedTargets": sum(not (r["sourceAttributionResolved"] is True
-                     or r["companionNatureResolved"] is True
-                     or r["physicalMechanismResolved"] is True
-                     or r["physicalCycleResolved"] is True) for r in all_rows),
+                 "unresolvedTargets": sum(_is_unresolved(r) for r in all_rows),
                  "sourceLocalizedTargets": sum(r["sourceAttributionResolved"] is True for r in all_rows),
                  "companionNatureResolvedTargets": sum(r["companionNatureResolved"] is True for r in all_rows),
                  "physicalMechanismResolvedTargets": sum(r["physicalMechanismResolved"] is True for r in all_rows),
@@ -327,11 +350,7 @@ class TargetProjectionStore:
         detail = self.detail(target_id)
         if not detail: return None
         latest = detail["runs"][0]
-        result_objects = [obj for stage in latest["stages"] for obj in _walk(stage["result"])]
-        def evidence(*names: str) -> dict[str, Any]:
-            value = _first(reversed(result_objects), *names)
-            return ({"status": "available", "data": _browser_safe(value)} if value is not None
-                    else {"status": "unavailable", "reason": "not_recorded_for_run"})
+        visual = _visual_evidence(latest["stages"])
         return {"targetID": target_id,
                 "sectorSupport": {"status": "available" if latest["primarySectors"] or latest["independentSectors"] else "unavailable",
                     "primary": latest["primarySectors"], "independent": latest["independentSectors"],
@@ -340,10 +359,86 @@ class TargetProjectionStore:
                     "detected": latest["detectedPeriod"], "physical": latest["resolvedPhysicalPeriod"],
                     "physicalCycleResolved": latest["physicalCycleResolved"],
                     "reason": None if latest["detectedPeriod"] is not None or latest["resolvedPhysicalPeriod"] is not None else "not_recorded_for_run"},
-                "differenceImage": evidence("differenceImage", "differenceImageSummary", "differenceImageEvidence"),
-                "centroid": evidence("measuredCentroid", "centroidMeasurement", "centroidEvidence"),
-                "sourceDistances": evidence("sourceDistances", "sourceDistanceComparison", "catalogSourceDistances"),
-                "independentSectorAgreement": evidence("independentSectorAgreement", "sectorAgreement")}
+                **visual}
+
+
+def _unavailable() -> dict[str, str]:
+    return {"status": "unavailable", "reason": "not_recorded_for_run"}
+
+
+def _bounded(value: Any, *, limit: int = 24) -> Any:
+    if isinstance(value, dict):
+        return {str(key): _bounded(item, limit=limit) for key, item in list(value.items())[:limit]}
+    if isinstance(value, (list, tuple)):
+        return [_bounded(item, limit=limit) for item in list(value)[:limit]]
+    return value if isinstance(value, (str, int, float, bool)) or value is None else str(value)
+
+
+def _matrix(value: Any) -> dict[str, Any] | None:
+    if isinstance(value, dict):
+        value = _first([value], "matrix", "values", "pixels", "differenceImage")
+    if not isinstance(value, (list, tuple)) or not value:
+        return None
+    rows = [row for row in value if isinstance(row, (list, tuple))]
+    if not rows:
+        return None
+    columns = max((len(row) for row in rows), default=0)
+    bounded = [[cell if isinstance(cell, (int, float)) and not isinstance(cell, bool) else None
+                for cell in list(row)[:32]] for row in rows[:32]]
+    return {"values": bounded, "rows": len(rows), "columns": columns,
+            "truncated": len(rows) > 32 or columns > 32}
+
+
+def _visual_containers(result: dict[str, Any]):
+    """Yield recognized visual records without flattening unrelated measurements."""
+    yield result
+    for name in ("visualEvidence", "differenceImageEvidence", "localizationEvidence"):
+        value = result.get(name)
+        if isinstance(value, dict):
+            yield value
+    sectors = result.get("sectorResults")
+    if isinstance(sectors, list):
+        for item in sectors[:24]:
+            if isinstance(item, dict):
+                yield item
+
+
+def _visual_evidence(stages: list[dict[str, Any]]) -> dict[str, Any]:
+    output = {name: _unavailable() for name in ("differenceImage", "centroid",
+              "sourceDistances", "independentSectorAgreement")}
+    for stage in reversed(stages):
+        stage_id = stage["id"]
+        centroid_data: dict[str, Any] = {}
+        distance_data: dict[str, Any] = {}
+        for item in _visual_containers(stage["result"]):
+            if output["differenceImage"]["status"] == "unavailable":
+                image = _matrix(item.get("differenceImage") or item.get("differenceImageSummary"))
+                if image:
+                    snr = item.get("differenceImagePeakSNR", item.get("peakSNR"))
+                    output["differenceImage"] = {"status": "available", "stageID": stage_id,
+                        "data": {**image, "peakSNR": snr if isinstance(snr, (int, float)) else None}}
+            centroid = item.get("measuredPixelCentroid") or item.get("measuredCentroid")
+            if isinstance(centroid, dict):
+                centroid_data.update(_bounded(centroid))
+            for name in ("centroidX", "centroidY", "centroidSky",
+                         "centroidUncertaintyPixels", "jackknifeCentroids"):
+                if name in item and name not in centroid_data:
+                    centroid_data[name] = _bounded(item[name])
+            for name in ("catalogDistances", "distancesPixels", "matchedCatalogHypothesis"):
+                if name in item and name not in distance_data:
+                    distance_data[name] = _bounded(item[name])
+            if output["independentSectorAgreement"]["status"] == "unavailable":
+                value = _first([item], "independentSectorAgreement", "sectorAgreement")
+                if value is not None:
+                    output["independentSectorAgreement"] = {"status": "available",
+                        "stageID": stage_id, "data": _bounded(value)}
+        if output["centroid"]["status"] == "unavailable" and centroid_data:
+            output["centroid"] = {"status": "available", "stageID": stage_id,
+                                  "data": centroid_data}
+        if output["sourceDistances"]["status"] == "unavailable" and distance_data:
+            output["sourceDistances"] = {"status": "available", "stageID": stage_id,
+                                         "data": distance_data}
+    return _browser_safe(output)
 
 
 def _browser_safe(value: Any, key: str = "") -> Any:
