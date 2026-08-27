@@ -427,6 +427,19 @@ def _primary_harmonic_morphology_family(
 def time_frequency_continuation(summary: dict[str, Any], *, request_id: str) -> StageRequest:
     """Continue only the explicitly recommended, still-unresolved experiment."""
 
+    period_reference = summary.get("periodReference") or {}
+    try:
+        physical_period = float(period_reference.get("periodDays"))
+    except (TypeError, ValueError):
+        physical_period = math.nan
+    run_physical_interpretation = (
+        summary.get("recommendedNextTest") == "BINARY_ROTATION_EXTERNAL_EVIDENCE"
+        and summary.get("physicalMechanismResolved") is False
+        and period_reference.get("physicalCycleResolved") is True
+        and period_reference.get("kind") == "MORPHOLOGY_RESOLVED_PHYSICAL_PERIOD"
+        and math.isfinite(physical_period)
+        and physical_period > 0
+    )
     run_mode_identification = (
         summary.get("recommendedNextTest") == "MODE_IDENTIFICATION_OR_PULSATION_MODELING"
         and summary.get("physicalMechanismResolved") is False
@@ -440,16 +453,20 @@ def time_frequency_continuation(summary: dict[str, Any], *, request_id: str) -> 
         id=_next_stage_id(
             request_id,
             "mode-identification" if run_mode_identification else
-            ("prepare-nonstationary" if run_nonstationary else "finalize"),
+            ("prepare-nonstationary" if run_nonstationary else
+             ("physical-interpretation" if run_physical_interpretation else "finalize")),
         ),
         handler_id=(
             "openstar.tess.mode-identification.analyze" if run_mode_identification else
             ("openstar.tess.nonstationary.prepare"
             if run_nonstationary
-            else "openstar.tess.finalize"
+            else ("openstar.tess.physical.interpret"
+                  if run_physical_interpretation
+                  else "openstar.tess.finalize")
             )
         ),
-        parameters={} if (run_nonstationary or run_mode_identification) else {"outputSuffix": "v20.8"},
+        parameters={} if (run_nonstationary or run_mode_identification
+                          or run_physical_interpretation) else {"outputSuffix": "v20.8"},
         triggered_by_stage_id=request_id,
     )
 
