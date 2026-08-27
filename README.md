@@ -116,6 +116,29 @@ always retains `HUMAN_REVIEW_REQUIRED`, `physicalCycleResolved=false`, and
 `physicalMechanismResolved=false`; the localization outcome only determines the
 next conservative experiment.
 
+### TIC 238919539 untouched-sector time-domain continuation
+
+After stages 013-015 localize the period family to the TIC target, validate the
+next manual boundary without changing the investigation:
+
+```bash
+python run_openstar_tess_period_family_time_domain_evolution.py \
+  --state-dir ~/Documents/OpenStarScience/autonomous-sector-1-scale-1/state \
+  --investigation-id tess-tess-sector-scan-1-tic-238919539-tess-sector-1-tic-238919539
+```
+
+The preregistered experiment freezes untouched Sectors 5, 6, 7, 8, 11, 61,
+65, 66, 67, 68, 69, 87, and 88. It requires official SPOC 120-second products,
+freezes both SAP and PDCSAP flux, and compares gap-aware autocorrelation with
+cycle-to-cycle and first-half/second-half waveform similarity. It does not run
+Lomb-Scargle and does not send TESS-specific work to generic compute workers.
+
+After reviewing the validation output, add `--execute` to append stages 016-018.
+SAP/PDCSAP disagreement fails closed. A replicated time-domain family remains a
+detection-level result: the exact physical cycle and mechanism remain unresolved,
+the claim remains `HUMAN_REVIEW_REQUIRED`, and the next test is selected from the
+persisted stability/evolution outcome.
+
 ## Targeted observation campaign
 
 Two Sector 1 deep investigations have reached a genuine external-observation boundary. OpenStar

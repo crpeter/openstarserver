@@ -136,6 +136,15 @@ from .tess_period_family_difference_image import (
     run_period_family_difference_imaging,
     interpret_period_family_difference_imaging,
 )
+from .tess_period_family_time_domain_evolution import (
+    PREPARE_HANDLER as PERIOD_FAMILY_TIME_DOMAIN_PREPARE_HANDLER,
+    RUN_HANDLER as PERIOD_FAMILY_TIME_DOMAIN_RUN_HANDLER,
+    INTERPRET_HANDLER as PERIOD_FAMILY_TIME_DOMAIN_INTERPRET_HANDLER,
+    verified_time_domain_evolution_boundary,
+    prepare_period_family_time_domain_evolution,
+    run_period_family_time_domain_evolution,
+    interpret_period_family_time_domain_evolution,
+)
 from .tess_source_switching_temporal import (
     prepare_source_switching_temporal_model,
     run_source_switching_temporal_model,
@@ -5049,6 +5058,88 @@ def build_engine(
             input_hashes={
                 "preparation": sha256_json(preparation),
                 "run": sha256_json(run),
+            },
+            artifacts=(_artifact(path, "application/json"),),
+        )
+
+    def period_family_time_domain_prepare_stage(investigation, request):
+        frozen, ledger_hashes = verified_time_domain_evolution_boundary(
+            store, investigation
+        )
+        preparation = prepare_period_family_time_domain_evolution(
+            frozen_boundary=frozen,
+            ledger_hashes=ledger_hashes,
+            output_dir=store.directory_for(investigation.id) / "artifacts",
+            investigation_id=investigation.id,
+        )
+        return StageOutcome(
+            result=preparation,
+            next_stage=StageRequest(
+                _next_stage_id(request.id, "run-period-family-time-domain-evolution"),
+                PERIOD_FAMILY_TIME_DOMAIN_RUN_HANDLER,
+                {},
+                request.id,
+            ),
+            input_hashes={
+                "frozenBoundary": sha256_json(frozen),
+                **{f"stageLedger:{stage_id}": value
+                   for stage_id, value in ledger_hashes.items()},
+            },
+            artifacts=(_artifact(Path(preparation["preparationPath"]), "application/json"),),
+        )
+
+    def period_family_time_domain_run_stage(investigation, request):
+        preparation = _latest_result_for_handler(
+            investigation, PERIOD_FAMILY_TIME_DOMAIN_PREPARE_HANDLER
+        )
+        if preparation is None:
+            raise RuntimeError("Period-family time-domain evolution requires preparation.")
+        result = run_period_family_time_domain_evolution(
+            preparation, sector_inputs=request.parameters.get("sectorInputs")
+        )
+        path = Path(preparation["artifactRoot"]) / "run.json"
+        _write_json(path, result)
+        dataset_artifacts = tuple(
+            _artifact(Path(item["path"]), "application/x-npz")
+            for item in result.get("frozenDatasets") or []
+        )
+        return StageOutcome(
+            result=result,
+            next_stage=StageRequest(
+                _next_stage_id(request.id, "interpret-period-family-time-domain-evolution"),
+                PERIOD_FAMILY_TIME_DOMAIN_INTERPRET_HANDLER,
+                {},
+                request.id,
+            ),
+            input_hashes={
+                "preparation": sha256_json(preparation),
+                **{f"frozenDataset:sector{item['sector']}": item["sha256"]
+                   for item in result.get("frozenDatasets") or []},
+            },
+            artifacts=(_artifact(path, "application/json"),) + dataset_artifacts,
+        )
+
+    def period_family_time_domain_interpret_stage(investigation, request):
+        preparation = _latest_result_for_handler(
+            investigation, PERIOD_FAMILY_TIME_DOMAIN_PREPARE_HANDLER
+        )
+        run = _latest_result_for_handler(
+            investigation, PERIOD_FAMILY_TIME_DOMAIN_RUN_HANDLER
+        )
+        if preparation is None or run is None:
+            raise RuntimeError("Time-domain evolution interpretation requires prepare and run.")
+        result = interpret_period_family_time_domain_evolution(preparation, run)
+        path = Path(preparation["artifactRoot"]) / "interpretation.json"
+        _write_json(path, result)
+        return StageOutcome(
+            result=result,
+            stop=True,
+            final_status="QUIESCENT_AWAITING_DATA",
+            input_hashes={
+                "preparation": sha256_json(preparation),
+                "run": sha256_json(run),
+                **{f"frozenDataset:sector{item['sector']}": item["sha256"]
+                   for item in run.get("frozenDatasets") or []},
             },
             artifacts=(_artifact(path, "application/json"),),
         )
@@ -10039,6 +10130,18 @@ def build_engine(
     engine.register_handler(
         PERIOD_FAMILY_DIFFERENCE_INTERPRET_HANDLER,
         period_family_difference_image_interpret_stage,
+    )
+    engine.register_handler(
+        PERIOD_FAMILY_TIME_DOMAIN_PREPARE_HANDLER,
+        period_family_time_domain_prepare_stage,
+    )
+    engine.register_handler(
+        PERIOD_FAMILY_TIME_DOMAIN_RUN_HANDLER,
+        period_family_time_domain_run_stage,
+    )
+    engine.register_handler(
+        PERIOD_FAMILY_TIME_DOMAIN_INTERPRET_HANDLER,
+        period_family_time_domain_interpret_stage,
     )
     engine.register_handler(
         "openstar.tess.source-switching-temporal-model.prepare",
