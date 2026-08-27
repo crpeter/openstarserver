@@ -4476,6 +4476,78 @@ def build_engine(
                 **{f"frozenDatasetFile:sector{s['sectorID']}":s["datasetSHA256"] for s in sectors}},
             artifacts=(_artifact(artifact_path,"application/json"),))
 
+    def main_family_frequency_domain_reassessment_stage(investigation, request):
+        """Reassess only the frozen family against fixed rotation branches."""
+        from .tess_dynamic_harmonic import read_frozen_light_curve
+        from .tess_main_family_frequency_domain_reassessment import (
+            analyze_frequency_domain_reassessment,
+        )
+        recurrence = next((s for s in investigation.stages if
+            s.id == "033-main-family-time-domain-recurrence"), None)
+        final = next((s for s in investigation.stages if s.id == request.triggered_by_stage_id), None)
+        science = next((s for s in investigation.stages if
+            s.id == "031-target-residual-astrophysical-interpretation"), None)
+        if not (request.id == "035-main-family-frequency-domain-reassessment"
+                and recurrence and science and final and final.id == "034-finalize"
+                and final is investigation.stages[-1]
+                and recurrence.status == science.status == final.status == "COMPLETE"
+                and recurrence.handler_id == "openstar.tess.main-family-time-domain-recurrence.analyze"
+                and science.handler_id == "openstar.tess.target-residual-astrophysical-interpretation.analyze"
+                and final.handler_id == "openstar.tess.finalize" and final.stop is True
+                and recurrence.triggered_by_stage_id == "032-finalize"
+                and final.triggered_by_stage_id == recurrence.id
+                and store.verified_terminal_stage_ledger_hash(investigation.id, science)
+                and store.verified_terminal_stage_ledger_hash(investigation.id, recurrence)
+                and store.verified_terminal_stage_ledger_hash(investigation.id, final)):
+            raise RuntimeError("frequency reassessment exact stage034 boundary verification failed")
+        prior = recurrence.result or {}; combined = prior.get("combinedEvidence") or {}
+        if not (prior.get("classification") == "FREQUENCY_FAMILY_NOT_TIME_DOMAIN_REPLICATED"
+                and combined.get("rawFamilyRecurrenceSectorIDs") == []
+                and combined.get("possibleDoubleRecurrenceSectorIDs") == []):
+            raise RuntimeError("frequency reassessment requires authoritative negative stage033 evidence")
+        resolver = historical_path_resolver or HistoricalPathResolver()
+        sectors = []
+        for provenance in prior.get("frozenDatasetProvenance") or []:
+            path = resolver.resolve(provenance["datasetPath"])
+            if sha256_file(path) != provenance.get("datasetSHA256"):
+                raise RuntimeError("frequency reassessment frozen dataset verification failed")
+            dataset = read_frozen_light_curve(path, len(sectors))
+            if (dataset["sector"] != provenance.get("sectorID")
+                    or dataset["source"] != provenance.get("source")
+                    or dataset["appliedTimeOriginDays"] != provenance.get("appliedTimeOriginDays")):
+                raise RuntimeError("frequency reassessment frozen dataset provenance disagrees")
+            sectors.append({"sectorID": dataset["sector"], "time": dataset["times"],
+                "flux": dataset["flux"], **provenance})
+        if not sectors:
+            raise RuntimeError("frequency reassessment requires stage033 frozen sectors")
+        family = (science.result or {}).get("mainPhotometricFamily") or {}
+        summary = analyze_frequency_domain_reassessment(sectors,
+            rotation_period_days=float((science.result or {})["targetResidualPeriodDays"]),
+            family_period_days=float(family["representativeRawPeriodDays"]),
+            possible_double_days=float(family["possibleDoubleCycleDays"]),
+            prior_time_domain={"classification": prior["classification"],
+                **{key: combined[key] for key in ("rawFamilyRecurrenceSectorIDs",
+                    "possibleDoubleRecurrenceSectorIDs", "rawFamilyCoverageSectorIDs",
+                    "possibleDoubleCoverageSectorIDs")}})
+        summary["frozenDatasetProvenance"] = [{**p,
+            "baselineDays": r["baselineDays"], "sampleCount": r["sampleCount"]}
+            for p, r in zip(prior["frozenDatasetProvenance"], summary["sectorResults"])]
+        summary["priorTimeDomainStageID"] = recurrence.id
+        summary["priorTimeDomainLedgerSHA256"] = store.verified_terminal_stage_ledger_hash(
+            investigation.id, recurrence)
+        summary["priorTimeDomainArtifactSHA256"] = recurrence.artifacts[0].sha256
+        artifact_path = store.directory_for(investigation.id)/"artifacts"/"main-family-frequency-domain-reassessment"/"main-family-frequency-domain-reassessment-v20.14.3.json"
+        _write_json(artifact_path, summary)
+        return StageOutcome(result=summary, next_stage=StageRequest(
+            "036-finalize", "openstar.tess.finalize",
+            {"outputSuffix":"v20.14.3-main-family-frequency-domain-reassessment"}, request.id),
+            input_hashes={"stage031Ledger":store.verified_terminal_stage_ledger_hash(investigation.id,science),
+                "stage033Ledger":summary["priorTimeDomainLedgerSHA256"],
+                "stage033Artifact":summary["priorTimeDomainArtifactSHA256"],
+                "stage034Ledger":store.verified_terminal_stage_ledger_hash(investigation.id,final),
+                **{f"frozenDatasetFile:sector{s['sectorID']}":s["datasetSHA256"] for s in sectors}},
+            artifacts=(_artifact(artifact_path,"application/json"),))
+
     def target_residual_mechanism_adjudication_stage(investigation, request):
         v2014_stage = next((stage for stage in reversed(investigation.stages)
             if stage.handler_id == "openstar.tess.target-residual-mechanism.analyze"
@@ -8492,6 +8564,8 @@ def build_engine(
         )
         main_family_time_domain_recurrence = _latest_result_for_handler(
             investigation, "openstar.tess.main-family-time-domain-recurrence.analyze")
+        main_family_frequency_domain_reassessment = _latest_result_for_handler(
+            investigation, "openstar.tess.main-family-frequency-domain-reassessment.analyze")
         target_residual_archival_baseline_extension = _latest_result_for_handler(
             investigation, "openstar.tess.target-residual-archival-baseline.interpret",
         )
@@ -9505,6 +9579,36 @@ def build_engine(
         else:
             recommended_next_test = (physical_interpretation or {}).get("recommendedNextTest")
 
+        if main_family_time_domain_recurrence is not None:
+            recurrence = main_family_time_domain_recurrence
+            combined = recurrence.get("combinedEvidence") or {}
+            family = recurrence.get("mainPhotometricFamily") or {}
+            coverage = sorted(set((combined.get("rawFamilyCoverageSectorIDs") or []) +
+                (combined.get("possibleDoubleCoverageSectorIDs") or [])))
+            existing_rationale = list(claim_decision.get("rationale") or [])
+            existing_rationale.append(
+                "Superseding time-domain evidence: the previously persisted "
+                f"~{family.get('representativeRawPeriodDays'):.3f}-day raw family and "
+                f"~{family.get('possibleDoubleCycleDays'):.3f}-day possible double were not "
+                f"reproduced ({recurrence.get('classification')}) despite adequate coverage "
+                f"in sectors {coverage}; recurrence sectors were raw="
+                f"{combined.get('rawFamilyRecurrenceSectorIDs') or []} and double="
+                f"{combined.get('possibleDoubleRecurrenceSectorIDs') or []}. Nearby recurrence "
+                f"instead tracks approximately 2x/4x the solved ~{recurrence.get('authoritativeRotationPeriodDays'):.4f}-day "
+                "rotation. The historical frequency family remains a candidate requiring "
+                "frequency-domain reassessment, is not by itself evidence for an independent "
+                "longer physical clock, and its exact physical cycle remains unresolved.")
+            claim_decision = {"claim": claim_decision["claim"], "rationale": existing_rationale}
+        if main_family_frequency_domain_reassessment is not None:
+            existing_rationale = list(claim_decision.get("rationale") or [])
+            existing_rationale.append(
+                "Newest superseding frequency-domain reassessment classification: "
+                f"{main_family_frequency_domain_reassessment.get('classification')}. This "
+                "fixed-hypothesis diagnostic preserves the negative independent time-domain "
+                "evidence and cannot establish an exact physical cycle; physicalCycleResolved "
+                "remains false.")
+            claim_decision = {"claim": claim_decision["claim"], "rationale": existing_rationale}
+
         # Finalizers summarize an append-only history.  The newest completed
         # science stage carrying an explicit recommendation is authoritative;
         # handler-specific variables above only preserve report compatibility.
@@ -9556,6 +9660,7 @@ def build_engine(
             ),
             "targetResidualAstrophysicalInterpretation": target_residual_astrophysical_interpretation,
             "mainFamilyTimeDomainRecurrence": main_family_time_domain_recurrence,
+            "mainFamilyFrequencyDomainReassessment": main_family_frequency_domain_reassessment,
             "targetResidualArchivalBaselineExtension": target_residual_archival_baseline_extension,
             "targetResidualPixelRecurrenceValidation": target_residual_pixel_recurrence,
             "targetResidualMultisectorSourceLocalization": target_residual_multisector_source,
@@ -10396,6 +10501,8 @@ def build_engine(
     )
     engine.register_handler("openstar.tess.main-family-time-domain-recurrence.analyze",
         main_family_time_domain_recurrence_stage)
+    engine.register_handler("openstar.tess.main-family-frequency-domain-reassessment.analyze",
+        main_family_frequency_domain_reassessment_stage)
     # All TESS handlers share this provider-to-workflow adapter.  Localization
     # builders call _download_tpf indirectly, so a centralized boundary also
     # protects new experiments from persisting MAST outages as NON_RETRYABLE.

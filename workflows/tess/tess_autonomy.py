@@ -35,6 +35,61 @@ _ADDITIONAL_SECTOR_PREFIX = "openstar.tess.additional-sector-source-localization
 _ASTROPHYSICAL_INTERPRETATION_HANDLER = (
     "openstar.tess.target-residual-astrophysical-interpretation.analyze")
 _MAIN_FAMILY_RECURRENCE_HANDLER = "openstar.tess.main-family-time-domain-recurrence.analyze"
+_MAIN_FAMILY_FREQUENCY_REASSESSMENT_HANDLER = (
+    "openstar.tess.main-family-frequency-domain-reassessment.analyze")
+
+
+def _continue_finalized_main_family_frequency_reassessment(store, investigation, control,
+        *, historical_path_resolver):
+    """Admit only the immutable real 031/033/034 terminal lineage."""
+    canonical = {"branchAssessments": [], "selectedExperiment": None,
+        "schedulerAction": "INVESTIGATION_COMPLETE"}
+    # A terminal status may predate generic control-state canonicalization.  Only
+    # this exact boundary is allowed to normalize such mutable metadata.
+    if investigation.status != "COMPLETE" or any(s.handler_id ==
+            _MAIN_FAMILY_FREQUENCY_REASSESSMENT_HANDLER for s in investigation.stages):
+        return None
+    science = next((s for s in investigation.stages if s.id ==
+        "031-target-residual-astrophysical-interpretation"), None)
+    recurrence = next((s for s in investigation.stages if s.id ==
+        "033-main-family-time-domain-recurrence"), None)
+    final = next((s for s in investigation.stages if s.id == "034-finalize"), None)
+    family_stage = next((s for s in reversed(investigation.stages) if s.status == "COMPLETE"
+        and s.handler_id in {"openstar.tess.independent.harmonic-family.interpret",
+            "openstar.tess.independent.broad.interpret"}), None)
+    prior = recurrence.result if recurrence and isinstance(recurrence.result, dict) else {}
+    combined = prior.get("combinedEvidence") or {}
+    if not (science and recurrence and final and family_stage and final is investigation.stages[-1]
+            and science.status == recurrence.status == final.status == "COMPLETE"
+            and science.handler_id == _ASTROPHYSICAL_INTERPRETATION_HANDLER
+            and recurrence.handler_id == _MAIN_FAMILY_RECURRENCE_HANDLER
+            and final.handler_id == "openstar.tess.finalize" and final.stop is True
+            and recurrence.triggered_by_stage_id == "032-finalize"
+            and final.triggered_by_stage_id == recurrence.id
+            and prior.get("classification") == "FREQUENCY_FAMILY_NOT_TIME_DOMAIN_REPLICATED"
+            and prior.get("recommendedNextTest") == "MAIN_FAMILY_FREQUENCY_DOMAIN_REASSESSMENT"
+            and combined.get("rawFamilyRecurrenceSectorIDs") == []
+            and combined.get("possibleDoubleRecurrenceSectorIDs") == []
+            and store.verified_terminal_stage_ledger_hash(investigation.id, science)
+            and store.verified_terminal_stage_ledger_hash(investigation.id, family_stage)
+            and store.verified_terminal_stage_ledger_hash(investigation.id, recurrence)
+            and store.verified_terminal_stage_ledger_hash(investigation.id, final)
+            and _verified_stage_json(science,
+                "target-residual-astrophysical-interpretation-v20.14.1.json",
+                resolver=historical_path_resolver)
+            and _verified_stage_json(recurrence,
+                "main-family-time-domain-recurrence-v20.14.2.json",
+                resolver=historical_path_resolver)
+            and _verified_stage_json(final,
+                "conclusion-v20.14.2-main-family-time-domain-recurrence.json",
+                resolver=historical_path_resolver)):
+        return None
+    request = StageRequest("035-main-family-frequency-domain-reassessment",
+        _MAIN_FAMILY_FREQUENCY_REASSESSMENT_HANDLER, {}, final.id)
+    return store.set_control_state(investigation, status="RUNNING", control_state={
+        **canonical, "selectedExperiment": asdict(request),
+        "schedulerAction": "RUN_EXPERIMENT",
+        "recovery": "TESS_STAGE_034_MAIN_FAMILY_FREQUENCY_DOMAIN_REASSESSMENT"})
 
 
 def _continue_finalized_main_family_recurrence(store, investigation, control,
@@ -1634,6 +1689,10 @@ def repair_obsolete_terminal_wait(
         store, investigation, control, historical_path_resolver=resolver)
     if recurrence is not None:
         return recurrence
+    frequency_reassessment = _continue_finalized_main_family_frequency_reassessment(
+        store, investigation, control, historical_path_resolver=resolver)
+    if frequency_reassessment is not None:
+        return frequency_reassessment
     astrophysical = _continue_finalized_v2014_astrophysical_interpretation(
         store, investigation, control, historical_path_resolver=resolver)
     if astrophysical is not None:
