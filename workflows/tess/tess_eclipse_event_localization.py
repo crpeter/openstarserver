@@ -16,8 +16,10 @@ import numpy as np
 from openstar_investigation import sha256_json
 
 from .tess_difference_image import MIN_IMAGE_PEAK_SNR, SOURCE_MATCH_MAX_PIXELS, _centroid_from_frames
+from .tess_difference_image_constants import SOURCE_MARGIN_FLOOR_PIXELS
 from .tess_localization import (MAX_CADENCES, MIN_VALID_CADENCES, OFF_TARGET_MIN_PIXELS,
                                 _background_subtract_cube, _download_tpf, _pixel_scale_arcsec,
+                                _world_offsets_arcsec,
                                 _uniform_indices)
 from .tess_offset_variability import _skycoord
 from .tess_period_family_difference_image import _filled_cube
@@ -31,6 +33,11 @@ MIN_BIN_CADENCES = 6
 MIN_EVENTS = 3
 MAX_JACKKNIFE_UNCERTAINTY_PIXELS = 0.75
 CATALOG_OVERLAP_PIXELS = 0.5
+MAX_OFF_CATALOG_SCATTER_ARCSEC = 15.0
+
+
+class EclipseLocalizationDataUnavailable(RuntimeError):
+    """Recognized scientific/data-coverage failure, safe as a sector rejection."""
 
 
 def authoritative_binary_gate(result: dict[str, Any]) -> bool:
@@ -40,11 +47,14 @@ def authoritative_binary_gate(result: dict[str, Any]) -> bool:
     return (
         result.get("resultVersion") == "2.0"
         and evidence.get("classification") == "REPLICATED_ECLIPSE_LIKE_EVENT_SUPPORTED"
-        and int(evidence.get("supportingIndependentSectorCount") or 0) >= 3
+        and isinstance(evidence.get("supportingIndependentSectorCount"), int)
+        and evidence["supportingIndependentSectorCount"] >= 3
         and ephemeris.get("coherent") is True
         and ephemeris.get("primaryTimingConsistent") is True
         and result.get("recommendedNextTest") == "ECLIPSE_EVENT_SOURCE_LOCALIZATION"
         and result.get("catalogAnswerKeyUsed") is False
+        and result.get("physicalMechanismResolved") is False
+        and result.get("companionNatureResolved") is False
     )
 
 
@@ -88,7 +98,10 @@ def _catalog_pixels(item: dict[str, Any]) -> list[dict[str, Any]]:
         pixel = hypothesis.get("pixel") or hypothesis
         x, y = _finite(pixel.get("x")), _finite(pixel.get("y"))
         if x is not None and y is not None:
-            result.append({"id": str(hypothesis.get("id") or hypothesis.get("label") or "CATALOG_SOURCE"),
+            source_id = hypothesis.get("sourceID") or hypothesis.get("id")
+            if not source_id:
+                raise ValueError("frozen catalog hypothesis lacks a stable sourceID")
+            result.append({"id": str(source_id),
                            "isTarget": hypothesis.get("isTarget") is True, "x": x, "y": y,
                            "sky": hypothesis.get("sky")})
     if not result and item.get("targetPixel"):
@@ -118,7 +131,8 @@ def _event_jackknife(cube: np.ndarray, valid: np.ndarray, inside: np.ndarray,
     xs = [item["centroidX"] for item in centroids]
     ys = [item["centroidY"] for item in centroids]
     center_x, center_y = statistics.mean(xs), statistics.mean(ys)
-    uncertainty = max(0.12, math.sqrt(statistics.mean(
+    n = len(centroids)
+    uncertainty = max(0.12, math.sqrt((n - 1.0) / n * sum(
         (x - center_x) ** 2 + (y - center_y) ** 2 for x, y in zip(xs, ys))))
     return uncertainty, centroids
 
@@ -127,8 +141,13 @@ def measure_eclipse_sector(item: dict[str, Any], frozen: dict[str, Any],
                            ephemeris: dict[str, Any]) -> dict[str, Any]:
     sector, role = int(frozen["sector"]), str(frozen["role"])
     period = float(ephemeris["refinedPeriodDays"])
-    epoch = float(ephemeris["referenceEpoch"])
+    epoch = float(frozen["eventEpoch"])
     duration = float(frozen["durationDays"])
+    assignments = [value for value in ephemeris.get("cycleAssignments") or []
+                   if value.get("sector") is not None and int(value["sector"]) == sector]
+    if len(assignments) != 1 or not math.isclose(float(assignments[0]["eventEpoch"]), epoch,
+                                                 rel_tol=0.0, abs_tol=1e-10):
+        raise ValueError("frozen sector epoch does not match its unique cycle assignment")
     times = np.asarray(item["times"], dtype=np.float64)
     cube = np.asarray(item["fluxCube"], dtype=np.float64)
     if cube.ndim != 3 or len(cube) != len(times):
@@ -141,15 +160,21 @@ def measure_eclipse_sector(item: dict[str, Any], frozen: dict[str, Any],
     indices = np.flatnonzero(keep)[selected]
     times, cube = times[indices], cube[indices]
     if len(times) < MIN_VALID_CADENCES:
-        raise RuntimeError("inadequate cadence coverage")
-    corrected, background = _background_subtract_cube(cube)
-    corrected, valid = _filled_cube(corrected)
+        raise EclipseLocalizationDataUnavailable("inadequate cadence coverage")
+    try:
+        corrected, background = _background_subtract_cube(cube)
+        corrected, valid = _filled_cube(corrected)
+    except RuntimeError as error:
+        raise EclipseLocalizationDataUnavailable(str(error)) from error
     inside, control, cycles = _event_bins(times, period, epoch, duration)
     event_count = len(set(int(value) for value in cycles[inside]))
     if np.count_nonzero(inside) < MIN_BIN_CADENCES or np.count_nonzero(control) < MIN_BIN_CADENCES or event_count < MIN_EVENTS:
-        raise RuntimeError("inadequate frozen eclipse/control-window coverage")
-    image = _centroid_from_frames(corrected, valid, np.flatnonzero(control), np.flatnonzero(inside))
-    uncertainty, jackknife = _event_jackknife(corrected, valid, inside, control, cycles)
+        raise EclipseLocalizationDataUnavailable("inadequate frozen eclipse/control-window coverage")
+    try:
+        image = _centroid_from_frames(corrected, valid, np.flatnonzero(control), np.flatnonzero(inside))
+        uncertainty, jackknife = _event_jackknife(corrected, valid, inside, control, cycles)
+    except RuntimeError as error:
+        raise EclipseLocalizationDataUnavailable(str(error)) from error
     catalog = _catalog_pixels(item)
     distances = [{"id": source["id"], "isTarget": source["isTarget"],
                   "distancePixels": math.hypot(image["centroidX"] - source["x"],
@@ -161,7 +186,10 @@ def measure_eclipse_sector(item: dict[str, Any], frozen: dict[str, Any],
     usable = image["peakSNR"] >= MIN_IMAGE_PEAK_SNR and uncertainty <= MAX_JACKKNIFE_UNCERTAINTY_PIXELS and not overlap
     classification = "AMBIGUOUS"
     matched = None
-    if usable and ordered[0]["distancePixels"] + 2 * uncertainty <= SOURCE_MATCH_MAX_PIXELS:
+    margin = max(SOURCE_MARGIN_FLOOR_PIXELS, 2 * uncertainty)
+    unique = (len(ordered) == 1 or
+              ordered[1]["distancePixels"] - ordered[0]["distancePixels"] >= margin)
+    if usable and ordered[0]["distancePixels"] <= SOURCE_MATCH_MAX_PIXELS and unique:
         matched = ordered[0]["id"]
         classification = "TARGET_CONSISTENT" if ordered[0]["isTarget"] else "CATALOG_CANDIDATE_CONSISTENT"
     elif usable and ordered[0]["distancePixels"] - 2 * uncertainty >= OFF_TARGET_MIN_PIXELS:
@@ -175,48 +203,51 @@ def measure_eclipse_sector(item: dict[str, Any], frozen: dict[str, Any],
             "differenceImagePeakSNR": image["peakSNR"], "differenceImage": image,
             "measuredPixelCentroid": {"x": image["centroidX"], "y": image["centroidY"]},
             "centroidUncertaintyPixels": uncertainty, "eventJackknifeCentroids": jackknife,
-            "centroidSky": item.get("centroidSky"), "catalogDistances": distances,
+            "centroidSky": item.get("centroidSky"),
+            "skyOffsetEastArcsec": item.get("skyOffsetEastArcsec"),
+            "skyOffsetNorthArcsec": item.get("skyOffsetNorthArcsec"),
+            "pixelScaleArcsec": item.get("pixelScaleArcsec"),
+            "catalogDistances": distances, "requiredCatalogMarginPixels": margin,
             "matchedCatalogHypothesis": matched, "classification": classification,
             "usable": usable and classification != "AMBIGUOUS", "qualityRejectionReasons": reasons,
             "backgroundCorrection": background, "acquisitionProvenance": item.get("acquisitionProvenance"),
+            "catalogQueryProvenance": item.get("catalogQueryProvenance"),
             "inputProvenance": item.get("inputProvenance"), "frozenMask": {"periodDays": period,
-                "referenceEpoch": epoch, "durationDays": duration, "oppositeConjunctionExcluded": True,
+                "referenceEpoch": float(ephemeris["referenceEpoch"]), "sectorEventEpoch": epoch,
+                "cycleAssignment": assignments[0], "durationDays": duration, "oppositeConjunctionExcluded": True,
                 "phaseOrDurationSearched": False}}
 
 
-def _production_input(tic_id: int, identity: dict[str, Any], frozen: dict[str, Any]) -> dict[str, Any]:
+def _production_input(tic_id: int, identity: dict[str, Any], frozen: dict[str, Any],
+                      frozen_catalog: dict[str, Any]) -> dict[str, Any]:
     metadata = ((identity.get("tic") or {}).get("metadata") or {})
     ra, dec = float(metadata["raDeg"]), float(metadata["decDeg"])
     tpf, provenance = _download_tpf(tic_id=tic_id, sector=int(frozen["sector"]), ra_deg=ra, dec_deg=dec)
     flux = getattr(tpf.flux, "value", tpf.flux)
     cube = np.ma.filled(flux, np.nan) if np.ma.isMaskedArray(flux) else np.asarray(flux)
     target = _skycoord(ra, dec); x, y = tpf.wcs.world_to_pixel(target)
-    hypotheses = [{"id": "TARGET", "isTarget": True, "pixel": {"x": x, "y": y},
-                   "sky": {"raDeg": ra, "decDeg": dec}}]
-    # Identity collectors may freeze neighboring sources under either name.
-    candidates = (identity.get("catalogHypotheses") or identity.get("nearbySources") or
-                  (identity.get("gaiaDR3") or {}).get("sources") or [])
-    nearest_gaia = ((identity.get("gaiaDR3") or {}).get("nearest") or {}).get("sourceID")
-    for candidate in candidates:
-        # The nearest Gaia counterpart represents the target already inserted
-        # above rather than a distinct blending hypothesis.
-        if nearest_gaia is not None and candidate.get("sourceID") == nearest_gaia:
-            continue
+    hypotheses = []
+    for candidate in frozen_catalog.get("catalogHypotheses") or []:
         sky = candidate.get("sky") or candidate
         cra, cdec = _finite(sky.get("raDeg")), _finite(sky.get("decDeg"))
         if cra is not None and cdec is not None:
             cx, cy = tpf.wcs.world_to_pixel(_skycoord(cra, cdec))
-            hypotheses.append({"id": str(candidate.get("id") or candidate.get("sourceID") or "CATALOG_SOURCE"),
-                               "isTarget": False, "pixel": {"x": cx, "y": cy}, "sky": sky})
+            source_id = candidate.get("sourceID")
+            if not source_id:
+                raise ValueError("frozen catalog hypothesis lacks a stable sourceID")
+            hypotheses.append({"id": str(source_id), "isTarget": candidate.get("isTarget") is True,
+                               "pixel": {"x": cx, "y": cy}, "sky": sky})
     quality = np.asarray(getattr(tpf, "quality", np.zeros(len(cube))), dtype=np.int64) == 0
     return {"sector": int(frozen["sector"]), "times": np.asarray(tpf.time.value), "fluxCube": cube,
             "qualityMask": quality, "targetPixel": {"x": x, "y": y},
             "catalogHypotheses": hypotheses, "pixelScaleArcsec": _pixel_scale_arcsec(tpf.wcs),
-            "acquisitionProvenance": provenance}
+            "acquisitionProvenance": provenance, "_wcs": tpf.wcs, "_targetCoordinate": target,
+            "catalogQueryProvenance": frozen_catalog.get("queryProvenance")}
 
 
 def localize_eclipse_events(*, binary_confirmation: dict[str, Any], identity: dict[str, Any],
-                            tic_id: int, sector_inputs: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+                            tic_id: int, sector_inputs: list[dict[str, Any]] | None = None,
+                            frozen_catalog: dict[str, Any] | None = None) -> dict[str, Any]:
     if not authoritative_binary_gate(binary_confirmation):
         raise ValueError("authoritative binary-confirmation-v2 localization gate is not satisfied")
     ephemeris = binary_confirmation["linearEphemeris"]
@@ -226,20 +257,52 @@ def localize_eclipse_events(*, binary_confirmation: dict[str, Any], identity: di
         if frozen.get("usable") is not True: continue
         sector = int(frozen["sector"])
         try:
-            item = _production_input(tic_id, identity, frozen) if supplied is None else supplied[sector]
-            results.append(measure_eclipse_sector(item, frozen, ephemeris))
+            if supplied is None and frozen_catalog is None:
+                raise ValueError("production localization requires a catalog frozen before pixel acquisition")
+            item = (_production_input(tic_id, identity, frozen, frozen_catalog or {})
+                    if supplied is None else supplied[sector])
+            result = measure_eclipse_sector(item, frozen, ephemeris)
+            wcs, target = item.get("_wcs"), item.get("_targetCoordinate")
+            if wcs is not None and target is not None:
+                centroid = result["measuredPixelCentroid"]
+                signal = wcs.pixel_to_world(centroid["x"], centroid["y"])
+                east, north, _ = _world_offsets_arcsec(target, signal)
+                result.update({"centroidSky": {"raDeg": _finite(getattr(getattr(signal, "ra", None), "deg", None)),
+                                                "decDeg": _finite(getattr(getattr(signal, "dec", None), "deg", None))},
+                               "skyOffsetEastArcsec": east, "skyOffsetNorthArcsec": north})
+            results.append(result)
         except TessArchiveTransientError:
             raise
-        except Exception as error:
+        except EclipseLocalizationDataUnavailable as error:
             rejections.append({"sector": sector, "role": frozen.get("role"),
                                "reason": f"{type(error).__name__}: {error}"})
     independent = [item for item in results if item["role"] == "INDEPENDENT" and item["usable"]]
     groups: dict[str, list[dict[str, Any]]] = {}
+    off_catalog = []
     for item in independent:
-        key = item["matchedCatalogHypothesis"] or item["classification"]
-        groups.setdefault(key, []).append(item)
+        if item["matchedCatalogHypothesis"]:
+            groups.setdefault(item["matchedCatalogHypothesis"], []).append(item)
+        elif item["classification"] == "OFF_CATALOG":
+            off_catalog.append(item)
+    if len(off_catalog) >= MIN_INDEPENDENT_SECTORS and all(
+            isinstance(item.get("centroidSky"), dict) and
+            _finite((item.get("centroidSky") or {}).get("raDeg")) is not None and
+            _finite((item.get("centroidSky") or {}).get("decDeg")) is not None and
+            _finite(item.get("skyOffsetEastArcsec")) is not None and
+            _finite(item.get("skyOffsetNorthArcsec")) is not None and
+            _finite(item.get("pixelScaleArcsec")) is not None for item in off_catalog):
+        mutually_consistent = all(
+            math.hypot(float(first["skyOffsetEastArcsec"]) - float(second["skyOffsetEastArcsec"]),
+                       float(first["skyOffsetNorthArcsec"]) - float(second["skyOffsetNorthArcsec"]))
+            <= MAX_OFF_CATALOG_SCATTER_ARCSEC + 2 * (
+                float(first["centroidUncertaintyPixels"]) * float(first["pixelScaleArcsec"]) +
+                float(second["centroidUncertaintyPixels"]) * float(second["pixelScaleArcsec"]))
+            for index, first in enumerate(off_catalog) for second in off_catalog[index + 1:])
+        if mutually_consistent:
+            groups["OFF_CATALOG_SKY_CLUSTER"] = off_catalog
     winner = max(groups, key=lambda key: len(groups[key])) if groups else None
-    strong_conflict = any(key != winner and values for key, values in groups.items()) if winner else False
+    strong_conflict = (any(key != winner and values for key, values in groups.items())
+                       or (winner != "OFF_CATALOG_SKY_CLUSTER" and bool(off_catalog))) if winner else False
     support = len(groups.get(winner, [])) if winner else 0
     if support >= MIN_INDEPENDENT_SECTORS and not strong_conflict:
         sample = groups[winner][0]
@@ -256,6 +319,7 @@ def localize_eclipse_events(*, binary_confirmation: dict[str, Any], identity: di
             "sourceAttributionResolved": resolved, "attributedCatalogHypothesis": winner if resolved else None,
             "usableIndependentSectorCount": len(independent), "requiredIndependentSectorCount": MIN_INDEPENDENT_SECTORS,
             "primarySectorCanSatisfyReplication": False, "sectorResults": results, "sectorRejections": rejections,
+            "frozenCatalog": frozen_catalog, "offCatalogSkyConsistencyThresholdArcsec": MAX_OFF_CATALOG_SCATTER_ARCSEC,
             "frozenEphemeris": {"refinedPeriodDays": ephemeris["refinedPeriodDays"],
                                 "referenceEpoch": ephemeris["referenceEpoch"],
                                 "cycleAssignments": ephemeris.get("cycleAssignments")},

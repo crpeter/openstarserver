@@ -2841,8 +2841,34 @@ def build_engine(
         if not authoritative_binary_gate(binary):
             raise RuntimeError("Exact binary-confirmation-v2 localization boundary is not satisfied.")
         artifact_root = store.directory_for(investigation.id) / "artifacts" / "eclipse-event-source-localization"
+        metadata = ((identity.get("tic") or {}).get("metadata") or {})
+        try:
+            catalog = freeze_catalog_hypotheses(tic_id=int(prepared["ticID"]),
+                                                ra_deg=float(metadata["raDeg"]),
+                                                dec_deg=float(metadata["decDeg"]))
+        except CatalogInfrastructureError as error:
+            raise RetryableExecutionError(
+                str(error), result={"operation": "eclipse-localization-catalog-freeze", **error.diagnostics}
+            ) from error
+        target = next(item for item in catalog["catalogHypotheses"] if item.get("isTarget") is True)
+        catalog["catalogHypotheses"] = [
+            item for item in catalog["catalogHypotheses"]
+            if item.get("isTarget") is True or not (
+                item.get("ticID") == target.get("ticID") or
+                (target.get("gaiaDR3SourceID") is not None and
+                 item.get("gaiaDR3SourceID") == target.get("gaiaDR3SourceID"))
+            )
+        ]
+        source_ids = [item.get("sourceID") for item in catalog["catalogHypotheses"]]
+        if any(not value for value in source_ids) or len(source_ids) != len(set(source_ids)):
+            raise RetryableExecutionError(
+                "complete frozen localization catalog lacks unique stable source IDs",
+                result={"operation": "eclipse-localization-catalog-freeze"},
+            )
+        catalog_path = artifact_root / "frozen-catalog-v1.json"
+        _write_json(catalog_path, catalog)
         result = localize_eclipse_events(binary_confirmation=binary, identity=identity,
-                                         tic_id=int(prepared["ticID"]))
+                                         tic_id=int(prepared["ticID"]), frozen_catalog=catalog)
         artifact_path = artifact_root / "eclipse-event-source-localization-v1.json"
         _write_json(artifact_path, result)
         return StageOutcome(
@@ -2853,7 +2879,8 @@ def build_engine(
                                     triggered_by_stage_id=request.id),
             input_hashes={"binaryConfirmation": sha256_json(binary), "catalogIdentity": sha256_json(identity),
                           "independentPreparation": sha256_json(independent_prepare)},
-            artifacts=(_artifact(artifact_path, "application/json"),),
+            artifacts=(_artifact(catalog_path, "application/json"),
+                       _artifact(artifact_path, "application/json")),
         )
 
     def source_localization_stage(investigation, request):
