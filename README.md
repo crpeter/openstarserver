@@ -219,3 +219,41 @@ reported without being repeatedly dispatched. RECOVERY_REQUIRED remains a
 fail-closed condition needing a human decision or a narrow workflow-specific
 recovery adapter with an explicit replay-safety contract. The heartbeat is
 observability only and is never used to reconstruct scientific state.
+
+## Autonomous period-family follow-up
+
+OpenStar admits period-family follow-up from verified persisted semantics, never a
+TIC identifier or stage count. An unresolved/source-ambiguous family may enter
+phase difference-image localization; target-supported unresolved families may
+enter untouched-sector time-domain evolution; replicated but clock-unresolved
+families may enter external long-baseline photometry. Historical COMPLETE or
+QUIESCENT investigations are not reopened by deployment. Their existing manual
+admission commands remain the explicit compatibility path.
+
+Sector selection starts with persisted official sector/product/cadence/epoch
+identity, rejects already consumed sectors, and freezes a deterministic
+one-per-epoch selection before flux access. Small phase imaging and time-domain
+model comparisons run coordinator-local. Only heavy frequency searches are sent
+to generic workers as `openstar.lomb-scargle.v1`; workers contain no TESS or
+survey logic.
+
+External surveys are tried in preregistered priority order. The first provider
+passing coverage, season, band, quality, and persisted catalog-neighbor blending
+gates is frozen with its raw response and SHA-256 provenance. ASAS-SN Sky Patrol
+is the first adapter, but production fails closed as data unavailable unless its
+public transport is configured; tests are network-free. The external observable
+is blocked seasonal phase prediction inside the already frozen period-family
+window, not another Lomb–Scargle detection.
+
+**Detection is not source attribution, stable-clock resolution, a physical
+cycle, or a physical mechanism.** Results retain `HUMAN_REVIEW_REQUIRED` unless
+separate evidence justifies more.
+
+Read-only compatibility validation (use a copied fixture/state tree, **never the
+live science state**) is:
+
+```bash
+python -m pytest -q test_historical_stage_ledger.py \
+  test_tess_period_family_difference_image.py \
+  test_tess_period_family_time_domain_evolution.py
+```

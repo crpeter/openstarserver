@@ -136,6 +136,8 @@ from .tess_period_family_difference_image import (
     run_period_family_difference_imaging,
     interpret_period_family_difference_imaging,
 )
+from .external_long_baseline import ASASSNSkyPatrolProvider, run_external_experiment
+from .period_family_followup import verify_semantic_boundary
 from .tess_period_family_time_domain_evolution import (
     PREPARE_HANDLER as PERIOD_FAMILY_TIME_DOMAIN_PREPARE_HANDLER,
     RUN_HANDLER as PERIOD_FAMILY_TIME_DOMAIN_RUN_HANDLER,
@@ -5144,6 +5146,35 @@ def build_engine(
             artifacts=(_artifact(path, "application/json"),),
         )
 
+    def external_long_baseline_stage(investigation, request):
+        boundary = verify_semantic_boundary(store, investigation)
+        evidence = boundary["result"]
+        window = (evidence.get("familyAcceptanceWindowDays")
+                  or evidence.get("periodFamilyWindowDays"))
+        if not (isinstance(window, list) and len(window) == 2):
+            result = {"classification": "EXTERNAL_DATA_INSUFFICIENT",
+                "externalRecurrenceReplicated": False, "stableClockSupported": False,
+                "waveformEvolutionSupported": False,
+                "sourceAttributionReliableAtExternalResolution": False,
+                "periodFamilyResolved": False, "physicalCycleResolved": False,
+                "physicalMechanismResolved": False,
+                "claimDecision": {"claim": "HUMAN_REVIEW_REQUIRED"},
+                "rationale": "No authoritative frozen period-family window.",
+                "recommendedNextTest": "MANUAL_EXTERNAL_DATA_REVIEW"}
+        else:
+            identity = _latest_result_for_handler(investigation, "openstar.tess.catalog-identity") or {}
+            metadata = ((identity.get("tic") or {}).get("metadata") or {})
+            result = run_external_experiment(
+                target={"raDeg": metadata.get("raDeg"), "decDeg": metadata.get("decDeg")},
+                family_window=window, neighbors=list(evidence.get("catalogNeighbors") or []),
+                providers=[ASASSNSkyPatrolProvider()],
+                artifact_root=store.directory_for(investigation.id) / "artifacts" / "external-long-baseline")
+        path = store.directory_for(investigation.id) / "artifacts" / "external-long-baseline" / "interpretation.json"
+        _write_json(path, result)
+        return StageOutcome(result=result, stop=True, final_status="QUIESCENT_AWAITING_DATA",
+            input_hashes={"semanticBoundary": sha256_json(boundary)},
+            artifacts=(_artifact(path, "application/json"),))
+
     def residual_phase_difference_image_interpret_stage(investigation, request):
         preparation = _latest_result_for_handler(
             investigation, "openstar.tess.residual-phase-difference-imaging.prepare")
@@ -10118,6 +10149,10 @@ def build_engine(
     engine.register_handler(
         "openstar.tess.residual-phase-difference-imaging.interpret",
         residual_phase_difference_image_interpret_stage,
+    )
+    engine.register_handler(
+        "openstar.tess.external-long-baseline.analyze",
+        external_long_baseline_stage,
     )
     engine.register_handler(
         PERIOD_FAMILY_DIFFERENCE_PREPARE_HANDLER,
