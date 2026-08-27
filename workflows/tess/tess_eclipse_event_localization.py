@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import math
 import statistics
+import hashlib
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +29,7 @@ from .tess_sector_archive import TessArchiveTransientError
 
 RESULT_VERSION = "openstar.tess-eclipse-event-source-localization.v1"
 HANDLER_ID = "openstar.tess.eclipse-event-source-localization.analyze"
+PREPARE_HANDLER_ID = "openstar.tess.eclipse-event-source-localization.prepare"
 MIN_INDEPENDENT_SECTORS = 3
 MIN_BIN_CADENCES = 6
 MIN_EVENTS = 3
@@ -38,6 +40,21 @@ MAX_OFF_CATALOG_SCATTER_ARCSEC = 15.0
 
 class EclipseLocalizationDataUnavailable(RuntimeError):
     """Recognized scientific/data-coverage failure, safe as a sector rejection."""
+
+
+_SCIENTIFIC_RUNTIME_PREFIXES = (
+    "No pixel has at least 90 percent finite cadences.",
+    "No valid pixels remain for difference-image localization.",
+    "Difference image requires at least two cadences per phase bin.",
+    "Difference image has no positive residual source peak.",
+    "Difference-image source cluster has zero positive weight.",
+)
+
+
+def _translate_scientific_runtime(error: RuntimeError) -> EclipseLocalizationDataUnavailable:
+    if type(error) is RuntimeError and str(error).startswith(_SCIENTIFIC_RUNTIME_PREFIXES):
+        return EclipseLocalizationDataUnavailable(str(error))
+    raise error
 
 
 def authoritative_binary_gate(result: dict[str, Any]) -> bool:
@@ -64,6 +81,18 @@ def _finite(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return value if math.isfinite(value) else None
+
+
+def _pixel_input_hash(times: np.ndarray, cube: np.ndarray, quality: np.ndarray,
+                      provenance: Any) -> str:
+    digest = hashlib.sha256()
+    for array in (np.ascontiguousarray(times), np.ascontiguousarray(cube),
+                  np.ascontiguousarray(quality)):
+        digest.update(str(array.dtype).encode())
+        digest.update(str(array.shape).encode())
+        digest.update(array.tobytes())
+    digest.update(sha256_json(provenance).encode())
+    return digest.hexdigest()
 
 
 def _frozen_sector(binary: dict[str, Any], sector: int) -> dict[str, Any]:
@@ -165,7 +194,7 @@ def measure_eclipse_sector(item: dict[str, Any], frozen: dict[str, Any],
         corrected, background = _background_subtract_cube(cube)
         corrected, valid = _filled_cube(corrected)
     except RuntimeError as error:
-        raise EclipseLocalizationDataUnavailable(str(error)) from error
+        raise _translate_scientific_runtime(error) from error
     inside, control, cycles = _event_bins(times, period, epoch, duration)
     event_count = len(set(int(value) for value in cycles[inside]))
     if np.count_nonzero(inside) < MIN_BIN_CADENCES or np.count_nonzero(control) < MIN_BIN_CADENCES or event_count < MIN_EVENTS:
@@ -174,7 +203,7 @@ def measure_eclipse_sector(item: dict[str, Any], frozen: dict[str, Any],
         image = _centroid_from_frames(corrected, valid, np.flatnonzero(control), np.flatnonzero(inside))
         uncertainty, jackknife = _event_jackknife(corrected, valid, inside, control, cycles)
     except RuntimeError as error:
-        raise EclipseLocalizationDataUnavailable(str(error)) from error
+        raise _translate_scientific_runtime(error) from error
     catalog = _catalog_pixels(item)
     distances = [{"id": source["id"], "isTarget": source["isTarget"],
                   "distancePixels": math.hypot(image["centroidX"] - source["x"],
@@ -212,6 +241,7 @@ def measure_eclipse_sector(item: dict[str, Any], frozen: dict[str, Any],
             "usable": usable and classification != "AMBIGUOUS", "qualityRejectionReasons": reasons,
             "backgroundCorrection": background, "acquisitionProvenance": item.get("acquisitionProvenance"),
             "catalogQueryProvenance": item.get("catalogQueryProvenance"),
+            "pixelInputSHA256": item.get("pixelInputSHA256"),
             "inputProvenance": item.get("inputProvenance"), "frozenMask": {"periodDays": period,
                 "referenceEpoch": float(ephemeris["referenceEpoch"]), "sectorEventEpoch": epoch,
                 "cycleAssignment": assignments[0], "durationDays": duration, "oppositeConjunctionExcluded": True,
@@ -222,7 +252,9 @@ def _production_input(tic_id: int, identity: dict[str, Any], frozen: dict[str, A
                       frozen_catalog: dict[str, Any]) -> dict[str, Any]:
     metadata = ((identity.get("tic") or {}).get("metadata") or {})
     ra, dec = float(metadata["raDeg"]), float(metadata["decDeg"])
-    tpf, provenance = _download_tpf(tic_id=tic_id, sector=int(frozen["sector"]), ra_deg=ra, dec_deg=dec)
+    from .tess_target_residual_pixel_recurrence import acquire_selected_sector
+    tpf, provenance = acquire_selected_sector(
+        _download_tpf, tic_id=tic_id, sector=int(frozen["sector"]), ra_deg=ra, dec_deg=dec)
     flux = getattr(tpf.flux, "value", tpf.flux)
     cube = np.ma.filled(flux, np.nan) if np.ma.isMaskedArray(flux) else np.asarray(flux)
     target = _skycoord(ra, dec); x, y = tpf.wcs.world_to_pixel(target)
@@ -238,8 +270,15 @@ def _production_input(tic_id: int, identity: dict[str, Any], frozen: dict[str, A
             hypotheses.append({"id": str(source_id), "isTarget": candidate.get("isTarget") is True,
                                "pixel": {"x": cx, "y": cy}, "sky": sky})
     quality = np.asarray(getattr(tpf, "quality", np.zeros(len(cube))), dtype=np.int64) == 0
-    return {"sector": int(frozen["sector"]), "times": np.asarray(tpf.time.value), "fluxCube": cube,
-            "qualityMask": quality, "targetPixel": {"x": x, "y": y},
+    times = np.asarray(tpf.time.value)
+    try:
+        wcs_header = dict(tpf.wcs.to_header())
+    except AttributeError:
+        wcs_header = {"representation": repr(tpf.wcs)}
+    pixel_hash = _pixel_input_hash(times, cube, quality,
+                                   {"acquisition": provenance, "wcsHeader": wcs_header})
+    return {"sector": int(frozen["sector"]), "times": times, "fluxCube": cube,
+            "qualityMask": quality, "pixelInputSHA256": pixel_hash, "targetPixel": {"x": x, "y": y},
             "catalogHypotheses": hypotheses, "pixelScaleArcsec": _pixel_scale_arcsec(tpf.wcs),
             "acquisitionProvenance": provenance, "_wcs": tpf.wcs, "_targetCoordinate": target,
             "catalogQueryProvenance": frozen_catalog.get("queryProvenance")}
@@ -261,6 +300,14 @@ def localize_eclipse_events(*, binary_confirmation: dict[str, Any], identity: di
                 raise ValueError("production localization requires a catalog frozen before pixel acquisition")
             item = (_production_input(tic_id, identity, frozen, frozen_catalog or {})
                     if supplied is None else supplied[sector])
+            if not item.get("pixelInputSHA256"):
+                raw_quality = item.get("qualityMask")
+                quality_for_hash = (np.asarray(raw_quality, dtype=bool) if raw_quality is not None
+                                    else np.ones(len(item["times"]), dtype=bool))
+                item["pixelInputSHA256"] = _pixel_input_hash(
+                    np.asarray(item["times"]), np.asarray(item["fluxCube"]), quality_for_hash,
+                    {"acquisition": item.get("acquisitionProvenance"),
+                     "wcs": repr(item.get("_wcs")) if item.get("_wcs") is not None else None})
             result = measure_eclipse_sector(item, frozen, ephemeris)
             wcs, target = item.get("_wcs"), item.get("_targetCoordinate")
             if wcs is not None and target is not None:
@@ -276,6 +323,13 @@ def localize_eclipse_events(*, binary_confirmation: dict[str, Any], identity: di
         except EclipseLocalizationDataUnavailable as error:
             rejections.append({"sector": sector, "role": frozen.get("role"),
                                "reason": f"{type(error).__name__}: {error}"})
+        except Exception as error:
+            from .tess_target_residual_pixel_recurrence import NoPixelCoverageError
+            if isinstance(error, NoPixelCoverageError):
+                rejections.append({"sector": sector, "role": frozen.get("role"),
+                                   "reason": f"NoPixelCoverageError: {error}"})
+                continue
+            raise
     independent = [item for item in results if item["role"] == "INDEPENDENT" and item["usable"]]
     groups: dict[str, list[dict[str, Any]]] = {}
     off_catalog = []
@@ -294,9 +348,9 @@ def localize_eclipse_events(*, binary_confirmation: dict[str, Any], identity: di
         mutually_consistent = all(
             math.hypot(float(first["skyOffsetEastArcsec"]) - float(second["skyOffsetEastArcsec"]),
                        float(first["skyOffsetNorthArcsec"]) - float(second["skyOffsetNorthArcsec"]))
-            <= MAX_OFF_CATALOG_SCATTER_ARCSEC + 2 * (
-                float(first["centroidUncertaintyPixels"]) * float(first["pixelScaleArcsec"]) +
-                float(second["centroidUncertaintyPixels"]) * float(second["pixelScaleArcsec"]))
+            <= max(MAX_OFF_CATALOG_SCATTER_ARCSEC, 2 * math.hypot(
+                float(first["centroidUncertaintyPixels"]) * float(first["pixelScaleArcsec"]),
+                float(second["centroidUncertaintyPixels"]) * float(second["pixelScaleArcsec"])))
             for index, first in enumerate(off_catalog) for second in off_catalog[index + 1:])
         if mutually_consistent:
             groups["OFF_CATALOG_SKY_CLUSTER"] = off_catalog

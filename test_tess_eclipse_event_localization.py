@@ -102,9 +102,13 @@ class EclipseEventLocalizationTests(unittest.TestCase):
     def test_nearby_candidate_is_ambiguous_at_centroid_uncertainty(self):
         candidates = [{"id": "TARGET", "isTarget": True, "pixel": {"x": 3, "y": 3}},
                       {"id": "NEARBY", "isTarget": False, "pixel": {"x": 3.6, "y": 3}}]
-        result = self.localize([self.sector(i, candidates=candidates) for i in (1, 2, 3, 4)])
+        result = self.localize([self.sector(i, source=(3.25, 3.0), candidates=candidates)
+                                for i in (1, 2, 3, 4)])
         self.assertFalse(result["sourceAttributionResolved"])
         self.assertTrue(all(item["classification"] == "AMBIGUOUS" for item in result["sectorResults"]))
+        for item in result["sectorResults"]:
+            distances = sorted(value["distancePixels"] for value in item["catalogDistances"])
+            self.assertLess(distances[1] - distances[0], item["requiredCatalogMarginPixels"])
 
     def test_unrelated_off_catalog_detector_centroids_do_not_resolve(self):
         inputs = [self.sector(1, (5, 3), sky_offset=(20, 0)),
@@ -116,6 +120,15 @@ class EclipseEventLocalizationTests(unittest.TestCase):
     def test_missing_wcs_cannot_resolve_off_catalog(self):
         result = self.localize([self.sector(i, (5, 3)) for i in (1, 2, 3, 4)])
         self.assertFalse(result["sourceAttributionResolved"])
+
+    def test_three_sky_consistent_off_catalog_sectors_resolve(self):
+        inputs = [self.sector(1, (5, 3), sky_offset=(22, -4)),
+                  self.sector(2, (5, 3), sky_offset=(21, -3)),
+                  self.sector(3, (5, 3), sky_offset=(23, -5)),
+                  self.sector(4, (5, 3), sky_offset=(20, -4))]
+        result = self.localize(inputs)
+        self.assertEqual("CONSISTENTLY_OFF_TARGET_ECLIPSE_SOURCE", result["classification"])
+        self.assertTrue(result["sourceAttributionResolved"])
 
     def test_event_jackknife_instability_blocks_attribution(self):
         result = self.localize([self.sector(i, unstable_event=True) for i in (1, 2, 3, 4)])
