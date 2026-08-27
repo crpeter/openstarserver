@@ -69,6 +69,13 @@ from .tess_companion_evidence_synthesis import (
     HANDLER_ID as COMPANION_SYNTHESIS_HANDLER_ID,
     synthesize_companion_evidence,
 )
+from .tess_event_depth_accuracy import (
+    AUDIT_HANDLER_ID as EVENT_DEPTH_AUDIT_HANDLER_ID,
+    FREEZE_HANDLER_ID as EVENT_DEPTH_FREEZE_HANDLER_ID,
+    audit_depth_attenuation,
+    freeze_photometry,
+    unresolved_freeze,
+)
 from .tess_localization import localize_periodic_source
 from .tess_sector_archive import TessArchiveTransientError
 from .tess_multimode import (
@@ -1897,6 +1904,7 @@ def _render_report(conclusion: dict[str, Any]) -> str:
         for item in archival.get("sectorEvidence") or []:
             lines.append(f"- Sector {item.get('sector')}: author={item.get('author')}, cadence={item.get('cadenceSeconds')} s, baseline={item.get('baselineDays')} d, candidatePeriod={item.get('candidatePeriodDays')} d, candidateFrequency={item.get('candidateFrequency')}, CI={item.get('candidateFrequencyConfidenceInterval')}, classification={item.get('recurrenceClassification')}, supports={item.get('supportsHistoricalResidualFamily')}")
     source_review = conclusion.get("sourceAttributionReview")
+    depth_audit = conclusion.get("eventDepthAttenuationAudit")
     external_companion = conclusion.get("externalCompanionEvidence")
     if source_review is not None:
         lines.extend([
@@ -1904,6 +1912,18 @@ def _render_report(conclusion: dict[str, Any]) -> str:
             f"- Classification: {source_review.get('classification')}",
             f"- Recomputed independent support: {source_review.get('supportingIndependentSectorCount')}",
             f"- Supporting independent sectors: {source_review.get('supportingIndependentSectors')}",
+        ])
+    if depth_audit is not None:
+        lines.extend([
+            "", "## Software-blind event-depth attenuation audit", "",
+            f"- Status: {depth_audit.get('status')}",
+            "- Detection-only standardized box depth remains nonphysical.",
+            "- Diagnostic transformations: full-precision local baseline, downsampling, Float32 standardization, protected harmonic subtraction, and discrete duration selection.",
+            f"- Cross-sector attenuation summary: {depth_audit.get('crossSectorRobustSummary')}",
+            f"- Suitable for later precision modeling: {depth_audit.get('suitableForLaterPrecisionModeling')}",
+            f"- External catalog information used: {depth_audit.get('externalCatalogInformationUsed')}",
+            f"- Catalog answer key used: {depth_audit.get('catalogAnswerKeyUsed')}",
+            "- No companion radius or precision physical transit solution is claimed.",
         ])
     if external_companion is not None:
         synthesis_complete = conclusion.get("finalCompanionEvidenceSynthesis") is not None
@@ -2994,10 +3014,61 @@ def build_engine(
         _write_json(path, result)
         proceed = result["recommendedNextTest"] == "EXTERNAL_COMPANION_EVIDENCE_FREEZE"
         return StageOutcome(result=result,
-            next_stage=StageRequest(_next_stage_id(request.id, "external-evidence-freeze" if proceed else "finalize"),
-                EXTERNAL_EVIDENCE_FREEZE_HANDLER_ID if proceed else "openstar.tess.finalize",
+            next_stage=StageRequest(_next_stage_id(request.id, "event-depth-photometry-freeze" if proceed else "finalize"),
+                EVENT_DEPTH_FREEZE_HANDLER_ID if proceed else "openstar.tess.finalize",
                 {} if proceed else {"outputSuffix": "source-attribution-review-v1"}, request.id),
             input_hashes={"sourceLocalization": sha256_json(localization)},
+            artifacts=(_artifact(path, "application/json"),))
+
+    def event_depth_photometry_freeze_stage(investigation, request):
+        review = _required_latest_result_for_handler(investigation, SOURCE_ATTRIBUTION_REVIEW_HANDLER_ID)
+        binary = _required_latest_result_for_handler(investigation, "openstar.tess.binary-confirmation.analyze")
+        prepared = _result(investigation, "001-prepare-target")
+        independent = _required_latest_result_for_handler(investigation, "openstar.tess.independent.prepare")
+        timing = list((binary.get("linearEphemeris") or {}).get("timingSectors") or [])
+        datasets = [prepared.get("datasetPath")]
+        datasets.extend(item.get("datasetPath") for item in independent.get("preparedSectors") or [])
+        products, reasons = [], []
+        for raw in datasets:
+            if not raw: continue
+            dataset = _load_json(Path(raw)); source = dataset.get("source") or {}
+            precision = source.get("fullPrecisionPhotometry") or dataset.get("fullPrecisionPhotometry")
+            if not isinstance(precision, dict):
+                reasons.append(f"sector {source.get('sector')} has no frozen full-precision official photometry")
+                continue
+            products.append({**precision, "sector": source.get("sector"),
+                             "cadenceSeconds": precision.get("cadenceSeconds", source.get("cadenceSeconds")),
+                             "author": precision.get("author", source.get("author")),
+                             "productIdentity": precision.get("productIdentity", source.get("productIdentity")),
+                             "sourceProductProvenance": precision.get("sourceProductProvenance", source)})
+        try:
+            result = freeze_photometry(products, timing,
+                                       before_external_known_object_query=True) if not reasons else unresolved_freeze(reasons)
+        except (ValueError, TypeError) as error:
+            result = unresolved_freeze([str(error)])
+        path = (store.directory_for(investigation.id) / "artifacts" / "event-depth-accuracy" /
+                "full-precision-photometry-freeze-v1.json")
+        _write_json(path, result)
+        hashes = {"binaryConfirmation": sha256_json(binary), "sourceAttributionReview": sha256_json(review)}
+        for raw in datasets:
+            if raw: hashes[f"dataset:{Path(raw).name}"] = sha256_file(Path(raw))
+        return StageOutcome(result=result,
+            next_stage=StageRequest(_next_stage_id(request.id, "attenuation-audit"),
+                                    EVENT_DEPTH_AUDIT_HANDLER_ID, {}, request.id),
+            input_hashes=hashes, artifacts=(_artifact(path, "application/json"),))
+
+    def event_depth_attenuation_audit_stage(investigation, request):
+        freeze = _required_latest_result_for_handler(investigation, EVENT_DEPTH_FREEZE_HANDLER_ID)
+        binary = _required_latest_result_for_handler(investigation, "openstar.tess.binary-confirmation.analyze")
+        result = audit_depth_attenuation(freeze, binary)
+        path = (store.directory_for(investigation.id) / "artifacts" / "event-depth-accuracy" /
+                "event-depth-attenuation-audit-v1.json")
+        _write_json(path, result)
+        return StageOutcome(result=result,
+            next_stage=StageRequest(_next_stage_id(request.id, "external-evidence-freeze"),
+                                    EXTERNAL_EVIDENCE_FREEZE_HANDLER_ID, {}, request.id),
+            input_hashes={"photometryFreeze": sha256_json(freeze),
+                          "binaryConfirmation": sha256_json(binary)},
             artifacts=(_artifact(path, "application/json"),))
 
     def external_evidence_freeze_stage(investigation, request):
@@ -8861,6 +8932,9 @@ def build_engine(
         source_attribution_review = _latest_result_for_handler(
             investigation, SOURCE_ATTRIBUTION_REVIEW_HANDLER_ID,
         )
+        event_depth_attenuation_audit = _latest_result_for_handler(
+            investigation, EVENT_DEPTH_AUDIT_HANDLER_ID,
+        )
         external_companion_evidence = _latest_result_for_handler(
             investigation, EXTERNAL_EVIDENCE_INTERPRET_HANDLER_ID,
         )
@@ -10140,6 +10214,7 @@ def build_engine(
             "binaryConfirmation": binary_confirmation,
             "eclipseEventSourceLocalization": eclipse_event_localization,
             "sourceAttributionReview": source_attribution_review,
+            "eventDepthAttenuationAudit": event_depth_attenuation_audit,
             "externalCompanionEvidence": external_companion_evidence,
             "finalCompanionEvidenceSynthesis": final_companion_evidence_synthesis,
             "sourceLocalization": source_localization,
@@ -10605,6 +10680,8 @@ def build_engine(
                             eclipse_event_localization_prepare_stage)
     engine.register_handler(ECLIPSE_LOCALIZATION_HANDLER_ID, eclipse_event_localization_stage)
     engine.register_handler(SOURCE_ATTRIBUTION_REVIEW_HANDLER_ID, source_attribution_review_stage)
+    engine.register_handler(EVENT_DEPTH_FREEZE_HANDLER_ID, event_depth_photometry_freeze_stage)
+    engine.register_handler(EVENT_DEPTH_AUDIT_HANDLER_ID, event_depth_attenuation_audit_stage)
     engine.register_handler(EXTERNAL_EVIDENCE_FREEZE_HANDLER_ID, external_evidence_freeze_stage)
     engine.register_handler(EXTERNAL_EVIDENCE_INTERPRET_HANDLER_ID, external_evidence_interpret_stage)
     engine.register_handler(COMPANION_SYNTHESIS_HANDLER_ID, companion_evidence_synthesis_stage)
