@@ -34,6 +34,49 @@ _V2019_HANDLER_PREFIX = "openstar.tess.target-residual-multisector-source."
 _ADDITIONAL_SECTOR_PREFIX = "openstar.tess.additional-sector-source-localization."
 _ASTROPHYSICAL_INTERPRETATION_HANDLER = (
     "openstar.tess.target-residual-astrophysical-interpretation.analyze")
+_MAIN_FAMILY_RECURRENCE_HANDLER = "openstar.tess.main-family-time-domain-recurrence.analyze"
+
+
+def _continue_finalized_main_family_recurrence(store, investigation, control,
+        *, historical_path_resolver):
+    """Admit exactly one append-only continuation after the completed 031/032 boundary."""
+    terminal={"branchAssessments":[],"selectedExperiment":None,
+              "schedulerAction":"INVESTIGATION_COMPLETE"}
+    if (investigation.status != "COMPLETE" or control != terminal
+            or any(s.handler_id == _MAIN_FAMILY_RECURRENCE_HANDLER
+                   for s in investigation.stages)):
+        return None
+    science=next((s for s in investigation.stages if s.id ==
+        "031-target-residual-astrophysical-interpretation"),None)
+    final=next((s for s in investigation.stages if s.id=="032-finalize"),None)
+    result=science.result if science else {}; family=result.get("mainPhotometricFamily") or {}
+    if not (science and final and final is investigation.stages[-1]
+            and science.status=="COMPLETE" and science.handler_id==_ASTROPHYSICAL_INTERPRETATION_HANDLER
+            and result.get("classification")=="ROTATIONAL_ACTIVE_REGION_MODULATION_SUPPORTED"
+            and result.get("physicalMechanismResolved") is True
+            and result.get("targetResidualMechanismResolved") is True
+            and result.get("targetResidualPeriodDays") == 3.600708338567666
+            and result.get("smoothAmplitudeSupportingSectorIDs") == [68,95]
+            and family.get("available") is True
+            and family.get("representativeRawPeriodDays") == 7.546257528330875
+            and family.get("possibleDoubleCycleDays") == 15.09251505666175
+            and family.get("physicalCycleResolved") is False
+            and _verified_stage_json(science,
+                "target-residual-astrophysical-interpretation-v20.14.1.json",
+                resolver=historical_path_resolver)
+            and final.status=="COMPLETE" and final.handler_id=="openstar.tess.finalize"
+            and final.stop is True and final.triggered_by_stage_id==science.id
+            and final.parameters=={"outputSuffix":"v20.14.1-astrophysical-interpretation"}
+            and _verified_stage_json(final,
+                "conclusion-v20.14.1-astrophysical-interpretation.json",
+                resolver=historical_path_resolver)):
+        return None
+    request=StageRequest("033-main-family-time-domain-recurrence",
+        _MAIN_FAMILY_RECURRENCE_HANDLER,{},final.id)
+    return store.set_control_state(investigation,status="RUNNING",control_state={
+        "branchAssessments":[],"selectedExperiment":asdict(request),
+        "schedulerAction":"RUN_EXPERIMENT",
+        "recovery":"TESS_STAGE_032_MAIN_FAMILY_TIME_DOMAIN_RECURRENCE"})
 _FAMILY_LEDGER_COMPATIBILITY_ERROR = (
     "RuntimeError: main recurrent-family artifact verification failed")
 
@@ -1587,6 +1630,10 @@ def repair_obsolete_terminal_wait(
         store, investigation, historical_path_resolver=resolver)
     if family_recovery is not None:
         return family_recovery
+    recurrence = _continue_finalized_main_family_recurrence(
+        store, investigation, control, historical_path_resolver=resolver)
+    if recurrence is not None:
+        return recurrence
     astrophysical = _continue_finalized_v2014_astrophysical_interpretation(
         store, investigation, control, historical_path_resolver=resolver)
     if astrophysical is not None:

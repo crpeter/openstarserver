@@ -14,7 +14,12 @@ from typing import Any, Iterable
 from .tess_mode_identification import GENERIC_REFINEMENT_WORKLOAD_ID, MIN_BIC_IMPROVEMENT, _solve
 
 
-def _read(path: str | Path, position: int) -> dict[str, Any]:
+def read_frozen_light_curve(path: str | Path, position: int = 0) -> dict[str, Any]:
+    """Normalize OpenStar's authoritative frozen ``times``/``flux`` schema.
+
+    Relative times are translated only by an explicitly persisted source time
+    origin.  The original source mapping is retained for downstream provenance.
+    """
     resolved = Path(path).expanduser().resolve()
     with resolved.open(encoding="utf-8") as handle:
         raw = json.load(handle)
@@ -26,7 +31,11 @@ def _read(path: str | Path, position: int) -> dict[str, Any]:
         raise RuntimeError("Frozen dataset has too few finite samples for dynamic harmonic modeling.")
     sector = source.get("sector", raw.get("sector", position))
     return {"path": str(resolved), "sector": int(sector), "times": [p[0] for p in pairs],
-            "flux": [p[1] for p in pairs]}
+            "flux": [p[1] for p in pairs], "source": dict(source),
+            "appliedTimeOriginDays": float(offset or 0)}
+
+
+_read = read_frozen_light_curve  # private compatibility for earlier callers
 
 
 def _linear_fit(rows: list[list[float]], values: list[float], parameters: int | None = None) -> dict[str, Any]:
