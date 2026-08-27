@@ -52,7 +52,9 @@ def _recover_failed_v2014_family_ledger_compatibility(store, investigation,
             and failed.failure_classification == "NON_RETRYABLE"
             and failed.error == _FAMILY_LEDGER_COMPATIBILITY_ERROR
             and failed.triggered_by_stage_id == "029-finalize"
-            and failed.result is None and attempts == [failed]):
+            and failed.result is None and attempts == [failed]
+            and store.verified_terminal_stage_ledger_hash(
+                investigation.id, failed)):
         return None
     science = next((s for s in investigation.stages
         if s.id == "028-target-residual-mechanism"), None)
@@ -66,7 +68,11 @@ def _recover_failed_v2014_family_ledger_compatibility(store, investigation,
     final_family = (((final.result or {}).get("independentBroadVerification")
         or {}).get("harmonicFamily") if final else None)
     science_result = science.result if science else {}
-    if not (science and final and family_stage and final.triggered_by_stage_id == science.id
+    if not (science and final and family_stage
+            and final.id == "029-finalize"
+            and len(investigation.stages) >= 2
+            and investigation.stages[-2] is final
+            and final.triggered_by_stage_id == science.id
             and science.status == "COMPLETE"
             and science.handler_id == "openstar.tess.target-residual-mechanism.analyze"
             and science_result.get("classification") ==
@@ -74,7 +80,14 @@ def _recover_failed_v2014_family_ledger_compatibility(store, investigation,
             and science_result.get("physicalMechanismResolved") is False
             and science_result.get("recommendedNextTest") ==
                 "ASTROPHYSICAL_MECHANISM_INTERPRETATION"
+            and science_result.get("adjudicationVersion") ==
+                "route-independent-all-models-v1"
+            and science_result.get("crossSectorPhaseUsed") is False
             and science_result.get("failClosedReasons") == []
+            and science_result.get("replicatedMechanisms") ==
+                ["SMOOTH_TARGET_MODE_AMPLITUDE_MODULATION"]
+            and (science_result.get("replicatedMechanismSupportingSectorIDs")
+                or {}).get("SMOOTH_TARGET_MODE_AMPLITUDE_MODULATION") == [68, 95]
             and _verified_stage_json(science, "target-residual-mechanism-v20.14.json",
                 resolver=historical_path_resolver)
             and final.status == "COMPLETE" and final.handler_id == "openstar.tess.finalize"

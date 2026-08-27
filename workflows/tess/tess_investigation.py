@@ -4221,7 +4221,9 @@ def build_engine(
             and prior_attempts[0].failure_classification == "NON_RETRYABLE"
             and prior_attempts[0].error ==
                 "RuntimeError: main recurrent-family artifact verification failed"
-            and prior_attempts[0].result is None)
+            and prior_attempts[0].result is None
+            and store.verified_terminal_stage_ledger_hash(
+                investigation.id, prior_attempts[0]))
         if prior_attempts and not compatibility_retry:
             raise RuntimeError("an astrophysical-mechanism interpretation was already attempted")
         # This is intentionally a bounded resolver, not a general stage graph
