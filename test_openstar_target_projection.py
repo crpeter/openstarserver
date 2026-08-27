@@ -1,100 +1,177 @@
 import json
 import tempfile
+import threading
 import unittest
+import urllib.error
+import urllib.request
+from dataclasses import replace
 from pathlib import Path
 
+from openstar_dashboard import DashboardApplication, make_server
+from openstar_investigation import ArtifactReference, InvestigationStage, InvestigationStore
 from openstar_science_runs import ScienceRunCatalog
-from openstar_target_projection import TargetProjectionStore, project_investigation
+from openstar_target_projection import TargetProjectionStore
 
 
-def snapshot(investigation="inv-1", tic="123", status="COMPLETE", stages=None, **extra):
-    value = {"investigationID": investigation, "status": status,
-             "metadata": {"targetName": "Archive target", "ticID": tic,
-                          "gaiaID": "987", "sectors": [1, 28]},
-             "stages": stages or [
-                 {"id": "detect", "handlerID": "tess.detect.v1", "status": "COMPLETE",
-                  "result": {"detectedPeriodDays": 2.5, "classification": "periodic"}},
-                 {"id": "final", "handlerID": "generic.finalizer", "status": "COMPLETE",
-                  "result": {"summary": "done"}},
-             ]}
-    value.update(extra)
-    return value
+class QuietCoordinator:
+    def observation(self):
+        return {"health": {"ok": True}, "nodes": [], "projects": [],
+                "contributions": {"currentSession": {}, "allTime": {}}}
 
 
-class InvestigationProjectionTests(unittest.TestCase):
-    def test_projects_identity_period_sectors_and_latest_meaningful_result(self):
-        row = project_investigation(snapshot())
-        self.assertEqual("tic:123", row["identityKey"])
-        self.assertEqual("periodic", row["classification"])
-        self.assertEqual(2.5, row["detectedPeriod"])
-        self.assertEqual([1, 28], row["primarySectors"])
-        self.assertEqual({"completed": 2, "failed": 0, "total": 2}, row["stageCounts"])
-
-    def test_future_stage_and_missing_identity_degrade_gracefully(self):
-        row = project_investigation({"investigationID": "future", "status": "ACTIVE",
-            "stages": {"new-stage": {"handler": "future.handler", "status": "WAITING"}}})
-        self.assertEqual("investigation:future", row["identityKey"])
-        self.assertEqual("future.handler", row["stages"][0]["handler"])
-
-    def test_failure_recovery_source_and_companion_evidence(self):
-        stages = [{"id": "source", "status": "FAILED", "result": {
-            "sourceAttribution": {"source": "catalog-7"},
-            "companionNature": "stellar", "recommendedNextTest": "spectroscopy",
-            "resolvedPhysicalPeriod": 5.0, "independentSectors": [28]}}]
-        row = project_investigation(snapshot(status="RECOVERY_REQUIRED", stages=stages))
-        self.assertTrue(row["degraded"]); self.assertTrue(row["recoveryRequired"])
-        self.assertEqual({"source": "catalog-7"}, row["sourceAttribution"])
-        self.assertEqual("stellar", row["companionNature"])
-        self.assertEqual([28], row["independentSectors"])
-
-
-class TargetProjectionStoreTests(unittest.TestCase):
+class ProductionTargetProjectionTests(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(); self.root = Path(self.temp.name)
-        self.catalog = self.root / "catalog.sqlite3"
+        self.temporary = tempfile.TemporaryDirectory()
+        self.base = Path(self.temporary.name)
+        self.catalog = self.base / "science-runs.sqlite3"
 
-    def tearDown(self): self.temp.cleanup()
+    def tearDown(self):
+        self.temporary.cleanup()
 
-    def add(self, run_root, investigation, payload, kind="tess-autonomous"):
-        record = run_root / "investigations" / investigation / "investigation.json"
-        record.parent.mkdir(parents=True); record.write_text(json.dumps(payload))
-        ScienceRunCatalog(self.catalog).record(kind, run_root, status=payload.get("status", "FINISHED"),
-                                                logical_identity=investigation)
-        return record
+    def persist(self, root_name, investigation_id, metadata, results, *, status="COMPLETE", artifacts=()):
+        root = self.base / root_name
+        store = InvestigationStore(root / "investigations")
+        investigation = store.create(investigation_id, "openstar.tess.autonomous",
+                                     "20.31", metadata)
+        for index, result in enumerate(results):
+            stage_id = f"{index + 1:03d}-science"
+            running = InvestigationStage(stage_id, f"openstar.tess.handler.{index + 1}",
+                "RUNNING", None, {}, started_at=f"2026-01-0{index + 1}T00:00:00+00:00")
+            investigation = store.append_running_stage(investigation, running)
+            terminal = replace(running, status="COMPLETE",
+                completed_at=f"2026-01-0{index + 1}T01:00:00+00:00", result=result,
+                artifacts=artifacts if index == len(results) - 1 else ())
+            investigation = store.complete_current_stage(investigation, terminal)
+        investigation = replace(investigation, status=status)
+        store.save(investigation)
+        ScienceRunCatalog(self.catalog).record("tess-autonomous", root, status=status,
+                                               logical_identity=investigation_id)
+        return store, investigation
 
-    def test_groups_exact_tic_across_preserved_runs_and_filters_sorts_pages(self):
-        first = self.add(self.root / "one", "one", snapshot("one", "123"))
-        self.add(self.root / "two", "two", snapshot("two", "123", status="RUNNING"))
-        self.add(self.root / "three", "three", snapshot("three", "124"))
-        before = first.read_bytes(); store = TargetProjectionStore(self.catalog, ttl=60)
-        result = store.list({"q": ["123"], "sort": ["depth"], "pageSize": ["1"]})
-        self.assertEqual(1, result["total"]); self.assertEqual(2, result["targets"][0]["runCount"])
-        self.assertEqual(before, first.read_bytes())
-        detail = store.detail(result["targets"][0]["targetID"])
-        self.assertEqual(2, len(detail["runs"]))
-        self.assertIsNotNone(store.visuals(detail["targetID"])["stageTimeline"])
+    def test_canonical_resolved_record_latest_stage_and_stats(self):
+        old = {"classification": "OLD_CLASS", "recommendedNextTest": "OLD_TEST",
+               "sourceAttributionResolved": False, "companionNatureResolved": False,
+               "detectedPeriodDays": 2.4}
+        latest = {"classification": "ECLIPSING_BINARY", "recommendedNextTest": "SPECTROSCOPY",
+            "claim": "SOURCE_LOCALIZED_BINARY", "sourceAttribution": "TARGET",
+            "sourceAttributionResolved": True, "companionNature": "STELLAR",
+            "companionNatureResolved": True, "physicalMechanism": "ECLIPSE",
+            "physicalMechanismResolved": True, "physicalCycleResolved": True,
+            "resolvedPhysicalPeriodDays": 4.8, "independentSectors": [28],
+            "differenceImageSummary": {"sector": 28, "pixels": [[1, 2], [3, 4]]},
+            "measuredCentroid": {"row": 4.2, "column": 7.1}}
+        store, investigation = self.persist("resolved", "resolved-1", {
+            "ticID": 1001, "gaiaDR3SourceID": 9001, "targetName": "Resolved target",
+            "sector": 1, "raDeg": 12.5, "decDeg": -4.5}, [old, latest],
+            artifacts=(ArtifactReference(str(self.base / "private" / "report.pdf"), "a" * 64, "application/pdf"),))
+        before_snapshot = store.path_for(investigation.id).read_bytes()
+        before_ledgers = {path: path.read_bytes() for path in
+                          store.directory_for(investigation.id).glob("stages/*.json")}
+        projection = TargetProjectionStore(self.catalog, ttl=60)
+        listing = projection.list({})
+        self.assertEqual(1, listing["total"])
+        self.assertEqual(0, listing["stats"]["unresolvedTargets"])
+        self.assertEqual(1, listing["stats"]["sourceLocalizedTargets"])
+        self.assertEqual(1, listing["stats"]["companionNatureResolvedTargets"])
+        self.assertEqual(1, listing["stats"]["physicalMechanismResolvedTargets"])
+        row = projection.detail(listing["targets"][0]["targetID"])
+        self.assertEqual("openstar.tess.autonomous", row["workflow"])
+        self.assertEqual("20.31", row["workflowVersion"])
+        self.assertEqual("openstar.tess.handler.2", row["stages"][1]["handler"])
+        self.assertIsInstance(row["createdAt"], float)
+        self.assertIsInstance(row["stages"][1]["completedAt"], float)
+        self.assertEqual("ECLIPSING_BINARY", row["classification"])
+        self.assertEqual("SPECTROSCOPY", row["recommendedNextTest"])
+        self.assertEqual(4.8, row["resolvedPhysicalPeriod"])
+        self.assertEqual("report.pdf", row["artifacts"][0]["path"])
+        self.assertNotIn(str(self.base), json.dumps(row))
+        visuals = projection.visuals(row["targetID"])
+        self.assertEqual("available", visuals["differenceImage"]["status"])
+        self.assertEqual("available", visuals["centroid"]["status"])
+        self.assertEqual(before_snapshot, store.path_for(investigation.id).read_bytes())
+        self.assertEqual(before_ledgers, {path: path.read_bytes() for path in
+                         store.directory_for(investigation.id).glob("stages/*.json")})
 
-    def test_gaia_grouping_only_when_tic_missing_and_missing_identity_is_distinct(self):
-        a = snapshot("a", None); b = snapshot("b", None)
-        self.add(self.root / "a", "a", a); self.add(self.root / "b", "b", b)
-        c = snapshot("c", None); c["metadata"].pop("gaiaID")
-        self.add(self.root / "c", "c", c)
-        rows = TargetProjectionStore(self.catalog).list({})
-        self.assertEqual(2, rows["total"])
+    def test_explicit_unresolved_and_neighbor_identity_is_not_adopted(self):
+        self.persist("unresolved", "unresolved-1", {"targetName": "Anonymous target"}, [{
+            "classification": "UNRESOLVED", "sourceAttribution": "candidate nearby",
+            "sourceAttributionResolved": False, "companionNatureResolved": False,
+            "physicalMechanismResolved": False, "physicalCycleResolved": False,
+            "catalogCandidates": [{"ticID": 777, "gaiaDR3SourceID": 888,
+                                   "periodDays": 99.0}]}])
+        listing = TargetProjectionStore(self.catalog).list({})
+        row = listing["targets"][0]
+        self.assertEqual("investigation:unresolved-1", row["identityKey"])
+        self.assertIsNone(row["ticID"]); self.assertIsNone(row["detectedPeriod"])
+        self.assertEqual(1, listing["stats"]["unresolvedTargets"])
+        self.assertEqual(0, listing["stats"]["sourceLocalizedTargets"])
 
-    def test_corrupt_record_missing_artifact_and_bulk_sweep_are_isolated(self):
-        good = snapshot(); good["artifacts"] = [{"path": "/private/missing/report.pdf"}]
-        self.add(self.root / "good", "good", good)
-        corrupt = self.root / "bad" / "investigations" / "bad" / "investigation.json"
-        corrupt.parent.mkdir(parents=True); corrupt.write_text("{")
-        ScienceRunCatalog(self.catalog).record("tess-autonomous", self.root / "bad", logical_identity="bad")
-        self.add(self.root / "bulk", "bulk", snapshot("bulk", "999"), kind="tess-sector-sweep")
-        store = TargetProjectionStore(self.catalog); result = store.list({})
-        self.assertEqual(1, result["total"])
-        detail = store.detail(result["targets"][0]["targetID"])
-        encoded = json.dumps(detail)
-        self.assertNotIn(str(self.root), encoded); self.assertIn("report.pdf", encoded)
-        self.assertIsNone(store.detail("../etc/passwd")); self.assertIsNone(store.detail("target_deadbeef"))
+    def test_exact_tic_and_gaia_grouping_with_mixed_timestamps(self):
+        self.persist("tic-a", "tic-a", {"ticID": 42}, [{"classification": "A"}])
+        store, investigation = self.persist("tic-b", "tic-b", {"ticID": 42}, [{"classification": "B"}])
+        payload = json.loads(store.path_for(investigation.id).read_text())
+        payload["updated_at"] = 1893456000
+        store.path_for(investigation.id).write_text(json.dumps(payload))
+        self.persist("gaia-a", "gaia-a", {"gaiaDR3SourceID": 55}, [{"classification": "G"}])
+        listing = TargetProjectionStore(self.catalog).list({"sort": ["updated"]})
+        self.assertEqual(2, listing["total"])
+        tic = next(row for row in listing["targets"] if row["ticID"] == "42")
+        self.assertEqual(2, tic["runCount"])
+
+    def test_corrupt_isolation_browser_safe_paths_and_unavailable_visuals(self):
+        self.persist("healthy", "healthy", {"ticID": 9}, [{"classification": "PERIODIC"}])
+        root = self.base / "corrupt"
+        record = root / "investigations" / "bad" / "investigation.json"
+        record.parent.mkdir(parents=True); record.write_text("{")
+        ScienceRunCatalog(self.catalog).record("tess-autonomous", root, logical_identity="bad")
+        projection = TargetProjectionStore(self.catalog)
+        listing = projection.list({}); self.assertEqual(1, listing["total"])
+        detail = projection.detail(listing["targets"][0]["targetID"])
+        self.assertNotIn(str(self.base), json.dumps(detail))
+        visuals = projection.visuals(detail["targetID"])
+        self.assertEqual({"status": "unavailable", "reason": "not_recorded_for_run"},
+                         visuals["differenceImage"])
+
+
+class TargetProjectionHTTPTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.temporary = tempfile.TemporaryDirectory()
+        base = Path(cls.temporary.name); catalog = base / "catalog.sqlite3"
+        store = InvestigationStore(base / "run" / "investigations")
+        investigation = store.create("http-target", "workflow.real", "3", {"ticID": 321})
+        running = InvestigationStage("science", "handler.real", "RUNNING", None, {},
+                                     started_at="2026-01-01T00:00:00Z")
+        investigation = store.append_running_stage(investigation, running)
+        investigation = store.complete_current_stage(investigation, replace(running,
+            status="COMPLETE", completed_at="2026-01-01T01:00:00Z",
+            result={"classification": "REAL", "sourceAttributionResolved": True,
+                    "recommendedNextTest": "FOLLOW_UP", "sectorAgreement": {"sectors": [1, 2]}}))
+        ScienceRunCatalog(catalog).record("tess-autonomous", base / "run",
+                                         status="COMPLETE", logical_identity="http-target")
+        cls.server = make_server("127.0.0.1", 0, DashboardApplication(
+            QuietCoordinator(), science_run_catalog=catalog, contribution_ledger=None))
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True); cls.thread.start()
+        cls.base = f"http://127.0.0.1:{cls.server.server_port}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown(); cls.server.server_close(); cls.temporary.cleanup()
+
+    def get(self, path):
+        with urllib.request.urlopen(self.base + path) as response:
+            self.assertEqual("no-store", response.headers["Cache-Control"])
+            return response.status, json.loads(response.read())
+
+    def test_list_detail_and_visuals(self):
+        status, listing = self.get("/api/dashboard/targets?pageSize=1&sort=updated")
+        self.assertEqual(200, status); self.assertEqual(1, listing["total"])
+        target_id = listing["targets"][0]["targetID"]
+        self.assertEqual("handler.real", self.get(f"/api/dashboard/targets/{target_id}")[1]["stages"][0]["handler"])
+        self.assertEqual("available", self.get(f"/api/dashboard/targets/{target_id}/visuals")[1]["independentSectorAgreement"]["status"])
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            self.get("/api/dashboard/targets/%2e%2e%2fetc%2fpasswd")
+        self.assertEqual(404, caught.exception.code)
 
 
 if __name__ == "__main__": unittest.main()
