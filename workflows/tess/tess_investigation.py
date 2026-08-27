@@ -2798,9 +2798,11 @@ def build_engine(
         print("🌘 Replicating narrow events at the frozen physical clock")
         print(f"   classification: {(result.get('independentEvidence') or {}).get('classification')}")
         print(f"   coherent ephemeris: {(result.get('linearEphemeris') or {}).get('coherent')}")
+        print(f"   ephemeris timing sectors: {(result.get('linearEphemeris') or {}).get('timingSectors')}")
+        print(f"   primary timing epoch included: {(result.get('linearEphemeris') or {}).get('primarySectorIncluded')}")
         print(f"   recommended next test: {result.get('recommendedNextTest')}")
         artifact_path = (store.directory_for(investigation.id) / "artifacts" /
-                         "binary-confirmation" / "binary-confirmation-v1.json")
+                         "binary-confirmation" / "binary-confirmation-v2.json")
         _write_json(artifact_path, result)
         input_hashes = {
             "physicalInterpretation": sha256_json(physical),
@@ -2817,7 +2819,7 @@ def build_engine(
             next_stage=StageRequest(
                 id=_next_stage_id(request.id, "finalize"),
                 handler_id="openstar.tess.finalize",
-                parameters={"outputSuffix": "binary-confirmation-v1"},
+                parameters={"outputSuffix": "binary-confirmation-v2"},
                 triggered_by_stage_id=request.id),
             input_hashes=input_hashes,
             artifacts=(_artifact(artifact_path, "application/json"),),
@@ -8813,6 +8815,12 @@ def build_engine(
                 "separate opposite-conjunction test classified the evidence as "
                 f"{opposite.get('classification')}. This does not resolve companion nature."
             )
+            if ephemeris.get("timingSectors") is not None:
+                existing_rationale.append(
+                    f"Ephemeris timing sectors: {ephemeris.get('timingSectors')}; "
+                    "primary timing epoch included: "
+                    f"{str(ephemeris.get('primarySectorIncluded')).lower()}."
+                )
             existing_rationale.append(
                 "Authoritative recommended next test: "
                 f"{binary_confirmation.get('recommendedNextTest')}."
@@ -9976,6 +9984,8 @@ def build_engine(
             binary_opposite = binary_confirmation.get("oppositeConjunctionEvidence") or {}
             print(f"   eclipse-like replication: {binary_evidence.get('classification')}")
             print(f"   binary-confirmation ephemeris coherent: {binary_ephemeris.get('coherent')}")
+            print(f"   ephemeris timing sectors: {binary_ephemeris.get('timingSectors')}")
+            print(f"   primary timing epoch included: {binary_ephemeris.get('primarySectorIncluded')}")
             print(f"   opposite-conjunction evidence: {binary_opposite.get('classification')}")
         print(f"   authoritative recommended next test: {recommended_next_test}")
         if residual_mode_localization is not None:

@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 
-RESULT_VERSION = "1.0"
+RESULT_VERSION = "2.0"
 DURATION_FRACTIONS = (0.01, 0.015, 0.02, 0.03, 0.05, 0.08, 0.12)
 MIN_INDEPENDENT_SUPPORTERS = 3
 MIN_SAMPLES = 80
@@ -249,12 +249,43 @@ def analyze_binary_confirmation(*, primary_dataset_path: str | Path,
     results = [_sector(_load(primary_dataset_path), period, "PRIMARY")]
     results += [_sector(_load(item["datasetPath"]), period, "INDEPENDENT") for item in prepared]
     supporters = [item for item in results if item["role"] == "INDEPENDENT" and item.get("usable")]
-    ephemeris = _ephemeris(supporters, period) if len(supporters) >= 3 else {
+    independent_ephemeris = _ephemeris(supporters, period) if len(supporters) >= 3 else {
         "coherent": False, "reason": "FEWER_THAN_THREE_INDEPENDENT_SUPPORTERS"}
-    supported = len(supporters) >= 3 and ephemeris.get("coherent") is True
+    supported = (len(supporters) >= MIN_INDEPENDENT_SUPPORTERS
+                 and independent_ephemeris.get("coherent") is True)
+    ephemeris = independent_ephemeris
+    if supported:
+        timing_events = [item for item in results if item.get("usable")]
+        timing_attempt = _ephemeris(timing_events, period)
+        primary_in_attempt = any(item["role"] == "PRIMARY" for item in timing_events)
+        if timing_attempt.get("coherent") is True:
+            ephemeris = timing_attempt
+            timing_basis = ("PRIMARY_PLUS_INDEPENDENT_AFTER_INDEPENDENT_REPLICATION"
+                            if primary_in_attempt else
+                            "INDEPENDENT_ONLY_PRIMARY_UNUSABLE")
+            primary_included = primary_in_attempt
+        else:
+            # A discrepant primary epoch cannot invalidate independently replicated
+            # geometry or corrupt its authoritative clock.
+            timing_basis = "INDEPENDENT_FALLBACK_AFTER_NONCOHERENT_TIMING_REFINEMENT"
+            primary_included = False
+            ephemeris = dict(independent_ephemeris)
+            ephemeris["expandedTimingAttempt"] = timing_attempt
+        ephemeris.update({
+            "timingSectorCount": (len(timing_events) if timing_attempt.get("coherent") else
+                                  len(supporters)),
+            "timingSectors": ([item.get("sector") for item in timing_events]
+                              if timing_attempt.get("coherent") else
+                              [item.get("sector") for item in supporters]),
+            "primarySectorIncluded": primary_included,
+            "independentSectorCount": len(supporters),
+            "timingEvidenceBasis": timing_basis,
+            "primaryTimingConsistent": (not primary_in_attempt or
+                                        timing_attempt.get("coherent") is True),
+        })
     secondary_results = []
     if supported:
-        primary_phase = (ephemeris["referenceEpoch"] / period) % 1.0
+        primary_phase = (independent_ephemeris["referenceEpoch"] / period) % 1.0
         median_duty = statistics.median(item["dutyCycle"] for item in supporters)
         durations = tuple(median_duty * factor for factor in (0.5, 0.75, 1.0, 1.25, 1.5))
         for item in results:
@@ -282,7 +313,9 @@ def analyze_binary_confirmation(*, primary_dataset_path: str | Path,
                 "ECLIPSE_LIKE_EVENT_UNRESOLVED"),
                 "supportingIndependentSectorCount": len(supporters),
                 "minimumSupportingIndependentSectors": MIN_INDEPENDENT_SUPPORTERS,
-                "supportingSectors": [item.get("sector") for item in supporters]},
+                "supportingSectors": [item.get("sector") for item in supporters],
+                "independentEphemerisCoherent": independent_ephemeris.get("coherent") is True,
+                "independentLinearEphemeris": independent_ephemeris},
             "linearEphemeris": ephemeris,
             "oppositeConjunctionEvidence": {"classification": (
                 "OPPOSITE_CONJUNCTION_EVENT_SUPPORTED" if secondary_coherent else
@@ -293,5 +326,7 @@ def analyze_binary_confirmation(*, primary_dataset_path: str | Path,
             "physicalMechanismResolved": False, "companionNatureResolved": False,
             "catalogAnswerKeyUsed": False,
             "claim": "Narrow-event replication tests orbital geometry only; companion nature remains unresolved.",
-            "recommendedNextTest": ("ECLIPSE_EVENT_SOURCE_LOCALIZATION" if supported else
+            "recommendedNextTest": (("ECLIPSE_TIMING_REFINEMENT_REVIEW"
+                                     if supported and ephemeris.get("primaryTimingConsistent") is False
+                                     else "ECLIPSE_EVENT_SOURCE_LOCALIZATION") if supported else
                                     "BINARY_ROTATION_EXTERNAL_EVIDENCE")}
