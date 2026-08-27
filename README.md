@@ -257,3 +257,19 @@ python -m pytest -q test_historical_stage_ledger.py \
   test_tess_period_family_difference_image.py \
   test_tess_period_family_time_domain_evolution.py
 ```
+
+### ASAS-SN configuration and immutable external stages
+
+The optional official `pyasassn` client is configured only through
+`OPENSTAR_ASASSN_USERNAME` and `OPENSTAR_ASASSN_TOKEN`. Credentials are passed
+directly to the client and are never logged, serialized, hashed, or stored in an
+investigation. If either variable or the optional client is absent, the run
+persists `PROVIDER_CONFIGURATION_UNAVAILABLE`; it does not reinterpret an
+operational condition as scientific insufficiency.
+
+External follow-up is an append-only prepare/run/interpret sequence. Preparation
+freezes the provider priority, family window, target identity, quality contract,
+and authoritative catalog-neighbor evidence. Run freezes the canonical raw
+response and cleaned analysis. Interpret binds both stage results and preserves
+physical-cycle and physical-mechanism resolution as false. Recovery reuses
+byte-identical artifacts and rejects a mismatched frozen hash.

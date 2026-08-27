@@ -1966,7 +1966,8 @@ def plan_tess_branches(
     # Only actively running investigations cross new semantic capability
     # boundaries.  COMPLETE/QUIESCENT historical investigations remain closed
     # until the existing explicit manual-admission path reopens them.
-    if investigation.status == "RUNNING":
+    if (investigation.status == "RUNNING" or (investigation.status == "QUIESCENT_AWAITING_DATA"
+            and investigation.stages and (investigation.stages[-1].result or {}).get("autonomousContinuationEligible") is True)):
         from .period_family_followup import latest_semantic_result
         semantic = latest_semantic_result(investigation)
         if semantic is not None:
@@ -1975,13 +1976,13 @@ def plan_tess_branches(
             routes = {
                 "PERIOD_FAMILY_DIFFERENCE_IMAGE_LOCALIZATION": (
                     "prepare-period-family-difference-imaging",
-                    "openstar.tess.period-family-difference-imaging.prepare"),
+                    "openstar.tess.generic-period-family-difference-imaging.prepare"),
                 "UNTOUCHED_SECTOR_TIME_DOMAIN_EVOLUTION": (
                     "prepare-period-family-time-domain-evolution",
-                    "openstar.tess.period-family-time-domain-evolution.prepare"),
+                    "openstar.tess.generic-period-family-time-domain-evolution.prepare"),
                 "ADDITIONAL_LONG_BASELINE_TIME_DOMAIN_DATA": (
                     "external-long-baseline-photometry",
-                    "openstar.tess.external-long-baseline.analyze"),
+                    "openstar.tess.external-long-baseline.prepare"),
             }
             route = routes.get(trigger)
             already_started = route and any(s.handler_id == route[1] for s in investigation.stages)

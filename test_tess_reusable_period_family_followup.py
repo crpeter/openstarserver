@@ -48,9 +48,9 @@ class ReusableFollowupTests(unittest.TestCase):
     def test_three_semantic_autonomy_routes_and_quiescence(self):
         target=InvestigationTarget("x","inv","openstar.workflow.tess-investigation.v1","20.2",{})
         routes={
-          "PERIOD_FAMILY_DIFFERENCE_IMAGE_LOCALIZATION":"period-family-difference-imaging.prepare",
-          "UNTOUCHED_SECTOR_TIME_DOMAIN_EVOLUTION":"period-family-time-domain-evolution.prepare",
-          "ADDITIONAL_LONG_BASELINE_TIME_DOMAIN_DATA":"external-long-baseline.analyze"}
+          "PERIOD_FAMILY_DIFFERENCE_IMAGE_LOCALIZATION":"generic-period-family-difference-imaging.prepare",
+          "UNTOUCHED_SECTOR_TIME_DOMAIN_EVOLUTION":"generic-period-family-time-domain-evolution.prepare",
+          "ADDITIONAL_LONG_BASELINE_TIME_DOMAIN_DATA":"external-long-baseline.prepare"}
         for n,(trigger,suffix) in enumerate(routes.items()):
             result={"recommendedNextTest":trigger,"periodFamilyResolved":False,
                     "claimDecision":{"claim":"HUMAN_REVIEW_REQUIRED"}}
@@ -67,7 +67,7 @@ class ReusableFollowupTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             provider=ASASSNSkyPatrolProvider(Transport(rows()))
             result=run_external_experiment(target={"raDeg":1,"decDeg":2}, family_window=[4.50,4.60],
-                neighbors=[],providers=[provider],artifact_root=Path(d))
+                neighbors=[{"separationArcsec":30,"fluxFraction":0.0,"providerRadiusArcsec":16}],providers=[provider],artifact_root=Path(d))
             self.assertEqual(result["classification"],"EXTERNAL_STABLE_CLOCK_SUPPORTED")
             self.assertFalse(result["lombScarglePerformed"])
             self.assertTrue(Path(result["rawResponsePath"]).exists())
@@ -83,7 +83,7 @@ class ReusableFollowupTests(unittest.TestCase):
         evolving=analyze_seasonal_coherence(rows(True),[4.5,4.6])
         insufficient=analyze_seasonal_coherence(rows()[:20],[4.5,4.6])
         self.assertEqual(stable["classification"],"EXTERNAL_STABLE_CLOCK_SUPPORTED")
-        self.assertIn(evolving["classification"],{"EXTERNAL_EVOLVING_RECURRENCE_SUPPORTED","EXTERNAL_RECURRENCE_NOT_REPLICATED"})
+        self.assertEqual(evolving["classification"],"EXTERNAL_EVOLVING_RECURRENCE_SUPPORTED")
         self.assertEqual(insufficient["classification"],"EXTERNAL_DATA_INSUFFICIENT")
         self.assertGreater(stable["periodUncertaintyDays"],0)
 
