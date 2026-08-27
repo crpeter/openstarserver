@@ -60,6 +60,12 @@ class MainFamilyTimeDomainRecurrenceTests(unittest.TestCase):
         self.assertEqual(ROTATION_MULTICYCLE,result["classification"])
         self.assertTrue(result["decisionGates"]["cycleMorphologySupportsSameRelation"])
         self.assertFalse(result["physicalCycleResolved"])
+        self.assertTrue(all(not sector["rotationRecurrenceReliable"]
+            for sector in result["acfSectorResults"]))
+        self.assertTrue(all(sector["rotationMultipleReference"]==
+            "AUTHORITATIVE_ROTATION_FALLBACK" for sector in result["acfSectorResults"]))
+        self.assertNotEqual("INDEPENDENT_LONGER_PERIOD_RECURRENCE_SUPPORTED",
+            result["classification"])
 
     def test_materially_offset_persisted_family_is_not_falsely_rotation_related(self):
         offset_family={"available":True,"representativeRawPeriodDays":8.5,
@@ -89,11 +95,14 @@ class MainFamilyTimeDomainRecurrenceTests(unittest.TestCase):
         multiple={"order":order,"consistent":relation=="related"}
         evidence=lambda coverage,detected: {"coverageSufficient":coverage,
             "candidateWithinEmpiricalPeakUncertainty":detected,
-            "sectorLocalRotationMultipleConsistency":multiple}
+            "sectorLocalRotationMultipleConsistency":multiple,
+            "selectedRotationMultipleConsistency":multiple,
+            "independentLongPeriodSupported":relation=="independent"}
         summaries={str(k):{"pairCount":3,"medianCorrelation":
             (0.9 if k==(morphology or order) else 0.1)} for k in (1,2,4)}
         return {"sectorID":sector,"rotationRecurrencePeak":{"lagDays":3.6,
             "localPeakWidthDays":.2,"uncertaintyEstimate":{"intervalDays":[3.55,3.65]}},
+            "rotationRecurrenceReliable":True,
             "acfPeaks":[{"lagDays":lag,"peakCorrelation":.8,"localPeakWidthDays":.2}],
             "rawFamilyCandidateEvidence":evidence(raw_coverage,raw_coverage),
             "possibleDoubleCandidateEvidence":evidence(double_coverage,False),
@@ -141,6 +150,26 @@ class MainFamilyTimeDomainRecurrenceTests(unittest.TestCase):
         mixed=self.combine([self.combined_fixture(1,order=2,morphology=2),
             self.combined_fixture(2,order=4,morphology=4)])
         self.assertEqual(UNRESOLVED,mixed["classification"])
+
+    def test_unreliable_local_rotation_without_authoritative_consistency_is_unresolved(self):
+        rows=[self.combined_fixture(1,"independent"),self.combined_fixture(2,"independent")]
+        for row in rows:
+            row["rotationRecurrenceReliable"]=False
+            evidence=row["rawFamilyCandidateEvidence"]
+            evidence["independentLongPeriodSupported"]=False
+            evidence["selectedRotationMultipleConsistency"]={"order":2,"consistent":False}
+        self.assertEqual(UNRESOLVED,self.combine(rows)["classification"])
+
+    def test_stable_shifted_local_rotation_supports_matching_two_cycle_recurrence(self):
+        rows=[self.combined_fixture(1),self.combined_fixture(2)]
+        for row in rows:
+            row["rotationRecurrencePeak"]["lagDays"]=3.72
+            evidence=row["rawFamilyCandidateEvidence"]
+            evidence["selectedRotationMultipleConsistency"]={"order":2,
+                "expectedLagDays":7.44,"consistent":True}
+        result=self.combine(rows)
+        self.assertEqual(ROTATION_MULTICYCLE,result["classification"])
+        self.assertEqual([2],result["relatedRotationMultiples"])
 
     def test_short_sector_fails_closed_for_double(self):
         s=self.sector(94); keep=np.asarray(s["time"])<18

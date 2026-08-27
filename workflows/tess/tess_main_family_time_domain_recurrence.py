@@ -24,6 +24,7 @@ METHOD = {
     "minimumPeakProminence": 0.08,
     "jackknifeBlocks": 6,
     "minimumJackknifeDetections": 4,
+    "rotationCandidateAssociationWindowDays": 0.5,
     "phaseBins": 16,
     "minimumPopulatedPhaseBinFraction": 0.75,
     "minimumCyclePairsPerSeparation": 3,
@@ -33,6 +34,7 @@ METHOD = {
         "minimumPeakProminence": "peak rise above its local ACF shoulders",
         "minimumPairSupport": "prevents sparse-lag correlations from masquerading as recurrence",
         "minimumCandidateLagOverlapDays": "requires a substantive observed time span after applying the candidate lag",
+        "rotationCandidateAssociationWindowDays": "broad peak-discovery admission around the solved rotation; reliability still requires empirical jackknife compatibility",
         "replicatedSectorCount": "independent-sector replication requirement",
     },
 }
@@ -115,7 +117,22 @@ def _jackknife_peak(time, flux, peak, method):
         "successfulResamples":int(len(detected))}
 
 
-def _candidate_evidence(name,target,lags,acf,support,peaks,time,flux,rotation,method):
+def _multiple_consistency(peak, reference_lag, reference_interval, method):
+    if peak is None or reference_lag is None: return None
+    candidates={order:abs(peak["lagDays"]-order*reference_lag) for order in (2,4)}
+    order=min(candidates,key=candidates.get)
+    reference_spread=((reference_interval[1]-reference_interval[0])/2
+        if reference_interval else 0)
+    peak_interval=(peak.get("uncertaintyEstimate") or {}).get("intervalDays")
+    peak_spread=((peak_interval[1]-peak_interval[0])/2 if peak_interval else 0)
+    tolerance=peak["localPeakWidthDays"]/2+peak_spread+order*reference_spread
+    return {"order":order,"expectedLagDays":order*reference_lag,
+        "absoluteDifferenceDays":candidates[order],"empiricalToleranceDays":tolerance,
+        "consistent":candidates[order]<=tolerance}
+
+
+def _candidate_evidence(name,target,lags,acf,support,peaks,time,flux,
+                        rotation_association,authoritative_rotation,method):
     grid=int(np.argmin(np.abs(lags-target)))
     overlap_days=max(0.0,float(time.max()-time.min()-lags[grid])) if len(time) else 0.0
     coverage=(support[grid]>=method["minimumPairSupport"] and
@@ -130,33 +147,47 @@ def _candidate_evidence(name,target,lags,acf,support,peaks,time,flux,rotation,me
     else: low=high=None
     associated=bool(nearest and uncertainty["successfulResamples"]>=method["minimumJackknifeDetections"]
         and low-empirical_half_width<=target<=high+empirical_half_width)
-    multiple=None
-    if nearest and rotation:
-        candidates={2:abs(nearest["lagDays"]-2*rotation["lagDays"]),
-                    4:abs(nearest["lagDays"]-4*rotation["lagDays"])}
-        order=min(candidates,key=candidates.get)
-        rotation_interval=(rotation.get("uncertaintyEstimate") or {}).get("intervalDays")
-        rotation_spread=((rotation_interval[1]-rotation_interval[0])/2 if rotation_interval else 0)
-        tolerance=empirical_half_width+order*rotation_spread
-        multiple={"order":order,"expectedLagDays":order*rotation["lagDays"],
-            "absoluteDifferenceDays":candidates[order],"empiricalToleranceDays":tolerance,
-            "consistent":candidates[order]<=tolerance}
+    if nearest: nearest={**nearest,"uncertaintyEstimate":uncertainty}
+    authoritative_multiple=_multiple_consistency(nearest,authoritative_rotation,None,method)
+    local_peak=rotation_association.get("candidatePeak")
+    local_interval=(local_peak.get("uncertaintyEstimate") or {}).get("intervalDays") if local_peak else None
+    local_multiple=(_multiple_consistency(nearest,local_peak["lagDays"],local_interval,method)
+        if rotation_association.get("reliable") else None)
+    selected=(local_multiple if rotation_association.get("reliable") else authoritative_multiple)
+    independent=bool(associated and rotation_association.get("reliable")
+        and authoritative_multiple and not authoritative_multiple["consistent"]
+        and local_multiple and not local_multiple["consistent"])
     return {"candidate":name,"persistedLagDays":target,"coverageSufficient":coverage,
         "coverage":{"laggedPairSupport":int(support[grid]),"laggedTemporalOverlapDays":overlap_days,
             "minimumPairSupport":method["minimumPairSupport"],
             "minimumCandidateLagOverlapDays":method["minimumCandidateLagOverlapDays"]},
-        "nearestQualifyingPeak":({**nearest,"uncertaintyEstimate":uncertainty} if nearest else None),
+        "nearestQualifyingPeak":nearest,
         "candidateWithinEmpiricalPeakUncertainty":associated,
-        "sectorLocalRotationMultipleConsistency":multiple}
+        "rotationMultipleReference":rotation_association["reference"],
+        "authoritativeRotationMultipleConsistency":authoritative_multiple,
+        "sectorLocalRotationMultipleConsistency":local_multiple,
+        "selectedRotationMultipleConsistency":selected,
+        "independentLongPeriodSupported":independent}
 
 
 def analyze_sector(time, flux, *, sector_id, rotation_period_days,
                    family_period_days=None, possible_double_days=None, method=METHOD):
     lags, acf, support, time, flux = gap_aware_acf(time, flux, method)
     peaks = _peaks(lags, acf, support, method)
-    rotation = _nearest(peaks, rotation_period_days, max(.5, 2*method["lagGridStepDays"]))
+    rotation = _nearest(peaks, rotation_period_days,
+        method["rotationCandidateAssociationWindowDays"])
     uncertainty = _jackknife_peak(time,flux,rotation,method)
     if rotation: rotation["uncertaintyEstimate"] = uncertainty
+    interval=uncertainty.get("intervalDays")
+    reliable=bool(rotation and uncertainty["successfulResamples"]>=method["minimumJackknifeDetections"]
+        and interval and interval[0]-rotation["localPeakWidthDays"]/2<=rotation_period_days
+        <=interval[1]+rotation["localPeakWidthDays"]/2)
+    rotation_association={"candidatePeak":rotation,"reliable":reliable,
+        "stabilityRequirement":{"minimumSuccessfulResamples":method["minimumJackknifeDetections"],
+            "authoritativePeriodMustLieWithinJackknifeIntervalExpandedByHalfPeakWidth":True},
+        "reference":"SECTOR_LOCAL_ROTATION_RECURRENCE" if reliable else
+            "AUTHORITATIVE_ROTATION_FALLBACK",
+        "referenceLagDays":rotation["lagDays"] if reliable else rotation_period_days}
     # Cycle profiles and correlations.
     cycle = np.floor((time-time.min())/rotation_period_days).astype(int)
     phase = ((time-time.min())/rotation_period_days) % 1
@@ -179,11 +210,14 @@ def analyze_sector(time, flux, *, sector_id, rotation_period_days,
         for k,v in pairs.items()}
     baseline=float(time.max()-time.min()) if len(time) else 0
     raw=_candidate_evidence("RAW_FAMILY",float(family_period_days),lags,acf,support,
-        peaks,time,flux,rotation,method) if family_period_days else None
+        peaks,time,flux,rotation_association,rotation_period_days,method) if family_period_days else None
     double=_candidate_evidence("POSSIBLE_DOUBLE",float(possible_double_days),lags,acf,support,
-        peaks,time,flux,rotation,method) if possible_double_days else None
+        peaks,time,flux,rotation_association,rotation_period_days,method) if possible_double_days else None
     return {"sectorID":sector_id,"timeBaselineDays":baseline,"acfPeaks":peaks,
         "rotationRecurrencePeak":rotation,"rotationJackknife":uncertainty,
+        "rotationRecurrenceReliable":reliable,
+        "rotationRecurrenceAssociation":rotation_association,
+        "rotationMultipleReference":rotation_association["reference"],
         "rawFamilyCandidateEvidence":raw,"possibleDoubleCandidateEvidence":double,
         "canConstrainPossibleDouble":bool(double and double["coverageSufficient"]),
         "cyclePairMeasurements":pairs,"cycleSeparationSummaries":summaries,
@@ -196,11 +230,6 @@ def combine_sector_results(results, *, rotation_period_days, family_period_days,
     related=[]; independent=[]; morphology=[]; raw_ids=[]; double_ids=[]
     raw_covered=[]; double_covered=[]; related_orders={}
     for result in results:
-        rotation=result.get("rotationRecurrencePeak")
-        if not rotation: continue
-        interval=(rotation.get("uncertaintyEstimate") or {}).get("intervalDays")
-        sigma=max((interval[1]-interval[0])/2 if interval else 0, rotation["localPeakWidthDays"]/2,
-                  method["lagGridStepDays"])
         raw=result.get("rawFamilyCandidateEvidence") or {}
         double=result.get("possibleDoubleCandidateEvidence") or {}
         if raw.get("coverageSufficient"): raw_covered.append(result["sectorID"])
@@ -210,11 +239,12 @@ def combine_sector_results(results, *, rotation_period_days, family_period_days,
             if evidence.get("candidateWithinEmpiricalPeakUncertainty"):
                 bucket.append(result["sectorID"]); associated.append(evidence)
         if associated:
-            multiples=[e.get("sectorLocalRotationMultipleConsistency") or {} for e in associated]
+            multiples=[e.get("selectedRotationMultipleConsistency") or {} for e in associated]
             consistent_orders={m.get("order") for m in multiples if m.get("consistent")}
             if consistent_orders:
                 related.append(result["sectorID"]); related_orders[result["sectorID"]]=consistent_orders
-            elif all(m and not m.get("consistent") for m in multiples): independent.append(result["sectorID"])
+            elif all(e.get("independentLongPeriodSupported") for e in associated):
+                independent.append(result["sectorID"])
         s=result["cycleSeparationSummaries"]
         valid=[(int(k),v["medianCorrelation"]) for k,v in s.items() if v["pairCount"]>=method["minimumCyclePairsPerSeparation"] and v["medianCorrelation"] is not None]
         if valid:
