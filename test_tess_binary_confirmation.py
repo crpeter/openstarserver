@@ -78,6 +78,74 @@ class BinaryConfirmationTests(unittest.TestCase):
                          result["oppositeConjunctionEvidence"]["classification"])
         self.assertNotIn("radius", json.dumps(result).lower())
 
+    def test_primary_epoch_expands_timing_baseline_only_after_replication(self):
+        result = self.run_case([lambda s, t: dataset(s, t) for _ in range(4)])
+        evidence = result["independentEvidence"]
+        final = result["linearEphemeris"]
+        independent = evidence["independentLinearEphemeris"]
+        self.assertEqual("REPLICATED_ECLIPSE_LIKE_EVENT_SUPPORTED", evidence["classification"])
+        self.assertEqual(4, evidence["supportingIndependentSectorCount"])
+        self.assertEqual(5, final["timingSectorCount"])
+        self.assertTrue(final["primarySectorIncluded"])
+        self.assertEqual("PRIMARY_PLUS_INDEPENDENT_AFTER_INDEPENDENT_REPLICATION",
+                         final["timingEvidenceBasis"])
+        final_span = (final["cycleAssignments"][-1]["cycleNumber"] -
+                      final["cycleAssignments"][0]["cycleNumber"])
+        independent_span = (independent["cycleAssignments"][-1]["cycleNumber"] -
+                            independent["cycleAssignments"][0]["cycleNumber"])
+        self.assertGreater(final_span, independent_span)
+        self.assertAlmostEqual(PERIOD, final["refinedPeriodDays"], places=6)
+
+    def test_primary_cannot_rescue_weak_independent_evidence(self):
+        makers = ([lambda s, t: dataset(s, t)] * 2 +
+                  [lambda s, t: dataset(s, t, primary=False)] * 2)
+        result = self.run_case(makers)
+        self.assertEqual("ECLIPSE_LIKE_EVENT_UNRESOLVED",
+                         result["independentEvidence"]["classification"])
+        self.assertEqual(2, result["independentEvidence"]["supportingIndependentSectorCount"])
+        self.assertFalse(result["linearEphemeris"]["coherent"])
+        self.assertNotIn("timingSectorCount", result["linearEphemeris"])
+
+    def test_unusable_primary_leaves_independent_ephemeris_authoritative(self):
+        primary = self.root / "primary.json"
+        primary.write_text(json.dumps(dataset(1, 1000.0, primary=False)), encoding="utf-8")
+        sectors = []
+        for sector in range(2, 6):
+            path = self.root / f"s{sector}.json"
+            path.write_text(json.dumps(dataset(sector, 1000.0 + (sector - 1) * 30.0)),
+                            encoding="utf-8")
+            sectors.append({"sector": sector, "datasetPath": str(path)})
+        result = analyze_binary_confirmation(primary_dataset_path=primary,
+            independent_spec={"preparedSectors": sectors}, morphology=self.morphology,
+            physical_interpretation=self.physical)
+        self.assertEqual("REPLICATED_ECLIPSE_LIKE_EVENT_SUPPORTED",
+                         result["independentEvidence"]["classification"])
+        self.assertFalse(result["linearEphemeris"]["primarySectorIncluded"])
+        self.assertEqual(4, result["linearEphemeris"]["timingSectorCount"])
+        self.assertEqual("INDEPENDENT_ONLY_PRIMARY_UNUSABLE",
+                         result["linearEphemeris"]["timingEvidenceBasis"])
+
+    def test_primary_timing_outlier_falls_back_without_erasing_replication(self):
+        primary = self.root / "primary.json"
+        primary.write_text(json.dumps(dataset(1, 1000.0, phase_shift=0.20)), encoding="utf-8")
+        sectors = []
+        for sector in range(2, 6):
+            path = self.root / f"s{sector}.json"
+            path.write_text(json.dumps(dataset(sector, 1000.0 + (sector - 1) * 30.0)),
+                            encoding="utf-8")
+            sectors.append({"sector": sector, "datasetPath": str(path)})
+        result = analyze_binary_confirmation(primary_dataset_path=primary,
+            independent_spec={"preparedSectors": sectors}, morphology=self.morphology,
+            physical_interpretation=self.physical)
+        self.assertEqual("REPLICATED_ECLIPSE_LIKE_EVENT_SUPPORTED",
+                         result["independentEvidence"]["classification"])
+        final = result["linearEphemeris"]
+        self.assertTrue(final["coherent"])
+        self.assertFalse(final["primarySectorIncluded"])
+        self.assertFalse(final["primaryTimingConsistent"])
+        self.assertFalse(final["expandedTimingAttempt"]["coherent"])
+        self.assertEqual("ECLIPSE_TIMING_REFINEMENT_REVIEW", result["recommendedNextTest"])
+
     def test_pure_double_wave_fails_closed(self):
         result = self.run_case([lambda s, t: dataset(s, t, primary=False) for _ in range(4)])
         self.assertEqual("ECLIPSE_LIKE_EVENT_UNRESOLVED",
