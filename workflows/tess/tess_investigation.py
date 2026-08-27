@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 
 import json
+import math
 from dataclasses import asdict
 from functools import wraps
 from pathlib import Path
@@ -377,6 +378,50 @@ def broad_independent_continuation(
         parameters={} if warranted else dict(finalize_parameters or {}),
         triggered_by_stage_id=request_id,
     )
+
+
+def _primary_harmonic_morphology_family(
+    analysis: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Return a persisted primary harmonic question, or fail closed.
+
+    The relation label and the two periods must describe the same multiplicative
+    family.  This prevents an unrelated preferred period from being promoted to
+    morphology merely because both values happen to be present.
+    """
+
+    if analysis.get("primaryReliable") is not True:
+        return None
+    relation = str(analysis.get("preferredPhysicalPeriodRelation") or "1x")
+    if relation == "1x" or not relation.endswith("x"):
+        return None
+    try:
+        relation_multiplier = float(relation[:-1])
+        raw_period = float(
+            analysis.get("rawCandidatePeriodDays")
+            if analysis.get("rawCandidatePeriodDays") is not None
+            else analysis.get("candidatePeriodDays")
+        )
+        preferred_period = float(
+            analysis.get("preferredPhysicalPeriodDays")
+            if analysis.get("preferredPhysicalPeriodDays") is not None
+            else analysis.get("observedPeriodDays")
+        )
+    except (TypeError, ValueError):
+        return None
+    values = (relation_multiplier, raw_period, preferred_period)
+    if not all(math.isfinite(value) and value > 0 for value in values):
+        return None
+    observed_multiplier = preferred_period / raw_period
+    if not math.isclose(observed_multiplier, relation_multiplier, rel_tol=0.05):
+        return None
+    return {
+        "representativeRawPeriodDays": raw_period,
+        "possibleDoubleCycleDays": preferred_period,
+        "preferredPhysicalPeriodRelation": relation,
+        "physicalCycleResolved": False,
+        "evidenceSource": "authoritative-persisted-primary-analysis",
+    }
 
 
 def time_frequency_continuation(summary: dict[str, Any], *, request_id: str) -> StageRequest:
@@ -2256,12 +2301,30 @@ def build_engine(
         print(f"   boundary hits: {contradiction_plan.get('boundaryHitCount')}")
 
         if contradiction_plan["action"] == "BROAD_INDEPENDENT_SEARCH":
-            next_stage = StageRequest(
-                id=_next_stage_id(request.id, "prepare-broad-independent-search"),
-                handler_id="openstar.tess.independent.broad.prepare",
-                parameters={"continuation": False},
-                triggered_by_stage_id=request.id,
+            primary_analysis = _required_latest_result_for_handler(
+                investigation, "openstar.tess.hypotheses"
             )
+            primary_family = _primary_harmonic_morphology_family(primary_analysis)
+            morphology_already_completed = _latest_result_for_handler(
+                investigation, "openstar.tess.morphology.analyze"
+            ) is not None
+            if primary_family is not None and not morphology_already_completed:
+                next_stage = StageRequest(
+                    id=_next_stage_id(request.id, "morphology"),
+                    handler_id="openstar.tess.morphology.analyze",
+                    parameters={
+                        "evidenceSource": "primary-harmonic-contradiction",
+                        "unresolvedFallback": "BROAD_INDEPENDENT_SEARCH",
+                    },
+                    triggered_by_stage_id=request.id,
+                )
+            else:
+                next_stage = StageRequest(
+                    id=_next_stage_id(request.id, "prepare-broad-independent-search"),
+                    handler_id="openstar.tess.independent.broad.prepare",
+                    parameters={"continuation": False},
+                    triggered_by_stage_id=request.id,
+                )
         else:
             next_stage = StageRequest(
                 id=_next_stage_id(request.id, "finalize"),
@@ -2490,6 +2553,14 @@ def build_engine(
             "openstar.tess.independent.broad.interpret",
         )
         family = ((harmonic or broad or {}).get("harmonicFamily") or {})
+        primary_analysis = None
+        direct_primary_family = False
+        if not family and request.parameters.get("evidenceSource") == "primary-harmonic-contradiction":
+            primary_analysis = _required_latest_result_for_handler(
+                investigation, "openstar.tess.hypotheses"
+            )
+            family = _primary_harmonic_morphology_family(primary_analysis) or {}
+            direct_primary_family = bool(family)
         raw_period = family.get("representativeRawPeriodDays")
         double_period = family.get("possibleDoubleCycleDays")
         if independent_prepare is None:
@@ -2544,6 +2615,9 @@ def build_engine(
             "periodFamily": sha256_json(family),
             "primaryDataset": sha256_file(Path(prepared["datasetPath"])),
         }
+        if direct_primary_family:
+            input_hashes["primaryAnalysis"] = sha256_json(primary_analysis)
+            input_hashes["independentPreparation"] = sha256_json(independent_prepare)
         for item in independent_prepare.get("preparedSectors") or []:
             sector = item.get("sector")
             path = item.get("datasetPath")
@@ -2551,11 +2625,25 @@ def build_engine(
                 input_hashes[f"independentSector{sector}"] = sha256_file(Path(path))
 
         continuation = morphology.get("continuationEvidence") or {}
-        if continuation.get("timeFrequencyEvolutionWarranted"):
+        if morphology.get("physicalCycleResolved"):
+            next_stage = StageRequest(
+                id=_next_stage_id(request.id, "physical-interpretation"),
+                handler_id="openstar.tess.physical.interpret",
+                parameters={},
+                triggered_by_stage_id=request.id,
+            )
+        elif continuation.get("timeFrequencyEvolutionWarranted"):
             next_stage = StageRequest(
                 id=_next_stage_id(request.id, "prepare-time-frequency"),
                 handler_id="openstar.tess.time-frequency.prepare",
                 parameters={"entryReason": continuation.get("entryReason")},
+                triggered_by_stage_id=request.id,
+            )
+        elif request.parameters.get("unresolvedFallback") == "BROAD_INDEPENDENT_SEARCH":
+            next_stage = StageRequest(
+                id=_next_stage_id(request.id, "prepare-broad-independent-search"),
+                handler_id="openstar.tess.independent.broad.prepare",
+                parameters={"continuation": False},
                 triggered_by_stage_id=request.id,
             )
         else:

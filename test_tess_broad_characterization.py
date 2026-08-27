@@ -37,6 +37,7 @@ if _real_numpy is None:
     sys.modules["numpy"] = types.ModuleType("numpy")
 
 from workflows.tess.tess_investigation import build_engine
+from workflows.tess.tess_investigation import _primary_harmonic_morphology_family
 from workflows.tess.tess_investigation import time_frequency_continuation
 from workflows.tess.tess_investigation import nonstationary_continuation
 from workflows.tess.tess_investigation import dynamic_harmonic_continuation
@@ -63,6 +64,30 @@ if _installed_numpy_stub:
 
 
 class BroadIndependentCharacterizationTests(unittest.TestCase):
+    def test_primary_harmonic_morphology_family_is_authoritative_and_fail_closed(self):
+        evidence = {
+            "primaryReliable": True,
+            "preferredPhysicalPeriodRelation": "2x",
+            "rawCandidatePeriodDays": 4.0,
+            "observedPeriodDays": 8.0,
+        }
+        family = _primary_harmonic_morphology_family(evidence)
+        self.assertEqual(4.0, family["representativeRawPeriodDays"])
+        self.assertEqual(8.0, family["possibleDoubleCycleDays"])
+        self.assertEqual("authoritative-persisted-primary-analysis",
+                         family["evidenceSource"])
+
+        for override in (
+            {"primaryReliable": False},
+            {"preferredPhysicalPeriodRelation": "1x"},
+            {"observedPeriodDays": float("nan")},
+            {"observedPeriodDays": 9.0},
+        ):
+            with self.subTest(override=override):
+                self.assertIsNone(_primary_harmonic_morphology_family({
+                    **evidence, **override,
+                }))
+
     def test_resolved_without_v209_uses_frozen_family_for_multisource_prepare(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
