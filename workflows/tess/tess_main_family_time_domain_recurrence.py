@@ -193,7 +193,8 @@ def analyze_sector(time, flux, *, sector_id, rotation_period_days,
 
 def combine_sector_results(results, *, rotation_period_days, family_period_days,
                            possible_double_days, method=METHOD):
-    related=[]; independent=[]; morphology=[]; raw_ids=[]; double_ids=[]; double_covered=[]
+    related=[]; independent=[]; morphology=[]; raw_ids=[]; double_ids=[]
+    raw_covered=[]; double_covered=[]; related_orders={}
     for result in results:
         rotation=result.get("rotationRecurrencePeak")
         if not rotation: continue
@@ -202,6 +203,7 @@ def combine_sector_results(results, *, rotation_period_days, family_period_days,
                   method["lagGridStepDays"])
         raw=result.get("rawFamilyCandidateEvidence") or {}
         double=result.get("possibleDoubleCandidateEvidence") or {}
+        if raw.get("coverageSufficient"): raw_covered.append(result["sectorID"])
         if double.get("coverageSufficient"): double_covered.append(result["sectorID"])
         associated=[]
         for evidence,bucket in ((raw,raw_ids),(double,double_ids)):
@@ -209,17 +211,24 @@ def combine_sector_results(results, *, rotation_period_days, family_period_days,
                 bucket.append(result["sectorID"]); associated.append(evidence)
         if associated:
             multiples=[e.get("sectorLocalRotationMultipleConsistency") or {} for e in associated]
-            if any(m.get("consistent") for m in multiples): related.append(result["sectorID"])
+            consistent_orders={m.get("order") for m in multiples if m.get("consistent")}
+            if consistent_orders:
+                related.append(result["sectorID"]); related_orders[result["sectorID"]]=consistent_orders
             elif all(m and not m.get("consistent") for m in multiples): independent.append(result["sectorID"])
         s=result["cycleSeparationSummaries"]
         valid=[(int(k),v["medianCorrelation"]) for k,v in s.items() if v["pairCount"]>=method["minimumCyclePairsPerSeparation"] and v["medianCorrelation"] is not None]
         if valid:
             best=max(valid,key=lambda x:x[1])
-            if best[0] in (2,4): morphology.append(result["sectorID"])
+            result["morphologyPreferredRotationMultiple"]=(best[0] if best[0] in (2,4) else None)
+            if best[0] in related_orders.get(result["sectorID"],set()): morphology.append(result["sectorID"])
+        else: result["morphologyPreferredRotationMultiple"]=None
     n=method["replicatedSectorCount"]
-    if len(related)>=n and len(morphology)>=n: classification=ROTATION_MULTICYCLE
-    elif len(independent)>=n: classification=INDEPENDENT_LONG
-    elif len(results)>=n and not raw_ids and not double_ids: classification=NOT_REPLICATED
+    relationship_orders={order for orders in related_orders.values() for order in orders}
+    contradiction=bool(related and independent) or len(relationship_orders)>1
+    both_branches_adequately_tested=(len(raw_covered)>=n and len(double_covered)>=n)
+    if not contradiction and len(related)>=n and len(morphology)>=n: classification=ROTATION_MULTICYCLE
+    elif not contradiction and len(independent)>=n: classification=INDEPENDENT_LONG
+    elif both_branches_adequately_tested and not raw_ids and not double_ids: classification=NOT_REPLICATED
     else: classification=UNRESOLVED
     relationship=classification in (ROTATION_MULTICYCLE,INDEPENDENT_LONG)
     exact=(classification==ROTATION_MULTICYCLE and
@@ -234,16 +243,19 @@ def combine_sector_results(results, *, rotation_period_days, family_period_days,
         "acfRotationRecurrenceDetected":sum(bool(r.get("rotationRecurrencePeak")) for r in results)>=n,
         "replicatedLongLagRecurrence":max(len(raw_ids),len(double_ids))>=n,"rotationMultipleConsistency":len(related)>=n,
         "cycleMorphologySupportsSameRelation":len(morphology)>=n,"independentLongPeriodEvidence":len(independent)>=n,
-        "noStrongerContradiction":not (related and independent)}
+        "noStrongerContradiction":not contradiction}
     return {"classification":classification,"mainFamilyRelationshipToRotationResolved":relationship,
         "mainFamilyRelationshipClassification":classification,"physicalCycleResolved":exact,
         "exactPhysicalCycleResolved":exact,"recommendedNextTest":next_test,"decisionGates":gates,
         "relatedSectorIDs":related,"independentSectorIDs":independent,
         "rawFamilyRecurrenceSectorIDs":raw_ids,
+        "rawFamilyCoverageSectorIDs":raw_covered,
         "possibleDoubleRecurrenceSectorIDs":double_ids,
         "possibleDoubleCoverageSectorIDs":double_covered,
         "rawVsPossibleDoubleDistinguished":exact,
-        "morphologySupportingSectorIDs":morphology}
+        "morphologySupportingSameRelationSectorIDs":morphology,
+        "sectorLocalRelatedRotationMultiples":{str(k):sorted(v) for k,v in related_orders.items()},
+        "relatedRotationMultiples":sorted(relationship_orders)}
 
 
 def analyze_time_domain_recurrence(sectors, *, rotation_period_days, rotation_classification,
@@ -262,7 +274,7 @@ def analyze_time_domain_recurrence(sectors, *, rotation_period_days, rotation_cl
         "acfMethod":{"name":"gap-aware-normalized-slot-autocorrelation","parameters":method},
         "acfSectorResults":[{k:v for k,v in r.items() if k not in ("cyclePairMeasurements","cycleSeparationSummaries","cyclesAccepted","coverageCriteria")} for r in results],
         "cycleRecurrenceMethod":{"name":"rotation-clock-phase-binned-profile-correlation","parameters":method},
-        "cycleRecurrenceSectorResults":[{"sectorID":r["sectorID"],"cyclePairMeasurements":r["cyclePairMeasurements"],"cycleSeparationSummaries":r["cycleSeparationSummaries"],"cyclesAccepted":r["cyclesAccepted"],"coverageCriteria":r["coverageCriteria"]} for r in results],
+        "cycleRecurrenceSectorResults":[{"sectorID":r["sectorID"],"cyclePairMeasurements":r["cyclePairMeasurements"],"cycleSeparationSummaries":r["cycleSeparationSummaries"],"morphologyPreferredRotationMultiple":r.get("morphologyPreferredRotationMultiple"),"cyclesAccepted":r["cyclesAccepted"],"coverageCriteria":r["coverageCriteria"]} for r in results],
         "combinedEvidence":combined,"decisionGates":combined["decisionGates"],
         "classification":combined["classification"],"mainFamilyRelationshipToRotationResolved":combined["mainFamilyRelationshipToRotationResolved"],
         "mainFamilyRelationshipClassification":combined["mainFamilyRelationshipClassification"],"physicalCycleResolved":combined["physicalCycleResolved"],

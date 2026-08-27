@@ -6,8 +6,7 @@ from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
 
-import pytest
-np = pytest.importorskip("numpy", reason="numpy scientific runtime is not installed")
+import numpy as np
 
 from workflows.tess.tess_main_family_time_domain_recurrence import (
     METHOD, ROTATION_MULTICYCLE, UNRESOLVED, analyze_sector,
@@ -67,6 +66,65 @@ class MainFamilyTimeDomainRecurrenceTests(unittest.TestCase):
             family_period_days=7.2,possible_double_days=14.4)
         self.assertEqual(UNRESOLVED,combined["classification"])
 
+    def combined_fixture(self, sector, relation="related", order=2,
+                         raw_coverage=True, double_coverage=True, morphology=None):
+        lag=7.2 if order==2 else 14.4
+        multiple={"order":order,"consistent":relation=="related"}
+        evidence=lambda coverage,detected: {"coverageSufficient":coverage,
+            "candidateWithinEmpiricalPeakUncertainty":detected,
+            "sectorLocalRotationMultipleConsistency":multiple}
+        summaries={str(k):{"pairCount":3,"medianCorrelation":
+            (0.9 if k==(morphology or order) else 0.1)} for k in (1,2,4)}
+        return {"sectorID":sector,"rotationRecurrencePeak":{"lagDays":3.6,
+            "localPeakWidthDays":.2,"uncertaintyEstimate":{"intervalDays":[3.55,3.65]}},
+            "acfPeaks":[{"lagDays":lag,"peakCorrelation":.8,"localPeakWidthDays":.2}],
+            "rawFamilyCandidateEvidence":evidence(raw_coverage,raw_coverage),
+            "possibleDoubleCandidateEvidence":evidence(double_coverage,False),
+            "cycleSeparationSummaries":summaries}
+
+    def combine(self, rows):
+        return combine_sector_results(rows,rotation_period_days=self.P,
+            family_period_days=7.2,possible_double_days=14.4)
+
+    def test_inadequate_candidate_coverage_never_means_not_replicated(self):
+        rows=[self.combined_fixture(i,raw_coverage=False,double_coverage=False) for i in (1,2,3)]
+        for row in rows:
+            row["rawFamilyCandidateEvidence"]["candidateWithinEmpiricalPeakUncertainty"]=False
+        result=self.combine(rows)
+        self.assertEqual(UNRESOLVED,result["classification"])
+        self.assertEqual([],result["rawFamilyCoverageSectorIDs"])
+        self.assertEqual("LONG_BASELINE_TIME_DOMAIN_RECURRENCE_DATA",result["recommendedNextTest"])
+
+    def test_related_and_independent_evidence_fail_closed(self):
+        for rows in ([self.combined_fixture(1),self.combined_fixture(2),
+                      self.combined_fixture(3,"independent")],
+                     [self.combined_fixture(1,"independent"),self.combined_fixture(2,"independent"),
+                      self.combined_fixture(3)]):
+            result=self.combine(rows)
+            self.assertEqual(UNRESOLVED,result["classification"])
+            self.assertFalse(result["decisionGates"]["noStrongerContradiction"])
+
+    def test_pure_replication_and_same_morphology_order_resolve(self):
+        related=self.combine([self.combined_fixture(1),self.combined_fixture(2)])
+        self.assertEqual(ROTATION_MULTICYCLE,related["classification"])
+        independent=self.combine([self.combined_fixture(1,"independent"),
+            self.combined_fixture(2,"independent")])
+        self.assertEqual("INDEPENDENT_LONGER_PERIOD_RECURRENCE_SUPPORTED",independent["classification"])
+
+    def test_morphology_must_support_same_acf_multiple(self):
+        matching=self.combine([self.combined_fixture(1,order=2,morphology=2),
+            self.combined_fixture(2,order=2,morphology=2)])
+        self.assertTrue(matching["decisionGates"]["cycleMorphologySupportsSameRelation"])
+        mismatched=self.combine([self.combined_fixture(1,order=2,morphology=4),
+            self.combined_fixture(2,order=2,morphology=4)])
+        self.assertEqual(UNRESOLVED,mismatched["classification"])
+        four=self.combine([self.combined_fixture(1,order=4,morphology=4),
+            self.combined_fixture(2,order=4,morphology=4)])
+        self.assertEqual(ROTATION_MULTICYCLE,four["classification"])
+        mixed=self.combine([self.combined_fixture(1,order=2,morphology=2),
+            self.combined_fixture(2,order=4,morphology=4)])
+        self.assertEqual(UNRESOLVED,mixed["classification"])
+
     def test_short_sector_fails_closed_for_double(self):
         s=self.sector(94); keep=np.asarray(s["time"])<18
         result=analyze_sector(np.asarray(s["time"])[keep],np.asarray(s["flux"])[keep],
@@ -90,6 +148,9 @@ class MainFamilyTimeDomainRecurrenceTests(unittest.TestCase):
                 path=root/name; path.write_text(json.dumps(result),encoding="utf-8")
                 return InvestigationStage(stage_id,handler,"COMPLETE",trigger,parameters or {},
                     result=result,artifacts=(ArtifactReference(str(path),sha256_file(path),"application/json"),),stop=stop)
+            def ledger_only(stage_id,handler,result):
+                return InvestigationStage(stage_id,handler,"COMPLETE",None,{},
+                    result=result,artifacts=())
             prepared=[]
             for sector in (94,95):
                 times=np.arange(0,18,.04)
@@ -108,8 +169,8 @@ class MainFamilyTimeDomainRecurrenceTests(unittest.TestCase):
             stages=(
                 complete("001-prepare-target","openstar.tess.prepare-target",
                     {"preparedSectors":prepared},"prepare.json"),
-                complete("009-family","openstar.tess.independent.broad.interpret",
-                    {"harmonicFamily":family_value},"family.json"),
+                ledger_only("011-interpret-broad-independent-search",
+                    "openstar.tess.independent.broad.interpret",{"harmonicFamily":family_value}),
                 complete("018-mode-identification","openstar.tess.mode-identification.analyze",
                     {"modeCandidate":{"periodDays":self.P}},"mode.json"),
                 complete("031-target-residual-astrophysical-interpretation",
@@ -131,6 +192,7 @@ class MainFamilyTimeDomainRecurrenceTests(unittest.TestCase):
             admitted=repair_obsolete_terminal_wait(store,investigation)
             selected=admitted.metadata["controlState"]["selectedExperiment"]
             self.assertEqual("033-main-family-time-domain-recurrence",selected["id"])
+            self.assertEqual((),stages[1].artifacts)
             engine=build_engine(store,SimpleNamespace(),poll_interval=0,timeout=None); engine.chain_stages=False
             completed,next_request=engine.run_stage(admitted,StageRequest(**selected),software_id="test",software_version="1")
             result=completed.stages[-1].result
