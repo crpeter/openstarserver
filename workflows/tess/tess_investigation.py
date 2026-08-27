@@ -50,6 +50,11 @@ from .tess_binary_confirmation import (
     analyze_binary_confirmation,
     physical_interpretation_continuation,
 )
+from .tess_eclipse_event_localization import (
+    HANDLER_ID as ECLIPSE_LOCALIZATION_HANDLER_ID,
+    authoritative_binary_gate,
+    localize_eclipse_events,
+)
 from .tess_localization import localize_periodic_source
 from .tess_sector_archive import TessArchiveTransientError
 from .tess_multimode import (
@@ -2814,14 +2819,40 @@ def build_engine(
             if item.get("datasetPath"):
                 input_hashes[f"independentSector{item.get('sector')}"] = sha256_file(
                     Path(item["datasetPath"]))
+        qualifies = authoritative_binary_gate(result)
         return StageOutcome(
             result=result,
             next_stage=StageRequest(
-                id=_next_stage_id(request.id, "finalize"),
-                handler_id="openstar.tess.finalize",
-                parameters={"outputSuffix": "binary-confirmation-v2"},
+                id=_next_stage_id(request.id, "eclipse-event-source-localization" if qualifies else "finalize"),
+                handler_id=(ECLIPSE_LOCALIZATION_HANDLER_ID if qualifies else "openstar.tess.finalize"),
+                parameters={} if qualifies else {"outputSuffix": "binary-confirmation-v2"},
                 triggered_by_stage_id=request.id),
             input_hashes=input_hashes,
+            artifacts=(_artifact(artifact_path, "application/json"),),
+        )
+
+    def eclipse_event_localization_stage(investigation, request):
+        binary = _required_latest_result_for_handler(
+            investigation, "openstar.tess.binary-confirmation.analyze")
+        identity = _required_latest_result_for_handler(investigation, "openstar.tess.catalog-identity")
+        independent_prepare = _required_latest_result_for_handler(
+            investigation, "openstar.tess.independent.prepare")
+        prepared = _result(investigation, "001-prepare-target")
+        if not authoritative_binary_gate(binary):
+            raise RuntimeError("Exact binary-confirmation-v2 localization boundary is not satisfied.")
+        artifact_root = store.directory_for(investigation.id) / "artifacts" / "eclipse-event-source-localization"
+        result = localize_eclipse_events(binary_confirmation=binary, identity=identity,
+                                         tic_id=int(prepared["ticID"]))
+        artifact_path = artifact_root / "eclipse-event-source-localization-v1.json"
+        _write_json(artifact_path, result)
+        return StageOutcome(
+            result=result,
+            next_stage=StageRequest(id=_next_stage_id(request.id, "finalize"),
+                                    handler_id="openstar.tess.finalize",
+                                    parameters={"outputSuffix": "eclipse-event-source-localization-v1"},
+                                    triggered_by_stage_id=request.id),
+            input_hashes={"binaryConfirmation": sha256_json(binary), "catalogIdentity": sha256_json(identity),
+                          "independentPreparation": sha256_json(independent_prepare)},
             artifacts=(_artifact(artifact_path, "application/json"),),
         )
 
@@ -8612,6 +8643,9 @@ def build_engine(
             investigation,
             "openstar.tess.binary-confirmation.analyze",
         )
+        eclipse_event_localization = _latest_result_for_handler(
+            investigation, ECLIPSE_LOCALIZATION_HANDLER_ID,
+        )
         source_localization = _latest_result_for_handler(
             investigation,
             "openstar.tess.source-localization.analyze",
@@ -8827,6 +8861,20 @@ def build_engine(
             )
             claim_decision = {"claim": claim_decision["claim"],
                               "rationale": existing_rationale}
+
+        if eclipse_event_localization is not None:
+            existing_rationale = list(claim_decision.get("rationale") or [])
+            existing_rationale.append(
+                "Fixed-ephemeris eclipse difference imaging classified source attribution as "
+                f"{eclipse_event_localization.get('classification')} using "
+                f"{eclipse_event_localization.get('usableIndependentSectorCount')} usable independent sectors. "
+                "This spatial result does not resolve companion nature or physical mechanism."
+            )
+            existing_rationale.append(
+                "Authoritative recommended next spatial test: "
+                f"{eclipse_event_localization.get('recommendedNextTest')}."
+            )
+            claim_decision = {"claim": claim_decision["claim"], "rationale": existing_rationale}
 
         if source_localization is not None:
             cross = source_localization.get("crossSector") or {}
@@ -9836,6 +9884,7 @@ def build_engine(
             "morphology": morphology_interpretation,
             "physicalInterpretation": physical_interpretation,
             "binaryConfirmation": binary_confirmation,
+            "eclipseEventSourceLocalization": eclipse_event_localization,
             "sourceLocalization": source_localization,
             "multiModeDecomposition": multimode_decomposition,
             "timeFrequencyEvolution": time_frequency_evolution,
@@ -10275,6 +10324,7 @@ def build_engine(
         "openstar.tess.binary-confirmation.analyze",
         binary_confirmation_stage,
     )
+    engine.register_handler(ECLIPSE_LOCALIZATION_HANDLER_ID, eclipse_event_localization_stage)
     engine.register_handler(
         "openstar.tess.source-localization.analyze",
         source_localization_stage,
