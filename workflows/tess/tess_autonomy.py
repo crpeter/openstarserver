@@ -34,6 +34,77 @@ _V2019_HANDLER_PREFIX = "openstar.tess.target-residual-multisector-source."
 _ADDITIONAL_SECTOR_PREFIX = "openstar.tess.additional-sector-source-localization."
 _ASTROPHYSICAL_INTERPRETATION_HANDLER = (
     "openstar.tess.target-residual-astrophysical-interpretation.analyze")
+_FAMILY_LEDGER_COMPATIBILITY_ERROR = (
+    "RuntimeError: main recurrent-family artifact verification failed")
+
+
+def _recover_failed_v2014_family_ledger_compatibility(store, investigation,
+        *, historical_path_resolver):
+    """Append the sole allowed retry of the known historical stage-030 failure."""
+    if investigation.status != "FAILED" or not investigation.stages:
+        return None
+    failed = investigation.stages[-1]
+    attempts = [s for s in investigation.stages
+        if s.handler_id == _ASTROPHYSICAL_INTERPRETATION_HANDLER]
+    if not (failed.id == "030-target-residual-astrophysical-interpretation"
+            and failed.handler_id == _ASTROPHYSICAL_INTERPRETATION_HANDLER
+            and failed.status == "FAILED"
+            and failed.failure_classification == "NON_RETRYABLE"
+            and failed.error == _FAMILY_LEDGER_COMPATIBILITY_ERROR
+            and failed.triggered_by_stage_id == "029-finalize"
+            and failed.result is None and attempts == [failed]
+            and store.verified_terminal_stage_ledger_hash(
+                investigation.id, failed)):
+        return None
+    science = next((s for s in investigation.stages
+        if s.id == "028-target-residual-mechanism"), None)
+    final = next((s for s in investigation.stages if s.id == "029-finalize"), None)
+    family_stage = next((s for s in reversed(investigation.stages)
+        if s.status == "COMPLETE" and s.handler_id in {
+            "openstar.tess.independent.harmonic-family.interpret",
+            "openstar.tess.independent.broad.interpret"}), None)
+    family = ((family_stage.result or {}).get("harmonicFamily")
+              if family_stage else None)
+    final_family = (((final.result or {}).get("independentBroadVerification")
+        or {}).get("harmonicFamily") if final else None)
+    science_result = science.result if science else {}
+    if not (science and final and family_stage
+            and final.id == "029-finalize"
+            and len(investigation.stages) >= 2
+            and investigation.stages[-2] is final
+            and final.triggered_by_stage_id == science.id
+            and science.status == "COMPLETE"
+            and science.handler_id == "openstar.tess.target-residual-mechanism.analyze"
+            and science_result.get("classification") ==
+                "SMOOTH_TARGET_MODE_AMPLITUDE_MODULATION"
+            and science_result.get("physicalMechanismResolved") is False
+            and science_result.get("recommendedNextTest") ==
+                "ASTROPHYSICAL_MECHANISM_INTERPRETATION"
+            and science_result.get("adjudicationVersion") ==
+                "route-independent-all-models-v1"
+            and science_result.get("crossSectorPhaseUsed") is False
+            and science_result.get("failClosedReasons") == []
+            and science_result.get("replicatedMechanisms") ==
+                ["SMOOTH_TARGET_MODE_AMPLITUDE_MODULATION"]
+            and (science_result.get("replicatedMechanismSupportingSectorIDs")
+                or {}).get("SMOOTH_TARGET_MODE_AMPLITUDE_MODULATION") == [68, 95]
+            and _verified_stage_json(science, "target-residual-mechanism-v20.14.json",
+                resolver=historical_path_resolver)
+            and final.status == "COMPLETE" and final.handler_id == "openstar.tess.finalize"
+            and final.stop is True
+            and final.parameters == {"outputSuffix": "v20.14-intrinsic"}
+            and _verified_stage_json(final, "conclusion-v20.14-intrinsic.json",
+                resolver=historical_path_resolver)
+            and store.verified_terminal_stage_ledger_hash(
+                investigation.id, family_stage)
+            and family and family == final_family):
+        return None
+    request = StageRequest("031-target-residual-astrophysical-interpretation",
+        _ASTROPHYSICAL_INTERPRETATION_HANDLER, {}, failed.id)
+    return store.set_control_state(investigation, status="RUNNING", control_state={
+        "branchAssessments": [], "selectedExperiment": asdict(request),
+        "schedulerAction": "RUN_EXPERIMENT", "recovery":
+        "TESS_V20_14_ASTROPHYSICAL_FAMILY_LEDGER_COMPATIBILITY_RECOVERY"})
 
 
 def _continue_finalized_v2014_astrophysical_interpretation(store, investigation,
@@ -1512,6 +1583,10 @@ def repair_obsolete_terminal_wait(
         return investigation
 
     resolver = historical_path_resolver or NO_HISTORICAL_PATH_RELOCATION
+    family_recovery = _recover_failed_v2014_family_ledger_compatibility(
+        store, investigation, historical_path_resolver=resolver)
+    if family_recovery is not None:
+        return family_recovery
     astrophysical = _continue_finalized_v2014_astrophysical_interpretation(
         store, investigation, control, historical_path_resolver=resolver)
     if astrophysical is not None:

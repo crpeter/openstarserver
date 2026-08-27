@@ -2,7 +2,7 @@ import json
 import tempfile
 import unittest
 import sys
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -251,8 +251,286 @@ class V2014AdmissionTests(unittest.TestCase):
                 self.assertEqual(investigation,
                     repair_obsolete_terminal_wait(store, investigation))
 
+    def test_exact_failed_stage030_admits_append_only_stage031_idempotently(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td); store = InvestigationStore(root / "state")
+            boundary = self.make_boundary(root)
+            family_value = {"interpretation": "recurrent-raw-period-family",
+                "representativeRawPeriodDays": 7.546257528330875,
+                "possibleDoubleCycleDays": 15.09251505666175,
+                "physicalCycleResolved": False,
+                "supportingSectorCount": 2, "supportingSectors": [94, 95]}
+            family = InvestigationStage("011-interpret-broad-independent-search",
+                "openstar.tess.independent.broad.interpret", "COMPLETE", "010-search",
+                {}, result={"harmonicFamily": family_value})
+            final_result = {**boundary.stages[1].result,
+                "independentBroadVerification": {"harmonicFamily": family_value}}
+            final_path = Path(boundary.stages[1].artifacts[0].path)
+            final_path.write_text(json.dumps(final_result, sort_keys=True))
+            final = replace(boundary.stages[1], result=final_result, artifacts=(
+                replace(boundary.stages[1].artifacts[0], sha256=sha256_file(final_path)),))
+            failed = InvestigationStage(
+                "030-target-residual-astrophysical-interpretation",
+                "openstar.tess.target-residual-astrophysical-interpretation.analyze",
+                "FAILED", "029-finalize", {}, result=None,
+                error="RuntimeError: main recurrent-family artifact verification failed",
+                failure_classification="NON_RETRYABLE")
+            investigation = replace(boundary, status="FAILED",
+                stages=(family, boundary.stages[0], final, failed))
+            store.save(investigation)
+            family_ledger = store.stage_path_for(investigation.id, family.id)
+            family_ledger.parent.mkdir(parents=True)
+            family_ledger.write_text(json.dumps(asdict(family)))
+            failed_ledger = store.stage_path_for(investigation.id, failed.id)
+            failed_ledger.write_text(json.dumps(asdict(failed)))
+            failed_bytes = failed_ledger.read_bytes()
+
+            admitted = repair_obsolete_terminal_wait(store, investigation)
+            selected = admitted.metadata["controlState"]["selectedExperiment"]
+            self.assertEqual("RUNNING", admitted.status)
+            self.assertEqual("031-target-residual-astrophysical-interpretation",
+                             selected["id"])
+            self.assertEqual(failed.id, selected["triggered_by_stage_id"])
+            self.assertEqual("FAILED", admitted.stages[-1].status)
+            self.assertEqual(failed_bytes, failed_ledger.read_bytes())
+            self.assertEqual(admitted, repair_obsolete_terminal_wait(store, admitted))
+
+    def test_failed030_and_family_provenance_mutations_fail_closed(self):
+        mutations = {
+            "snapshot error": lambda i: replace(i, stages=i.stages[:-1] +
+                (replace(i.stages[-1], error="RuntimeError: different"),)),
+            "classification": lambda i: replace(i, stages=i.stages[:-1] +
+                (replace(i.stages[-1], failure_classification="RETRYABLE"),)),
+            "trigger": lambda i: replace(i, stages=i.stages[:-1] +
+                (replace(i.stages[-1], triggered_by_stage_id="028-target-residual-mechanism"),)),
+            "result": lambda i: replace(i, stages=i.stages[:-1] +
+                (replace(i.stages[-1], result={"unexpected": True}),)),
+            "handler": lambda i: replace(i, stages=i.stages[:-1] +
+                (replace(i.stages[-1], handler_id="openstar.tess.wrong"),)),
+            "prior successful interpretation": lambda i: replace(i,
+                stages=i.stages[:-1] + (InvestigationStage("030-prior-success",
+                    "openstar.tess.target-residual-astrophysical-interpretation.analyze",
+                    "COMPLETE", "029-finalize", {}, result={"science": True}),
+                    i.stages[-1])),
+            "raw period": lambda i: replace(i, stages=(replace(i.stages[0],
+                result={"harmonicFamily": {**i.stages[0].result["harmonicFamily"],
+                    "representativeRawPeriodDays": 7.0}}),) + i.stages[1:]),
+            "double period": lambda i: replace(i, stages=(replace(i.stages[0],
+                result={"harmonicFamily": {**i.stages[0].result["harmonicFamily"],
+                    "possibleDoubleCycleDays": 14.0}}),) + i.stages[1:]),
+            "resolved family": lambda i: replace(i, stages=(replace(i.stages[0],
+                result={"harmonicFamily": {**i.stages[0].result["harmonicFamily"],
+                    "physicalCycleResolved": True}}),) + i.stages[1:]),
+            "stage029 raw period": lambda i: replace(i, stages=i.stages[:2] +
+                (replace(i.stages[2], result={**i.stages[2].result,
+                    "independentBroadVerification": {"harmonicFamily": {
+                        **i.stages[2].result["independentBroadVerification"]["harmonicFamily"],
+                        "representativeRawPeriodDays": 7.0}}}),) + i.stages[3:]),
+            "stage029 double period": lambda i: replace(i, stages=i.stages[:2] +
+                (replace(i.stages[2], result={**i.stages[2].result,
+                    "independentBroadVerification": {"harmonicFamily": {
+                        **i.stages[2].result["independentBroadVerification"]["harmonicFamily"],
+                        "possibleDoubleCycleDays": 14.0}}}),) + i.stages[3:]),
+            "stage029 resolved family": lambda i: replace(i, stages=i.stages[:2] +
+                (replace(i.stages[2], result={**i.stages[2].result,
+                    "independentBroadVerification": {"harmonicFamily": {
+                        **i.stages[2].result["independentBroadVerification"]["harmonicFamily"],
+                        "physicalCycleResolved": True}}}),) + i.stages[3:]),
+            "final sha": lambda i: replace(i, stages=i.stages[:2] +
+                (replace(i.stages[2], artifacts=(replace(i.stages[2].artifacts[0],
+                    sha256="0" * 64),)),) + i.stages[3:]),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as td:
+                root = Path(td); store = InvestigationStore(root / "state")
+                boundary = self.make_boundary(root)
+                family_value = {"representativeRawPeriodDays": 7.546257528330875,
+                    "possibleDoubleCycleDays": 15.09251505666175,
+                    "physicalCycleResolved": False, "supportingSectors": [94, 95]}
+                family = InvestigationStage("011-interpret-broad-independent-search",
+                    "openstar.tess.independent.broad.interpret", "COMPLETE",
+                    "010-search", {}, result={"harmonicFamily": family_value})
+                final_result = {**boundary.stages[1].result,
+                    "independentBroadVerification": {"harmonicFamily": family_value}}
+                final_path = Path(boundary.stages[1].artifacts[0].path)
+                final_path.write_text(json.dumps(final_result, sort_keys=True))
+                final = replace(boundary.stages[1], result=final_result, artifacts=(
+                    replace(boundary.stages[1].artifacts[0],
+                        sha256=sha256_file(final_path)),))
+                failed = InvestigationStage(
+                    "030-target-residual-astrophysical-interpretation",
+                    "openstar.tess.target-residual-astrophysical-interpretation.analyze",
+                    "FAILED", "029-finalize", {}, result=None,
+                    error="RuntimeError: main recurrent-family artifact verification failed",
+                    failure_classification="NON_RETRYABLE")
+                original = replace(boundary, status="FAILED",
+                    stages=(family, boundary.stages[0], final, failed))
+                store.save(original)
+                for item in (family, failed):
+                    path = store.stage_path_for(original.id, item.id)
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text(json.dumps(asdict(item)))
+                changed = mutate(original)
+                if name.startswith("stage029"):
+                    changed_final = changed.stages[2]
+                    final_path.write_text(json.dumps(changed_final.result, sort_keys=True))
+                    changed = replace(changed, stages=changed.stages[:2] +
+                        (replace(changed_final, artifacts=(replace(
+                            changed_final.artifacts[0], sha256=sha256_file(final_path)),)),)
+                        + changed.stages[3:])
+                self.assertEqual(changed,
+                    repair_obsolete_terminal_wait(store, changed))
+
+    def test_missing_or_tampered_failed030_ledger_fails_closed(self):
+        for tamper in (False, True):
+            with self.subTest(tamper=tamper), tempfile.TemporaryDirectory() as td:
+                root = Path(td); store = InvestigationStore(root / "state")
+                # Start from the admitted fixture produced by the happy-path test shape.
+                boundary = self.make_boundary(root)
+                family_value = {"representativeRawPeriodDays": 7.546257528330875,
+                    "possibleDoubleCycleDays": 15.09251505666175,
+                    "physicalCycleResolved": False, "supportingSectors": [94, 95]}
+                family = InvestigationStage("011-interpret-broad-independent-search",
+                    "openstar.tess.independent.broad.interpret", "COMPLETE", None, {},
+                    result={"harmonicFamily": family_value})
+                final_result = {**boundary.stages[1].result,
+                    "independentBroadVerification": {"harmonicFamily": family_value}}
+                final_path = Path(boundary.stages[1].artifacts[0].path)
+                final_path.write_text(json.dumps(final_result))
+                final = replace(boundary.stages[1], result=final_result, artifacts=(
+                    replace(boundary.stages[1].artifacts[0], sha256=sha256_file(final_path)),))
+                failed = InvestigationStage("030-target-residual-astrophysical-interpretation",
+                    "openstar.tess.target-residual-astrophysical-interpretation.analyze",
+                    "FAILED", "029-finalize", {}, result=None,
+                    error="RuntimeError: main recurrent-family artifact verification failed",
+                    failure_classification="NON_RETRYABLE")
+                investigation = replace(boundary, status="FAILED",
+                    stages=(family, boundary.stages[0], final, failed))
+                store.save(investigation)
+                family_path = store.stage_path_for(investigation.id, family.id)
+                family_path.parent.mkdir(parents=True)
+                family_path.write_text(json.dumps(asdict(family)))
+                if tamper:
+                    failed_path = store.stage_path_for(investigation.id, failed.id)
+                    failed_path.write_text(json.dumps({**asdict(failed), "stop": True}))
+                self.assertEqual(investigation,
+                    repair_obsolete_terminal_wait(store, investigation))
+
 
 class RealBoundaryHandlerIntegrationTests(unittest.TestCase):
+    def test_failed030_recovery_executes_031_and_returns_unexecuted_032(self):
+        sys.modules.setdefault("numpy", MagicMock())
+        from workflows.tess.tess_investigation import build_engine
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td); store = InvestigationStore(root / "state")
+            family_value = {"interpretation": "recurrent-raw-period-family",
+                "representativeRawPeriodDays": 7.546257528330875,
+                "possibleDoubleCycleDays": 15.09251505666175,
+                "physicalCycleResolved": False, "supportingSectorCount": 2,
+                "supportingSectors": [94, 95]}
+            identity = {"ticID": 266997586, "retrievedAt": "2025-01-01T00:00:00Z",
+                "tic": {"metadata": {"massMsun": .94, "radiusRsun": .864}},
+                "vsx": {"found": True, "nearest": {"name": "NSV 15055",
+                    "type": "TTS/ROT", "periodDays": 3.721,
+                    "separationArcsec": .15}, "queryProvenance": {
+                        "service": "VizieR", "catalog": "B/vsx/vsx",
+                        "ticID": 266997586, "radiusArcsec": 10.0}}}
+            mode = {"classification": "INDEPENDENT_STABLE_MODE",
+                "modeCandidate": {"periodDays": 3.604,
+                    "frequencyCyclesPerDay": 1 / 3.604,
+                    "supportingSectors": [1, 28, 67, 68, 94, 95]},
+                "physicalMechanismResolved": False}
+            attribution = {"classification": "TARGET_RESIDUAL_COMPONENT_DOMINANT",
+                "residualModeOrigin": "TARGET_DOMINANT",
+                "physicalMechanismResolved": False}
+            intrinsic = {"classification": "TRANSIENT_INTERMITTENT_TARGET_RESIDUAL",
+                "physicalMechanismResolved": False,
+                "recommendedNextTest": "TARGET_RESIDUAL_PHYSICAL_MECHANISM_FOLLOWUP"}
+            mechanism = {"classification": "SMOOTH_TARGET_MODE_AMPLITUDE_MODULATION",
+                "physicalMechanismResolved": False,
+                "recommendedNextTest": "ASTROPHYSICAL_MECHANISM_INTERPRETATION",
+                "adjudicationVersion": "route-independent-all-models-v1",
+                "crossSectorPhaseUsed": False, "failClosedReasons": [],
+                "replicatedMechanisms": ["SMOOTH_TARGET_MODE_AMPLITUDE_MODULATION"],
+                "replicatedMechanismSupportingSectorIDs": {
+                    "SMOOTH_TARGET_MODE_AMPLITUDE_MODULATION": [68, 95]}}
+            family = InvestigationStage("011-interpret-broad-independent-search",
+                "openstar.tess.independent.broad.interpret", "COMPLETE", "010-search",
+                {}, result={"harmonicFamily": family_value})
+            stages = [
+                stage("003-catalog-identity", "openstar.tess.catalog-identity", identity,
+                    root / "003-catalog-identity.json"), family,
+                stage("018-mode-identification", "openstar.tess.mode-identification.analyze",
+                    mode, root / "mode-identification-v20.9.json"),
+                stage("026-interpret-multi-source-residual",
+                    "openstar.tess.multi-source-residual.interpret", attribution,
+                    root / "multi-source-residual-v20.12.json"),
+                stage("027-classify-intrinsic-target-residual",
+                    "openstar.tess.intrinsic-nonstationary.analyze", intrinsic,
+                    root / "intrinsic-nonstationary-v20.13.json"),
+                stage("028-target-residual-mechanism",
+                    "openstar.tess.target-residual-mechanism.analyze", mechanism,
+                    root / "target-residual-mechanism-v20.14.json")]
+            conclusion = {"recommendedNextTest":
+                "INTRINSIC_NONSTATIONARY_VARIABILITY_CLASSIFICATION",
+                "independentBroadVerification": {"harmonicFamily": family_value}}
+            stages.append(stage("029-finalize", "openstar.tess.finalize", conclusion,
+                root / "conclusion-v20.14-intrinsic.json",
+                trigger="028-target-residual-mechanism",
+                parameters={"outputSuffix": "v20.14-intrinsic"}, stop=True))
+            failed = InvestigationStage(
+                "030-target-residual-astrophysical-interpretation",
+                "openstar.tess.target-residual-astrophysical-interpretation.analyze",
+                "FAILED", "029-finalize", {}, result=None,
+                error="RuntimeError: main recurrent-family artifact verification failed",
+                failure_classification="NON_RETRYABLE")
+            stages.append(failed)
+            control = {"branchAssessments": [], "selectedExperiment": None,
+                "schedulerAction": "INVESTIGATION_COMPLETE"}
+            investigation = Investigation("real-shaped-recovery",
+                "openstar.workflow.tess-investigation.v1", "20.2", "FAILED",
+                "now", "now", {"ticID": 266997586, "controlState": control},
+                tuple(stages))
+            store.save(investigation)
+            for old_stage in stages:
+                ledger = store.stage_path_for(investigation.id, old_stage.id)
+                ledger.parent.mkdir(parents=True, exist_ok=True)
+                ledger.write_text(json.dumps(asdict(old_stage), sort_keys=True))
+            prior_files = {store.stage_path_for(investigation.id, item.id):
+                store.stage_path_for(investigation.id, item.id).read_bytes()
+                for item in stages}
+            prior_files.update({Path(ref.path): Path(ref.path).read_bytes()
+                for item in stages for ref in item.artifacts})
+
+            admitted = repair_obsolete_terminal_wait(store, investigation)
+            selected = admitted.metadata["controlState"]["selectedExperiment"]
+            self.assertEqual("031-target-residual-astrophysical-interpretation",
+                selected["id"])
+            self.assertEqual(
+                "openstar.tess.target-residual-astrophysical-interpretation.analyze",
+                selected["handler_id"])
+            self.assertEqual(failed.id, selected["triggered_by_stage_id"])
+            engine = build_engine(store, SimpleNamespace(), poll_interval=0, timeout=None)
+            engine.chain_stages = False
+            completed, next_request = engine.run_stage(admitted,
+                StageRequest(**selected), software_id="test", software_version="1")
+            result = completed.stages[-1].result
+            self.assertEqual("COMPLETE", completed.stages[-1].status)
+            self.assertEqual(ROTATION, result["classification"])
+            self.assertEqual(3.604, result["targetResidualPeriodDays"])
+            self.assertEqual(7.546257528330875,
+                result["mainPhotometricFamily"]["representativeRawPeriodDays"])
+            self.assertEqual(15.09251505666175,
+                result["mainPhotometricFamily"]["possibleDoubleCycleDays"])
+            self.assertFalse(result["mainPhotometricFamily"]["physicalCycleResolved"])
+            self.assertEqual("032-finalize", next_request.id)
+            self.assertFalse(any(item.id == "032-finalize" for item in completed.stages))
+            self.assertEqual("FAILED", next(item for item in completed.stages
+                if item.id == failed.id).status)
+            self.assertEqual(prior_files,
+                {path: path.read_bytes() for path in prior_files})
+
     def test_real_schema_boundary_executes_stage030_append_only(self):
         # Numerical modules are not exercised by this coordinator-local stage;
         # isolate their optional import in this minimal test environment.
