@@ -2625,14 +2625,7 @@ def build_engine(
                 input_hashes[f"independentSector{sector}"] = sha256_file(Path(path))
 
         continuation = morphology.get("continuationEvidence") or {}
-        if morphology.get("physicalCycleResolved"):
-            next_stage = StageRequest(
-                id=_next_stage_id(request.id, "physical-interpretation"),
-                handler_id="openstar.tess.physical.interpret",
-                parameters={},
-                triggered_by_stage_id=request.id,
-            )
-        elif continuation.get("timeFrequencyEvolutionWarranted"):
+        if continuation.get("timeFrequencyEvolutionWarranted"):
             next_stage = StageRequest(
                 id=_next_stage_id(request.id, "prepare-time-frequency"),
                 handler_id="openstar.tess.time-frequency.prepare",
