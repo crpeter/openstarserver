@@ -265,7 +265,8 @@ class ExternalCompanionEvidenceTests(unittest.TestCase):
                 investigation, next_request = engine.run_stage(
                     investigation, next_request, software_id="test", software_version="1")
             archive.assert_not_called()
-            self.assertEqual("openstar.tess.finalize", next_request.handler_id)
+            self.assertEqual("openstar.tess.final-companion-evidence-synthesis",
+                             next_request.handler_id)
             result = investigation.stages[-1].result
             self.assertEqual("PERIOD_MATCHED_PLANETARY_MASS_COMPANION_SUPPORTED",
                              result["classification"])

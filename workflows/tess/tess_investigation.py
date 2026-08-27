@@ -65,6 +65,10 @@ from .tess_external_companion_evidence import (
     interpret_external_evidence,
     review_source_attribution,
 )
+from .tess_companion_evidence_synthesis import (
+    HANDLER_ID as COMPANION_SYNTHESIS_HANDLER_ID,
+    synthesize_companion_evidence,
+)
 from .tess_localization import localize_periodic_source
 from .tess_sector_archive import TessArchiveTransientError
 from .tess_multimode import (
@@ -1902,6 +1906,7 @@ def _render_report(conclusion: dict[str, Any]) -> str:
             f"- Supporting independent sectors: {source_review.get('supportingIndependentSectors')}",
         ])
     if external_companion is not None:
+        synthesis_complete = conclusion.get("finalCompanionEvidenceSynthesis") is not None
         lines.extend([
             "", "## Published external companion confirmation", "",
             f"- Classification: {external_companion.get('classification')}",
@@ -1912,9 +1917,28 @@ def _render_report(conclusion: dict[str, Any]) -> str:
             f"- Supported mass regime: {external_companion.get('supportedCompanionMassRegime')}",
             f"- Known-object catalog used: {external_companion.get('externalKnownObjectCatalogUsed')}",
             f"- Preceding photometric/spatial evidence remained software-blind: {external_companion.get('softwareBlindPhotometricEvidencePreserved')}",
-            f"- Final physical mechanism resolved: {external_companion.get('physicalMechanismResolved')}",
-            f"- Final companion nature resolved: {external_companion.get('companionNatureResolved')}",
+            f"- At external interpretation, physical mechanism resolved: {external_companion.get('physicalMechanismResolved')}",
+            ("- At external interpretation, companion nature was pending final synthesis."
+             if synthesis_complete else
+             f"- At external interpretation, companion nature resolved: {external_companion.get('companionNatureResolved')}"),
             f"- Authoritative next test: {conclusion.get('recommendedNextTest')}",
+        ])
+    synthesis = conclusion.get("finalCompanionEvidenceSynthesis")
+    if synthesis is not None:
+        relationship = ("the investigated target" if synthesis.get("sourceRelationship") == "TARGET_ASSOCIATED"
+                        else "an off-target source (not the investigated target)")
+        lines.extend([
+            "", "## Final companion-evidence synthesis", "",
+            f"- Classification: {synthesis.get('classification')}",
+            f"- Source attribution: {relationship}",
+            "- Evidence separation: software-blind photometric and spatial evidence was frozen before published known-object confirmation evidence was consulted.",
+            f"- Resolved companion mass regime: {synthesis.get('supportedCompanionMassRegime')}",
+            "- Detailed photometric mechanism: **unresolved** (reflection, thermal emission, ellipsoidal variation, beaming, eclipses, and other components are not uniquely decomposed).",
+            f"- Autonomous companion-evidence analysis complete: {synthesis.get('autonomousCompanionEvidenceComplete')}",
+            "- Required next step: human scientific review.",
+            f"- Automatic discovery claim: {synthesis.get('automaticDiscoveryClaim')}",
+            f"- Catalog answer key used: {synthesis.get('catalogAnswerKeyUsed')}",
+            "- Interpretation: OpenStar independently recovered evidence consistent with a previously known companion; it did not discover a new object.",
         ])
     return "\n".join(lines)
 
@@ -3008,12 +3032,41 @@ def build_engine(
         print("🔭 Published external companion confirmation evidence")
         print(f"   external classification: {result['classification']}")
         print("   OpenStar photometric/spatial evidence remains software-blind")
-        print("   final physical mechanism and companion nature remain unresolved")
+        print("   companion nature pending final synthesis; detailed physical mechanism unresolved")
+        proceed = (result.get("externalCompanionEvidenceResolved") is True
+                   and result.get("recommendedNextTest") == "FINAL_COMPANION_EVIDENCE_SYNTHESIS")
         return StageOutcome(result=result,
-            next_stage=StageRequest(_next_stage_id(request.id, "finalize"), "openstar.tess.finalize",
-                {"outputSuffix": "external-companion-evidence-v1"}, request.id),
+            next_stage=StageRequest(_next_stage_id(request.id, "companion-evidence-synthesis" if proceed else "finalize"),
+                COMPANION_SYNTHESIS_HANDLER_ID if proceed else "openstar.tess.finalize",
+                {} if proceed else {"outputSuffix": "external-companion-evidence-v1"}, request.id),
             input_hashes={"externalEvidenceFreeze": sha256_json(frozen)},
             artifacts=(_artifact(path, "application/json"),))
+
+    def companion_evidence_synthesis_stage(investigation, request):
+        binary = _required_latest_result_for_handler(investigation, "openstar.tess.binary-confirmation.analyze")
+        localization = _required_latest_result_for_handler(investigation, ECLIPSE_LOCALIZATION_HANDLER_ID)
+        review = _required_latest_result_for_handler(investigation, SOURCE_ATTRIBUTION_REVIEW_HANDLER_ID)
+        frozen = _required_latest_result_for_handler(investigation, EXTERNAL_EVIDENCE_FREEZE_HANDLER_ID)
+        external = _required_latest_result_for_handler(investigation, EXTERNAL_EVIDENCE_INTERPRET_HANDLER_ID)
+        result = synthesize_companion_evidence(binary, localization, review, frozen, external)
+        path = (store.directory_for(investigation.id) / "artifacts" /
+                "companion-evidence-synthesis" / "companion-evidence-synthesis-v1.json")
+        _write_json(path, result)
+        print("🧬 Final companion-evidence synthesis")
+        print(f"   classification: {result['classification']}")
+        print(f"   source relationship: {result['sourceRelationship']}")
+        print(f"   supported mass regime: {result['supportedCompanionMassRegime']}")
+        print("   companion nature resolved: True")
+        print("   physical mechanism still unresolved: True")
+        print("   automatic discovery claim: False")
+        print("   human scientific review recommended: True")
+        hashes = {"binaryConfirmation": sha256_json(binary), "sourceLocalization": sha256_json(localization),
+                  "sourceAttributionReview": sha256_json(review), "externalEvidenceFreeze": sha256_json(frozen),
+                  "externalCompanionEvidence": sha256_json(external)}
+        return StageOutcome(result=result,
+            next_stage=StageRequest(_next_stage_id(request.id, "finalize"), "openstar.tess.finalize",
+                {"outputSuffix": "companion-evidence-synthesis-v1"}, request.id),
+            input_hashes=hashes, artifacts=(_artifact(path, "application/json"),))
 
     def source_localization_stage(investigation, request):
         prepared = _result(investigation, "001-prepare-target")
@@ -8811,6 +8864,9 @@ def build_engine(
         external_companion_evidence = _latest_result_for_handler(
             investigation, EXTERNAL_EVIDENCE_INTERPRET_HANDLER_ID,
         )
+        final_companion_evidence_synthesis = _latest_result_for_handler(
+            investigation, COMPANION_SYNTHESIS_HANDLER_ID,
+        )
         source_localization = _latest_result_for_handler(
             investigation,
             "openstar.tess.source-localization.analyze",
@@ -9051,11 +9107,26 @@ def build_engine(
             claim_decision = {"claim": claim_decision["claim"], "rationale": existing_rationale}
         if external_companion_evidence is not None:
             existing_rationale = list(claim_decision.get("rationale") or [])
+            interpretation_boundary = (
+                "At the external-evidence interpretation stage, companion nature and the "
+                "detailed photometric mechanism were still pending final synthesis."
+                if final_companion_evidence_synthesis is not None else
+                "Companion nature and the detailed photometric mechanism remain pending final synthesis."
+            )
             existing_rationale.append(
                 "Published known-object confirmation evidence was kept separate from the "
                 "software-blind photometric/spatial evidence and classified as "
-                f"{external_companion_evidence.get('classification')}. Final physical mechanism "
-                "and companion nature remain unresolved pending global synthesis."
+                f"{external_companion_evidence.get('classification')}. {interpretation_boundary}"
+            )
+            claim_decision = {"claim": claim_decision["claim"], "rationale": existing_rationale}
+        if final_companion_evidence_synthesis is not None:
+            existing_rationale = list(claim_decision.get("rationale") or [])
+            existing_rationale.append(
+                "Final hash-linked synthesis resolved the known companion mass regime and "
+                f"source relationship as {final_companion_evidence_synthesis.get('classification')}. "
+                "OpenStar independently recovered evidence consistent with a previously known "
+                "companion; detailed photometric mechanism remains unresolved and no automatic "
+                "discovery claim is made. Human scientific review is required."
             )
             claim_decision = {"claim": claim_decision["claim"], "rationale": existing_rationale}
 
@@ -10070,6 +10141,7 @@ def build_engine(
             "eclipseEventSourceLocalization": eclipse_event_localization,
             "sourceAttributionReview": source_attribution_review,
             "externalCompanionEvidence": external_companion_evidence,
+            "finalCompanionEvidenceSynthesis": final_companion_evidence_synthesis,
             "sourceLocalization": source_localization,
             "multiModeDecomposition": multimode_decomposition,
             "timeFrequencyEvolution": time_frequency_evolution,
@@ -10233,7 +10305,14 @@ def build_engine(
             print(f"   supported mass regime: {external_companion_evidence.get('supportedCompanionMassRegime')}")
             print(f"   known-object catalog used: {external_companion_evidence.get('externalKnownObjectCatalogUsed')}")
             print(f"   software-blind photometric/spatial evidence preserved: {external_companion_evidence.get('softwareBlindPhotometricEvidencePreserved')}")
-            print("   final physical mechanism and companion nature remain unresolved")
+        if final_companion_evidence_synthesis is not None:
+            print(f"   final companion synthesis: {final_companion_evidence_synthesis.get('classification')}")
+            print(f"   source relationship: {final_companion_evidence_synthesis.get('sourceRelationship')}")
+            print(f"   supported mass regime: {final_companion_evidence_synthesis.get('supportedCompanionMassRegime')}")
+            print("   companion nature resolved: True")
+            print("   detailed photometric mechanism unresolved: True")
+            print("   automatic discovery claim: False")
+            print("   authoritative next test: HUMAN_SCIENTIFIC_REVIEW")
         print(f"   authoritative recommended next test: {recommended_next_test}")
         if residual_mode_localization is not None:
             residual_cross = residual_mode_localization.get("crossSector") or {}
@@ -10528,6 +10607,7 @@ def build_engine(
     engine.register_handler(SOURCE_ATTRIBUTION_REVIEW_HANDLER_ID, source_attribution_review_stage)
     engine.register_handler(EXTERNAL_EVIDENCE_FREEZE_HANDLER_ID, external_evidence_freeze_stage)
     engine.register_handler(EXTERNAL_EVIDENCE_INTERPRET_HANDLER_ID, external_evidence_interpret_stage)
+    engine.register_handler(COMPANION_SYNTHESIS_HANDLER_ID, companion_evidence_synthesis_stage)
     engine.register_handler(
         "openstar.tess.source-localization.analyze",
         source_localization_stage,
