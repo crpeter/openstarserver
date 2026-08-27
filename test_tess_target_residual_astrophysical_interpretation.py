@@ -524,7 +524,7 @@ class RealBoundaryHandlerIntegrationTests(unittest.TestCase):
             self.assertEqual(15.09251505666175,
                 result["mainPhotometricFamily"]["possibleDoubleCycleDays"])
             self.assertFalse(result["mainPhotometricFamily"]["physicalCycleResolved"])
-            self.assertEqual("032-finalize", next_request.id)
+            self.assertEqual("032-main-family-time-domain-recurrence", next_request.id)
             self.assertFalse(any(item.id == "032-finalize" for item in completed.stages))
             self.assertEqual("FAILED", next(item for item in completed.stages
                 if item.id == failed.id).status)
@@ -619,7 +619,7 @@ class RealBoundaryHandlerIntegrationTests(unittest.TestCase):
             self.assertFalse(result["mainPhotometricFamily"]["physicalCycleResolved"])
             self.assertEqual(7.546428731,
                 result["mainPhotometricFamily"]["representativeRawPeriodDays"])
-            self.assertEqual("031-finalize", next_request.id)
+            self.assertEqual("031-main-family-time-domain-recurrence", next_request.id)
             self.assertFalse(engine.chain_stages)
             self.assertEqual(immutable_bytes, {path: Path(path).read_bytes()
                                               for path in immutable_bytes})

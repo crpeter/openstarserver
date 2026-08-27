@@ -439,6 +439,23 @@ def target_residual_mechanism_continuation(summary: dict[str, Any], *,
         parameters=parameters, triggered_by_stage_id=request_id)
 
 
+def astrophysical_interpretation_continuation(summary: dict[str, Any], *,
+        request_id: str) -> StageRequest:
+    """Schedule the independent recurrence test before finalization when warranted."""
+    family = summary.get("mainPhotometricFamily") or {}
+    warranted = (summary.get("targetResidualMechanismResolved") is True
+        and summary.get("classification") ==
+            "ROTATIONAL_ACTIVE_REGION_MODULATION_SUPPORTED"
+        and family.get("available") is True
+        and family.get("physicalCycleResolved") is False)
+    label = "main-family-time-domain-recurrence" if warranted else "finalize"
+    handler = ("openstar.tess.main-family-time-domain-recurrence.analyze" if warranted
+               else "openstar.tess.finalize")
+    return StageRequest(_next_stage_id(request_id, label), handler,
+        {} if warranted else {"outputSuffix":"v20.14.1-astrophysical-interpretation"},
+        request_id)
+
+
 def _dynamic_mode_localization_evidence(
     dynamic: dict[str, Any] | None,
     time_frequency_prepare: dict[str, Any] | None,
@@ -4334,10 +4351,8 @@ def build_engine(
             "target-residual-astrophysical-interpretation" /
             "target-residual-astrophysical-interpretation-v20.14.1.json")
         _write_json(artifact_path, summary)
-        return StageOutcome(result=summary, next_stage=StageRequest(
-            id=_next_stage_id(request.id, "finalize"), handler_id="openstar.tess.finalize",
-            parameters={"outputSuffix": "v20.14.1-astrophysical-interpretation"},
-            triggered_by_stage_id=request.id), input_hashes={
+        return StageOutcome(result=summary,
+            next_stage=astrophysical_interpretation_continuation(summary, request_id=request.id), input_hashes={
                 "v20.14Result": sha256_json(mechanism.result),
                 "targetAttribution": sha256_json(attribution.result),
                 "modeIdentification": sha256_json(mode.result),
@@ -4351,6 +4366,57 @@ def build_engine(
                 **({"frozenRecord:mainPhotometricFamily": family_hash}
                    if family_hash else {})},
             artifacts=(_artifact(artifact_path, "application/json"),))
+
+    def main_family_time_domain_recurrence_stage(investigation, request):
+        from .tess_main_family_time_domain_recurrence import analyze_time_domain_recurrence
+        upstream = next((s for s in reversed(investigation.stages)
+            if s.status == "COMPLETE" and s.handler_id ==
+            "openstar.tess.target-residual-astrophysical-interpretation.analyze"), None)
+        trigger = next((s for s in investigation.stages if s.id == request.triggered_by_stage_id),None)
+        historical = (request.id == "033-main-family-time-domain-recurrence" and trigger
+            and trigger.id == "032-finalize" and trigger.status == "COMPLETE"
+            and trigger.handler_id == "openstar.tess.finalize"
+            and trigger.triggered_by_stage_id == (upstream.id if upstream else None))
+        if upstream is None or (upstream.id != request.triggered_by_stage_id and not historical):
+            raise RuntimeError("recurrence analysis requires the directly preceding authoritative interpretation")
+        source = upstream.result or {}; family = source.get("mainPhotometricFamily") or {}
+        if not (source.get("classification") == "ROTATIONAL_ACTIVE_REGION_MODULATION_SUPPORTED"
+                and source.get("targetResidualMechanismResolved") is True
+                and family.get("available") is True and family.get("physicalCycleResolved") is False):
+            raise RuntimeError("authoritative solved-rotation/unresolved-family gates failed")
+        sectors = request.parameters.get("frozenSectors")
+        if sectors is None:
+            sectors=[]
+            resolver=historical_path_resolver or HistoricalPathResolver()
+            seen=set()
+            for stage in investigation.stages:
+                prepared=(stage.result or {}).get("preparedSectors") if isinstance(stage.result,dict) else None
+                for item in prepared or []:
+                    sector=item.get("sector"); raw=item.get("datasetPath")
+                    if sector in seen or not raw: continue
+                    path=resolver.resolve(raw)
+                    if not path.is_file(): continue
+                    dataset=_load_json(path)
+                    time=dataset.get("time") or dataset.get("timeDays")
+                    flux=dataset.get("flux") or dataset.get("values")
+                    if isinstance(time,list) and isinstance(flux,list) and len(time)==len(flux):
+                        sectors.append({"sectorID":sector,"time":time,"flux":flux,
+                            "datasetPath":str(path),"datasetSHA256":sha256_file(path)})
+                        seen.add(sector)
+        if not isinstance(sectors, list) or not sectors:
+            raise RuntimeError("frozenSectors time-domain datasets are required")
+        summary = analyze_time_domain_recurrence(sectors,
+            rotation_period_days=float(source["targetResidualPeriodDays"]),
+            rotation_classification=source["classification"],
+            main_photometric_family=family)
+        artifact_path = store.directory_for(investigation.id)/"artifacts"/"main-family-time-domain-recurrence"/"main-family-time-domain-recurrence-v20.14.2.json"
+        _write_json(artifact_path, summary)
+        return StageOutcome(result=summary,next_stage=StageRequest(
+            _next_stage_id(request.id,"finalize"),"openstar.tess.finalize",
+            {"outputSuffix":"v20.14.2-main-family-time-domain-recurrence"},request.id),
+            input_hashes={"stage031AstrophysicalInterpretation":sha256_json(source),
+                **{f"frozenSector:{s['sectorID']}":sha256_json(s) for s in sectors}},
+            artifacts=(_artifact(artifact_path,"application/json"),))
 
     def target_residual_mechanism_adjudication_stage(investigation, request):
         v2014_stage = next((stage for stage in reversed(investigation.stages)
@@ -8215,6 +8281,8 @@ def build_engine(
             investigation,
             "openstar.tess.target-residual-astrophysical-interpretation.analyze",
         )
+        main_family_time_domain_recurrence = _latest_result_for_handler(
+            investigation, "openstar.tess.main-family-time-domain-recurrence.analyze")
         target_residual_archival_baseline_extension = _latest_result_for_handler(
             investigation, "openstar.tess.target-residual-archival-baseline.interpret",
         )
@@ -9278,6 +9346,7 @@ def build_engine(
                 target_residual_mechanism_predictive_validation
             ),
             "targetResidualAstrophysicalInterpretation": target_residual_astrophysical_interpretation,
+            "mainFamilyTimeDomainRecurrence": main_family_time_domain_recurrence,
             "targetResidualArchivalBaselineExtension": target_residual_archival_baseline_extension,
             "targetResidualPixelRecurrenceValidation": target_residual_pixel_recurrence,
             "targetResidualMultisectorSourceLocalization": target_residual_multisector_source,
@@ -10092,6 +10161,8 @@ def build_engine(
         "openstar.tess.target-residual-astrophysical-interpretation.analyze",
         target_residual_astrophysical_interpretation_stage,
     )
+    engine.register_handler("openstar.tess.main-family-time-domain-recurrence.analyze",
+        main_family_time_domain_recurrence_stage)
     # All TESS handlers share this provider-to-workflow adapter.  Localization
     # builders call _download_tpf indirectly, so a centralized boundary also
     # protects new experiments from persisting MAST outages as NON_RETRYABLE.
