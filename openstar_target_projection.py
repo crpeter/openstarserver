@@ -312,11 +312,9 @@ class TargetProjectionStore:
         if sector:
             rows = [r for r in rows if sector in map(str, r["primarySectors"] + r["independentSectors"])]
         resolution = get("resolution")
-        if resolution:
-            rows = [r for r in rows if bool(r.get("sourceAttributionResolved") is True
-                    or r.get("companionNatureResolved") is True
-                    or r.get("physicalMechanismResolved") is True
-                    or r.get("physicalCycleResolved") is True) == (resolution == "resolved")]
+        if resolution in {"resolved", "unresolved"}:
+            rows = [r for r in rows
+                    if _is_unresolved(r) is (resolution == "unresolved")]
         health = get("health")
         if health:
             rows = [r for r in rows if r["degraded"] == (health == "degraded")]

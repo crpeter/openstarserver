@@ -164,9 +164,12 @@ class ProductionTargetProjectionTests(unittest.TestCase):
         self.persist("partial", "partial", {"ticID": 74}, [{
             "sourceAttributionResolved": True, "companionNatureResolved": False,
             "physicalMechanismResolved": False, "classification": "SOURCE_LOCALIZED"}])
-        stats = TargetProjectionStore(self.catalog).list({})["stats"]
+        projection = TargetProjectionStore(self.catalog)
+        stats = projection.list({})["stats"]
         self.assertEqual(1, stats["sourceLocalizedTargets"])
         self.assertEqual(1, stats["unresolvedTargets"])
+        self.assertEqual(1, projection.list({"resolution": ["unresolved"]})["total"])
+        self.assertEqual(0, projection.list({"resolution": ["resolved"]})["total"])
 
     def test_exact_tic_and_gaia_grouping_with_mixed_timestamps(self):
         self.persist("tic-a", "tic-a", {"ticID": 42}, [{"classification": "A"}])
