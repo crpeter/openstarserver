@@ -1,3 +1,5 @@
+import contextlib
+import io
 import json
 import math
 import sys
@@ -919,6 +921,65 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
                     )
                 else:
                     self.assertIsNone(conclusion["selectedPeriodDays"])
+
+    def test_actual_finalizer_uses_physical_then_binary_recommendation(self):
+        def run(include_binary):
+            root = Path(tempfile.mkdtemp())
+            self.addCleanup(lambda: __import__("shutil").rmtree(root, ignore_errors=True))
+            store = InvestigationStore(root / "investigations")
+            investigation = store.create("finalizer", WORKFLOW_ID, WORKFLOW_VERSION)
+            physical = {"recommendedNextTest": "INDEPENDENT_BINARY_CONFIRMATION",
+                "physicalMechanismResolved": False,
+                "preferredPhotometricHypothesis": "BINARY_LIKE_DOUBLE_WAVE"}
+            stages = [
+                ("001-prepare-target", "openstar.tess.prepare-target", {
+                    "datasetID": "primary", "ticID": 1, "targetName": "Synthetic", "sector": 1}),
+                ("002-hypotheses", "openstar.tess.hypotheses", {
+                    "rawCandidatePeriodDays": 1.0, "observedPeriodDays": 2.0}),
+                ("003-planner", "openstar.tess.planner", {
+                    "claimDecision": {"claim": "CANDIDATE_PERIOD", "rationale": []}}),
+                ("010-morphology", "openstar.tess.morphology.analyze", {
+                    "physicalCycleResolved": True, "resolvedPhysicalPeriodDays": 2.0}),
+                ("020-time-frequency", "openstar.tess.time-frequency.summarize", {
+                    "classification": "NO_SIGNIFICANT_TIME_FREQUENCY_STRUCTURE",
+                    "recommendedNextTest": "BINARY_ROTATION_EXTERNAL_EVIDENCE"}),
+                ("021-physical", "openstar.tess.physical.interpret", physical),
+            ]
+            if include_binary:
+                stages.append(("022-binary", "openstar.tess.binary-confirmation.analyze", {
+                    "independentEvidence": {"classification": "REPLICATED_ECLIPSE_LIKE_EVENT_SUPPORTED"},
+                    "linearEphemeris": {"coherent": True},
+                    "oppositeConjunctionEvidence": {
+                        "classification": "OPPOSITE_CONJUNCTION_EVENT_UNRESOLVED"},
+                    "recommendedNextTest": "ECLIPSE_EVENT_SOURCE_LOCALIZATION"}))
+            for stage in stages:
+                investigation = self._complete(store, investigation, *stage)
+            engine = build_engine(store, coordinator=types.SimpleNamespace(),
+                                  poll_interval=0.0, timeout=None)
+            engine.chain_stages = False
+            console = io.StringIO()
+            with contextlib.redirect_stdout(console):
+                completed, request = engine.run_stage(investigation,
+                    StageRequest("099-finalize", "openstar.tess.finalize", {}, stages[-1][0]),
+                    software_id="integration", software_version="1")
+            self.assertIsNone(request)
+            return completed.stages[-1].result, console.getvalue()
+
+        physical, physical_console = run(False)
+        self.assertEqual("INDEPENDENT_BINARY_CONFIRMATION", physical["recommendedNextTest"])
+        self.assertIn("INDEPENDENT_BINARY_CONFIRMATION",
+                      Path(physical["reportPath"]).read_text(encoding="utf-8"))
+        self.assertNotIn("recommended next test: BINARY_ROTATION_EXTERNAL_EVIDENCE",
+                         physical_console)
+        binary, binary_console = run(True)
+        self.assertEqual("ECLIPSE_EVENT_SOURCE_LOCALIZATION", binary["recommendedNextTest"])
+        report = Path(binary["reportPath"]).read_text(encoding="utf-8")
+        self.assertIn("ECLIPSE_EVENT_SOURCE_LOCALIZATION", report)
+        self.assertIn("REPLICATED_ECLIPSE_LIKE_EVENT_SUPPORTED", report)
+        self.assertIn("eclipse-like replication: REPLICATED_ECLIPSE_LIKE_EVENT_SUPPORTED",
+                      binary_console)
+        self.assertIn("authoritative recommended next test: ECLIPSE_EVENT_SOURCE_LOCALIZATION",
+                      binary_console)
 
     def test_broad_continuation_executes_existing_morphology_handler(self):
         temporary = tempfile.TemporaryDirectory()
