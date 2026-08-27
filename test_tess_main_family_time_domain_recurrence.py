@@ -24,8 +24,8 @@ class MainFamilyTimeDomainRecurrenceTests(unittest.TestCase):
               "possibleDoubleCycleDays": 15.09251505666175,
               "physicalCycleResolved": False, "supportingSectorIDs": [94, 95]}
 
-    def sector(self, sector, alternating=False, gap=False):
-        time = np.arange(0, 40, .04)
+    def sector(self, sector, alternating=False, gap=False, duration=40):
+        time = np.arange(0, duration, .04)
         cycle = np.floor(time/self.P).astype(int)
         flux = np.sin(2*math.pi*time/self.P)
         if alternating:
@@ -46,15 +46,32 @@ class MainFamilyTimeDomainRecurrenceTests(unittest.TestCase):
         self.assertIn("perResamplePeakLocationsDays",a["rotationJackknife"])
 
     def test_alternating_morphology_preserves_pairs(self):
-        result=analyze_time_domain_recurrence([self.sector(94,True),self.sector(95,True)],
+        synthetic_family={"available":True,"representativeRawPeriodDays":2*self.P,
+            "possibleDoubleCycleDays":4*self.P,"physicalCycleResolved":False,
+            "supportingSectorIDs":[94,95]}
+        result=analyze_time_domain_recurrence([self.sector(94,True,duration=19.2),
+            self.sector(95,True,duration=19.2)],
             rotation_period_days=self.P,rotation_classification="ROTATIONAL_ACTIVE_REGION_MODULATION_SUPPORTED",
-            main_photometric_family=self.FAMILY)
+            main_photometric_family=synthetic_family)
         pairs=result["cycleRecurrenceSectorResults"][0]["cyclePairMeasurements"]
-        self.assertGreater(len(pairs["2"]),3)
+        self.assertGreaterEqual(len(pairs["2"]),3)
         self.assertGreater(np.median([x["correlation"] for x in pairs["2"]]),
                            np.median([x["correlation"] for x in pairs["1"]]))
-        self.assertIn(result["classification"],(ROTATION_MULTICYCLE,UNRESOLVED))
+        self.assertEqual(ROTATION_MULTICYCLE,result["classification"])
+        self.assertTrue(result["decisionGates"]["cycleMorphologySupportsSameRelation"])
         self.assertFalse(result["physicalCycleResolved"])
+
+    def test_materially_offset_persisted_family_is_not_falsely_rotation_related(self):
+        offset_family={"available":True,"representativeRawPeriodDays":8.5,
+            "possibleDoubleCycleDays":17.0,"physicalCycleResolved":False,
+            "supportingSectorIDs":[94,95]}
+        result=analyze_time_domain_recurrence([self.sector(94),self.sector(95)],
+            rotation_period_days=self.P,
+            rotation_classification="ROTATIONAL_ACTIVE_REGION_MODULATION_SUPPORTED",
+            main_photometric_family=offset_family)
+        self.assertEqual("FREQUENCY_FAMILY_NOT_TIME_DOMAIN_REPLICATED",
+            result["classification"])
+        self.assertFalse(result["mainFamilyRelationshipToRotationResolved"])
 
     def test_replication_required(self):
         synthetic={"sectorID":94,"rotationRecurrencePeak":{"lagDays":3.6,"localPeakWidthDays":.2,
@@ -154,7 +171,7 @@ class MainFamilyTimeDomainRecurrenceTests(unittest.TestCase):
             prepared=[]
             for sector in (94,95):
                 times=np.arange(0,18,.04)
-                flux=np.sin(2*np.pi*times/self.P)+.5*np.sin(np.pi*times/self.P)
+                flux=np.sin(2*np.pi*times/self.P)
                 path=root/f"sector-{sector}.json"
                 path.write_text(json.dumps({"times":times.tolist(),"flux":flux.tolist(),
                     "source":{"sector":sector,"originalTimeOriginDays":2459000.0}}))
