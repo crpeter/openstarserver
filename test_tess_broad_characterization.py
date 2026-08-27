@@ -2498,6 +2498,106 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
                                   correlated_offset["residualCoherentChiSquare"])
         self.assertFalse(correlated_offset["independentSpatialSupport"])
 
+    def test_time_frequency_continuation_routes_only_resolved_physical_cycle(self):
+        resolved = {
+            "recommendedNextTest": "BINARY_ROTATION_EXTERNAL_EVIDENCE",
+            "physicalMechanismResolved": False,
+            "periodReference": {
+                "kind": "MORPHOLOGY_RESOLVED_PHYSICAL_PERIOD",
+                "physicalCycleResolved": True,
+                "periodDays": 7.25,
+            },
+        }
+        request = time_frequency_continuation(
+            resolved, request_id="014-summarize-time-frequency",
+        )
+        self.assertEqual("openstar.tess.physical.interpret", request.handler_id)
+
+        invalid_overrides = (
+            {"periodReference": {**resolved["periodReference"],
+                                 "kind": "UNRESOLVED_FAMILY_ANALYSIS_REFERENCE"}},
+            {"periodReference": {**resolved["periodReference"],
+                                 "physicalCycleResolved": False}},
+            {"periodReference": None},
+            {"periodReference": {**resolved["periodReference"], "periodDays": None}},
+            {"periodReference": {**resolved["periodReference"], "periodDays": math.nan}},
+            {"periodReference": {**resolved["periodReference"], "periodDays": 0}},
+            {"periodReference": {**resolved["periodReference"], "periodDays": -1}},
+            {"physicalMechanismResolved": True},
+        )
+        for override in invalid_overrides:
+            with self.subTest(override=override):
+                summary = {**resolved, **override}
+                request = time_frequency_continuation(
+                    summary, request_id="014-summarize-time-frequency",
+                )
+                self.assertEqual("openstar.tess.finalize", request.handler_id)
+
+        expected_routes = (
+            ("MODE_IDENTIFICATION_OR_PULSATION_MODELING",
+             "openstar.tess.mode-identification.analyze"),
+            ("LONG_BASELINE_NONSTATIONARY_MODE_MODELING",
+             "openstar.tess.nonstationary.prepare"),
+        )
+        for recommendation, expected_handler in expected_routes:
+            with self.subTest(recommendation=recommendation):
+                request = time_frequency_continuation(
+                    {"recommendedNextTest": recommendation,
+                     "physicalMechanismResolved": False},
+                    request_id="014-summarize-time-frequency",
+                )
+                self.assertEqual(expected_handler, request.handler_id)
+
+    def test_resolved_stable_time_frequency_summary_routes_to_physical_interpretation(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        store = InvestigationStore(Path(temporary.name) / "investigations")
+        investigation = store.create("resolved-stable", WORKFLOW_ID, WORKFLOW_VERSION)
+        morphology = {
+            "physicalCycleResolved": True,
+            "resolvedPhysicalPeriodDays": 7.25,
+        }
+        interpretation = {"windowResults": [], "familyTrack": []}
+        for stage_id, handler, result in (
+            ("010-morphology", "openstar.tess.morphology.analyze", morphology),
+            ("013-interpret-time-frequency", "openstar.tess.time-frequency.interpret",
+             interpretation),
+        ):
+            investigation = self._complete(
+                store, investigation, stage_id, handler, result,
+            )
+
+        engine = build_engine(
+            store, coordinator=types.SimpleNamespace(), poll_interval=0.0, timeout=None,
+        )
+        engine.chain_stages = False
+        completed, next_request = engine.run_stage(
+            investigation,
+            StageRequest(
+                "014-summarize-time-frequency",
+                "openstar.tess.time-frequency.summarize",
+                {},
+                "013-interpret-time-frequency",
+            ),
+            software_id="integration",
+            software_version="20.30",
+        )
+
+        summary_stage = completed.stages[-1]
+        self.assertEqual("BINARY_ROTATION_EXTERNAL_EVIDENCE",
+                         summary_stage.result["recommendedNextTest"])
+        self.assertFalse(summary_stage.result["physicalMechanismResolved"])
+        self.assertEqual({
+            "periodDays": 7.25,
+            "kind": "MORPHOLOGY_RESOLVED_PHYSICAL_PERIOD",
+            "physicalCycleResolved": True,
+        }, summary_stage.result["periodReference"])
+        self.assertEqual("openstar.tess.physical.interpret", next_request.handler_id)
+        self.assertEqual({
+            "morphology": sha256_json(morphology),
+            "timeFrequencyInterpretation": sha256_json(interpretation),
+        }, summary_stage.provenance.input_hashes)
+
     def test_transient_recommendation_does_not_route_to_nonstationary(self):
         request = time_frequency_continuation(
             {"recommendedNextTest": "TRANSIENT_MODE_VALIDATION",
