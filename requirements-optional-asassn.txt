@@ -1,0 +1,3 @@
+# Optional coordinator-only ASAS-SN Sky Patrol client.
+# Never install this dependency on generic compute workers.
+pyasassn==1.6.3

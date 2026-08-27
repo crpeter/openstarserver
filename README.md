@@ -267,6 +267,10 @@ investigation. If either variable or the optional client is absent, the run
 persists `PROVIDER_CONFIGURATION_UNAVAILABLE`; it does not reinterpret an
 operational condition as scientific insufficiency.
 
+Install the coordinator-only, pinned interface with
+`python -m pip install -r requirements-optional-asassn.txt`. OpenStar supports
+`pyasassn==1.6.3` for this adapter; it is not a worker dependency.
+
 External follow-up is an append-only prepare/run/interpret sequence. Preparation
 freezes the provider priority, family window, target identity, quality contract,
 and authoritative catalog-neighbor evidence. Run freezes the canonical raw

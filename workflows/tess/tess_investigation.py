@@ -140,7 +140,7 @@ from .external_long_baseline import (
     ASASSNSkyPatrolProvider, ProviderConfigurationUnavailable,
     ProviderTransientError, run_external_experiment,
 )
-from .period_family_followup import verify_semantic_boundary, select_untouched_sectors
+from .period_family_followup import verify_semantic_boundary, select_untouched_sectors, extract_gaia_context, freeze_period_family_contract, verified_contract
 from .tess_period_family_time_domain_evolution import (
     PREPARE_HANDLER as PERIOD_FAMILY_TIME_DOMAIN_PREPARE_HANDLER,
     RUN_HANDLER as PERIOD_FAMILY_TIME_DOMAIN_RUN_HANDLER,
@@ -5162,6 +5162,9 @@ def build_engine(
             ledger_hashes=boundary["ledgerSHA256"],
             output_dir=store.directory_for(investigation.id)/"artifacts",investigation_id=investigation.id)
         preparation["semanticPolicyVersion"]=boundary["policyVersion"]
+        contract=freeze_period_family_contract(evidence,boundary["triggerStageID"])
+        preparation["periodFamilyContract"]=contract
+        preparation["periodFamilyContractSHA256"]=sha256_json(contract)
         return StageOutcome(result=preparation,next_stage=StageRequest(
             _next_stage_id(request.id,"run-generic-period-family-difference-imaging"),
             "openstar.tess.generic-period-family-difference-imaging.run",{},request.id),
@@ -5181,6 +5184,9 @@ def build_engine(
         preparation=_latest_result_for_handler(investigation,"openstar.tess.generic-period-family-difference-imaging.prepare")
         run=_latest_result_for_handler(investigation,"openstar.tess.generic-period-family-difference-imaging.run")
         result=interpret_period_family_difference_imaging(preparation,run)
+        contract=verified_contract(preparation)
+        result["periodFamilyContract"]=contract
+        result["periodFamilyContractSHA256"]=sha256_json(contract)
         result["autonomousContinuationEligible"]=result.get("recommendedNextTest")=="UNTOUCHED_SECTOR_TIME_DOMAIN_EVOLUTION"
         path=Path(preparation["artifactRoot"])/"generic-interpretation.json"; _write_json(path,result)
         return StageOutcome(result=result,stop=True,final_status="QUIESCENT_AWAITING_DATA",
@@ -5189,21 +5195,24 @@ def build_engine(
     def generic_period_family_time_prepare_stage(investigation,request):
         boundary=verify_semantic_boundary(store,investigation); evidence=boundary["result"]
         identity=_latest_result_for_handler(investigation,"openstar.tess.catalog-identity") or {}
-        products=list((identity.get("tess") or {}).get("archiveProducts") or [])
-        consumed=list(evidence.get("previouslyConsumedSectors") or evidence.get("supportingSectors") or [])
+        products=list((identity.get("tess") or {}).get("officialProducts") or (identity.get("tess") or {}).get("products") or [])
+        contract=verified_contract(evidence)
+        consumed=list(contract["consumedSectors"])
         selection=select_untouched_sectors(products,consumed)
-        family=list(evidence.get("persistedPeriodFamilyDays") or [])
-        window=evidence.get("familyAcceptanceWindowDays") or evidence.get("periodFamilyWindowDays")
-        frozen={"ticID":identity.get("ticID"),"primaryPeriodDays":evidence.get("primaryPeriodDays"),
-            "persistedPeriodFamilyDays":family,"familyCenterDays":evidence.get("familyCenterDays"),
+        family=list(contract["periodFamilyMembersDays"])
+        window=contract["acceptanceWindowDays"]
+        frozen={"ticID":identity.get("ticID"),"primaryPeriodDays":contract["primaryPeriodDays"],
+            "persistedPeriodFamilyDays":family,"familyCenterDays":contract["familyCenterDays"],
             "familyAcceptanceWindowDays":window,"previouslyConsumedSectors":consumed,
             "untouchedSectors":selection["selectedSectors"],
-            "campaigns":{epoch:[s for s in selection["selectedSectors"] if next((p for p in products if int(p["sector"])==s),{}).get("epoch")==epoch] for epoch in selection.get("selectedEpochs",[])},
-            "archiveContract":{"product":"SPOC_LIGHTCURVE","cadenceSeconds":120},}
+            "campaigns":{epoch:[s for s in selection["selectedSectors"] if selection.get("selectedSectorEpochs",{}).get(str(s))==epoch] for epoch in selection.get("selectedEpochs",[])},
+            "archiveContract":{"mission":"TESS","author":"SPOC","exptimeSeconds":120},}
         preparation=prepare_period_family_time_domain_evolution(frozen_boundary=frozen,
             ledger_hashes=boundary["ledgerSHA256"],output_dir=store.directory_for(investigation.id)/"artifacts",
             investigation_id=investigation.id)
         preparation["sectorSelection"]=selection
+        preparation["periodFamilyContract"]=contract
+        preparation["periodFamilyContractSHA256"]=sha256_json(contract)
         return StageOutcome(result=preparation,next_stage=StageRequest(
             _next_stage_id(request.id,"run-generic-period-family-time-domain-evolution"),
             "openstar.tess.generic-period-family-time-domain-evolution.run",{},request.id),
@@ -5223,6 +5232,9 @@ def build_engine(
         preparation=_latest_result_for_handler(investigation,"openstar.tess.generic-period-family-time-domain-evolution.prepare")
         run=_latest_result_for_handler(investigation,"openstar.tess.generic-period-family-time-domain-evolution.run")
         result=interpret_period_family_time_domain_evolution(preparation,run)
+        contract=verified_contract(preparation)
+        result["periodFamilyContract"]=contract
+        result["periodFamilyContractSHA256"]=sha256_json(contract)
         result["autonomousContinuationEligible"]=result.get("recommendedNextTest")=="ADDITIONAL_LONG_BASELINE_TIME_DOMAIN_DATA"
         path=Path(preparation["artifactRoot"])/"generic-interpretation.json"; _write_json(path,result)
         return StageOutcome(result=result,stop=True,final_status="QUIESCENT_AWAITING_DATA",
@@ -5231,17 +5243,18 @@ def build_engine(
     def external_long_baseline_prepare_stage(investigation, request):
         boundary = verify_semantic_boundary(store, investigation)
         evidence = boundary["result"]
-        window = (evidence.get("familyAcceptanceWindowDays")
-                  or evidence.get("periodFamilyWindowDays"))
+        contract = verified_contract(evidence)
+        window = contract["acceptanceWindowDays"]
         identity = _latest_result_for_handler(investigation, "openstar.tess.catalog-identity") or {}
         metadata = ((identity.get("tic") or {}).get("metadata") or {})
-        gaia = identity.get("gaia") or {}
-        neighbors = gaia.get("neighbors") if "neighbors" in gaia else None
+        gaia_context = extract_gaia_context(identity)
         result = {"version":"openstar.external-long-baseline-preparation.v2",
             "semanticBoundary":boundary, "familyWindowDays":window,
-            "target":{"ticID":identity.get("ticID"),"gaiaDR3SourceID":gaia.get("sourceID"),
+            "periodFamilyContract":contract,"periodFamilyContractSHA256":sha256_json(contract),
+            "target":{"ticID":identity.get("ticID"),"gaiaDR3SourceID":gaia_context.get("targetGaiaDR3SourceID"),
                       "raDeg":metadata.get("raDeg"),"decDeg":metadata.get("decDeg")},
-            "catalogNeighbors":neighbors, "providerPriority":["ASAS-SN_SKY_PATROL"],
+            "gaiaContext":gaia_context, "catalogNeighbors":gaia_context.get("neighbors"),
+            "providerPriority":["ASAS-SN_SKY_PATROL"],
             "credentialsPersisted":False}
         path = store.directory_for(investigation.id) / "artifacts" / "external-long-baseline" / "preregistration.json"
         if path.exists() and json.loads(path.read_text()) != result:

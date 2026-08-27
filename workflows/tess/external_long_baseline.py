@@ -17,6 +17,7 @@ from typing import Any, Protocol
 
 import numpy as np
 
+SUPPORTED_PYASASSN_VERSION = "1.6.3"
 
 class ProviderTransientError(RuntimeError): pass
 class ProviderUnavailable(RuntimeError): pass
@@ -85,33 +86,47 @@ class OfficialASASSNTransport:
                 "The optional pyasassn package is not installed") from exc
         self._client = SkyPatrolClient(username, token)
         self.client_version = getattr(pyasassn, "__version__", "unknown")
+        if self.client_version != SUPPORTED_PYASASSN_VERSION:
+            raise ProviderConfigurationUnavailable(
+                f"pyasassn=={SUPPORTED_PYASASSN_VERSION} is required; found {self.client_version}")
 
     def coverage(self, target):
-        lookup = ({"catalog": "tic", "id": target["ticID"]}
-                  if target.get("ticID") is not None else
-                  {"ra_deg": target.get("raDeg"), "dec_deg": target.get("decDeg")})
+        if target.get("ticID") is None:
+            return {"available": False, "reason": "tic-id-required",
+                    "clientVersion": self.client_version}
+        lookup = {"catalog": "stellar_main", "idColumn": "tic_id",
+                  "ids": [int(target["ticID"])]}
         # The official client performs the deterministic catalog/coordinate
         # lookup.  Keep its returned identity for positional validation.
-        result = self._client.query_list(lookup, catalog="master_list")
+        try:
+            result = self._client.query_list(
+                lookup["ids"], catalog="stellar_main", id_col="tic_id", download=False)
+        except (ConnectionError, TimeoutError, OSError) as exc:
+            raise ProviderTransientError("Transient ASAS-SN lookup failure") from exc
         if result is None or len(result) == 0:
             return {"available": False, "reason": "source-not-found",
                     "lookup": lookup, "clientVersion": self.client_version}
         return {"available": True, "lookup": lookup,
-                "selectedSource": str(result.iloc[0].get("asas_sn_id", "unknown")),
+                "selectedSource": str(target["ticID"]),
                 "clientVersion": self.client_version,
                 "product": "ASAS-SN Sky Patrol light curve"}
 
     def acquire(self, target, request):
-        result = self._client.query_list(
-            {"ra_deg": target.get("raDeg"), "dec_deg": target.get("decDeg")},
-            catalog="stellar_main", download=True)
+        try:
+            result = self._client.query_list([int(target["ticID"])],
+                catalog="stellar_main", id_col="tic_id", download=True)
+        except (ConnectionError, TimeoutError, OSError) as exc:
+            raise ProviderTransientError("Transient ASAS-SN acquisition failure") from exc
         # Canonical lossless JSON is the frozen provider response.  Tokens and
         # usernames are never included in request or provenance dictionaries.
-        rows = result.to_dict(orient="records")
+        data = getattr(result, "data", None)
+        if data is None:
+            raise MalformedProviderData("ASAS-SN LightCurveCollection lacks .data")
+        rows = data.to_dict(orient="records")
         mapped = [{"time": r.get("jd", r.get("hjd")),
                    "flux": r.get("flux", r.get("mag")),
                    "uncertainty": r.get("flux_err", r.get("mag_err")),
-                   "band": r.get("filter", r.get("band")),
+                   "band": r.get("phot_filter"),
                    "quality": r.get("quality", "GOOD")} for r in rows]
         return json.dumps(mapped, sort_keys=True, separators=(",", ":"),
                           allow_nan=False).encode("utf-8")
@@ -119,7 +134,7 @@ class OfficialASASSNTransport:
 
 DEFAULT_CONTRACT = {"minimumMeasurements": 80, "minimumBaselineDays": 730.0,
                     "minimumSeasons": 3, "acceptedBands": ["g", "V"],
-                    "acceptedQualityFlags": ["GOOD"], "minimumPhaseBins": 6,
+                    "acceptedQualityFlags": ["G", "GOOD"], "minimumPhaseBins": 6,
                     "maximumNeighborFluxFraction": 0.10}
 
 
@@ -133,7 +148,7 @@ def run_external_experiment(*, target: dict[str, Any], family_window: list[float
     preregistration = {"familyWindowDays": list(family_window), "providerPriority": [p.name for p in providers],
                        "qualityContract": policy, "observable": "blocked-seasonal-phase-prediction"}
     root = Path(artifact_root); root.mkdir(parents=True, exist_ok=True)
-    (root / "preregistration.json").write_text(json.dumps(preregistration, sort_keys=True), encoding="utf-8")
+    _write_once_json(root / "execution-preregistration.json", preregistration)
     if neighbors is None:
         return _decision("EXTERNAL_CONTAMINATION_AMBIGUOUS", attempts, None,
                          "Authoritative catalog-neighbor evidence is missing.", False, False, False)
@@ -154,6 +169,11 @@ def run_external_experiment(*, target: dict[str, Any], family_window: list[float
                     raise RuntimeError("Frozen provider response differs on recovery")
             else: raw_path.write_bytes(raw)
             rows = [r for r in provider.parse(raw) if r["band"] in policy["acceptedBands"] and r["quality"] in policy["acceptedQualityFlags"]]
+            cleaned = {"measurements": rows, "rawMeasurementCount": len(provider.parse(raw)),
+                       "acceptedMeasurementCount": len(rows),
+                       "excludedMeasurementCount": len(provider.parse(raw)) - len(rows)}
+            cleaned_path = root / f"{provider.name.lower()}-cleaned.json"
+            _write_once_json(cleaned_path, cleaned)
             quality = objective_coverage(rows, policy)
             if quality["status"] != "QUALIFIED":
                 attempts.append({"provider": provider.name, "availability": "AVAILABLE",
@@ -165,7 +185,16 @@ def run_external_experiment(*, target: dict[str, Any], family_window: list[float
                            "rawResponsePath": str(raw_path), "rawResponseSHA256": hashlib.sha256(raw).hexdigest(),
                            "requestParameters": {"familyWindowDays": family_window, "acceptedBands": policy["acceptedBands"]},
                            "providerProvenance": coverage, "crowdingFluxFraction": crowding})
-            result["acquiredAt"] = datetime.now(timezone.utc).isoformat()
+            acquisition_path = root / f"{provider.name.lower()}-acquisition.json"
+            if acquisition_path.exists():
+                acquisition = json.loads(acquisition_path.read_text(encoding="utf-8"))
+            else:
+                acquisition = {"acquiredAt": datetime.now(timezone.utc).isoformat(),
+                    "provider": provider.name, "rawSHA256": hashlib.sha256(raw).hexdigest()}
+                _write_once_json(acquisition_path, acquisition)
+            result["acquiredAt"] = acquisition["acquiredAt"]
+            result["cleanedMeasurementsPath"] = str(cleaned_path)
+            result["cleanedMeasurementsSHA256"] = hashlib.sha256(cleaned_path.read_bytes()).hexdigest()
             result["qualityContract"] = policy
             result["catalogNeighbors"] = neighbors
             return result
@@ -173,6 +202,16 @@ def run_external_experiment(*, target: dict[str, Any], family_window: list[float
             attempts.append({"provider": provider.name, "availability": "UNAVAILABLE", "rejectionReason": str(exc)})
     return _decision("EXTERNAL_DATA_INSUFFICIENT", attempts, None,
                      "No preregistered provider passed objective availability gates.", False, False, False)
+
+
+def _write_once_json(path: Path, value: dict[str, Any]) -> None:
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":"),
+                         ensure_ascii=False, allow_nan=False).encode("utf-8")
+    if path.exists():
+        if path.read_bytes() != encoded:
+            raise RuntimeError(f"Immutable artifact differs on recovery: {path.name}")
+        return
+    path.write_bytes(encoded)
 
 
 def analyze_seasonal_coherence(rows, family_window, policy=DEFAULT_CONTRACT):
@@ -238,9 +277,15 @@ def _analyze_single_band(rows, family_window, policy=DEFAULT_CONTRACT):
         try: jack.append(float(min(grid,key=lambda p: score(p,mask)[1])))
         except (ValueError,np.linalg.LinAlgError) as exc: failures.append({"season":int(season),"error":type(exc).__name__})
     interval=[float(np.percentile(jack,16)),float(np.percentile(jack,84))] if len(jack)>=3 else [None,None]
-    uncertainty=(interval[1]-interval[0])/2 if interval[0] is not None else None
+    grid_resolution=float(grid[1]-grid[0])
+    jackknife_half_width=((interval[1]-interval[0])/2 if interval[0] is not None else None)
+    # A finite profile grid cannot support precision below half a cell.  Report
+    # that resolution floor explicitly instead of false zero precision when all
+    # seasonal jackknife optima occupy the same cell.
+    uncertainty=(max(jackknife_half_width, grid_resolution/2)
+                 if jackknife_half_width is not None else None)
     result.update({"bestPeriodDays": float(period), "periodGridStepDays": float(grid[1]-grid[0]), "predictiveReducedChiSquare": predictive,
-                   "periodUncertaintyDays": uncertainty, "periodUncertainty":{"method":"leave-one-season-out-jackknife-profile-grid","successfulResamples":len(jack),"intervalDays":interval,"failures":failures,"frozenFamilyWindowDays":family_window},
+                   "periodUncertaintyDays": uncertainty, "periodUncertainty":{"method":"leave-one-season-out-jackknife-profile-with-grid-resolution-floor","successfulResamples":len(jack),"intervalDays":interval,"jackknifeHalfWidthDays":jackknife_half_width,"gridResolutionFloorDays":grid_resolution/2,"failures":failures,"frozenFamilyWindowDays":family_window},
                    "seasonalPhaseOC":seasonal,"seasonalPhaseRangeRadians":phase_range,"seasonalAmplitudeRange":amplitude_range,
                    "seasonCount": int(len(unique)), "measurementCount": len(rows),
                    "blindPeriodSearchPerformed": False, "lombScarglePerformed": False})

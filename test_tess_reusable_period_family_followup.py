@@ -9,7 +9,7 @@ import numpy as np
 
 from openstar_investigation import InvestigationStage, InvestigationStore
 from openstar_targets import InvestigationTarget
-from workflows.tess.period_family_followup import select_untouched_sectors
+from workflows.tess.period_family_followup import select_untouched_sectors, extract_gaia_context
 from workflows.tess.tess_autonomy import plan_tess_branches
 from workflows.tess.external_long_baseline import (
     ASASSNSkyPatrolProvider, MalformedProviderData, ProviderUnavailable,
@@ -36,8 +36,8 @@ def rows(evolving=False):
 
 class ReusableFollowupTests(unittest.TestCase):
     def test_sector_selection_is_deterministic_and_excludes_consumed(self):
-        catalog=[{"sector":s,"epoch":e,"product":"SPOC_LIGHTCURVE","cadenceSeconds":120,"available":True}
-                 for s,e in [(20,"B"),(3,"A"),(40,"C"),(4,"A")]]
+        catalog=[{"sector":s,"author":"SPOC","mission":f"TESS Sector {s}","exptimeSeconds":120}
+                 for s in [20,3,40,4]]
         first=select_untouched_sectors(catalog,[3])
         self.assertEqual(first["selectedSectors"],[4,20,40])
         self.assertEqual(first,select_untouched_sectors(reversed(catalog),[3]))
@@ -78,6 +78,17 @@ class ReusableFollowupTests(unittest.TestCase):
                 neighbors=[{"separationArcsec":2,"fluxFraction":.5}],providers=[provider],artifact_root=Path(d))
             self.assertEqual(result["classification"],"EXTERNAL_CONTAMINATION_AMBIGUOUS")
 
+    def test_real_gaia_schema_isolated_crowded_and_ambiguous(self):
+        identity={"gaiaDR3":{"nearest":{"sourceID":"target"},"sources":[
+            {"sourceID":"target","photGMeanMag":10.0,"separationArcsec":0.1},
+            {"sourceID":"neighbor","photGMeanMag":12.5,"separationArcsec":5.0}]}}
+        context=extract_gaia_context(identity)
+        self.assertFalse(context["identityAmbiguous"])
+        self.assertAlmostEqual(context["neighbors"][0]["fluxFraction"],0.1)
+        ambiguous=extract_gaia_context({"gaiaDR3":{"sources":identity["gaiaDR3"]["sources"]}})
+        self.assertTrue(ambiguous["identityAmbiguous"])
+        self.assertIsNone(ambiguous["neighbors"])
+
     def test_stable_evolving_and_insufficient_science(self):
         stable=analyze_seasonal_coherence(rows(),[4.5,4.6])
         evolving=analyze_seasonal_coherence(rows(True),[4.5,4.6])
@@ -86,5 +97,6 @@ class ReusableFollowupTests(unittest.TestCase):
         self.assertEqual(evolving["classification"],"EXTERNAL_EVOLVING_RECURRENCE_SUPPORTED")
         self.assertEqual(insufficient["classification"],"EXTERNAL_DATA_INSUFFICIENT")
         self.assertGreater(stable["periodUncertaintyDays"],0)
+        self.assertGreater(stable["periodUncertainty"]["gridResolutionFloorDays"],0)
 
 if __name__ == '__main__': unittest.main()
