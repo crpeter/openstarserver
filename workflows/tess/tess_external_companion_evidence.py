@@ -64,26 +64,94 @@ def _source_key(item: dict[str, Any]) -> str | None:
     return None
 
 
+def canonical_tic_id(value: Any) -> str:
+    """Return the archive's canonical TIC form without accepting loose prefixes."""
+    if isinstance(value, bool):
+        raise ValueError("malformed TIC identifier")
+    if isinstance(value, int):
+        number = value
+    elif isinstance(value, str):
+        text = value.strip()
+        digits = text[4:] if text.startswith("TIC ") else text
+        if not digits.isascii() or not digits.isdigit():
+            raise ValueError("malformed TIC identifier")
+        number = int(digits)
+    else:
+        raise ValueError("malformed TIC identifier")
+    if number <= 0:
+        raise ValueError("malformed TIC identifier")
+    return f"TIC {number}"
+
+
+def canonical_gaia_dr3_id(value: Any) -> str:
+    """Return an exact Gaia DR3 identifier, rejecting other Gaia releases."""
+    if isinstance(value, bool):
+        raise ValueError("malformed Gaia DR3 identifier")
+    if isinstance(value, int):
+        number = value
+    elif isinstance(value, str):
+        text = value.strip()
+        digits = text[9:] if text.startswith("Gaia DR3 ") else text
+        if not digits.isascii() or not digits.isdigit():
+            raise ValueError("malformed Gaia DR3 identifier")
+        number = int(digits)
+    else:
+        raise ValueError("malformed Gaia DR3 identifier")
+    if number <= 0:
+        raise ValueError("malformed Gaia DR3 identifier")
+    return f"Gaia DR3 {number}"
+
+
 def review_source_attribution(localization: dict[str, Any]) -> dict[str, Any]:
     if not localization_gate(localization):
         raise ValueError("exact localization-v1 source-attribution gate is not satisfied")
     attributed = localization.get("attributedCatalogHypothesis")
     support, conflicts, ambiguous = [], [], []
+    seen_sectors: set[Any] = set()
+    duplicate_sectors = []
+    top_class = localization["classification"]
+    expected_sector_class = {
+        "TARGET_CONSISTENT_ECLIPSE_SOURCE": "TARGET_CONSISTENT",
+        "OFF_TARGET_CATALOG_CANDIDATE_ECLIPSE_SOURCE": "CATALOG_CANDIDATE_CONSISTENT",
+        "CONSISTENTLY_OFF_TARGET_ECLIPSE_SOURCE": "OFF_CATALOG",
+    }[top_class]
     for sector in localization.get("sectorResults") or []:
         if sector.get("role") != "INDEPENDENT":
             continue
+        sector_id = sector.get("sector")
+        if (isinstance(sector_id, bool) or not isinstance(sector_id, int)
+                or sector_id <= 0 or sector_id in seen_sectors):
+            duplicate_sectors.append(sector_id)
+            continue
+        seen_sectors.add(sector_id)
         key = _source_key(sector) if sector.get("usable") is True else None
         if key is None:
-            ambiguous.append(sector.get("sector"))
-        elif key == attributed:
-            support.append(sector.get("sector"))
+            ambiguous.append(sector_id)
+        elif (key == attributed and sector.get("classification") == expected_sector_class
+              and (top_class != "CONSISTENTLY_OFF_TARGET_ECLIPSE_SOURCE"
+                   or sector.get("matchedCatalogHypothesis") is None)):
+            support.append(sector_id)
         else:
-            conflicts.append({"sector": sector.get("sector"), "source": key})
+            conflicts.append({"sector": sector_id, "source": key,
+                              "classification": sector.get("classification")})
     catalog = localization.get("frozenCatalog") or {}
     hypotheses = catalog.get("catalogHypotheses") or []
     matches = [row for row in hypotheses if str(row.get("sourceID")) == str(attributed)]
+    targets = [row for row in hypotheses if row.get("isTarget") is True]
+    source_ids = [row.get("sourceID") for row in hypotheses]
+    catalog_valid = (all(isinstance(value, str) and bool(value.strip()) for value in source_ids)
+                     and len(source_ids) == len(set(source_ids)))
     off_catalog = attributed == "OFF_CATALOG_SKY_CLUSTER"
-    passed = len(support) >= MIN_INDEPENDENT_SUPPORT and not conflicts
+    role_consistent = (catalog_valid and isinstance(attributed, str) and bool(attributed.strip())
+        and len(targets) == 1 and (
+        (top_class == "TARGET_CONSISTENT_ECLIPSE_SOURCE" and len(matches) == 1
+         and matches[0].get("isTarget") is True)
+        or (top_class == "OFF_TARGET_CATALOG_CANDIDATE_ECLIPSE_SOURCE" and len(matches) == 1
+            and matches[0].get("isTarget") is False)
+        or (top_class == "CONSISTENTLY_OFF_TARGET_ECLIPSE_SOURCE" and off_catalog
+            and not matches)))
+    passed = (len(support) >= MIN_INDEPENDENT_SUPPORT and not conflicts
+              and not duplicate_sectors and role_consistent)
     source = matches[0] if len(matches) == 1 else None
     if not passed:
         classification = "SOURCE_ATTRIBUTION_REVIEW_FAILED"
@@ -99,6 +167,7 @@ def review_source_attribution(localization: dict[str, Any]) -> dict[str, Any]:
             "sourceAttributionReviewPassed": classification.endswith("REVIEW_PASSED"),
             "supportingIndependentSectors": support, "supportingIndependentSectorCount": len(support),
             "ambiguousIndependentSectors": ambiguous, "conflictingIndependentSectors": conflicts,
+            "duplicateIndependentSectors": duplicate_sectors,
             "primarySectorCanSatisfyReplication": False, "requiredIndependentSectorCount": MIN_INDEPENDENT_SUPPORT,
             "attributedSource": source, "attributedCatalogHypothesis": attributed,
             "sourceLocalizationSHA256": sha256_json(localization),
@@ -108,19 +177,6 @@ def review_source_attribution(localization: dict[str, Any]) -> dict[str, Any]:
             "recommendedNextTest": ("EXTERNAL_COMPANION_EVIDENCE_FREEZE" if classification.endswith("REVIEW_PASSED")
                                     else "CATALOG_IDENTITY_FOLLOWUP" if off_catalog
                                     else "ADDITIONAL_SPATIAL_EVIDENCE")}
-
-
-def _canonical_tic(value: Any) -> str:
-    text = str(value).strip()
-    if text.upper().startswith("TIC "):
-        number = text[4:].strip()
-    elif text.isdigit():
-        number = text
-    else:
-        raise ValueError("attributed source has malformed TIC identifier")
-    if not number.isdigit() or int(number) <= 0:
-        raise ValueError("attributed source has malformed TIC identifier")
-    return f"TIC {int(number)}"
 
 
 def build_tap_query(tic_id: str) -> tuple[str, str]:
@@ -136,8 +192,10 @@ def acquire_external_evidence(review: dict[str, Any], *, opener: Callable[..., A
     if review.get("resultVersion") != REVIEW_VERSION or review.get("sourceAttributionReviewPassed") is not True:
         raise ValueError("passed source-attribution review is required")
     source = review.get("attributedSource") or {}
-    tic = _canonical_tic(source.get("ticID"))
-    gaia = source.get("gaiaDR3SourceID")
+    raw_tic = source.get("ticID")
+    raw_gaia = source.get("gaiaDR3SourceID")
+    tic = canonical_tic_id(raw_tic)
+    gaia = canonical_gaia_dr3_id(raw_gaia) if raw_gaia not in (None, "") else None
     _, encoded = build_tap_query(tic)
     request = urllib.request.Request(f"{TAP_ENDPOINT}?{encoded}", headers={"User-Agent": "OpenStarServer/1"})
     try:
@@ -172,7 +230,9 @@ def acquire_external_evidence(review: dict[str, Any], *, opener: Callable[..., A
             "httpStatus": status, "contentType": content_type, "returnedRows": rows,
             "rawResponseUTF8": raw.decode("utf-8"),
             "rawResponseSHA256": hashlib.sha256(raw).hexdigest(),
-            "attributedSourceIdentifiers": {"ticID": tic, "gaiaDR3SourceID": gaia},
+            "attributedSourceIdentifiers": {"ticID": tic, "gaiaDR3SourceID": gaia,
+                                            "rawTICID": raw_tic,
+                                            "rawGaiaDR3SourceID": raw_gaia},
             "sourceLocalizationSHA256": review["sourceLocalizationSHA256"],
             "binaryConfirmationSHA256": review.get("binaryConfirmationSHA256"),
             "frozenEphemeris": review.get("frozenEphemeris"), "sourceAttributionReviewSHA256": sha256_json(review),
@@ -194,9 +254,15 @@ def interpret_external_evidence(frozen: dict[str, Any]) -> dict[str, Any]:
     if period is None or period <= 0: raise ValueError("frozen ephemeris period is invalid")
     exact, conflicts = [], []
     for row in frozen.get("returnedRows") or []:
-        if row.get("tic_id") != tic:
+        try:
+            row_tic = canonical_tic_id(row.get("tic_id"))
+            row_gaia = (canonical_gaia_dr3_id(row.get("gaia_dr3_id"))
+                        if gaia is not None else None)
+        except ValueError:
             conflicts.append(row); continue
-        if gaia not in (None, "") and row.get("gaia_dr3_id") != gaia:
+        if row_tic != tic:
+            conflicts.append(row); continue
+        if gaia is not None and row_gaia != gaia:
             conflicts.append(row); continue
         external = _number(row.get("pl_orbper"))
         error = max(abs(_number(row.get("pl_orbpererr1")) or 0), abs(_number(row.get("pl_orbpererr2")) or 0))
@@ -210,8 +276,10 @@ def interpret_external_evidence(frozen: dict[str, Any]) -> dict[str, Any]:
         mass, up, down = (_number(selected.get(key)) for key in ("pl_bmassj", "pl_bmassjerr1", "pl_bmassjerr2"))
         valid = (selected.get("default_flag") == 1 and selected.get("pl_controv_flag") == 0
                  and selected.get("rv_flag") == 1 and mass is not None and up is not None and down is not None
-                 and up > 0 and down < 0 and selected.get("pl_bmassjlim") == 0
-                 and bool(selected.get("pl_bmassprov")))
+                 and mass > 0 and up > 0 and down < 0 and mass + down > 0
+                 and selected.get("pl_bmassjlim") == 0
+                 and isinstance(selected.get("pl_bmassprov"), str)
+                 and bool(selected["pl_bmassprov"].strip()))
         if not valid:
             classification = "PERIOD_MATCHED_COMPANION_MASS_UNRESOLVED"
         else:

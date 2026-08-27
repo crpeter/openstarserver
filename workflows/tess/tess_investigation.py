@@ -1892,6 +1892,30 @@ def _render_report(conclusion: dict[str, Any]) -> str:
             "", "### Archival sector recurrence", ""])
         for item in archival.get("sectorEvidence") or []:
             lines.append(f"- Sector {item.get('sector')}: author={item.get('author')}, cadence={item.get('cadenceSeconds')} s, baseline={item.get('baselineDays')} d, candidatePeriod={item.get('candidatePeriodDays')} d, candidateFrequency={item.get('candidateFrequency')}, CI={item.get('candidateFrequencyConfidenceInterval')}, classification={item.get('recurrenceClassification')}, supports={item.get('supportsHistoricalResidualFamily')}")
+    source_review = conclusion.get("sourceAttributionReview")
+    external_companion = conclusion.get("externalCompanionEvidence")
+    if source_review is not None:
+        lines.extend([
+            "", "## Eclipse source-attribution review", "",
+            f"- Classification: {source_review.get('classification')}",
+            f"- Recomputed independent support: {source_review.get('supportingIndependentSectorCount')}",
+            f"- Supporting independent sectors: {source_review.get('supportingIndependentSectors')}",
+        ])
+    if external_companion is not None:
+        lines.extend([
+            "", "## Published external companion confirmation", "",
+            f"- Classification: {external_companion.get('classification')}",
+            f"- Matched external period: {external_companion.get('externalOrbitalPeriodDays')} days",
+            f"- Period difference: {external_companion.get('externalOrbitalPeriodDifferenceDays')} days",
+            f"- Published mass: {external_companion.get('externalMassJupiter')} Jupiter masses",
+            f"- Published mass uncertainty interval: {external_companion.get('externalMassIntervalJupiter')}",
+            f"- Supported mass regime: {external_companion.get('supportedCompanionMassRegime')}",
+            f"- Known-object catalog used: {external_companion.get('externalKnownObjectCatalogUsed')}",
+            f"- Preceding photometric/spatial evidence remained software-blind: {external_companion.get('softwareBlindPhotometricEvidencePreserved')}",
+            f"- Final physical mechanism resolved: {external_companion.get('physicalMechanismResolved')}",
+            f"- Final companion nature resolved: {external_companion.get('companionNatureResolved')}",
+            f"- Authoritative next test: {conclusion.get('recommendedNextTest')}",
+        ])
     return "\n".join(lines)
 
 
@@ -2954,14 +2978,19 @@ def build_engine(
 
     def external_evidence_freeze_stage(investigation, request):
         review = _required_latest_result_for_handler(investigation, SOURCE_ATTRIBUTION_REVIEW_HANDLER_ID)
+        review_stage = next(stage for stage in reversed(investigation.stages)
+                            if stage.handler_id == SOURCE_ATTRIBUTION_REVIEW_HANDLER_ID
+                            and stage.status == "COMPLETE")
         input_hashes = {"sourceAttributionReview": sha256_json(review),
                         "sourceLocalization": review["sourceLocalizationSHA256"]}
         try:
             result = acquire_external_evidence(review)
         except ExternalEvidenceTransientError as error:
             raise RetryableExecutionError(str(error),
-                result={"operation": "external-companion-evidence-freeze"},
-                input_hashes=input_hashes) from error
+                result={"operation": "external-companion-evidence-freeze",
+                        "tapEndpoint": "NASA Exoplanet Archive TAP",
+                        "failure": str(error)},
+                input_hashes=input_hashes, artifacts=review_stage.artifacts) from error
         path = (store.directory_for(investigation.id) / "artifacts" /
                 "external-companion-evidence" / "external-response-v1.json")
         _write_json(path, result)
@@ -8776,6 +8805,12 @@ def build_engine(
         eclipse_event_localization = _latest_result_for_handler(
             investigation, ECLIPSE_LOCALIZATION_HANDLER_ID,
         )
+        source_attribution_review = _latest_result_for_handler(
+            investigation, SOURCE_ATTRIBUTION_REVIEW_HANDLER_ID,
+        )
+        external_companion_evidence = _latest_result_for_handler(
+            investigation, EXTERNAL_EVIDENCE_INTERPRET_HANDLER_ID,
+        )
         source_localization = _latest_result_for_handler(
             investigation,
             "openstar.tess.source-localization.analyze",
@@ -9003,6 +9038,24 @@ def build_engine(
             existing_rationale.append(
                 "Authoritative recommended next spatial test: "
                 f"{eclipse_event_localization.get('recommendedNextTest')}."
+            )
+            claim_decision = {"claim": claim_decision["claim"], "rationale": existing_rationale}
+
+        if source_attribution_review is not None:
+            existing_rationale = list(claim_decision.get("rationale") or [])
+            existing_rationale.append(
+                "Durable source-attribution review independently recomputed "
+                f"{source_attribution_review.get('supportingIndependentSectorCount')} supporting "
+                f"sectors and classified the boundary as {source_attribution_review.get('classification')}."
+            )
+            claim_decision = {"claim": claim_decision["claim"], "rationale": existing_rationale}
+        if external_companion_evidence is not None:
+            existing_rationale = list(claim_decision.get("rationale") or [])
+            existing_rationale.append(
+                "Published known-object confirmation evidence was kept separate from the "
+                "software-blind photometric/spatial evidence and classified as "
+                f"{external_companion_evidence.get('classification')}. Final physical mechanism "
+                "and companion nature remain unresolved pending global synthesis."
             )
             claim_decision = {"claim": claim_decision["claim"], "rationale": existing_rationale}
 
@@ -10015,6 +10068,8 @@ def build_engine(
             "physicalInterpretation": physical_interpretation,
             "binaryConfirmation": binary_confirmation,
             "eclipseEventSourceLocalization": eclipse_event_localization,
+            "sourceAttributionReview": source_attribution_review,
+            "externalCompanionEvidence": external_companion_evidence,
             "sourceLocalization": source_localization,
             "multiModeDecomposition": multimode_decomposition,
             "timeFrequencyEvolution": time_frequency_evolution,
@@ -10166,6 +10221,19 @@ def build_engine(
             print(f"   ephemeris timing sectors: {binary_ephemeris.get('timingSectors')}")
             print(f"   primary timing epoch included: {binary_ephemeris.get('primarySectorIncluded')}")
             print(f"   opposite-conjunction evidence: {binary_opposite.get('classification')}")
+        if source_attribution_review is not None:
+            print(f"   source-attribution review: {source_attribution_review.get('classification')}")
+            print("   recomputed independent source support: "
+                  f"{source_attribution_review.get('supportingIndependentSectorCount')}")
+        if external_companion_evidence is not None:
+            print(f"   external companion evidence: {external_companion_evidence.get('classification')}")
+            print(f"   matched external period: {external_companion_evidence.get('externalOrbitalPeriodDays')} days")
+            print(f"   external period difference: {external_companion_evidence.get('externalOrbitalPeriodDifferenceDays')} days")
+            print(f"   published mass and interval: {external_companion_evidence.get('externalMassJupiter')} / {external_companion_evidence.get('externalMassIntervalJupiter')} Jupiter masses")
+            print(f"   supported mass regime: {external_companion_evidence.get('supportedCompanionMassRegime')}")
+            print(f"   known-object catalog used: {external_companion_evidence.get('externalKnownObjectCatalogUsed')}")
+            print(f"   software-blind photometric/spatial evidence preserved: {external_companion_evidence.get('softwareBlindPhotometricEvidencePreserved')}")
+            print("   final physical mechanism and companion nature remain unresolved")
         print(f"   authoritative recommended next test: {recommended_next_test}")
         if residual_mode_localization is not None:
             residual_cross = residual_mode_localization.get("crossSector") or {}
