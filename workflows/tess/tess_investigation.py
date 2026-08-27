@@ -9107,11 +9107,16 @@ def build_engine(
             claim_decision = {"claim": claim_decision["claim"], "rationale": existing_rationale}
         if external_companion_evidence is not None:
             existing_rationale = list(claim_decision.get("rationale") or [])
+            interpretation_boundary = (
+                "At the external-evidence interpretation stage, companion nature and the "
+                "detailed photometric mechanism were still pending final synthesis."
+                if final_companion_evidence_synthesis is not None else
+                "Companion nature and the detailed photometric mechanism remain pending final synthesis."
+            )
             existing_rationale.append(
                 "Published known-object confirmation evidence was kept separate from the "
                 "software-blind photometric/spatial evidence and classified as "
-                f"{external_companion_evidence.get('classification')}. Final physical mechanism "
-                "and companion nature remain unresolved pending global synthesis."
+                f"{external_companion_evidence.get('classification')}. {interpretation_boundary}"
             )
             claim_decision = {"claim": claim_decision["claim"], "rationale": existing_rationale}
         if final_companion_evidence_synthesis is not None:

@@ -257,6 +257,11 @@ class CompanionEvidenceSynthesisTests(unittest.TestCase):
             self.assertIn("## Final companion-evidence synthesis", report)
             self.assertIn("software-blind photometric and spatial evidence", report)
             self.assertIn("published known-object confirmation evidence", report)
+            self.assertNotIn("Final physical mechanism and companion nature remain unresolved", report)
+            self.assertIn("At the external-evidence interpretation stage, companion nature and the detailed photometric mechanism were still pending final synthesis", report)
+            self.assertIn("Final hash-linked synthesis resolved the known companion mass regime and source relationship", report)
+            self.assertIn("detailed photometric mechanism remains unresolved", report)
+            self.assertIn("no automatic discovery claim is made", report)
             self.assertNotIn("final companion nature remains unresolved", report.lower())
             self.assertNotIn("companion nature remain unresolved", output.getvalue().lower())
 
