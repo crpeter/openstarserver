@@ -1,4 +1,8 @@
 import unittest
+import tempfile
+from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 
@@ -6,6 +10,9 @@ from workflows.tess.tess_eclipse_event_localization import (
     authoritative_binary_gate,
     localize_eclipse_events,
 )
+from openstar_investigation import ArtifactReference, InvestigationStage, InvestigationStore, sha256_file, sha256_json
+from openstar_workflow import RetryableExecutionError, StageRequest
+from workflows.tess.tess_sector_archive import TessArchiveTransientError
 
 
 class EclipseEventLocalizationTests(unittest.TestCase):
@@ -154,6 +161,48 @@ class EclipseEventLocalizationTests(unittest.TestCase):
         for key, value in (("catalogAnswerKeyUsed", True), ("recommendedNextTest", "OTHER")):
             changed = dict(self.binary); changed[key] = value
             self.assertFalse(authoritative_binary_gate(changed))
+
+    def test_archive_transient_stage_preserves_frozen_catalog_provenance(self):
+        from workflows.tess.tess_investigation import build_engine
+        from workflows.tess.tess_eclipse_event_localization import HANDLER_ID, PREPARE_HANDLER_ID
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
+            store = InvestigationStore(directory)
+            investigation = store.create("eclipse-retry", "test", "1")
+            catalog = {"catalogHypotheses": [{"sourceID": "TIC-42", "isTarget": True,
+                                               "raDeg": 1.0, "decDeg": 2.0}]}
+            catalog_sha = sha256_json(catalog)
+            artifact_path = Path(directory) / "frozen-catalog.json"
+            artifact_path.write_text("{}\n", encoding="utf-8")
+            artifact = ArtifactReference(str(artifact_path.resolve()), sha256_file(artifact_path), "application/json")
+            stages = (
+                InvestigationStage("001-prepare-target", "openstar.tess.prepare-target", "COMPLETE", None, {},
+                                   result={"ticID": 42}),
+                InvestigationStage("003-catalog-identity", "openstar.tess.catalog-identity", "COMPLETE", None, {},
+                                   result=self.identity),
+                InvestigationStage("006-independent", "openstar.tess.independent.prepare", "COMPLETE", None, {},
+                                   result={"preparedSectors": []}),
+                InvestigationStage("020-binary", "openstar.tess.binary-confirmation.analyze", "COMPLETE", None, {},
+                                   result=self.binary),
+                InvestigationStage("021-freeze", PREPARE_HANDLER_ID, "COMPLETE", "020-binary", {},
+                                   result={"frozenCatalog": catalog, "frozenCatalogSHA256": catalog_sha},
+                                   artifacts=(artifact,)),
+            )
+            investigation = type(investigation)(**{**investigation.__dict__, "stages": stages})
+            store.save(investigation)
+            engine = build_engine(store, SimpleNamespace(), poll_interval=0, timeout=None)
+            engine.chain_stages = False
+            request = StageRequest("022-localize", HANDLER_ID, {}, "021-freeze")
+            with mock.patch("workflows.tess.tess_investigation.localize_eclipse_events",
+                            side_effect=TessArchiveTransientError("archive outage")), \
+                    mock.patch("workflows.tess.tess_investigation.freeze_catalog_hypotheses") as freeze, \
+                    self.assertRaises(RetryableExecutionError):
+                engine.run_stage(investigation, request, software_id="test", software_version="1")
+            freeze.assert_not_called()
+            failed = store.load(investigation.id).stages[-1]
+            self.assertEqual("TRANSIENT_INFRASTRUCTURE", failed.failure_classification)
+            self.assertEqual(catalog_sha, failed.provenance.input_hashes["frozenCatalog"])
+            self.assertEqual(sha256_json(self.binary), failed.provenance.input_hashes["binaryConfirmation"])
+            self.assertEqual((artifact,), failed.artifacts)
 
 
 if __name__ == "__main__":

@@ -2891,6 +2891,17 @@ def build_engine(
         if sha256_json(catalog) != catalog_sha:
             raise ValueError("persisted frozen localization catalog hash mismatch")
         artifact_root = store.directory_for(investigation.id) / "artifacts" / "eclipse-event-source-localization"
+        localization_input_hashes = {
+            "binaryConfirmation": sha256_json(binary),
+            "catalogIdentity": sha256_json(identity),
+            "frozenCatalog": catalog_sha,
+            "independentPreparation": sha256_json(independent_prepare),
+        }
+        catalog_stage = next(
+            stage for stage in reversed(investigation.stages)
+            if stage.handler_id == ECLIPSE_LOCALIZATION_PREPARE_HANDLER_ID
+            and stage.status == "COMPLETE"
+        )
         try:
             result = localize_eclipse_events(binary_confirmation=binary, identity=identity,
                                              tic_id=int(prepared["ticID"]), frozen_catalog=catalog)
@@ -2898,7 +2909,9 @@ def build_engine(
             raise RetryableExecutionError(
                 str(error), result={"operation": "eclipse-event-pixel-acquisition",
                                     "frozenCatalogSHA256": catalog_sha,
-                                    "frozenCatalogArtifact": str((artifact_root / "frozen-catalog-v1.json").resolve())}
+                                    "frozenCatalogArtifact": str((artifact_root / "frozen-catalog-v1.json").resolve())},
+                input_hashes=localization_input_hashes,
+                artifacts=catalog_stage.artifacts,
             ) from error
         result["frozenCatalogSHA256"] = catalog_sha
         result["pixelEvidenceSHA256BySector"] = {
@@ -2912,9 +2925,7 @@ def build_engine(
                                     handler_id="openstar.tess.finalize",
                                     parameters={"outputSuffix": "eclipse-event-source-localization-v1"},
                                     triggered_by_stage_id=request.id),
-            input_hashes={"binaryConfirmation": sha256_json(binary), "catalogIdentity": sha256_json(identity),
-                          "frozenCatalog": catalog_sha,
-                          "independentPreparation": sha256_json(independent_prepare)},
+            input_hashes=localization_input_hashes,
             artifacts=(_artifact(artifact_path, "application/json"),),
         )
 
