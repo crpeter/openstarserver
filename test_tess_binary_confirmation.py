@@ -16,12 +16,13 @@ from openstar_investigation import InvestigationStage
 PERIOD = 2.0
 
 
-def dataset(sector, start, *, primary=True, secondary=False, phase_shift=0.0,
-            broad=False):
-    times = [start + i * 0.02 for i in range(700)]
+def dataset(sector, origin, *, primary=True, secondary=False, phase_shift=0.0,
+            broad=False, samples=700, cadence=0.02, local_shift=0.0):
+    times = [local_shift + i * cadence for i in range(samples)]
     flux = []
     for i, time in enumerate(times):
-        phase = ((time / PERIOD) - phase_shift) % 1
+        absolute_time = origin - local_shift + time
+        phase = ((absolute_time / PERIOD) - phase_shift) % 1
         value = 0.35 * math.sin(2 * math.pi * phase) + 0.7 * math.cos(4 * math.pi * phase)
         value += 0.025 * math.sin(i * 1.731)  # deterministic, non-orbital noise
         distance = abs((phase + 0.5) % 1 - 0.5)
@@ -30,7 +31,8 @@ def dataset(sector, start, *, primary=True, secondary=False, phase_shift=0.0,
         if secondary and abs((phase - 0.5 + 0.5) % 1 - 0.5) < 0.02 / 2:
             value -= 0.35
         flux.append(value)
-    return {"id": f"sector-{sector}", "source": {"sector": sector},
+    return {"id": f"sector-{sector}", "source": {"sector": sector,
+            "originalTimeOriginDays": origin - local_shift},
             "times": times, "flux": flux}
 
 
@@ -49,11 +51,11 @@ class BinaryConfirmationTests(unittest.TestCase):
 
     def run_case(self, makers):
         primary = self.root / "primary.json"
-        primary.write_text(json.dumps(dataset(1, 0)), encoding="utf-8")
+        primary.write_text(json.dumps(dataset(1, 1000.0)), encoding="utf-8")
         sectors = []
         for sector, maker in enumerate(makers, 2):
             path = self.root / f"s{sector}.json"
-            path.write_text(json.dumps(maker(sector, (sector - 1) * 30.0)), encoding="utf-8")
+            path.write_text(json.dumps(maker(sector, 1000.0 + (sector - 1) * 30.0)), encoding="utf-8")
             sectors.append({"sector": sector, "datasetPath": str(path)})
         return analyze_binary_confirmation(primary_dataset_path=primary,
             independent_spec={"preparedSectors": sectors}, morphology=self.morphology,
@@ -65,6 +67,10 @@ class BinaryConfirmationTests(unittest.TestCase):
                          result["independentEvidence"]["classification"])
         self.assertGreaterEqual(result["independentEvidence"]["supportingIndependentSectorCount"], 3)
         self.assertTrue(result["linearEphemeris"]["coherent"])
+        self.assertAlmostEqual(PERIOD, result["linearEphemeris"]["refinedPeriodDays"], places=6)
+        self.assertTrue(all(item["timeReference"] ==
+            "BTJD_RECONSTRUCTED_FROM_FROZEN_RELATIVE_TIME"
+            for item in result["sectorResults"]))
         self.assertFalse(result["physicalMechanismResolved"])
         self.assertFalse(result["companionNatureResolved"])
         self.assertFalse(result["catalogAnswerKeyUsed"])
@@ -120,6 +126,31 @@ class BinaryConfirmationTests(unittest.TestCase):
         self.assertTrue(measured["usable"])
         self.assertGreater(measured["depthStandardized"], 0.65)
         self.assertTrue(measured["smoothModel"]["candidateEventMaskedDuringRefit"])
+
+    def test_relative_time_translation_leaves_ephemeris_unchanged(self):
+        baseline = self.run_case([lambda s, origin: dataset(s, origin) for _ in range(4)])
+        shifted = self.run_case([lambda s, origin: dataset(s, origin, local_shift=17.25 + s)
+                                 for _ in range(4)])
+        for key in ("referenceEpoch", "refinedPeriodDays", "rmsOMinusCDays"):
+            self.assertAlmostEqual(baseline["linearEphemeris"][key],
+                                   shifted["linearEphemeris"][key], places=9)
+
+    def test_missing_or_nonfinite_time_origin_fails_closed(self):
+        for invalid in (None, float("nan"), float("inf")):
+            with self.subTest(invalid=invalid):
+                frozen = dataset(2, 1030.0)
+                if invalid is None:
+                    frozen["source"].pop("originalTimeOriginDays")
+                else:
+                    frozen["source"]["originalTimeOriginDays"] = invalid
+                with self.assertRaisesRegex(ValueError, "originalTimeOriginDays"):
+                    _sector(frozen, PERIOD, "INDEPENDENT")
+
+    def test_realistic_18000_sample_fixed_period_search(self):
+        measured = _sector(dataset(2, 1030.0, samples=18_000, cadence=0.001),
+                           PERIOD, "INDEPENDENT")
+        self.assertTrue(measured["usable"])
+        self.assertEqual(18_000, measured["sampleCount"])
 
     def test_exact_authoritative_routing_gate(self):
         self.assertTrue(physical_interpretation_continuation(self.physical, self.morphology))

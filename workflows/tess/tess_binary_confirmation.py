@@ -98,27 +98,41 @@ def _mad_sigma(values: list[float]) -> float:
 def _box_search(times: list[float], residual: list[float], period: float,
                 durations: tuple[float, ...] = DURATION_FRACTIONS,
                 phase_window: tuple[float, float] | None = None) -> dict[str, Any]:
-    phases = [(time / period) % 1.0 for time in times]
-    centers = sorted(set(round(phase, 5) for phase in phases))
-    if phase_window:
-        center, half_width = phase_window
-        centers = [phase for phase in centers
-                   if abs((phase - center + 0.5) % 1.0 - 0.5) <= half_width]
+    # A fixed-duration box optimum changes only when one of its edges crosses
+    # an observed phase.  Sorting once and sweeping a duplicated circular
+    # phase array therefore evaluates every relevant window in O(D*N), rather
+    # than rescanning N samples for each of N possible centers.
+    ordered = sorted(((time / period) % 1.0, value)
+                     for time, value in zip(times, residual))
+    phases = [item[0] for item in ordered]
+    values = [item[1] for item in ordered]
+    n = len(values)
+    doubled_phases = phases + [phase + 1.0 for phase in phases]
+    doubled_values = values + values
+    prefix = [0.0]
+    for value in doubled_values:
+        prefix.append(prefix[-1] + value)
+    baseline = statistics.median(values)
+    sigma = _mad_sigma(values)
     best = None
     for duty in durations:
-        for center in centers:
-            inside = [i for i, phase in enumerate(phases)
-                      if abs((phase - center + 0.5) % 1.0 - 0.5) <= duty / 2]
-            if len(inside) < MIN_EVENT_SAMPLES or len(inside) >= len(times) // 2:
+        right = 0
+        for left in range(n):
+            right = max(right, left)
+            edge = doubled_phases[left] + duty
+            while right < left + n and doubled_phases[right] <= edge:
+                right += 1
+            count = right - left
+            if count < MIN_EVENT_SAMPLES or count >= n // 2:
                 continue
-            selected = set(inside)
-            outside = [value for i, value in enumerate(residual) if i not in selected]
-            baseline = statistics.median(outside)
-            depth = baseline - statistics.mean(residual[i] for i in inside)
-            sigma = _mad_sigma(outside)
-            uncertainty = sigma / math.sqrt(len(inside)) if sigma > 1e-15 else None
+            center = (doubled_phases[left] + duty / 2.0) % 1.0
+            if phase_window and abs((center - phase_window[0] + 0.5) % 1.0 - 0.5) > phase_window[1]:
+                continue
+            inside_mean = (prefix[right] - prefix[left]) / count
+            depth = baseline - inside_mean
+            uncertainty = sigma / math.sqrt(count) if sigma > 1e-15 else None
             snr = depth / uncertainty if uncertainty else (float("inf") if depth > 1e-12 else 0.0)
-            candidate = (snr, depth, -duty, center, duty, len(inside), uncertainty, sigma)
+            candidate = (snr, depth, -duty, center, duty, count, uncertainty, sigma)
             if best is None or candidate > best:
                 best = candidate
     if best is None:
@@ -137,11 +151,24 @@ def _box_search(times: list[float], residual: list[float], period: float,
 
 
 def _sector(dataset: dict[str, Any], period: float, role: str) -> dict[str, Any]:
-    pairs = [(float(t), float(f)) for t, f in zip(dataset.get("times") or [],
-                                                  dataset.get("flux") or [])
-             if math.isfinite(float(t)) and math.isfinite(float(f))]
+    try:
+        origin = float((dataset.get("source") or {})["originalTimeOriginDays"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("frozen dataset lacks originalTimeOriginDays") from error
+    if not math.isfinite(origin):
+        raise ValueError("frozen dataset has nonfinite originalTimeOriginDays")
+    pairs = []
+    for relative_raw, flux_raw in zip(dataset.get("times") or [], dataset.get("flux") or []):
+        try:
+            relative, flux = float(relative_raw), float(flux_raw)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(relative) and math.isfinite(flux):
+            pairs.append((origin + relative, flux))
     result = {"datasetID": dataset.get("id"), "sector": (dataset.get("source") or {}).get("sector"),
-              "role": role, "sampleCount": len(pairs)}
+              "role": role, "sampleCount": len(pairs),
+              "originalTimeOriginDays": origin,
+              "timeReference": "BTJD_RECONSTRUCTED_FROM_FROZEN_RELATIVE_TIME"}
     if len(pairs) < MIN_SAMPLES:
         return {**result, "usable": False, "reason": "INSUFFICIENT_SAMPLES"}
     times, flux = map(list, zip(*pairs))

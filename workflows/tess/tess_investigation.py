@@ -8606,6 +8606,10 @@ def build_engine(
             investigation,
             "openstar.tess.physical.interpret",
         )
+        binary_confirmation = _latest_result_for_handler(
+            investigation,
+            "openstar.tess.binary-confirmation.analyze",
+        )
         source_localization = _latest_result_for_handler(
             investigation,
             "openstar.tess.source-localization.analyze",
@@ -8796,6 +8800,25 @@ def build_engine(
                 "claim": claim_decision["claim"],
                 "rationale": existing_rationale,
             }
+
+        if binary_confirmation is not None:
+            evidence = binary_confirmation.get("independentEvidence") or {}
+            ephemeris = binary_confirmation.get("linearEphemeris") or {}
+            opposite = binary_confirmation.get("oppositeConjunctionEvidence") or {}
+            existing_rationale = list(claim_decision.get("rationale") or [])
+            existing_rationale.append(
+                "Fixed-clock independent narrow-event replication classified the "
+                f"orbital-geometry evidence as {evidence.get('classification')}; "
+                f"linear-ephemeris coherence={ephemeris.get('coherent')}, and the "
+                "separate opposite-conjunction test classified the evidence as "
+                f"{opposite.get('classification')}. This does not resolve companion nature."
+            )
+            existing_rationale.append(
+                "Authoritative recommended next test: "
+                f"{binary_confirmation.get('recommendedNextTest')}."
+            )
+            claim_decision = {"claim": claim_decision["claim"],
+                              "rationale": existing_rationale}
 
         if source_localization is not None:
             cross = source_localization.get("crossSector") or {}
@@ -9804,6 +9827,7 @@ def build_engine(
             "independentHarmonicFamilyVerification": harmonic_family_interpretation,
             "morphology": morphology_interpretation,
             "physicalInterpretation": physical_interpretation,
+            "binaryConfirmation": binary_confirmation,
             "sourceLocalization": source_localization,
             "multiModeDecomposition": multimode_decomposition,
             "timeFrequencyEvolution": time_frequency_evolution,
@@ -9931,7 +9955,8 @@ def build_engine(
             print(f"   time-frequency structure: {time_frequency_evolution.get('classification')}")
             print(f"   residual evolution: {residual.get('classification')}")
             print(f"   established-family evolution: {family.get('classification')}")
-            print(f"   recommended next test: {time_frequency_evolution.get('recommendedNextTest')}")
+            if physical_interpretation is None and binary_confirmation is None:
+                print(f"   recommended next test: {time_frequency_evolution.get('recommendedNextTest')}")
         elif multimode_decomposition is not None:
             print(f"   residual frequency structure: {multimode_decomposition.get('classification')}")
             recurrent = multimode_decomposition.get("bestRecurrentSecondaryMode") or {}
@@ -9945,6 +9970,14 @@ def build_engine(
                 "   recommended next test: "
                 f"{physical_interpretation.get('recommendedNextTest')}"
             )
+        if binary_confirmation is not None:
+            binary_evidence = binary_confirmation.get("independentEvidence") or {}
+            binary_ephemeris = binary_confirmation.get("linearEphemeris") or {}
+            binary_opposite = binary_confirmation.get("oppositeConjunctionEvidence") or {}
+            print(f"   eclipse-like replication: {binary_evidence.get('classification')}")
+            print(f"   binary-confirmation ephemeris coherent: {binary_ephemeris.get('coherent')}")
+            print(f"   opposite-conjunction evidence: {binary_opposite.get('classification')}")
+        print(f"   authoritative recommended next test: {recommended_next_test}")
         if residual_mode_localization is not None:
             residual_cross = residual_mode_localization.get("crossSector") or {}
             print(f"   residual-mode localization: {residual_cross.get('classification')}")
