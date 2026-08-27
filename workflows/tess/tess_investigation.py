@@ -4209,13 +4209,36 @@ def build_engine(
         )
 
     def target_residual_astrophysical_interpretation_stage(investigation, request):
-        if any(s.handler_id == request.handler_id and s.id != request.id
-               for s in investigation.stages):
+        prior_attempts = [s for s in investigation.stages
+            if s.handler_id == request.handler_id and s.id != request.id]
+        compatibility_retry = (request.id ==
+            "031-target-residual-astrophysical-interpretation"
+            and request.triggered_by_stage_id ==
+                "030-target-residual-astrophysical-interpretation"
+            and len(prior_attempts) == 1
+            and prior_attempts[0].id == request.triggered_by_stage_id
+            and prior_attempts[0].status == "FAILED"
+            and prior_attempts[0].failure_classification == "NON_RETRYABLE"
+            and prior_attempts[0].error ==
+                "RuntimeError: main recurrent-family artifact verification failed"
+            and prior_attempts[0].result is None)
+        if prior_attempts and not compatibility_retry:
             raise RuntimeError("an astrophysical-mechanism interpretation was already attempted")
-        trigger = next((s for s in investigation.stages
-            if s.id == request.triggered_by_stage_id and s.status == "COMPLETE"), None)
-        mechanism_id = (trigger.triggered_by_stage_id if trigger is not None
-            and trigger.handler_id == "openstar.tess.finalize" else request.triggered_by_stage_id)
+        # This is intentionally a bounded resolver, not a general stage graph
+        # traversal: mechanism, or finalizer->mechanism, or the single admitted
+        # failed compatibility attempt->finalizer->mechanism.
+        by_id = {s.id: s for s in investigation.stages}
+        trigger = by_id.get(request.triggered_by_stage_id)
+        if compatibility_retry:
+            if trigger is not prior_attempts[0]:
+                raise RuntimeError("astrophysical interpretation recovery lineage is invalid")
+            trigger = by_id.get(trigger.triggered_by_stage_id)
+        if trigger is not None and trigger.handler_id == "openstar.tess.finalize":
+            if trigger.status != "COMPLETE":
+                raise RuntimeError("astrophysical interpretation finalizer lineage is invalid")
+            mechanism_id = trigger.triggered_by_stage_id
+        else:
+            mechanism_id = request.triggered_by_stage_id
         mechanism = next((s for s in reversed(investigation.stages)
             if s.id == mechanism_id and s.status == "COMPLETE"
             and s.handler_id == "openstar.tess.target-residual-mechanism.analyze"), None)
@@ -4249,13 +4272,8 @@ def build_engine(
                     pass
             # Some early server-local stages predate per-result artifacts. Their
             # immutable terminal stage ledger is the authoritative frozen record.
-            ledger = store.stage_path_for(investigation.id, stage.id)
-            try:
-                if ledger.is_file() and _load_json(ledger) == asdict(stage):
-                    return sha256_file(ledger)
-            except (OSError, ValueError, json.JSONDecodeError):
-                pass
-            return None
+            return store.verified_terminal_stage_ledger_hash(
+                investigation.id, stage)
         verified_hashes = {stage.id: verified_hash(stage) for stage in
             (mechanism, attribution, mode, identity)}
         if not all(verified_hashes.values()):
@@ -4273,6 +4291,28 @@ def build_engine(
         family_hash = verified_hash(family_stage) if family_stage is not None else None
         if family_stage is not None and not family_hash:
             raise RuntimeError("main recurrent-family artifact verification failed")
+        if compatibility_retry:
+            final = by_id.get("029-finalize")
+            final_family = (((final.result or {}).get("independentBroadVerification")
+                or {}).get("harmonicFamily") if final else None)
+            final_verified = False
+            if final is not None and isinstance(final.result, dict):
+                for ref in final.artifacts:
+                    try:
+                        path = resolver.resolve(ref.path)
+                        if (path.name == "conclusion-v20.14-intrinsic.json"
+                                and path.is_file()
+                                and ref.sha256 == sha256_file(path)
+                                and _load_json(path) == final.result):
+                            final_verified = True
+                            break
+                    except (OSError, ValueError, json.JSONDecodeError):
+                        pass
+            if (final is not trigger
+                    or not final_verified
+                    or family != final_family):
+                raise RuntimeError(
+                    "historical recurrent-family finalizer cross-check failed")
         object_identity = {"ticID": (identity.result or {}).get("ticID") or
             (investigation.metadata or {}).get("ticID"),
             "gaiaDR3SourceID": (identity.result or {}).get("gaiaDR3SourceID"),

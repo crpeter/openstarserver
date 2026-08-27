@@ -125,6 +125,28 @@ class InvestigationStore:
             / f"{self._safe_id(stage_id)}.json"
         )
 
+    def verified_terminal_stage_ledger_hash(
+        self, investigation_id: str, stage: InvestigationStage
+    ) -> str | None:
+        """Return the hash of an exact, immutable terminal-stage ledger.
+
+        JSON deliberately has only one sequence representation.  Comparing the
+        canonical JSON encodings therefore normalizes tuple-backed dataclass
+        fields (notably artifacts and provenance project IDs) to JSON arrays,
+        while still binding every stage field, including identity, handler,
+        status, result, causality, and terminal provenance.
+        """
+        if stage.status not in ("COMPLETE", "FAILED"):
+            return None
+        ledger = self.stage_path_for(investigation_id, stage.id)
+        try:
+            raw = json.loads(ledger.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError):
+            return None
+        if canonical_json_bytes(raw) != canonical_json_bytes(asdict(stage)):
+            return None
+        return sha256_file(ledger)
+
     def create(
         self,
         investigation_id: str,

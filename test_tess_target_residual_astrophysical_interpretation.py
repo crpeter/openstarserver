@@ -2,7 +2,7 @@ import json
 import tempfile
 import unittest
 import sys
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -250,6 +250,50 @@ class V2014AdmissionTests(unittest.TestCase):
                 investigation = mutate(self.make_boundary(root)); store.save(investigation)
                 self.assertEqual(investigation,
                     repair_obsolete_terminal_wait(store, investigation))
+
+    def test_exact_failed_stage030_admits_append_only_stage031_idempotently(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td); store = InvestigationStore(root / "state")
+            boundary = self.make_boundary(root)
+            family_value = {"interpretation": "recurrent-raw-period-family",
+                "representativeRawPeriodDays": 7.546257528330875,
+                "possibleDoubleCycleDays": 15.09251505666175,
+                "physicalCycleResolved": False,
+                "supportingSectorCount": 2, "supportingSectors": [94, 95]}
+            family = InvestigationStage("011-interpret-broad-independent-search",
+                "openstar.tess.independent.broad.interpret", "COMPLETE", "010-search",
+                {}, result={"harmonicFamily": family_value})
+            final_result = {**boundary.stages[1].result,
+                "independentBroadVerification": {"harmonicFamily": family_value}}
+            final_path = Path(boundary.stages[1].artifacts[0].path)
+            final_path.write_text(json.dumps(final_result, sort_keys=True))
+            final = replace(boundary.stages[1], result=final_result, artifacts=(
+                replace(boundary.stages[1].artifacts[0], sha256=sha256_file(final_path)),))
+            failed = InvestigationStage(
+                "030-target-residual-astrophysical-interpretation",
+                "openstar.tess.target-residual-astrophysical-interpretation.analyze",
+                "FAILED", "029-finalize", {}, result=None,
+                error="RuntimeError: main recurrent-family artifact verification failed",
+                failure_classification="NON_RETRYABLE")
+            investigation = replace(boundary, status="FAILED",
+                stages=(family, boundary.stages[0], final, failed))
+            store.save(investigation)
+            family_ledger = store.stage_path_for(investigation.id, family.id)
+            family_ledger.parent.mkdir(parents=True)
+            family_ledger.write_text(json.dumps(asdict(family)))
+            failed_ledger = store.stage_path_for(investigation.id, failed.id)
+            failed_ledger.write_text(json.dumps(asdict(failed)))
+            failed_bytes = failed_ledger.read_bytes()
+
+            admitted = repair_obsolete_terminal_wait(store, investigation)
+            selected = admitted.metadata["controlState"]["selectedExperiment"]
+            self.assertEqual("RUNNING", admitted.status)
+            self.assertEqual("031-target-residual-astrophysical-interpretation",
+                             selected["id"])
+            self.assertEqual(failed.id, selected["triggered_by_stage_id"])
+            self.assertEqual("FAILED", admitted.stages[-1].status)
+            self.assertEqual(failed_bytes, failed_ledger.read_bytes())
+            self.assertEqual(admitted, repair_obsolete_terminal_wait(store, admitted))
 
 
 class RealBoundaryHandlerIntegrationTests(unittest.TestCase):
