@@ -1906,6 +1906,7 @@ def _render_report(conclusion: dict[str, Any]) -> str:
             f"- Supporting independent sectors: {source_review.get('supportingIndependentSectors')}",
         ])
     if external_companion is not None:
+        synthesis_complete = conclusion.get("finalCompanionEvidenceSynthesis") is not None
         lines.extend([
             "", "## Published external companion confirmation", "",
             f"- Classification: {external_companion.get('classification')}",
@@ -1916,8 +1917,10 @@ def _render_report(conclusion: dict[str, Any]) -> str:
             f"- Supported mass regime: {external_companion.get('supportedCompanionMassRegime')}",
             f"- Known-object catalog used: {external_companion.get('externalKnownObjectCatalogUsed')}",
             f"- Preceding photometric/spatial evidence remained software-blind: {external_companion.get('softwareBlindPhotometricEvidencePreserved')}",
-            f"- Final physical mechanism resolved: {external_companion.get('physicalMechanismResolved')}",
-            f"- Final companion nature resolved: {external_companion.get('companionNatureResolved')}",
+            f"- At external interpretation, physical mechanism resolved: {external_companion.get('physicalMechanismResolved')}",
+            ("- At external interpretation, companion nature was pending final synthesis."
+             if synthesis_complete else
+             f"- At external interpretation, companion nature resolved: {external_companion.get('companionNatureResolved')}"),
             f"- Authoritative next test: {conclusion.get('recommendedNextTest')}",
         ])
     synthesis = conclusion.get("finalCompanionEvidenceSynthesis")
@@ -3029,8 +3032,9 @@ def build_engine(
         print("🔭 Published external companion confirmation evidence")
         print(f"   external classification: {result['classification']}")
         print("   OpenStar photometric/spatial evidence remains software-blind")
-        print("   final physical mechanism and companion nature remain unresolved")
-        proceed = result.get("recommendedNextTest") == "FINAL_COMPANION_EVIDENCE_SYNTHESIS"
+        print("   companion nature pending final synthesis; detailed physical mechanism unresolved")
+        proceed = (result.get("externalCompanionEvidenceResolved") is True
+                   and result.get("recommendedNextTest") == "FINAL_COMPANION_EVIDENCE_SYNTHESIS")
         return StageOutcome(result=result,
             next_stage=StageRequest(_next_stage_id(request.id, "companion-evidence-synthesis" if proceed else "finalize"),
                 COMPANION_SYNTHESIS_HANDLER_ID if proceed else "openstar.tess.finalize",
@@ -10296,6 +10300,14 @@ def build_engine(
             print(f"   supported mass regime: {external_companion_evidence.get('supportedCompanionMassRegime')}")
             print(f"   known-object catalog used: {external_companion_evidence.get('externalKnownObjectCatalogUsed')}")
             print(f"   software-blind photometric/spatial evidence preserved: {external_companion_evidence.get('softwareBlindPhotometricEvidencePreserved')}")
+        if final_companion_evidence_synthesis is not None:
+            print(f"   final companion synthesis: {final_companion_evidence_synthesis.get('classification')}")
+            print(f"   source relationship: {final_companion_evidence_synthesis.get('sourceRelationship')}")
+            print(f"   supported mass regime: {final_companion_evidence_synthesis.get('supportedCompanionMassRegime')}")
+            print("   companion nature resolved: True")
+            print("   detailed photometric mechanism unresolved: True")
+            print("   automatic discovery claim: False")
+            print("   authoritative next test: HUMAN_SCIENTIFIC_REVIEW")
             print("   final physical mechanism and companion nature remain unresolved")
         print(f"   authoritative recommended next test: {recommended_next_test}")
         if residual_mode_localization is not None:

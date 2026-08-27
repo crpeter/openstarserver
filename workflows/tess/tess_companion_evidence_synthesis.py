@@ -8,6 +8,7 @@ from openstar_investigation import sha256_json
 from .tess_external_companion_evidence import (
     FREEZE_VERSION, LOCALIZATION_VERSION, RESULT_VERSION as EXTERNAL_RESULT_VERSION,
     REVIEW_VERSION, canonical_gaia_dr3_id, canonical_tic_id,
+    interpret_external_evidence, review_source_attribution,
 )
 
 RESULT_VERSION = "openstar.final-companion-evidence-synthesis.v1"
@@ -59,6 +60,9 @@ def synthesize_companion_evidence(binary_confirmation: dict[str, Any],
     _require(source_review.get("resultVersion") == REVIEW_VERSION
              and source_review.get("sourceAttributionReviewPassed") is True,
              "source-attribution review did not pass")
+    expected_review = review_source_attribution(localization)
+    _require(sha256_json(source_review) == sha256_json(expected_review),
+             "persisted source review is not the deterministic localization review")
     expected_review_class = ("TARGET_SOURCE_ATTRIBUTION_REVIEW_PASSED" if relationship == "TARGET_ASSOCIATED"
                              else "OFF_TARGET_CATALOG_ATTRIBUTION_REVIEW_PASSED")
     _require(source_review.get("classification") == expected_review_class,
@@ -92,16 +96,25 @@ def synthesize_companion_evidence(binary_confirmation: dict[str, Any],
              "evidence separation gate failed")
 
     source = source_review.get("attributedSource") or {}
+    _require(source.get("sourceID") == source_review.get("attributedCatalogHypothesis")
+             and source.get("isTarget") is (relationship == "TARGET_ASSOCIATED"),
+             "attributed source role or identity conflicts with relationship")
     identifiers = frozen_external_response.get("attributedSourceIdentifiers") or {}
     row = external_result.get("selectedExternalRow")
     _require(isinstance(row, dict), "selected external row is missing")
     tic = canonical_tic_id(source.get("ticID")); freeze_tic = canonical_tic_id(identifiers.get("ticID"))
     row_tic = canonical_tic_id(row.get("tic_id"))
     _require(tic == freeze_tic == row_tic, "TIC identity changed across evidence")
-    source_gaia = canonical_gaia_dr3_id(source.get("gaiaDR3SourceID"))
-    freeze_gaia = canonical_gaia_dr3_id(identifiers.get("gaiaDR3SourceID"))
-    row_gaia = canonical_gaia_dr3_id(row.get("gaia_dr3_id"))
-    _require(source_gaia == freeze_gaia == row_gaia, "Gaia identity changed across evidence")
+    raw_source_gaia = source.get("gaiaDR3SourceID")
+    if raw_source_gaia in (None, ""):
+        _require(identifiers.get("gaiaDR3SourceID") is None,
+                 "Gaia identity appeared after source review")
+        source_gaia = None
+    else:
+        source_gaia = canonical_gaia_dr3_id(raw_source_gaia)
+        freeze_gaia = canonical_gaia_dr3_id(identifiers.get("gaiaDR3SourceID"))
+        row_gaia = canonical_gaia_dr3_id(row.get("gaia_dr3_id"))
+        _require(source_gaia == freeze_gaia == row_gaia, "Gaia identity changed across evidence")
     _require(source_review.get("attributedCatalogHypothesis") == localization.get("attributedCatalogHypothesis"),
              "attributed source changed")
 
@@ -113,6 +126,14 @@ def synthesize_companion_evidence(binary_confirmation: dict[str, Any],
     }
     _require(regime in expected_external and external_result.get("classification") == expected_external[regime],
              "classification/mass-regime conflict")
+    rows = frozen_external_response.get("returnedRows")
+    _require(isinstance(rows, list) and bool(rows) and all(isinstance(item, dict) for item in rows),
+             "resolved synthesis requires nonempty frozen returned rows")
+    _require(any(sha256_json(item) == sha256_json(row) for item in rows),
+             "selected external row is absent from frozen response")
+    deterministic_external = interpret_external_evidence(frozen_external_response)
+    _require(sha256_json(external_result) == sha256_json(deterministic_external),
+             "external result is not the exact deterministic frozen-response interpretation")
     period = _finite(external_result.get("externalOrbitalPeriodDays"), "external period")
     difference = _finite(external_result.get("externalOrbitalPeriodDifferenceDays"), "period difference")
     mass = _finite(external_result.get("externalMassJupiter"), "external mass")
@@ -121,6 +142,10 @@ def synthesize_companion_evidence(binary_confirmation: dict[str, Any],
              "invalid period or mass interval")
     low, high = (_finite(v, "mass interval") for v in interval)
     _require(0 < low <= mass <= high and low < high, "invalid mass interval")
+    regime_valid = ((regime == "PLANETARY" and high < 13)
+                    or (regime == "BROWN_DWARF" and low > 13 and high < 80)
+                    or (regime == "STELLAR" and low >= 80))
+    _require(regime_valid, "mass interval does not belong to claimed regime")
     row_period = _finite(row.get("pl_orbper"), "selected-row period")
     row_mass = _finite(row.get("pl_bmassj"), "selected-row mass")
     row_down = _finite(row.get("pl_bmassjerr2"), "selected-row lower mass error")
