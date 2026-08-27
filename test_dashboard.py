@@ -577,6 +577,19 @@ class SidecarHTTPTests(unittest.TestCase):
         self.assertFalse(self.request("/api/dashboard/history")[1]["available"])
         self.assertIn(b"OpenStar", self.request("/dashboard/")[1])
 
+    def test_empty_target_api_and_unknown_opaque_ids(self):
+        status, targets = self.request("/api/dashboard/targets?pageSize=500")
+        self.assertEqual(200, status)
+        self.assertEqual([], targets["targets"])
+        self.assertEqual(100, targets["pageSize"])
+        for path in ("/api/dashboard/targets/target_00000000000000000000",
+                     "/api/dashboard/targets/target_00000000000000000000/visuals",
+                     "/api/dashboard/targets/%2e%2e%2fetc%2fpasswd"):
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                self.request(path)
+            self.assertEqual(404, caught.exception.code)
+            self.assertEqual("no-store", caught.exception.headers["Cache-Control"])
+
     def test_heartbeat_and_worker_detail(self):
         self.assertEqual(
             202,

@@ -135,3 +135,73 @@ refreshFleet();
 refreshScience();
 setInterval(refreshFleet, 10000);
 setInterval(refreshScience, 3000);
+
+let targetPage = 1, targetPages = 1, targetController = null, targetQueryTimer = null;
+const targetFilters = () => new URLSearchParams({page: targetPage, pageSize: 24,
+  q: $("#targetSearch").value, status: $("#targetStatus").value,
+  sector: $("#targetSector").value, health: $("#targetHealth").value,
+  sort: $("#targetSort").value});
+function targetStatusClass(status) {
+  return ["FAILED", "BLOCKED", "RECOVERY_REQUIRED"].includes(status) ? "error" :
+    ["COMPLETE", "COMPLETED", "FINISHED"].includes(status) ? "active" : "idle";
+}
+function renderTargetCard(target) {
+  const card = element("article", {className: "target-card"}); card.tabIndex = 0;
+  const progress = target.stageCounts.total ? 100 * target.stageCounts.completed / target.stageCounts.total : 0;
+  card.replaceChildren(
+    element("div", {className: "target-top"}, [element("span", {className: `badge ${targetStatusClass(target.status)}`, text: target.status}), element("span", {className: "identity", text: target.classification || "Classification pending"})]),
+    element("h3", {text: target.targetName}), element("div", {className: "identity", text: [target.ticID && `TIC ${target.ticID}`, target.gaiaID && `Gaia ${target.gaiaID}`].filter(Boolean).join(" · ") || target.investigationID}),
+    element("p", {className: "target-conclusion", text: target.currentClaim || "No scientific conclusion recorded yet."}),
+    element("div", {className: "target-measures"}, [element("div", {}, [element("span", {text: target.resolvedPhysicalPeriod != null ? "Physical period" : "Detected period"}), element("b", {text: `${target.resolvedPhysicalPeriod ?? target.detectedPeriod ?? "Not recorded"}${target.resolvedPhysicalPeriod != null || target.detectedPeriod != null ? " d" : ""}`})]), element("div", {}, [element("span", {text: "Sectors"}), element("b", {text: [...target.primarySectors, ...target.independentSectors].join(", ") || "Not recorded"})])]),
+    element("div", {className: "evidence", title: `${target.stageCounts.completed} of ${target.stageCounts.total} stages complete`}, [Object.assign(element("i"), {style: `width:${progress}%`})]),
+    element("div", {className: "target-next"}, [element("span", {text: "Recommended next test"}), element("b", {text: target.recommendedNextTest || "No recommendation recorded"})]),
+    element("div", {className: "target-foot"}, [element("span", {text: `${target.runCount} preserved run${target.runCount === 1 ? "" : "s"}`}), element("span", {text: relative(target.updatedAt)})]));
+  const open = () => openTarget(target.targetID); card.addEventListener("click", open);
+  card.addEventListener("keydown", event => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); open(); }});
+  return card;
+}
+async function loadTargets() {
+  const gallery = $("#targetGallery");
+  gallery.replaceChildren(...Array.from({length: 6}, () => element("div", {className: "skeleton"})));
+  try {
+    const response = await fetch(`/api/dashboard/targets?${targetFilters()}`);
+    if (!response.ok) throw new Error(`Targets request failed (${response.status})`);
+    const data = await response.json();
+    const labels = [["Distinct targets", "totalTargets"], ["Active", "activeInvestigations"], ["Complete", "completedInvestigations"], ["Unresolved", "unresolvedTargets"], ["Source localized", "sourceLocalizedTargets"], ["Companion resolved", "companionNatureResolvedTargets"], ["Degraded", "degradedTargets"]];
+    replace($("#targetStats"), labels.map(([label, key]) => element("div", {className: "stat"}, [element("span", {text: label}), element("b", {text: count(data.stats[key] || 0)})])));
+    replace(gallery, data.targets.length ? data.targets.map(renderTargetCard) : [element("section", {className: "panel stat"}, [element("h3", {text: "No cataloged targets"}), element("p", {text: "Standalone investigation records will appear here when durable science history is cataloged."})])]);
+    targetPages = Math.max(1, Math.ceil(data.total / data.pageSize)); targetPage = data.page;
+    $("#targetPage").textContent = `Page ${targetPage} of ${targetPages}`; $("#targetPrev").disabled = targetPage <= 1; $("#targetNext").disabled = targetPage >= targetPages;
+  } catch (error) { replace(gallery, [element("section", {className: "panel stat"}, [element("h3", {text: "Targets unavailable"}), element("p", {text: error.message}), Object.assign(element("button", {text: "Retry"}), {onclick: loadTargets})])]); }
+}
+function renderHeatmap(evidence) {
+  const values = evidence.data.values || [], canvas = element("canvas", {className: "heatmap"});
+  canvas.width = Math.max(1, values[0]?.length || 1) * 12; canvas.height = Math.max(1, values.length) * 12;
+  canvas.setAttribute("role", "img"); canvas.setAttribute("aria-label", `Persisted difference-image heatmap${evidence.data.truncated ? ", bounded preview" : ""}`);
+  const flat = values.flat().filter(Number.isFinite), low = flat.length ? Math.min(...flat) : 0, high = flat.length ? Math.max(...flat) : 0, span = high - low || 1, context = canvas.getContext("2d");
+  values.forEach((row, y) => row.forEach((value, x) => { const level = Number.isFinite(value) ? (value - low) / span : 0; context.fillStyle = Number.isFinite(value) ? `hsl(${250 - level * 190} 85% ${22 + level * 48}%)` : "#101827"; context.fillRect(x * 12, y * 12, 12, 12); }));
+  return element("div", {}, [canvas, element("p", {className: "identity", text: `${evidence.data.rows} × ${evidence.data.columns} persisted pixels${evidence.data.truncated ? " · bounded to 32 × 32" : ""}${evidence.data.peakSNR != null ? ` · peak SNR ${evidence.data.peakSNR}` : ""}`})]);
+}
+function timeline(stages) { return element("div", {className: "timeline"}, stages.map(stage => element("article", {}, [element("b", {text: `${stage.id} · ${stage.status}`}), element("div", {className: "identity", text: [stage.handler, stage.startedAt && `started ${new Date(stage.startedAt * 1000).toISOString()}`, stage.completedAt && `completed ${new Date(stage.completedAt * 1000).toISOString()}`].filter(Boolean).join(" · ")})]))); }
+async function openTarget(id) {
+  if (targetController) targetController.abort(); targetController = new AbortController();
+  const signal = targetController.signal, dialog = $("#detail"), body = $("#detailBody");
+  replace(body, [element("div", {className: "skeleton"})]); if (!dialog.open) dialog.showModal();
+  try {
+    const response = await fetch(`/api/dashboard/targets/${encodeURIComponent(id)}`, {signal});
+    if (!response.ok) throw new Error(`Target request failed (${response.status})`); const target = await response.json();
+    const latest = target.runs[0];
+    const sections = [element("div", {className: "target-detail-head"}, [element("p", {className: "eyebrow", text: "TARGET DOSSIER"}), element("h2", {text: target.targetName}), element("p", {className: "identity", text: [target.ticID && `TIC ${target.ticID}`, target.gaiaID && `Gaia ${target.gaiaID}`, target.coordinates.ra != null && `RA ${target.coordinates.ra}`, target.coordinates.dec != null && `Dec ${target.coordinates.dec}`].filter(Boolean).join(" · ")})])];
+    if (target.answerKeyUsed) sections.push(element("div", {className: "warning-callout", text: "Answer-key or external known-object evidence was used in this history. This result must not be interpreted as blind."}));
+    sections.push(element("section", {className: "detail-section"}, [element("h3", {text: "What OpenStar knows"}), element("p", {text: target.currentClaim || "No authoritative scientific claim was recorded."}), ...(target.claimRationale || []).length ? [element("ul", {className: "claim-rationale"}, target.claimRationale.map(reason => element("li", {text: reason})))] : [], element("div", {className: "detailgrid"}, labelledRows({Classification: target.classification, "Detected period": target.detectedPeriod, "Physical period": target.resolvedPhysicalPeriod, "Source attribution": typeof target.sourceAttribution === "string" ? target.sourceAttribution : target.sourceAttribution && JSON.stringify(target.sourceAttribution), "Physical mechanism": typeof target.physicalMechanism === "string" ? target.physicalMechanism : target.physicalMechanism && JSON.stringify(target.physicalMechanism), "Companion nature": typeof target.companionNature === "string" ? target.companionNature : target.companionNature && JSON.stringify(target.companionNature)}))]), element("section", {className: "detail-section"}, [element("h3", {text: "Evidence chain"}), timeline(latest.stages)]), element("section", {className: "detail-section"}, [element("h3", {text: "Recommended next test"}), element("p", {text: target.recommendedNextTest || "No authoritative recommendation recorded."})]), element("section", {className: "detail-section"}, [element("h3", {text: `Preserved run history (${target.runCount})`}), ...target.runs.map(run => element("div", {className: "row"}, [element("span", {text: run.investigationID}), element("b", {text: `${run.status} · ${run.stageCounts.completed}/${run.stageCounts.total} stages`})]))]), element("details", {}, [element("summary", {text: "Provenance and artifact metadata"}), jsonBlock({workflow: [target.workflow, target.workflowVersion].filter(Boolean).join(" · "), projectID: target.projectID, datasetID: target.datasetID, hashes: target.provenanceHashes, artifacts: target.artifacts})]), element("section", {className: "detail-section", text: "Loading persisted visual evidence…"}));
+    replace(body, sections);
+    fetch(`/api/dashboard/targets/${encodeURIComponent(id)}/visuals`, {signal}).then(r => {if (!r.ok) throw new Error(); return r.json();}).then(visual => { const section = body.lastElementChild; const unavailable = label => element("div", {className: "row"}, [element("span", {text: label}), element("b", {text: "Not recorded for this run"})]); const rows = [element("h3", {text: "Persisted evidence overview"}), element("div", {className: "detailgrid"}, labelledRows({"Primary sectors": visual.sectorSupport.primary.join(", ") || "Not recorded", "Independent sectors": visual.sectorSupport.independent.join(", ") || "Not recorded", "Detected period": visual.periods.detected, "Resolved physical period": visual.periods.physical}))]; for (const [label, value] of [["Difference image", visual.differenceImage], ["Measured centroid", visual.centroid], ["Source distances", visual.sourceDistances], ["Independent-sector agreement", visual.independentSectorAgreement]]) rows.push(value.status === "available" ? element("details", {}, [element("summary", {text: label}), label === "Difference image" ? renderHeatmap(value) : jsonBlock(value.data)]) : unavailable(label)); section.replaceChildren(...rows); }).catch(error => {if (error.name !== "AbortError") body.lastElementChild.replaceChildren(element("p", {text: "Visualization evidence unavailable."}), Object.assign(element("button", {text: "Retry"}), {onclick: () => openTarget(id)}));});
+  } catch (error) { if (error.name !== "AbortError") replace(body, [element("h2", {text: "Target unavailable"}), element("p", {text: error.message}), Object.assign(element("button", {text: "Retry"}), {onclick: () => openTarget(id)})]); }
+}
+for (const button of document.querySelectorAll(".nav")) button.addEventListener("click", () => {
+  document.querySelectorAll(".nav").forEach(node => node.classList.toggle("active", node === button));
+  const targets = button.dataset.view === "targets"; $("#fleetView").hidden = targets; $("#targetsView").hidden = !targets; if (targets) loadTargets();
+});
+for (const control of [$("#targetSearch"), $("#targetStatus"), $("#targetSector"), $("#targetHealth"), $("#targetSort")]) control.addEventListener("input", () => { clearTimeout(targetQueryTimer); targetQueryTimer = setTimeout(() => {targetPage = 1; loadTargets();}, 180); });
+$("#targetPrev").addEventListener("click", () => {if (targetPage > 1) {targetPage--; loadTargets(); window.scrollTo({top: 0});}}); $("#targetNext").addEventListener("click", () => {if (targetPage < targetPages) {targetPage++; loadTargets(); window.scrollTo({top: 0});}});
+$("#detail").addEventListener("close", () => {if (targetController) targetController.abort();});

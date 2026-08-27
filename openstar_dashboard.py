@@ -12,13 +12,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Iterable
 from urllib.error import HTTPError, URLError
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 from urllib.request import urlopen
 
 from dashboard import build_snapshot, history_snapshot
 from openstar_sector_sweep_status import sector_sweeps_projection
 from openstar_science_runs import catalog_path, discover_science_runs
 from openstar_contributions import DEFAULT_CONTRIBUTION_DB
+from openstar_target_projection import TargetProjectionStore
 
 ROOT = Path(__file__).resolve().parent
 
@@ -124,6 +125,7 @@ class DashboardApplication:
         self._observation_lock = threading.Lock()
         self._cached_observation: dict[str, Any] | None = None
         self._cached_until = 0.0
+        self.targets = TargetProjectionStore(self.science_run_catalog)
 
     def observation(self) -> dict[str, Any]:
         """Coalesce concurrent browser reads into one dashboard observation."""
@@ -222,7 +224,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        path = urlparse(self.path).path
+        parsed_url = urlparse(self.path)
+        path = parsed_url.path
         assets = {
             "/": ("dashboard/index.html", "text/html; charset=utf-8"),
             "/dashboard": ("dashboard/index.html", "text/html; charset=utf-8"),
@@ -232,6 +235,27 @@ class DashboardHandler(BaseHTTPRequestHandler):
         }
         if path in assets:
             self.send_asset(*assets[path])
+            return
+        if path == "/api/dashboard/targets":
+            try:
+                self.send_json(200, self.application.targets.list(parse_qs(parsed_url.query)))
+            except Exception:
+                self.send_json(200, {"targets": [], "page": 1, "pageSize": 24,
+                                     "total": 0, "stats": {}})
+            return
+        target_prefix = "/api/dashboard/targets/"
+        if path.startswith(target_prefix):
+            remainder = path[len(target_prefix):].strip("/")
+            parts = remainder.split("/")
+            # IDs are opaque, fixed-format tokens.  Slashes and traversal are
+            # rejected before any catalog-backed filesystem access.
+            if len(parts) not in {1, 2} or not parts[0].startswith("target_") or not all(
+                    character in "0123456789abcdef" for character in parts[0][7:]) or len(parts[0]) != 27:
+                self.send_json(404, {"message": "Unknown target."})
+                return
+            payload = (self.application.targets.visuals(parts[0]) if len(parts) == 2 and parts[1] == "visuals"
+                       else self.application.targets.detail(parts[0]) if len(parts) == 1 else None)
+            self.send_json(200, payload) if payload else self.send_json(404, {"message": "Unknown target."})
             return
         try:
             snapshot, observation = self.application.snapshot()
