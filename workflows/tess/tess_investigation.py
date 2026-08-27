@@ -4489,7 +4489,12 @@ def build_engine(
             s.id == "031-target-residual-astrophysical-interpretation"), None)
         if not (request.id == "035-main-family-frequency-domain-reassessment"
                 and recurrence and science and final and final.id == "034-finalize"
-                and final is investigation.stages[-1]
+                and len(investigation.stages) >= 2
+                and final is investigation.stages[-2]
+                and investigation.stages[-1].id == request.id
+                and investigation.stages[-1].handler_id == request.handler_id
+                and investigation.stages[-1].status == "RUNNING"
+                and investigation.stages[-1].triggered_by_stage_id == final.id
                 and recurrence.status == science.status == final.status == "COMPLETE"
                 and recurrence.handler_id == "openstar.tess.main-family-time-domain-recurrence.analyze"
                 and science.handler_id == "openstar.tess.target-residual-astrophysical-interpretation.analyze"
