@@ -7,7 +7,7 @@ from openstar_investigation import sha256_json
 from workflows.tess.tess_event_depth_accuracy import (
     AUDIT_HANDLER_ID, FREEZE_HANDLER_ID, _harmonic_on_original_scale, _measure,
     acquire_full_precision_photometry, audit_depth_attenuation, freeze_photometry,
-    validate_freeze,
+    validate_audit_hash, validate_freeze,
 )
 
 
@@ -73,7 +73,13 @@ class TessEventDepthAccuracyTests(unittest.TestCase):
     def binary(self, sectors=(1, 2, 3), coherent=True):
         return {"linearEphemeris": {"coherent": coherent, "referenceEpoch": 20.,
                   "refinedPeriodDays": 2., "timingSectors": list(sectors)},
-                "sectorResults": [{"usable": True, "dutyCycle": .06, "sector": x} for x in sectors],
+                "independentEvidence": {
+                    "classification": "REPLICATED_ECLIPSE_LIKE_EVENT_SUPPORTED",
+                    "supportingIndependentSectorCount": len(sectors),
+                    "supportingSectors": list(sectors),
+                    "independentLinearEphemeris": {"coherent": coherent}},
+                "sectorResults": [{"usable": True, "role": "INDEPENDENT",
+                                   "dutyCycle": .06, "sector": x} for x in sectors],
                 "catalogAnswerKeyUsed": False}
 
     def chronology(self):
@@ -183,6 +189,43 @@ class TessEventDepthAccuracyTests(unittest.TestCase):
         self.assertEqual("UNRESOLVED", unresolved["status"])
         insufficient = self.binary((1,)); frozen = self.frozen([self.product(1)], insufficient)
         self.assertEqual("UNRESOLVED", audit_depth_attenuation(frozen, insufficient, binary_confirmation_sha256=sha256_json(insufficient))["status"])
+
+    def test_every_unresolved_path_is_hash_finalized(self):
+        cases = []
+        blind = self.binary(); blind["catalogAnswerKeyUsed"] = True; cases.append(({}, blind))
+        unreplicated = self.binary(); unreplicated["independentEvidence"]["classification"] = "ECLIPSE_LIKE_EVENT_UNRESOLVED"; cases.append(({}, unreplicated))
+        unsupported = self.binary(); unsupported["independentEvidence"]["supportingIndependentSectorCount"] = 2; cases.append(({}, unsupported))
+        independent_clock = self.binary(); independent_clock["independentEvidence"]["independentLinearEphemeris"]["coherent"] = False; cases.append(({}, independent_clock))
+        incoherent = self.binary(); incoherent["linearEphemeris"]["coherent"] = False; cases.append(({}, incoherent))
+        missing = self.binary(); cases.append(({"status": "UNRESOLVED", "unresolvedReasons": ["unavailable"]}, missing))
+        invalid = self.binary(); cases.append(({"status": "FROZEN"}, invalid))
+        malformed_rows = self.binary()
+        malformed_rows["sectorResults"] = [{"usable": True, "role": "PRIMARY", "dutyCycle": .06,
+                                             "sector": x} for x in (1, 2, 3)]
+        cases.append((self.frozen(binary=malformed_rows), malformed_rows))
+        for freeze, binary in cases:
+            result = audit_depth_attenuation(freeze, binary,
+                binary_confirmation_sha256=sha256_json(binary))
+            self.assertEqual("UNRESOLVED", result["status"])
+            self.assertEqual(result["auditSHA256"], validate_audit_hash(result))
+
+    def test_nonindependent_rows_cannot_satisfy_duration_gate(self):
+        binary = self.binary()
+        binary["sectorResults"] = [
+            {"usable": True, "role": "PRIMARY", "dutyCycle": .06, "sector": sector}
+            for sector in (1, 2, 3)]
+        result = audit_depth_attenuation(self.frozen(binary=binary), binary,
+            binary_confirmation_sha256=sha256_json(binary))
+        self.assertEqual("UNRESOLVED", result["status"])
+        self.assertIn("INSUFFICIENT_INDEPENDENT_EVENT_DURATION_SUPPORT", result["unresolvedReasons"])
+
+    def test_mutated_unresolved_audit_hash_is_rejected(self):
+        binary = self.binary()
+        result = audit_depth_attenuation({"status": "UNRESOLVED"}, binary,
+            binary_confirmation_sha256=sha256_json(binary))
+        result["unresolvedReasons"].append("mutation")
+        with self.assertRaisesRegex(ValueError, "audit hash mismatch"):
+            validate_audit_hash(result)
 
     def test_blind_contract_and_registered_identifiers(self):
         self.assertEqual("openstar.tess.event-depth-photometry.freeze", FREEZE_HANDLER_ID)

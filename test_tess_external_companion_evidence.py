@@ -252,7 +252,14 @@ class ExternalCompanionEvidenceTests(unittest.TestCase):
             investigation = store.create("external-lifecycle", "test", "1")
             binary = {"linearEphemeris": {"coherent": True, "referenceEpoch": 1.0,
                                            "refinedPeriodDays": 2.0, "timingSectors": [1, 2, 3]},
-                      "sectorResults": [{"usable": True, "dutyCycle": .05} for _ in range(3)],
+                      "independentEvidence": {
+                          "classification": "REPLICATED_ECLIPSE_LIKE_EVENT_SUPPORTED",
+                          "supportingIndependentSectorCount": 3,
+                          "supportingSectors": [1, 2, 3],
+                          "independentLinearEphemeris": {"coherent": True}},
+                      "sectorResults": [{"usable": True, "role": "INDEPENDENT",
+                                         "sector": sector, "dutyCycle": .05}
+                                        for sector in (1, 2, 3)],
                       "catalogAnswerKeyUsed": False}
             prepared_stage = InvestigationStage("001-prepare-target", "openstar.tess.prepare-target",
                 "COMPLETE", None, {}, result={"ticID": 42, "datasetID": "synthetic"})
@@ -308,6 +315,60 @@ class ExternalCompanionEvidenceTests(unittest.TestCase):
             result = investigation.stages[-1].result
             self.assertEqual("PERIOD_MATCHED_PLANETARY_MASS_COMPANION_SUPPORTED",
                              result["classification"])
+
+    @unittest.skipUnless(importlib.util.find_spec("numpy"), "NumPy required by TESS workflow engine")
+    def test_unavailable_photometry_audit_continues_to_external_freeze(self):
+        from workflows.tess.tess_external_companion_evidence import FREEZE_HANDLER_ID, REVIEW_HANDLER_ID
+        from workflows.tess.tess_eclipse_event_localization import HANDLER_ID
+        from workflows.tess.tess_event_depth_accuracy import FREEZE_HANDLER_ID as DEPTH_FREEZE_HANDLER_ID
+        from workflows.tess.tess_investigation import build_engine
+        binary = {"linearEphemeris": {"coherent": True, "referenceEpoch": 1.0,
+                                      "refinedPeriodDays": 2.0, "timingSectors": [1, 2, 3]},
+                  "independentEvidence": {
+                      "classification": "REPLICATED_ECLIPSE_LIKE_EVENT_SUPPORTED",
+                      "supportingIndependentSectorCount": 3,
+                      "supportingSectors": [1, 2, 3],
+                      "independentLinearEphemeris": {"coherent": True}},
+                  "sectorResults": [{"usable": True, "role": "INDEPENDENT", "sector": sector,
+                                     "dutyCycle": .05} for sector in (1, 2, 3)],
+                  "catalogAnswerKeyUsed": False}
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
+            store = InvestigationStore(directory)
+            investigation = store.create("unresolved-depth-continues", "test", "1")
+            stages = (
+                InvestigationStage("001-prepare-target", "openstar.tess.prepare-target", "COMPLETE",
+                                   None, {}, result={"ticID": 42, "datasetID": "synthetic"}),
+                InvestigationStage("021-binary", "openstar.tess.binary-confirmation.analyze", "COMPLETE",
+                                   None, {}, result=binary),
+                InvestigationStage("022-localize", HANDLER_ID, "COMPLETE", None, {}, result=self.localization),
+            )
+            investigation = type(investigation)(**{**investigation.__dict__, "stages": stages})
+            store.save(investigation)
+            engine = build_engine(store, SimpleNamespace(), poll_interval=0, timeout=None)
+            engine.chain_stages = False
+            investigation, request = engine.run_stage(investigation,
+                StageRequest("023-review", REVIEW_HANDLER_ID, {}, "022-localize"),
+                software_id="test", software_version="1")
+            self.assertEqual(DEPTH_FREEZE_HANDLER_ID, request.handler_id)
+            unresolved = {"resultVersion": "openstar.tess-event-depth-photometry-freeze.v1",
+                          "status": "UNRESOLVED", "unresolvedReasons": ["NO_OFFICIAL_PRODUCT"],
+                          "catalogAnswerKeyUsed": False, "externalCatalogInformationUsed": False}
+            with mock.patch("workflows.tess.tess_investigation.acquire_full_precision_photometry",
+                            return_value=unresolved) as mast:
+                investigation, request = engine.run_stage(
+                    investigation, request, software_id="test", software_version="1")
+            mast.assert_called_once()
+            investigation, request = engine.run_stage(
+                investigation, request, software_id="test", software_version="1")
+            audit = investigation.stages[-1].result
+            self.assertEqual("UNRESOLVED", audit["status"])
+            self.assertEqual(64, len(audit["auditSHA256"]))
+            self.assertEqual(FREEZE_HANDLER_ID, request.handler_id)
+            with mock.patch("workflows.tess.tess_investigation.acquire_external_evidence",
+                            return_value=self.freeze([self.row()])) as external:
+                _, request = engine.run_stage(
+                    investigation, request, software_id="test", software_version="1")
+            external.assert_called_once()
 
     @unittest.skipUnless(importlib.util.find_spec("numpy"), "NumPy required by TESS workflow engine")
     def test_registered_review_stops_off_catalog_and_failed_attribution_before_query(self):

@@ -267,6 +267,28 @@ def _attenuation(before: dict[str, Any], after: dict[str, Any]) -> float | None:
     return None if not before.get("usable") or not after.get("usable") or not a else 1-b/a
 
 
+def _finalize_audit(result: dict[str, Any]) -> dict[str, Any]:
+    """Attach the canonical hash to every terminal audit result."""
+    finalized = dict(result)
+    finalized.pop("auditSHA256", None)
+    finalized["auditSHA256"] = _sha(finalized)
+    return finalized
+
+
+def validate_audit_hash(result: dict[str, Any]) -> str:
+    value = dict(result)
+    claimed = value.pop("auditSHA256", None)
+    if claimed != _sha(value):
+        raise ValueError("persisted event-depth attenuation audit hash mismatch")
+    return claimed
+
+
+def _unresolved(base: dict[str, Any], reasons: list[str], recommendation: str) -> dict[str, Any]:
+    return _finalize_audit({**base, "status": "UNRESOLVED", "unresolvedReasons": reasons,
+                            "suitableForLaterPrecisionModeling": False,
+                            "recommendedNextTest": recommendation})
+
+
 def audit_depth_attenuation(freeze: dict[str, Any], binary: dict[str, Any], *,
                             binary_confirmation_sha256: str, downsampling_cap: int = MAX_SAMPLES) -> dict[str, Any]:
     base = {"resultVersion": AUDIT_VERSION, "classification": "DIAGNOSTIC_ONLY",
@@ -275,27 +297,54 @@ def audit_depth_attenuation(freeze: dict[str, Any], binary: dict[str, Any], *,
             "companionRadiusInferred": False, "precisionPhysicalTransitSolutionClaimed": False,
             "binaryConfirmationSHA256": binary_confirmation_sha256}
     ephemeris = binary.get("linearEphemeris") or {}
+    independent = binary.get("independentEvidence") or {}
+    independent_ephemeris = independent.get("independentLinearEphemeris") or {}
+    if binary.get("catalogAnswerKeyUsed") is not False:
+        return _unresolved(base, ["BINARY_CONFIRMATION_BLINDNESS_GATE_FAILED"],
+                           "PRECISION_EVENT_PHOTOMETRY_REVIEW")
+    if independent.get("classification") != "REPLICATED_ECLIPSE_LIKE_EVENT_SUPPORTED":
+        return _unresolved(base, ["INDEPENDENT_EVENT_REPLICATION_UNAVAILABLE"],
+                           "ADDITIONAL_PRECISION_EVENT_PHOTOMETRY")
+    support = independent.get("supportingIndependentSectorCount")
+    supporting_sectors = independent.get("supportingSectors")
+    if (isinstance(support, bool) or not isinstance(support, int) or support < 3
+            or not isinstance(supporting_sectors, list) or len(supporting_sectors) < 3
+            or support != len(supporting_sectors)
+            or len(set(supporting_sectors)) != len(supporting_sectors)
+            or any(isinstance(value, bool) or not isinstance(value, int) or value <= 0
+                   for value in supporting_sectors)):
+        return _unresolved(base, ["INSUFFICIENT_INDEPENDENT_EVENT_SUPPORT"],
+                           "ADDITIONAL_PRECISION_EVENT_PHOTOMETRY")
+    if independent_ephemeris.get("coherent") is not True:
+        return _unresolved(base, ["INDEPENDENT_EPHEMERIS_INCOHERENT"],
+                           "ADDITIONAL_PRECISION_EVENT_PHOTOMETRY")
     if ephemeris.get("coherent") is not True:
-        return {**base, "status": "UNRESOLVED", "unresolvedReasons": ["COHERENT_EPHEMERIS_UNAVAILABLE"],
-                "suitableForLaterPrecisionModeling": False,
-                "recommendedNextTest": "ADDITIONAL_PRECISION_EVENT_PHOTOMETRY"}
+        return _unresolved(base, ["COHERENT_EPHEMERIS_UNAVAILABLE"],
+                           "ADDITIONAL_PRECISION_EVENT_PHOTOMETRY")
     if freeze.get("status") != "FROZEN":
-        return {**base, "status": "UNRESOLVED",
-                "unresolvedReasons": list(freeze.get("unresolvedReasons") or
-                                          ["FULL_PRECISION_PHOTOMETRY_UNAVAILABLE"]),
-                "suitableForLaterPrecisionModeling": False,
-                "recommendedNextTest": "ADDITIONAL_PRECISION_EVENT_PHOTOMETRY"}
+        return _unresolved(base, list(freeze.get("unresolvedReasons") or
+                                     ["FULL_PRECISION_PHOTOMETRY_UNAVAILABLE"]),
+                           "ADDITIONAL_PRECISION_EVENT_PHOTOMETRY")
     try: validate_freeze(freeze, binary, binary_confirmation_sha256)
     except ValueError as error:
-        return {**base, "status": "UNRESOLVED", "unresolvedReasons": [str(error)],
-                "suitableForLaterPrecisionModeling": False,
-                "recommendedNextTest": "PRECISION_EVENT_PHOTOMETRY_REVIEW"}
+        return _unresolved(base, [str(error)], "PRECISION_EVENT_PHOTOMETRY_REVIEW")
     period, epoch = float(ephemeris["refinedPeriodDays"]), float(ephemeris["referenceEpoch"])
-    duties = [float(x["dutyCycle"]) for x in binary.get("sectorResults", []) if x.get("usable") and x.get("dutyCycle")]
-    if period <= 0 or len(duties) < 3:
-        return {**base, "status": "UNRESOLVED", "unresolvedReasons": ["INSUFFICIENT_INDEPENDENT_EVENT_DURATION_SUPPORT"],
-                "suitableForLaterPrecisionModeling": False,
-                "recommendedNextTest": "ADDITIONAL_PRECISION_EVENT_PHOTOMETRY"}
+    duration_rows = []
+    for row in binary.get("sectorResults", []):
+        if row.get("role") != "INDEPENDENT" or row.get("usable") is not True:
+            continue
+        try: duty = float(row.get("dutyCycle"))
+        except (TypeError, ValueError): continue
+        sector = row.get("sector")
+        if (math.isfinite(duty) and duty > 0 and isinstance(sector, int)
+                and not isinstance(sector, bool) and sector > 0):
+            if sector in supporting_sectors:
+                duration_rows.append((sector, duty))
+    if (not math.isfinite(period) or period <= 0 or len(duration_rows) < 3
+            or len({sector for sector, _ in duration_rows}) < 3):
+        return _unresolved(base, ["INSUFFICIENT_INDEPENDENT_EVENT_DURATION_SUPPORT"],
+                           "ADDITIONAL_PRECISION_EVENT_PHOTOMETRY")
+    duties = [duty for _, duty in duration_rows]
     duration = statistics.median(duties)*period; sectors = []
     for frozen_sector in freeze["sectors"]:
         times = list(map(float, frozen_sector["timeBTJDFloat64"])); flux = list(map(float, frozen_sector["relativeFluxFloat64"]))
@@ -348,5 +397,4 @@ def audit_depth_attenuation(freeze: dict[str, Any], binary: dict[str, Any], *,
               "sectorResults": sectors, "crossSectorRobustSummary": summary, "eventDurationDays": duration,
               "suitableForLaterPrecisionModeling": complete,
               "recommendedNextTest": "JOINT_TRANSIT_ECLIPSE_PHASE_CURVE_MODELING" if complete else "ADDITIONAL_PRECISION_EVENT_PHOTOMETRY"}
-    result["auditSHA256"] = _sha(result)
-    return result
+    return _finalize_audit(result)

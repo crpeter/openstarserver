@@ -74,6 +74,7 @@ from .tess_event_depth_accuracy import (
     FREEZE_HANDLER_ID as EVENT_DEPTH_FREEZE_HANDLER_ID,
     acquire_full_precision_photometry,
     audit_depth_attenuation,
+    validate_audit_hash,
 )
 from .tess_localization import localize_periodic_source
 from .tess_sector_archive import TessArchiveTransientError
@@ -3088,9 +3089,7 @@ def build_engine(
                             if stage.handler_id == SOURCE_ATTRIBUTION_REVIEW_HANDLER_ID
                             and stage.status == "COMPLETE")
         depth_audit = _required_latest_result_for_handler(investigation, EVENT_DEPTH_AUDIT_HANDLER_ID)
-        audit_copy = dict(depth_audit); audit_hash = audit_copy.pop("auditSHA256", None)
-        if audit_hash != sha256_json(audit_copy):
-            raise ValueError("persisted event-depth attenuation audit hash mismatch")
+        audit_hash = validate_audit_hash(depth_audit)
         input_hashes = {"sourceAttributionReview": sha256_json(review),
                         "sourceLocalization": review["sourceLocalizationSHA256"],
                         "eventDepthAttenuationAudit": audit_hash}
