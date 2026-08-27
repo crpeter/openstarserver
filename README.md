@@ -260,20 +260,21 @@ python -m pytest -q test_historical_stage_ledger.py \
 
 ### ASAS-SN configuration and immutable external stages
 
-The optional official `pyasassn` client is configured only through
-`OPENSTAR_ASASSN_USERNAME` and `OPENSTAR_ASASSN_TOKEN`. Credentials are passed
-directly to the client and are never logged, serialized, hashed, or stored in an
-investigation. If either variable or the optional client is absent, the run
-persists `PROVIDER_CONFIGURATION_UNAVAILABLE`; it does not reinterpret an
-operational condition as scientific insufficiency.
+The optional official Sky Patrol distribution is named `skypatrol` and exposes
+the `pyasassn` import package. Its public `SkyPatrolClient()` constructor does
+not use OpenStar credentials. If the optional client is absent or has the wrong
+version, the run persists `PROVIDER_CONFIGURATION_UNAVAILABLE`; it does not
+reinterpret an operational condition as scientific insufficiency.
 
 Install the coordinator-only, pinned interface with
 `python -m pip install -r requirements-optional-asassn.txt`. OpenStar supports
-`pyasassn==1.6.3` for this adapter; it is not a worker dependency.
+`skypatrol==0.6.21` for this adapter; it is not a worker dependency.
 
 External follow-up is an append-only prepare/run/interpret sequence. Preparation
 freezes the provider priority, family window, target identity, quality contract,
-and authoritative catalog-neighbor evidence. Run freezes the canonical raw
-response and cleaned analysis. Interpret binds both stage results and preserves
+and authoritative catalog-neighbor evidence. Run separately freezes and ledgers
+the provider coverage response, canonical raw response, cleaned measurements,
+quality-filter counts, and acquisition metadata. Interpret binds both stage
+results and preserves
 physical-cycle and physical-mechanism resolution as false. Recovery reuses
 byte-identical artifacts and rejects a mismatched frozen hash.

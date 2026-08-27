@@ -7,9 +7,9 @@ the same contract without changing the scientific interpretation.
 from __future__ import annotations
 
 import hashlib
+import importlib.metadata
 import json
 import math
-import os
 from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,7 +17,7 @@ from typing import Any, Protocol
 
 import numpy as np
 
-SUPPORTED_PYASASSN_VERSION = "1.6.3"
+SUPPORTED_SKYPATROL_VERSION = "0.6.21"
 
 class ProviderTransientError(RuntimeError): pass
 class ProviderUnavailable(RuntimeError): pass
@@ -56,7 +56,9 @@ class ASASSNSkyPatrolProvider:
             for row in rows:
                 item = {"time": float(row["time"]), "flux": float(row["flux"]),
                         "uncertainty": float(row["uncertainty"]),
-                        "band": str(row["band"]), "quality": str(row.get("quality", "GOOD"))}
+                        "band": str(row["band"]), "quality": str(row.get("quality", "GOOD")),
+                        "sourceID": (str(row["asasSnID"]) if row.get("asasSnID") is not None
+                                     else None)}
                 if not all(math.isfinite(item[k]) for k in ("time", "flux", "uncertainty")):
                     raise ValueError
                 result.append(item)
@@ -66,29 +68,31 @@ class ASASSNSkyPatrolProvider:
 
     @classmethod
     def from_environment(cls):
-        """Build the official-client transport without exposing credentials."""
-        username = os.environ.get("OPENSTAR_ASASSN_USERNAME")
-        token = os.environ.get("OPENSTAR_ASASSN_TOKEN")
-        if not username or not token:
-            raise ProviderConfigurationUnavailable(
-                "OPENSTAR_ASASSN_USERNAME and OPENSTAR_ASASSN_TOKEN are required")
-        return cls(OfficialASASSNTransport(username, token))
+        """Build the public official-client transport; no credential is used."""
+        return cls(OfficialASASSNTransport())
 
 
 class OfficialASASSNTransport:
     """Thin mapping to the optional official ``pyasassn`` Sky Patrol client."""
-    def __init__(self, username, token):
+    def __init__(self):
         try:
             from pyasassn.client import SkyPatrolClient
-            import pyasassn
         except ImportError as exc:
             raise ProviderConfigurationUnavailable(
-                "The optional pyasassn package is not installed") from exc
-        self._client = SkyPatrolClient(username, token)
-        self.client_version = getattr(pyasassn, "__version__", "unknown")
-        if self.client_version != SUPPORTED_PYASASSN_VERSION:
+                "The optional skypatrol package is not installed") from exc
+        try:
+            self.client_version = importlib.metadata.version("skypatrol")
+        except importlib.metadata.PackageNotFoundError as exc:
             raise ProviderConfigurationUnavailable(
-                f"pyasassn=={SUPPORTED_PYASASSN_VERSION} is required; found {self.client_version}")
+                "The skypatrol distribution metadata is unavailable") from exc
+        if self.client_version != SUPPORTED_SKYPATROL_VERSION:
+            raise ProviderConfigurationUnavailable(
+                f"skypatrol=={SUPPORTED_SKYPATROL_VERSION} is required; "
+                f"found {self.client_version}")
+        try:
+            self._client = SkyPatrolClient()
+        except (ConnectionError, TimeoutError, OSError) as exc:
+            raise ProviderTransientError("Transient ASAS-SN client initialization failure") from exc
 
     def coverage(self, target):
         if target.get("ticID") is None:
@@ -106,8 +110,31 @@ class OfficialASASSNTransport:
         if result is None or len(result) == 0:
             return {"available": False, "reason": "source-not-found",
                     "lookup": lookup, "clientVersion": self.client_version}
+        try:
+            records = result.to_dict(orient="records")
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise MalformedProviderData("ASAS-SN catalog lookup is not tabular") from exc
+        if len(records) != 1:
+            return {"available": False, "reason": "ambiguous-source-match",
+                    "matchCount": len(records), "lookup": lookup,
+                    "clientVersion": self.client_version}
+        row = records[0]
+        try:
+            source_id = int(row["asas_sn_id"])
+            source_ra = float(row["ra_deg"])
+            source_dec = float(row["dec_deg"])
+            separation = _angular_separation_arcsec(
+                float(target["raDeg"]), float(target["decDeg"]), source_ra, source_dec)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise MalformedProviderData("ASAS-SN catalog identity is incomplete") from exc
+        if separation > 2.0:
+            return {"available": False, "reason": "positional-match-exceeds-2-arcsec",
+                    "matchSeparationArcsec": separation, "lookup": lookup,
+                    "clientVersion": self.client_version}
         return {"available": True, "lookup": lookup,
-                "selectedSource": str(target["ticID"]),
+                "selectedSource": str(source_id), "asasSnID": source_id,
+                "sourceRaDeg": source_ra, "sourceDecDeg": source_dec,
+                "matchSeparationArcsec": separation,
                 "clientVersion": self.client_version,
                 "product": "ASAS-SN Sky Patrol light curve"}
 
@@ -122,14 +149,36 @@ class OfficialASASSNTransport:
         data = getattr(result, "data", None)
         if data is None:
             raise MalformedProviderData("ASAS-SN LightCurveCollection lacks .data")
-        rows = data.to_dict(orient="records")
-        mapped = [{"time": r.get("jd", r.get("hjd")),
-                   "flux": r.get("flux", r.get("mag")),
-                   "uncertainty": r.get("flux_err", r.get("mag_err")),
-                   "band": r.get("phot_filter"),
-                   "quality": r.get("quality", "GOOD")} for r in rows]
+        try:
+            rows = data.to_dict(orient="records")
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise MalformedProviderData("ASAS-SN LightCurveCollection .data is not tabular") from exc
+        try:
+            mapped = [{"time": _required_number(r, "jd", "hjd"),
+                       "flux": _required_number(r, "flux", "mag"),
+                       "uncertainty": _required_number(r, "flux_err", "mag_err"),
+                       "band": str(r["phot_filter"]),
+                       "quality": str(r["quality"]),
+                       "asasSnID": int(r["asas_sn_id"])} for r in rows]
+        except (KeyError, TypeError, ValueError) as exc:
+            raise MalformedProviderData("ASAS-SN photometry schema is incomplete") from exc
         return json.dumps(mapped, sort_keys=True, separators=(",", ":"),
                           allow_nan=False).encode("utf-8")
+
+
+def _required_number(row: dict[str, Any], primary: str, fallback: str) -> float:
+    value = row.get(primary, row.get(fallback))
+    result = float(value)
+    if not math.isfinite(result):
+        raise MalformedProviderData(f"ASAS-SN {primary} is not finite")
+    return result
+
+
+def _angular_separation_arcsec(ra1: float, dec1: float, ra2: float, dec2: float) -> float:
+    ra1r, dec1r, ra2r, dec2r = map(math.radians, (ra1, dec1, ra2, dec2))
+    value = (math.sin(dec1r) * math.sin(dec2r)
+             + math.cos(dec1r) * math.cos(dec2r) * math.cos(ra1r - ra2r))
+    return math.degrees(math.acos(max(-1.0, min(1.0, value)))) * 3600.0
 
 
 DEFAULT_CONTRACT = {"minimumMeasurements": 80, "minimumBaselineDays": 730.0,
@@ -148,33 +197,67 @@ def run_external_experiment(*, target: dict[str, Any], family_window: list[float
     preregistration = {"familyWindowDays": list(family_window), "providerPriority": [p.name for p in providers],
                        "qualityContract": policy, "observable": "blocked-seasonal-phase-prediction"}
     root = Path(artifact_root); root.mkdir(parents=True, exist_ok=True)
-    _write_once_json(root / "execution-preregistration.json", preregistration)
+    preregistration_path = root / "execution-preregistration.json"
+    _write_once_json(preregistration_path, preregistration)
+    artifacts = [_artifact_manifest_entry(preregistration_path, "EXECUTION_PREREGISTRATION")]
     if neighbors is None:
-        return _decision("EXTERNAL_CONTAMINATION_AMBIGUOUS", attempts, None,
-                         "Authoritative catalog-neighbor evidence is missing.", False, False, False)
-    crowding = sum(float(n.get("fluxFraction", 0.0)) for n in neighbors
-                   if float(n.get("separationArcsec", 1e9)) <= float(n.get("providerRadiusArcsec", 16.0)))
+        result = _decision("EXTERNAL_CONTAMINATION_AMBIGUOUS", attempts, None,
+                           "Authoritative catalog-neighbor evidence is missing.", False, False, False)
+        return _complete_execution_result(result, artifacts, analysis_available=False)
+    try:
+        crowding = sum(float(n["fluxFraction"]) for n in neighbors
+                       if float(n["separationArcsec"]) <= float(n.get("providerRadiusArcsec", 16.0)))
+    except (KeyError, TypeError, ValueError):
+        result = _decision("EXTERNAL_CONTAMINATION_AMBIGUOUS", attempts, None,
+                           "Catalog-neighbor evidence is incomplete.", False, False, False)
+        return _complete_execution_result(result, artifacts, analysis_available=False)
+    if not math.isfinite(crowding):
+        result = _decision("EXTERNAL_CONTAMINATION_AMBIGUOUS", attempts, None,
+                           "Catalog-neighbor flux evidence is non-finite.", False, False, False)
+        return _complete_execution_result(result, artifacts, analysis_available=False)
     if crowding > policy["maximumNeighborFluxFraction"]:
-        return _decision("EXTERNAL_CONTAMINATION_AMBIGUOUS", attempts, None,
-                         "Persisted catalog neighbors exceed the external-survey blending gate.", False, False, False)
+        result = _decision("EXTERNAL_CONTAMINATION_AMBIGUOUS", attempts, None,
+                           "Persisted catalog neighbors exceed the external-survey blending gate.", False, False, False)
+        result["crowdingFluxFraction"] = crowding
+        return _complete_execution_result(result, artifacts, analysis_available=False)
     for provider in providers:
         try:
             coverage = provider.coverage(target)
+            coverage_path = root / f"{provider.name.lower()}-coverage.json"
+            _write_once_json(coverage_path, coverage)
+            artifacts.append(_artifact_manifest_entry(coverage_path, "PROVIDER_COVERAGE"))
             if coverage.get("available") is not True:
                 attempts.append({"provider": provider.name, "availability": "UNAVAILABLE", "rejectionReason": coverage.get("reason")}); continue
-            raw = provider.acquire(target, {"familyWindowDays": family_window, "acceptedBands": policy["acceptedBands"]})
+            request_parameters = {"familyWindowDays": family_window,
+                                  "acceptedBands": policy["acceptedBands"],
+                                  "acceptedQualityFlags": policy["acceptedQualityFlags"],
+                                  "selectedSource": coverage.get("selectedSource")}
+            raw = provider.acquire(target, request_parameters)
             raw_path = root / f"{provider.name.lower()}-raw.json"
             if raw_path.exists():
                 if hashlib.sha256(raw_path.read_bytes()).digest() != hashlib.sha256(raw).digest():
                     raise RuntimeError("Frozen provider response differs on recovery")
             else: raw_path.write_bytes(raw)
-            rows = [r for r in provider.parse(raw) if r["band"] in policy["acceptedBands"] and r["quality"] in policy["acceptedQualityFlags"]]
-            cleaned = {"measurements": rows, "rawMeasurementCount": len(provider.parse(raw)),
+            artifacts.append(_artifact_manifest_entry(raw_path, "RAW_PROVIDER_RESPONSE"))
+            parsed = provider.parse(raw)
+            selected_source = coverage.get("selectedSource")
+            parsed_sources = {row.get("sourceID") for row in parsed if row.get("sourceID") is not None}
+            if selected_source is not None and parsed_sources != {str(selected_source)}:
+                raise MalformedProviderData(
+                    "ASAS-SN photometry source identity differs from the frozen catalog match")
+            rows = [r for r in parsed if r["band"] in policy["acceptedBands"] and r["quality"] in policy["acceptedQualityFlags"]]
+            cleaned = {"measurements": rows, "rawMeasurementCount": len(parsed),
                        "acceptedMeasurementCount": len(rows),
-                       "excludedMeasurementCount": len(provider.parse(raw)) - len(rows)}
+                       "excludedMeasurementCount": len(parsed) - len(rows),
+                       "qualityFilter":{"acceptedBands":policy["acceptedBands"],
+                                        "acceptedQualityFlags":policy["acceptedQualityFlags"]}}
             cleaned_path = root / f"{provider.name.lower()}-cleaned.json"
             _write_once_json(cleaned_path, cleaned)
+            artifacts.append(_artifact_manifest_entry(cleaned_path, "CLEANED_MEASUREMENTS"))
             quality = objective_coverage(rows, policy)
+            quality_path = root / f"{provider.name.lower()}-quality.json"
+            _write_once_json(quality_path, quality)
+            artifacts.append(_artifact_manifest_entry(quality_path, "OBJECTIVE_QUALITY_GATE"))
             if quality["status"] != "QUALIFIED":
                 attempts.append({"provider": provider.name, "availability": "AVAILABLE",
                                  "rejectionReason": quality["reason"]})
@@ -183,7 +266,7 @@ def run_external_experiment(*, target: dict[str, Any], family_window: list[float
             result = analyze_seasonal_coherence(rows, family_window, policy)
             result.update({"providersAttempted": attempts, "selectedProvider": provider.name,
                            "rawResponsePath": str(raw_path), "rawResponseSHA256": hashlib.sha256(raw).hexdigest(),
-                           "requestParameters": {"familyWindowDays": family_window, "acceptedBands": policy["acceptedBands"]},
+                           "requestParameters": request_parameters,
                            "providerProvenance": coverage, "crowdingFluxFraction": crowding})
             acquisition_path = root / f"{provider.name.lower()}-acquisition.json"
             if acquisition_path.exists():
@@ -192,16 +275,33 @@ def run_external_experiment(*, target: dict[str, Any], family_window: list[float
                 acquisition = {"acquiredAt": datetime.now(timezone.utc).isoformat(),
                     "provider": provider.name, "rawSHA256": hashlib.sha256(raw).hexdigest()}
                 _write_once_json(acquisition_path, acquisition)
+            artifacts.append(_artifact_manifest_entry(acquisition_path, "ACQUISITION_METADATA"))
             result["acquiredAt"] = acquisition["acquiredAt"]
             result["cleanedMeasurementsPath"] = str(cleaned_path)
             result["cleanedMeasurementsSHA256"] = hashlib.sha256(cleaned_path.read_bytes()).hexdigest()
             result["qualityContract"] = policy
             result["catalogNeighbors"] = neighbors
-            return result
-        except ProviderUnavailable as exc:
+            return _complete_execution_result(result, artifacts, analysis_available=True)
+        except (ProviderUnavailable, MalformedProviderData) as exc:
             attempts.append({"provider": provider.name, "availability": "UNAVAILABLE", "rejectionReason": str(exc)})
-    return _decision("EXTERNAL_DATA_INSUFFICIENT", attempts, None,
-                     "No preregistered provider passed objective availability gates.", False, False, False)
+    result = _decision("EXTERNAL_DATA_INSUFFICIENT", attempts, None,
+                       "No preregistered provider passed objective availability gates.", False, False, False)
+    return _complete_execution_result(result, artifacts, analysis_available=False)
+
+
+def _artifact_manifest_entry(path: Path, role: str) -> dict[str, Any]:
+    return {"role": role, "path": str(path),
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+
+
+def _complete_execution_result(result: dict[str, Any], artifacts: list[dict[str, Any]],
+                               *, analysis_available: bool) -> dict[str, Any]:
+    result["artifactManifest"] = list(artifacts)
+    result["analysisAvailable"] = analysis_available
+    result["operationalOutcome"] = (
+        "ANALYSIS_COMPLETE" if analysis_available else result["classification"]
+    )
+    return result
 
 
 def _write_once_json(path: Path, value: dict[str, Any]) -> None:
@@ -228,32 +328,69 @@ def analyze_seasonal_coherence(rows, family_window, policy=DEFAULT_CONTRACT):
         result=_decision("EXTERNAL_PIPELINE_OR_BAND_DEPENDENT",[],None,"Independent accepted bands disagree.",False,False,False)
     else:
         result=dict(next(iter(qualified.values())))
+        periods=[float(item["bestPeriodDays"]) for item in qualified.values()
+                 if item.get("bestPeriodDays") is not None]
+        tolerances=[float(item.get("periodUncertaintyDays") or 0.0)
+                    for item in qualified.values()]
+        if len(periods)>1 and max(periods)-min(periods)>max(2e-4,sum(tolerances)):
+            result=_decision("EXTERNAL_PIPELINE_OR_BAND_DEPENDENT",[],None,
+                             "Accepted bands select incompatible periods.",False,False,False)
     result["bandResults"]=results; result["bandsAnalyzedSeparately"]=True
     return result
 
 
 def _analyze_single_band(rows, family_window, policy=DEFAULT_CONTRACT):
-    """Narrow family fit with leave-last-season-out phase prediction."""
-    if len(rows) < policy["minimumMeasurements"]:
-        return _decision("EXTERNAL_DATA_INSUFFICIENT", [], None, "Too few quality measurements.", False, False, False)
-    times=np.array([r["time"] for r in rows]); flux=np.array([r["flux"] for r in rows]); err=np.array([r["uncertainty"] for r in rows])
+    """Narrow frozen-family fit with blocked prediction in every season."""
+    coverage=objective_coverage(rows,{**policy,
+        "frozenFamilyCenterDays":float(sum(family_window)/2.0)})
+    if coverage["status"] != "QUALIFIED":
+        result=_decision("EXTERNAL_DATA_INSUFFICIENT", [], None,
+                         f"Band coverage failed: {coverage['reason']}.",False,False,False)
+        result["coverageAssessment"]=coverage
+        return result
+    times=np.array([r["time"] for r in rows],dtype=float)
+    flux=np.array([r["flux"] for r in rows],dtype=float)
+    err=np.array([r["uncertainty"] for r in rows],dtype=float)
     # A new season begins at an objective 90-day sampling gap.
     order=np.argsort(times); season_ids=np.zeros(len(times),dtype=int); current=0
     for left,right in zip(order[:-1],order[1:]):
         if times[right]-times[left] >= 90.0: current += 1
         season_ids[right]=current
     seasons=season_ids; unique=np.unique(seasons)
-    if np.ptp(times) < policy["minimumBaselineDays"] or len(unique) < policy["minimumSeasons"]:
-        return _decision("EXTERNAL_DATA_INSUFFICIENT", [], None, "Baseline or seasonal coverage is inadequate.", False, False, False)
-    # Fixed finite grid is a narrow preregistered parameter fit, not a blind search.
-    grid=np.linspace(float(family_window[0]), float(family_window[1]), 101)
+    # Fixed finite grid is a narrow preregistered fit, not a blind period search.
+    grid=np.linspace(float(family_window[0]), float(family_window[1]), 401)
     def score(period, mask):
         x=np.column_stack([np.ones(mask.sum()), np.sin(2*np.pi*times[mask]/period), np.cos(2*np.pi*times[mask]/period)])
-        w=1/np.maximum(err[mask],1e-9); beta=np.linalg.lstsq(x*w[:,None],flux[mask]*w,rcond=None)[0]
-        return beta, float(np.mean(((flux[mask]-x@beta)/np.maximum(err[mask],1e-9))**2))
-    train=seasons != unique[-1]; period=min(grid,key=lambda p: score(p,train)[1]); beta,_=score(period,train)
-    test=~train; x=np.column_stack([np.ones(test.sum()),np.sin(2*np.pi*times[test]/period),np.cos(2*np.pi*times[test]/period)])
-    predictive=float(np.mean(((flux[test]-x@beta)/np.maximum(err[test],1e-9))**2))
+        w=1/np.maximum(err[mask],1e-9)
+        beta=np.linalg.lstsq(x*w[:,None],flux[mask]*w,rcond=None)[0]
+        residual=(flux[mask]-x@beta)/np.maximum(err[mask],1e-9)
+        return beta,float(np.sum(residual**2))
+    def predict_chi2(period,beta,mask):
+        x=np.column_stack([np.ones(mask.sum()),np.sin(2*np.pi*times[mask]/period),
+                           np.cos(2*np.pi*times[mask]/period)])
+        return float(np.sum(((flux[mask]-x@beta)/np.maximum(err[mask],1e-9))**2))
+    full=np.ones(len(times),dtype=bool)
+    profile=np.array([score(float(p),full)[1] for p in grid])
+    best_index=int(np.argmin(profile)); period=float(grid[best_index])
+    best_chi2=float(profile[best_index])
+    folds=[]; jack=[]
+    for held in unique:
+        train=seasons != held; test=~train
+        train_profile=np.array([score(float(p),train)[1] for p in grid])
+        fold_period=float(grid[int(np.argmin(train_profile))]); jack.append(fold_period)
+        beta,_=score(fold_period,train)
+        signal_chi2=predict_chi2(fold_period,beta,test)
+        train_weights=1/np.maximum(err[train],1e-9)**2
+        null_level=float(np.average(flux[train],weights=train_weights))
+        null_chi2=float(np.sum(((flux[test]-null_level)/np.maximum(err[test],1e-9))**2))
+        folds.append({"heldOutSeason":int(held),"trainingSeasonCount":int(len(unique)-1),
+                      "selectedPeriodDays":fold_period,"testMeasurementCount":int(test.sum()),
+                      "signalChiSquare":signal_chi2,"nullChiSquare":null_chi2,
+                      "predictiveReducedChiSquare":signal_chi2/max(1,int(test.sum())-3)})
+    predictive=float(np.median([item["predictiveReducedChiSquare"] for item in folds]))
+    signal_total=float(sum(item["signalChiSquare"] for item in folds))
+    null_total=float(sum(item["nullChiSquare"] for item in folds))
+    null_improvement=(1.0-signal_total/null_total) if null_total>0 else 0.0
     # Measure phase independently in every season at the preregistered family
     # centre.  This detects discrete seasonal O-C steps rather than allowing a
     # slightly shifted global period to absorb evolution across annual gaps.
@@ -264,30 +401,57 @@ def _analyze_single_band(rows, family_window, policy=DEFAULT_CONTRACT):
                          "amplitude":float(math.hypot(b[1],b[2])),"measurements":int(mask.sum())})
     unwrapped=np.unwrap([x["phaseRadians"] for x in seasonal])
     phase_range=float(np.ptp(unwrapped)); amplitude_range=float(np.ptp([x["amplitude"] for x in seasonal]))
-    replicated=predictive <= 9.0
-    stable=predictive <= 4.0 and phase_range <= 0.30
-    classification="EXTERNAL_STABLE_CLOCK_SUPPORTED" if stable else ("EXTERNAL_EVOLVING_RECURRENCE_SUPPORTED" if replicated else "EXTERNAL_RECURRENCE_NOT_REPLICATED")
-    result=_decision(classification, [], None, "Blocked final-season phase prediction; physical interpretation remains unresolved.", replicated, stable, replicated and not stable)
+    candidate_frequency=1.0/period
+    alias_periods=[]
+    for label,delta in (("DAILY_PLUS",1.0),("DAILY_MINUS",-1.0),
+                        ("YEARLY_PLUS",1.0/365.25),("YEARLY_MINUS",-1.0/365.25)):
+        frequency=candidate_frequency+delta
+        if frequency>0:
+            alias_period=1.0/frequency
+            alias_periods.append({"alias":label,"periodDays":alias_period,
+                                  "chiSquare":score(alias_period,full)[1]})
+    alias_threshold=best_chi2+max(1.0,0.01*best_chi2)
+    alias_ambiguous=any(item["chiSquare"]<=alias_threshold for item in alias_periods)
+    replicated=predictive <= 9.0 and null_improvement >= 0.10
+    stable=replicated and predictive <= 4.0 and phase_range <= 0.30 and not alias_ambiguous
+    if alias_ambiguous and replicated:
+        classification="EXTERNAL_ALIAS_AMBIGUOUS"
+    elif stable:
+        classification="EXTERNAL_STABLE_CLOCK_SUPPORTED"
+    elif replicated:
+        classification="EXTERNAL_EVOLVING_RECURRENCE_SUPPORTED"
+    else:
+        classification="EXTERNAL_RECURRENCE_NOT_REPLICATED"
+    result=_decision(classification, [], None,
+                     "Every season was held out once for phase prediction; physical interpretation remains unresolved.",
+                     replicated,stable,classification=="EXTERNAL_EVOLVING_RECURRENCE_SUPPORTED")
     # Seasonal jackknife is an uncertainty estimate, unlike the numerical grid
     # spacing.  Each leave-one-season-out fit is an independent long-baseline
     # perturbation of the shared-clock estimate.
-    jack=[]; failures=[]
-    for season in unique:
-        mask=seasons != season
-        try: jack.append(float(min(grid,key=lambda p: score(p,mask)[1])))
-        except (ValueError,np.linalg.LinAlgError) as exc: failures.append({"season":int(season),"error":type(exc).__name__})
+    failures=[]
     interval=[float(np.percentile(jack,16)),float(np.percentile(jack,84))] if len(jack)>=3 else [None,None]
     grid_resolution=float(grid[1]-grid[0])
     jackknife_half_width=((interval[1]-interval[0])/2 if interval[0] is not None else None)
     # A finite profile grid cannot support precision below half a cell.  Report
     # that resolution floor explicitly instead of false zero precision when all
     # seasonal jackknife optima occupy the same cell.
-    uncertainty=(max(jackknife_half_width, grid_resolution/2)
-                 if jackknife_half_width is not None else None)
+    profile_mask=profile<=best_chi2+1.0
+    profile_interval=[float(grid[profile_mask][0]),float(grid[profile_mask][-1])]
+    profile_half_width=max(period-profile_interval[0],profile_interval[1]-period,
+                           grid_resolution/2)
+    uncertainty=(max(jackknife_half_width or 0.0,profile_half_width,grid_resolution/2))
     result.update({"bestPeriodDays": float(period), "periodGridStepDays": float(grid[1]-grid[0]), "predictiveReducedChiSquare": predictive,
-                   "periodUncertaintyDays": uncertainty, "periodUncertainty":{"method":"leave-one-season-out-jackknife-profile-with-grid-resolution-floor","successfulResamples":len(jack),"intervalDays":interval,"jackknifeHalfWidthDays":jackknife_half_width,"gridResolutionFloorDays":grid_resolution/2,"failures":failures,"frozenFamilyWindowDays":family_window},
+                   "periodUncertaintyDays": uncertainty, "periodUncertainty":{"method":"leave-one-season-out-jackknife-plus-delta-chi-square-profile","successfulResamples":len(jack),"jackknifeIntervalDays":interval,"jackknifeHalfWidthDays":jackknife_half_width,"profileLikelihood68IntervalDays":profile_interval,"profileHalfWidthDays":profile_half_width,"gridResolutionFloorDays":grid_resolution/2,"failures":failures,"frozenFamilyWindowDays":family_window},
                    "seasonalPhaseOC":seasonal,"seasonalPhaseRangeRadians":phase_range,"seasonalAmplitudeRange":amplitude_range,
                    "seasonCount": int(len(unique)), "measurementCount": len(rows),
+                   "blockedSeasonFolds":folds,"allSeasonsHeldOut":len(folds)==len(unique),
+                   "nullModel":{"model":"weighted-constant-flux","blockedChiSquare":null_total,
+                                "signalBlockedChiSquare":signal_total,
+                                "fractionalImprovement":null_improvement},
+                   "aliasAssessment":{"dailyAndSeasonalAliasesTested":True,
+                                      "competitors":alias_periods,"ambiguous":alias_ambiguous,
+                                      "ambiguityThresholdChiSquare":alias_threshold},
+                   "coverageAssessment":coverage,
                    "blindPeriodSearchPerformed": False, "lombScarglePerformed": False})
     return result
 
@@ -313,16 +477,26 @@ def objective_coverage(rows, policy):
             season+=1; grouped[season]=[]
         grouped[season].append(time)
     bins=int(policy["minimumPhaseBins"])
-    if any(len({min(bins-1,int(((t/period)%1)*bins)) for t in values}) < bins
-           for values in grouped.values()):
-        return {"status":"REJECTED","reason":"inadequate-phase-coverage"}
-    return {"status":"QUALIFIED","reason":None}
+    populated={str(key):len({min(bins-1,int(((t/period)%1)*bins)) for t in values})
+               for key,values in grouped.items()}
+    if any(value < bins for value in populated.values()):
+        return {"status":"REJECTED","reason":"inadequate-phase-coverage",
+                "phaseBinsRequired":bins,"phaseBinsPopulatedBySeason":populated}
+    return {"status":"QUALIFIED","reason":None,"seasonCount":seasons,
+            "baselineDays":times[-1]-times[0],"phaseBinsRequired":bins,
+            "phaseBinsPopulatedBySeason":populated}
 
 
 def _decision(classification, attempts, selected, rationale, replicated, stable, evolving):
+    next_tests = {
+        "EXTERNAL_DATA_INSUFFICIENT": "MANUAL_EXTERNAL_DATA_REVIEW",
+        "EXTERNAL_CONTAMINATION_AMBIGUOUS": "HIGHER_RESOLUTION_SOURCE_LOCALIZATION",
+        "EXTERNAL_ALIAS_AMBIGUOUS": "INDEPENDENT_SAMPLING_WINDOW_PHOTOMETRY",
+        "EXTERNAL_PIPELINE_OR_BAND_DEPENDENT": "INDEPENDENT_CALIBRATED_BAND_PHOTOMETRY",
+    }
     return {"classification": classification, "providersAttempted": attempts, "selectedProvider": selected,
             "externalRecurrenceReplicated": replicated, "stableClockSupported": stable,
             "waveformEvolutionSupported": evolving, "sourceAttributionReliableAtExternalResolution": False,
             "periodFamilyResolved": False, "physicalCycleResolved": False, "physicalMechanismResolved": False,
             "claimDecision": {"claim": "HUMAN_REVIEW_REQUIRED"}, "rationale": rationale,
-            "recommendedNextTest": None if classification != "EXTERNAL_DATA_INSUFFICIENT" else "MANUAL_EXTERNAL_DATA_REVIEW"}
+            "recommendedNextTest": next_tests.get(classification)}

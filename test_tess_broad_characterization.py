@@ -37,6 +37,7 @@ if _real_numpy is None:
     sys.modules["numpy"] = types.ModuleType("numpy")
 
 from workflows.tess.tess_investigation import build_engine
+from workflows.tess.tess_investigation import _primary_harmonic_morphology_family
 from workflows.tess.tess_investigation import time_frequency_continuation
 from workflows.tess.tess_investigation import nonstationary_continuation
 from workflows.tess.tess_investigation import dynamic_harmonic_continuation
@@ -63,6 +64,187 @@ if _installed_numpy_stub:
 
 
 class BroadIndependentCharacterizationTests(unittest.TestCase):
+    def test_primary_harmonic_morphology_family_is_authoritative_and_fail_closed(self):
+        evidence = {
+            "primaryReliable": True,
+            "preferredPhysicalPeriodRelation": "2x",
+            "rawCandidatePeriodDays": 4.0,
+            "observedPeriodDays": 8.0,
+        }
+        family = _primary_harmonic_morphology_family(evidence)
+        self.assertEqual(4.0, family["representativeRawPeriodDays"])
+        self.assertEqual(8.0, family["possibleDoubleCycleDays"])
+        self.assertEqual("authoritative-persisted-primary-analysis",
+                         family["evidenceSource"])
+
+        for override in (
+            {"primaryReliable": False},
+            {"preferredPhysicalPeriodRelation": "1x"},
+            {"observedPeriodDays": float("nan")},
+            {"observedPeriodDays": 9.0},
+        ):
+            with self.subTest(override=override):
+                self.assertIsNone(_primary_harmonic_morphology_family({
+                    **evidence, **override,
+                }))
+
+    def _independent_contradiction_fixture(self, root, *, relation="2x",
+                                           completed_morphology=False,
+                                           recurrent=False):
+        store = InvestigationStore(root / "investigations")
+        investigation = store.create("synthetic-harmonic-routing", WORKFLOW_ID,
+                                     WORKFLOW_VERSION)
+        primary_path = root / "primary.json"
+        primary_path.write_text(json.dumps({"times": [0.0, 1.0], "flux": [1.0, 1.0]}))
+        independent_paths = []
+        for sector in (2, 3):
+            path = root / f"sector-{sector}.json"
+            path.write_text(json.dumps({"times": [0.0, 1.0], "flux": [1.0, 1.0]}))
+            independent_paths.append(path)
+        analysis = {
+            "primaryReliable": True,
+            "preferredPhysicalPeriodRelation": relation,
+            "rawCandidatePeriodDays": 4.0,
+            "observedPeriodDays": 8.0 if relation != "1x" else 4.0,
+        }
+        independent = {
+            "targetPeriodDays": analysis["observedPeriodDays"],
+            "preparedSectors": [
+                {"datasetID": f"sector-{sector}", "sector": sector,
+                 "baselineDays": 100.0, "datasetPath": str(path)}
+                for sector, path in zip((2, 3), independent_paths)
+            ],
+            "frequencySearch": {
+                "minimumFrequency": 0.05, "maximumFrequency": 0.5,
+                "frequencyStep": 0.0001,
+            },
+        }
+        candidate = analysis["observedPeriodDays"] if recurrent else 3.0
+        run = {"datasets": [
+            {"datasetID": f"sector-{sector}", "periodStatus": "RELIABLE",
+             "periodConfidence": "high", "candidatePeriodDays": candidate,
+             "candidateFrequency": 1.0 / candidate,
+             "candidateFrequencyConfidenceInterval": {
+                 "lower": 1.0 / candidate - 0.00001,
+                 "upper": 1.0 / candidate + 0.00001,
+             }}
+            for sector in (2, 3)
+        ]}
+        stages = (
+            ("001-prepare-target", "openstar.tess.prepare-target",
+             {"datasetPath": str(primary_path)}),
+            ("004-hypotheses", "openstar.tess.hypotheses", analysis),
+            ("005-independent-prepare", "openstar.tess.independent.prepare", independent),
+            ("006-independent-run", "openstar.tess.independent.run", run),
+        )
+        for stage_id, handler, result in stages:
+            investigation = self._complete(store, investigation, stage_id, handler, result)
+        if completed_morphology:
+            investigation = self._complete(
+                store, investigation, "007-morphology", "openstar.tess.morphology.analyze",
+                {"physicalCycleResolved": False},
+            )
+        engine = build_engine(store, coordinator=types.SimpleNamespace(),
+                              poll_interval=0.0, timeout=None)
+        engine.chain_stages = False
+        return store, investigation, engine, analysis, independent, primary_path
+
+    def _run_independent_interpretation(self, investigation, engine):
+        return engine.run_stage(
+            investigation,
+            StageRequest("008-independent-interpret",
+                         "openstar.tess.independent.interpret", {}, "006-independent-run"),
+            software_id="integration", software_version="routing-regression",
+        )
+
+    def test_harmonic_contradiction_routes_to_morphology_before_broad_search(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            _, investigation, engine, _, _, _ = self._independent_contradiction_fixture(
+                Path(temporary)
+            )
+            _, request = self._run_independent_interpretation(investigation, engine)
+            self.assertEqual("openstar.tess.morphology.analyze", request.handler_id)
+            self.assertNotEqual("openstar.tess.independent.broad.prepare", request.handler_id)
+
+    def test_direct_primary_morphology_uses_frozen_evidence_and_hashes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            _, investigation, engine, analysis, independent, primary_path = \
+                self._independent_contradiction_fixture(Path(temporary))
+            investigation, request = self._run_independent_interpretation(
+                investigation, engine
+            )
+            morphology = {
+                "physicalCycleResolved": False,
+                "continuationEvidence": {"timeFrequencyEvolutionWarranted": False},
+                "sectorResults": [],
+            }
+            with mock.patch(
+                "workflows.tess.tess_investigation.analyze_morphology",
+                return_value=morphology,
+            ) as analyze_mock:
+                completed, next_request = engine.run_stage(
+                    investigation, request, software_id="integration",
+                    software_version="routing-regression",
+                )
+            analyze_mock.assert_called_once_with(
+                primary_dataset_path=str(primary_path),
+                independent_spec=independent,
+                raw_period_days=4.0,
+                possible_double_cycle_days=8.0,
+            )
+            hashes = completed.stages[-1].provenance.input_hashes
+            self.assertEqual(sha256_json(analysis), hashes["primaryAnalysis"])
+            self.assertEqual(sha256_json(independent), hashes["independentPreparation"])
+            self.assertEqual("openstar.tess.independent.broad.prepare",
+                             next_request.handler_id)
+
+    def test_resolved_evolving_morphology_preserves_time_frequency_continuation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            _, investigation, engine, _, _, _ = self._independent_contradiction_fixture(
+                Path(temporary)
+            )
+            investigation, request = self._run_independent_interpretation(
+                investigation, engine
+            )
+            morphology = {
+                "physicalCycleResolved": True,
+                "resolvedPhysicalPeriodDays": 8.0,
+                "continuationEvidence": {
+                    "timeFrequencyEvolutionWarranted": True,
+                    "entryReason": "RESOLVED_MORPHOLOGY_EVOLUTION_FOLLOWUP",
+                },
+                "sectorResults": [],
+            }
+            with mock.patch("workflows.tess.tess_investigation.analyze_morphology",
+                            return_value=morphology):
+                _, next_request = engine.run_stage(
+                    investigation, request, software_id="integration",
+                    software_version="routing-regression",
+                )
+            self.assertEqual("openstar.tess.time-frequency.prepare",
+                             next_request.handler_id)
+            self.assertNotEqual("openstar.tess.physical.interpret",
+                                next_request.handler_id)
+
+    def test_nonharmonic_success_and_completed_morphology_do_not_reroute(self):
+        cases = (
+            {"relation": "1x", "expected": "openstar.tess.independent.broad.prepare"},
+            {"relation": "2x", "recurrent": True,
+             "expected": "openstar.tess.finalize"},
+            {"relation": "2x", "completed_morphology": True,
+             "expected": "openstar.tess.independent.broad.prepare"},
+        )
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                expected = case["expected"]
+                _, investigation, engine, _, _, _ = self._independent_contradiction_fixture(
+                    Path(temporary), **{
+                        key: value for key, value in case.items() if key != "expected"
+                    }
+                )
+                _, request = self._run_independent_interpretation(investigation, engine)
+                self.assertEqual(expected, request.handler_id)
+
     def test_resolved_without_v209_uses_frozen_family_for_multisource_prepare(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)

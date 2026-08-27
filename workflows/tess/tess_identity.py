@@ -19,7 +19,9 @@ GAIA_VARIABILITY_CATALOGS = (
     "I/358/vst",
 )
 VSX_RADIUS_ARCSEC = 10.0
-GAIA_RADIUS_ARCSEC = 5.0
+# Cover the full preregistered 16-arcsecond external-survey blending aperture.
+# A smaller catalog cone cannot support a reliable negative contamination gate.
+GAIA_RADIUS_ARCSEC = 16.0
 TRANSIENT_INFRASTRUCTURE = "TRANSIENT_INFRASTRUCTURE"
 AVAILABLE = "AVAILABLE"
 NOT_FOUND = "NOT_FOUND"
@@ -455,12 +457,16 @@ def _query_tess_products(tic_id: int) -> dict[str, Any]:
             "author": author,
             "exptimeSeconds": exptime,
             "mission": str(_python_value(table["mission"][index])) if "mission" in table.colnames else None,
+            "observationYear": _int(_python_value(table["year"][index])) if "year" in table.colnames else None,
         })
 
     unique = []
     seen = set()
     for product in products:
-        key = (product["sector"], product["author"], round(product["exptimeSeconds"], 3) if product["exptimeSeconds"] is not None else None)
+        key = (product["sector"], product["author"],
+               round(product["exptimeSeconds"], 3)
+               if product["exptimeSeconds"] is not None else None,
+               product["observationYear"])
         if key in seen:
             continue
         seen.add(key)

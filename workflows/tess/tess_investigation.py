@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 
 import json
+import math
 from dataclasses import asdict
 from functools import wraps
 from pathlib import Path
@@ -140,7 +141,15 @@ from .external_long_baseline import (
     ASASSNSkyPatrolProvider, ProviderConfigurationUnavailable,
     ProviderTransientError, run_external_experiment,
 )
-from .period_family_followup import verify_semantic_boundary, select_untouched_sectors, extract_gaia_context, freeze_period_family_contract, verified_contract
+from .period_family_followup import (
+    DIFFERENCE_TRIGGER,
+    build_period_family_followup_recommendation,
+    extract_gaia_context,
+    freeze_period_family_contract,
+    select_untouched_sectors,
+    verified_contract,
+    verify_semantic_boundary,
+)
 from .tess_period_family_time_domain_evolution import (
     PREPARE_HANDLER as PERIOD_FAMILY_TIME_DOMAIN_PREPARE_HANDLER,
     RUN_HANDLER as PERIOD_FAMILY_TIME_DOMAIN_RUN_HANDLER,
@@ -315,6 +324,15 @@ def _write_json(path: Path, value: dict[str, Any]) -> None:
         handle.write("\n")
 
 
+def _write_immutable_json(path: Path, value: dict[str, Any]) -> None:
+    """Write a new JSON artifact or verify an identical recovery artifact."""
+    if path.exists():
+        if sha256_json(_load_json(path)) != sha256_json(value):
+            raise RuntimeError(f"Immutable artifact differs on recovery: {path.name}")
+        return
+    _write_json(path, value)
+
+
 def _load_json(path: str | Path) -> dict[str, Any]:
     with Path(path).open("r", encoding="utf-8") as handle:
         return json.load(handle)
@@ -382,6 +400,50 @@ def broad_independent_continuation(
         parameters={} if warranted else dict(finalize_parameters or {}),
         triggered_by_stage_id=request_id,
     )
+
+
+def _primary_harmonic_morphology_family(
+    analysis: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Return a persisted primary harmonic question, or fail closed.
+
+    The relation label and the two periods must describe the same multiplicative
+    family.  This prevents an unrelated preferred period from being promoted to
+    morphology merely because both values happen to be present.
+    """
+
+    if analysis.get("primaryReliable") is not True:
+        return None
+    relation = str(analysis.get("preferredPhysicalPeriodRelation") or "1x")
+    if relation == "1x" or not relation.endswith("x"):
+        return None
+    try:
+        relation_multiplier = float(relation[:-1])
+        raw_period = float(
+            analysis.get("rawCandidatePeriodDays")
+            if analysis.get("rawCandidatePeriodDays") is not None
+            else analysis.get("candidatePeriodDays")
+        )
+        preferred_period = float(
+            analysis.get("preferredPhysicalPeriodDays")
+            if analysis.get("preferredPhysicalPeriodDays") is not None
+            else analysis.get("observedPeriodDays")
+        )
+    except (TypeError, ValueError):
+        return None
+    values = (relation_multiplier, raw_period, preferred_period)
+    if not all(math.isfinite(value) and value > 0 for value in values):
+        return None
+    observed_multiplier = preferred_period / raw_period
+    if not math.isclose(observed_multiplier, relation_multiplier, rel_tol=0.05):
+        return None
+    return {
+        "representativeRawPeriodDays": raw_period,
+        "possibleDoubleCycleDays": preferred_period,
+        "preferredPhysicalPeriodRelation": relation,
+        "physicalCycleResolved": False,
+        "evidenceSource": "authoritative-persisted-primary-analysis",
+    }
 
 
 def time_frequency_continuation(summary: dict[str, Any], *, request_id: str) -> StageRequest:
@@ -2261,12 +2323,30 @@ def build_engine(
         print(f"   boundary hits: {contradiction_plan.get('boundaryHitCount')}")
 
         if contradiction_plan["action"] == "BROAD_INDEPENDENT_SEARCH":
-            next_stage = StageRequest(
-                id=_next_stage_id(request.id, "prepare-broad-independent-search"),
-                handler_id="openstar.tess.independent.broad.prepare",
-                parameters={"continuation": False},
-                triggered_by_stage_id=request.id,
+            primary_analysis = _required_latest_result_for_handler(
+                investigation, "openstar.tess.hypotheses"
             )
+            primary_family = _primary_harmonic_morphology_family(primary_analysis)
+            morphology_already_completed = _latest_result_for_handler(
+                investigation, "openstar.tess.morphology.analyze"
+            ) is not None
+            if primary_family is not None and not morphology_already_completed:
+                next_stage = StageRequest(
+                    id=_next_stage_id(request.id, "morphology"),
+                    handler_id="openstar.tess.morphology.analyze",
+                    parameters={
+                        "evidenceSource": "primary-harmonic-contradiction",
+                        "unresolvedFallback": "BROAD_INDEPENDENT_SEARCH",
+                    },
+                    triggered_by_stage_id=request.id,
+                )
+            else:
+                next_stage = StageRequest(
+                    id=_next_stage_id(request.id, "prepare-broad-independent-search"),
+                    handler_id="openstar.tess.independent.broad.prepare",
+                    parameters={"continuation": False},
+                    triggered_by_stage_id=request.id,
+                )
         else:
             next_stage = StageRequest(
                 id=_next_stage_id(request.id, "finalize"),
@@ -2386,6 +2466,13 @@ def build_engine(
                 (followup_interpretation or {}).get("selectedPeriodDays")
             ),
         )
+        followup = build_period_family_followup_recommendation(
+            investigation,
+            interpreted,
+            origin_stage_id=request.id,
+        )
+        if followup is not None:
+            interpreted.update(followup)
         cluster = interpreted.get("bestCluster") or {}
         print("🧩 Independent-sector period clustering")
         print(f"   eligible sectors: {interpreted.get('eligibleSectorCount')}")
@@ -2414,6 +2501,13 @@ def build_engine(
         elif spec.get("continuation"):
             finalize_parameters["outputSuffix"] = "v20.3.1"
 
+        if interpreted.get("recommendedNextTest") == DIFFERENCE_TRIGGER:
+            return StageOutcome(
+                result=interpreted,
+                stop=True,
+                final_status="QUIESCENT_AWAITING_DATA",
+                input_hashes={"broadIndependentProjectResult": sha256_json(run)},
+            )
         return StageOutcome(
             result=interpreted,
             next_stage=broad_independent_continuation(
@@ -2495,6 +2589,14 @@ def build_engine(
             "openstar.tess.independent.broad.interpret",
         )
         family = ((harmonic or broad or {}).get("harmonicFamily") or {})
+        primary_analysis = None
+        direct_primary_family = False
+        if not family and request.parameters.get("evidenceSource") == "primary-harmonic-contradiction":
+            primary_analysis = _required_latest_result_for_handler(
+                investigation, "openstar.tess.hypotheses"
+            )
+            family = _primary_harmonic_morphology_family(primary_analysis) or {}
+            direct_primary_family = bool(family)
         raw_period = family.get("representativeRawPeriodDays")
         double_period = family.get("possibleDoubleCycleDays")
         if independent_prepare is None:
@@ -2549,6 +2651,9 @@ def build_engine(
             "periodFamily": sha256_json(family),
             "primaryDataset": sha256_file(Path(prepared["datasetPath"])),
         }
+        if direct_primary_family:
+            input_hashes["primaryAnalysis"] = sha256_json(primary_analysis)
+            input_hashes["independentPreparation"] = sha256_json(independent_prepare)
         for item in independent_prepare.get("preparedSectors") or []:
             sector = item.get("sector")
             path = item.get("datasetPath")
@@ -2561,6 +2666,13 @@ def build_engine(
                 id=_next_stage_id(request.id, "prepare-time-frequency"),
                 handler_id="openstar.tess.time-frequency.prepare",
                 parameters={"entryReason": continuation.get("entryReason")},
+                triggered_by_stage_id=request.id,
+            )
+        elif request.parameters.get("unresolvedFallback") == "BROAD_INDEPENDENT_SEARCH":
+            next_stage = StageRequest(
+                id=_next_stage_id(request.id, "prepare-broad-independent-search"),
+                handler_id="openstar.tess.independent.broad.prepare",
+                parameters={"continuation": False},
                 triggered_by_stage_id=request.id,
             )
         else:
@@ -4481,6 +4593,83 @@ def build_engine(
                 **{f"frozenDatasetFile:sector{s['sectorID']}":s["datasetSHA256"] for s in sectors}},
             artifacts=(_artifact(artifact_path,"application/json"),))
 
+    def main_family_frequency_domain_reassessment_stage(investigation, request):
+        """Reassess only the frozen family against fixed rotation branches."""
+        from .tess_dynamic_harmonic import read_frozen_light_curve
+        from .tess_main_family_frequency_domain_reassessment import (
+            analyze_frequency_domain_reassessment,
+        )
+        recurrence = next((s for s in investigation.stages if
+            s.id == "033-main-family-time-domain-recurrence"), None)
+        final = next((s for s in investigation.stages if s.id == request.triggered_by_stage_id), None)
+        science = next((s for s in investigation.stages if
+            s.id == "031-target-residual-astrophysical-interpretation"), None)
+        if not (request.id == "035-main-family-frequency-domain-reassessment"
+                and recurrence and science and final and final.id == "034-finalize"
+                and len(investigation.stages) >= 2
+                and final is investigation.stages[-2]
+                and investigation.stages[-1].id == request.id
+                and investigation.stages[-1].handler_id == request.handler_id
+                and investigation.stages[-1].status == "RUNNING"
+                and investigation.stages[-1].triggered_by_stage_id == final.id
+                and recurrence.status == science.status == final.status == "COMPLETE"
+                and recurrence.handler_id == "openstar.tess.main-family-time-domain-recurrence.analyze"
+                and science.handler_id == "openstar.tess.target-residual-astrophysical-interpretation.analyze"
+                and final.handler_id == "openstar.tess.finalize" and final.stop is True
+                and recurrence.triggered_by_stage_id == "032-finalize"
+                and final.triggered_by_stage_id == recurrence.id
+                and store.verified_terminal_stage_ledger_hash(investigation.id, science)
+                and store.verified_terminal_stage_ledger_hash(investigation.id, recurrence)
+                and store.verified_terminal_stage_ledger_hash(investigation.id, final)):
+            raise RuntimeError("frequency reassessment exact stage034 boundary verification failed")
+        prior = recurrence.result or {}; combined = prior.get("combinedEvidence") or {}
+        if not (prior.get("classification") == "FREQUENCY_FAMILY_NOT_TIME_DOMAIN_REPLICATED"
+                and combined.get("rawFamilyRecurrenceSectorIDs") == []
+                and combined.get("possibleDoubleRecurrenceSectorIDs") == []):
+            raise RuntimeError("frequency reassessment requires authoritative negative stage033 evidence")
+        resolver = historical_path_resolver or HistoricalPathResolver()
+        sectors = []
+        for provenance in prior.get("frozenDatasetProvenance") or []:
+            path = resolver.resolve(provenance["datasetPath"])
+            if sha256_file(path) != provenance.get("datasetSHA256"):
+                raise RuntimeError("frequency reassessment frozen dataset verification failed")
+            dataset = read_frozen_light_curve(path, len(sectors))
+            if (dataset["sector"] != provenance.get("sectorID")
+                    or dataset["source"] != provenance.get("source")
+                    or dataset["appliedTimeOriginDays"] != provenance.get("appliedTimeOriginDays")):
+                raise RuntimeError("frequency reassessment frozen dataset provenance disagrees")
+            sectors.append({"sectorID": dataset["sector"], "time": dataset["times"],
+                "flux": dataset["flux"], **provenance})
+        if not sectors:
+            raise RuntimeError("frequency reassessment requires stage033 frozen sectors")
+        family = (science.result or {}).get("mainPhotometricFamily") or {}
+        summary = analyze_frequency_domain_reassessment(sectors,
+            rotation_period_days=float((science.result or {})["targetResidualPeriodDays"]),
+            family_period_days=float(family["representativeRawPeriodDays"]),
+            possible_double_days=float(family["possibleDoubleCycleDays"]),
+            prior_time_domain={"classification": prior["classification"],
+                **{key: combined[key] for key in ("rawFamilyRecurrenceSectorIDs",
+                    "possibleDoubleRecurrenceSectorIDs", "rawFamilyCoverageSectorIDs",
+                    "possibleDoubleCoverageSectorIDs")}})
+        summary["frozenDatasetProvenance"] = [{**p,
+            "baselineDays": r["baselineDays"], "sampleCount": r["sampleCount"]}
+            for p, r in zip(prior["frozenDatasetProvenance"], summary["sectorResults"])]
+        summary["priorTimeDomainStageID"] = recurrence.id
+        summary["priorTimeDomainLedgerSHA256"] = store.verified_terminal_stage_ledger_hash(
+            investigation.id, recurrence)
+        summary["priorTimeDomainArtifactSHA256"] = recurrence.artifacts[0].sha256
+        artifact_path = store.directory_for(investigation.id)/"artifacts"/"main-family-frequency-domain-reassessment"/"main-family-frequency-domain-reassessment-v20.14.3.json"
+        _write_json(artifact_path, summary)
+        return StageOutcome(result=summary, next_stage=StageRequest(
+            "036-finalize", "openstar.tess.finalize",
+            {"outputSuffix":"v20.14.3-main-family-frequency-domain-reassessment"}, request.id),
+            input_hashes={"stage031Ledger":store.verified_terminal_stage_ledger_hash(investigation.id,science),
+                "stage033Ledger":summary["priorTimeDomainLedgerSHA256"],
+                "stage033Artifact":summary["priorTimeDomainArtifactSHA256"],
+                "stage034Ledger":store.verified_terminal_stage_ledger_hash(investigation.id,final),
+                **{f"frozenDatasetFile:sector{s['sectorID']}":s["datasetSHA256"] for s in sectors}},
+            artifacts=(_artifact(artifact_path,"application/json"),))
+
     def target_residual_mechanism_adjudication_stage(investigation, request):
         v2014_stage = next((stage for stage in reversed(investigation.stages)
             if stage.handler_id == "openstar.tess.target-residual-mechanism.analyze"
@@ -5162,19 +5351,23 @@ def build_engine(
             ledger_hashes=boundary["ledgerSHA256"],
             output_dir=store.directory_for(investigation.id)/"artifacts",investigation_id=investigation.id)
         preparation["semanticPolicyVersion"]=boundary["policyVersion"]
-        contract=freeze_period_family_contract(evidence,boundary["triggerStageID"])
+        contract=(verified_contract(evidence) if evidence.get("periodFamilyContract")
+                  else freeze_period_family_contract(evidence,boundary["triggerStageID"]))
         preparation["periodFamilyContract"]=contract
         preparation["periodFamilyContractSHA256"]=sha256_json(contract)
+        contract_path=Path(preparation["artifactRoot"])/"period-family-contract.json"
+        _write_immutable_json(contract_path,contract)
         return StageOutcome(result=preparation,next_stage=StageRequest(
             _next_stage_id(request.id,"run-generic-period-family-difference-imaging"),
             "openstar.tess.generic-period-family-difference-imaging.run",{},request.id),
             input_hashes={"semanticBoundary":sha256_json(boundary)},
-            artifacts=(_artifact(Path(preparation["preparationPath"]),"application/json"),))
+            artifacts=(_artifact(Path(preparation["preparationPath"]),"application/json"),
+                       _artifact(contract_path,"application/json")))
 
     def generic_period_family_difference_run_stage(investigation,request):
         preparation=_latest_result_for_handler(investigation,"openstar.tess.generic-period-family-difference-imaging.prepare")
         result=run_period_family_difference_imaging(preparation,sector_inputs=request.parameters.get("sectorInputs"))
-        path=Path(preparation["artifactRoot"])/"generic-run.json"; _write_json(path,result)
+        path=Path(preparation["artifactRoot"])/"generic-run.json"; _write_immutable_json(path,result)
         return StageOutcome(result=result,next_stage=StageRequest(
             _next_stage_id(request.id,"interpret-generic-period-family-difference-imaging"),
             "openstar.tess.generic-period-family-difference-imaging.interpret",{},request.id),
@@ -5188,7 +5381,7 @@ def build_engine(
         result["periodFamilyContract"]=contract
         result["periodFamilyContractSHA256"]=sha256_json(contract)
         result["autonomousContinuationEligible"]=result.get("recommendedNextTest")=="UNTOUCHED_SECTOR_TIME_DOMAIN_EVOLUTION"
-        path=Path(preparation["artifactRoot"])/"generic-interpretation.json"; _write_json(path,result)
+        path=Path(preparation["artifactRoot"])/"generic-interpretation.json"; _write_immutable_json(path,result)
         return StageOutcome(result=result,stop=True,final_status="QUIESCENT_AWAITING_DATA",
             input_hashes={"preparation":sha256_json(preparation),"run":sha256_json(run)},artifacts=(_artifact(path,"application/json"),))
 
@@ -5199,6 +5392,23 @@ def build_engine(
         contract=verified_contract(evidence)
         consumed=list(contract["consumedSectors"])
         selection=select_untouched_sectors(products,consumed)
+        if selection.get("status") != "SELECTED":
+            result={"version":"openstar.period-family-time-domain-preparation.v2",
+                    "classification":"NO_STABLE_UNTOUCHED_SECTOR_EPOCHS",
+                    "sectorSelection":selection,
+                    "periodFamilyContract":contract,
+                    "periodFamilyContractSHA256":sha256_json(contract),
+                    "autonomousContinuationEligible":False,
+                    "claimDecision":{"claim":"HUMAN_REVIEW_REQUIRED"},
+                    "recommendedNextTest":"MANUAL_ARCHIVE_METADATA_REVIEW"}
+            failure_path=(store.directory_for(investigation.id)/"artifacts"/
+                          "period-family-time-domain-evolution"/"selection-failure.json")
+            _write_immutable_json(failure_path,result)
+            return StageOutcome(result=result,stop=True,
+                final_status="QUIESCENT_AWAITING_DATA",
+                input_hashes={"semanticBoundary":sha256_json(boundary),
+                              "sectorSelection":sha256_json(selection)},
+                artifacts=(_artifact(failure_path,"application/json"),))
         family=list(contract["periodFamilyMembersDays"])
         window=contract["acceptanceWindowDays"]
         frozen={"ticID":identity.get("ticID"),"primaryPeriodDays":contract["primaryPeriodDays"],
@@ -5206,23 +5416,29 @@ def build_engine(
             "familyAcceptanceWindowDays":window,"previouslyConsumedSectors":consumed,
             "untouchedSectors":selection["selectedSectors"],
             "campaigns":{epoch:[s for s in selection["selectedSectors"] if selection.get("selectedSectorEpochs",{}).get(str(s))==epoch] for epoch in selection.get("selectedEpochs",[])},
-            "archiveContract":{"mission":"TESS","author":"SPOC","exptimeSeconds":120},}
+            "archiveContract":{"mission":"TESS","author":"SPOC",
+                               "cadenceSeconds":120,"exptimeSeconds":120,
+                               "fluxProducts":["SAP","PDCSAP"],
+                               "allowCadenceFallback":False},}
         preparation=prepare_period_family_time_domain_evolution(frozen_boundary=frozen,
             ledger_hashes=boundary["ledgerSHA256"],output_dir=store.directory_for(investigation.id)/"artifacts",
             investigation_id=investigation.id)
         preparation["sectorSelection"]=selection
         preparation["periodFamilyContract"]=contract
         preparation["periodFamilyContractSHA256"]=sha256_json(contract)
+        contract_path=Path(preparation["artifactRoot"])/"period-family-contract.json"
+        _write_immutable_json(contract_path,contract)
         return StageOutcome(result=preparation,next_stage=StageRequest(
             _next_stage_id(request.id,"run-generic-period-family-time-domain-evolution"),
             "openstar.tess.generic-period-family-time-domain-evolution.run",{},request.id),
             input_hashes={"semanticBoundary":sha256_json(boundary),"sectorSelection":sha256_json(selection)},
-            artifacts=(_artifact(Path(preparation["preparationPath"]),"application/json"),))
+            artifacts=(_artifact(Path(preparation["preparationPath"]),"application/json"),
+                       _artifact(contract_path,"application/json")))
 
     def generic_period_family_time_run_stage(investigation,request):
         preparation=_latest_result_for_handler(investigation,"openstar.tess.generic-period-family-time-domain-evolution.prepare")
         result=run_period_family_time_domain_evolution(preparation,sector_inputs=request.parameters.get("sectorInputs"))
-        path=Path(preparation["artifactRoot"])/"generic-run.json"; _write_json(path,result)
+        path=Path(preparation["artifactRoot"])/"generic-run.json"; _write_immutable_json(path,result)
         return StageOutcome(result=result,next_stage=StageRequest(
             _next_stage_id(request.id,"interpret-generic-period-family-time-domain-evolution"),
             "openstar.tess.generic-period-family-time-domain-evolution.interpret",{},request.id),
@@ -5236,7 +5452,7 @@ def build_engine(
         result["periodFamilyContract"]=contract
         result["periodFamilyContractSHA256"]=sha256_json(contract)
         result["autonomousContinuationEligible"]=result.get("recommendedNextTest")=="ADDITIONAL_LONG_BASELINE_TIME_DOMAIN_DATA"
-        path=Path(preparation["artifactRoot"])/"generic-interpretation.json"; _write_json(path,result)
+        path=Path(preparation["artifactRoot"])/"generic-interpretation.json"; _write_immutable_json(path,result)
         return StageOutcome(result=result,stop=True,final_status="QUIESCENT_AWAITING_DATA",
             input_hashes={"preparation":sha256_json(preparation),"run":sha256_json(run)},artifacts=(_artifact(path,"application/json"),))
 
@@ -5257,9 +5473,7 @@ def build_engine(
             "providerPriority":["ASAS-SN_SKY_PATROL"],
             "credentialsPersisted":False}
         path = store.directory_for(investigation.id) / "artifacts" / "external-long-baseline" / "preregistration.json"
-        if path.exists() and json.loads(path.read_text()) != result:
-            raise RuntimeError("Frozen external preregistration differs on recovery.")
-        if not path.exists(): _write_json(path, result)
+        _write_immutable_json(path, result)
         return StageOutcome(result=result,next_stage=StageRequest(
             _next_stage_id(request.id,"run-external-long-baseline"),
             "openstar.tess.external-long-baseline.run",{},request.id),
@@ -5278,6 +5492,8 @@ def build_engine(
             except ProviderConfigurationUnavailable as exc:
                 result={"operationalOutcome":"PROVIDER_CONFIGURATION_UNAVAILABLE",
                         "analysisAvailable":False,"reason":str(exc),"credentialsPersisted":False}
+            except ProviderTransientError as exc:
+                raise RetryableExecutionError(str(exc)) from exc
             else:
                 try:
                     result=run_external_experiment(target=preparation["target"],family_window=window,
@@ -5285,31 +5501,48 @@ def build_engine(
                         artifact_root=store.directory_for(investigation.id)/"artifacts"/"external-long-baseline")
                 except ProviderTransientError as exc:
                     raise RetryableExecutionError(str(exc)) from exc
-                result["operationalOutcome"]="ACQUIRED"; result["analysisAvailable"]=True
         path=store.directory_for(investigation.id)/"artifacts"/"external-long-baseline"/"analysis.json"
-        if path.exists() and json.loads(path.read_text()) != result:
-            raise RuntimeError("Frozen external analysis differs on recovery.")
-        if not path.exists(): _write_json(path,result)
+        _write_immutable_json(path,result)
+        evidence_artifacts=tuple(
+            _artifact(Path(item["path"]),"application/json")
+            for item in result.get("artifactManifest") or []
+        )
+        evidence_hashes={f"externalArtifact:{index}:{item['role']}":item["sha256"]
+                         for index,item in enumerate(result.get("artifactManifest") or [])}
         return StageOutcome(result=result,next_stage=StageRequest(
             _next_stage_id(request.id,"interpret-external-long-baseline"),
             "openstar.tess.external-long-baseline.interpret",{},request.id),
-            input_hashes={"preparation":sha256_json(preparation)},
-            artifacts=(_artifact(path,"application/json"),))
+            input_hashes={"preparation":sha256_json(preparation),**evidence_hashes},
+            artifacts=(_artifact(path,"application/json"),)+evidence_artifacts)
 
     def external_long_baseline_interpret_stage(investigation, request):
         preparation=_latest_result_for_handler(investigation,"openstar.tess.external-long-baseline.prepare")
         analysis=_latest_result_for_handler(investigation,"openstar.tess.external-long-baseline.run")
         if preparation is None or analysis is None: raise RuntimeError("External interpretation requires prepare and run.")
         result=dict(analysis)
-        if not analysis.get("analysisAvailable"):
+        operational=analysis.get("operationalOutcome")
+        if operational == "PROVIDER_CONFIGURATION_UNAVAILABLE":
             result.update({"classification":"EXTERNAL_OPERATIONALLY_UNAVAILABLE",
                 "externalRecurrenceReplicated":False,"stableClockSupported":False,
                 "waveformEvolutionSupported":False,"sourceAttributionReliableAtExternalResolution":False,
                 "periodFamilyResolved":False,"physicalCycleResolved":False,"physicalMechanismResolved":False,
-                "claimDecision":{"claim":"HUMAN_REVIEW_REQUIRED"},"recommendedNextTest":"MANUAL_PROVIDER_CONFIGURATION"})
+                "claimDecision":{"claim":"HUMAN_REVIEW_REQUIRED"},
+                "recommendedNextTest":"INSTALL_OPTIONAL_COORDINATOR_DEPENDENCY"})
+        elif operational == "MALFORMED_PREREGISTRATION":
+            result.update({"classification":"EXTERNAL_PREREGISTRATION_INVALID",
+                "externalRecurrenceReplicated":False,"stableClockSupported":False,
+                "waveformEvolutionSupported":False,
+                "sourceAttributionReliableAtExternalResolution":False,
+                "periodFamilyResolved":False,"physicalCycleResolved":False,
+                "physicalMechanismResolved":False,
+                "claimDecision":{"claim":"HUMAN_REVIEW_REQUIRED"},
+                "recommendedNextTest":"MANUAL_WORKFLOW_CONTRACT_REVIEW"})
+        else:
+            result.update({"periodFamilyResolved":False,"physicalCycleResolved":False,
+                           "physicalMechanismResolved":False,
+                           "claimDecision":{"claim":"HUMAN_REVIEW_REQUIRED"}})
         path=store.directory_for(investigation.id)/"artifacts"/"external-long-baseline"/"interpretation.json"
-        if path.exists() and json.loads(path.read_text()) != result: raise RuntimeError("Frozen interpretation differs on recovery.")
-        if not path.exists(): _write_json(path,result)
+        _write_immutable_json(path,result)
         return StageOutcome(result=result,stop=True,final_status="QUIESCENT_AWAITING_DATA",
             input_hashes={"preparation":sha256_json(preparation),"analysis":sha256_json(analysis)},
             artifacts=(_artifact(path,"application/json"),))
@@ -8662,6 +8895,8 @@ def build_engine(
         )
         main_family_time_domain_recurrence = _latest_result_for_handler(
             investigation, "openstar.tess.main-family-time-domain-recurrence.analyze")
+        main_family_frequency_domain_reassessment = _latest_result_for_handler(
+            investigation, "openstar.tess.main-family-frequency-domain-reassessment.analyze")
         target_residual_archival_baseline_extension = _latest_result_for_handler(
             investigation, "openstar.tess.target-residual-archival-baseline.interpret",
         )
@@ -9675,6 +9910,36 @@ def build_engine(
         else:
             recommended_next_test = (physical_interpretation or {}).get("recommendedNextTest")
 
+        if main_family_time_domain_recurrence is not None:
+            recurrence = main_family_time_domain_recurrence
+            combined = recurrence.get("combinedEvidence") or {}
+            family = recurrence.get("mainPhotometricFamily") or {}
+            coverage = sorted(set((combined.get("rawFamilyCoverageSectorIDs") or []) +
+                (combined.get("possibleDoubleCoverageSectorIDs") or [])))
+            existing_rationale = list(claim_decision.get("rationale") or [])
+            existing_rationale.append(
+                "Superseding time-domain evidence: the previously persisted "
+                f"~{family.get('representativeRawPeriodDays'):.3f}-day raw family and "
+                f"~{family.get('possibleDoubleCycleDays'):.3f}-day possible double were not "
+                f"reproduced ({recurrence.get('classification')}) despite adequate coverage "
+                f"in sectors {coverage}; recurrence sectors were raw="
+                f"{combined.get('rawFamilyRecurrenceSectorIDs') or []} and double="
+                f"{combined.get('possibleDoubleRecurrenceSectorIDs') or []}. Nearby recurrence "
+                f"instead tracks approximately 2x/4x the solved ~{recurrence.get('authoritativeRotationPeriodDays'):.4f}-day "
+                "rotation. The historical frequency family remains a candidate requiring "
+                "frequency-domain reassessment, is not by itself evidence for an independent "
+                "longer physical clock, and its exact physical cycle remains unresolved.")
+            claim_decision = {"claim": claim_decision["claim"], "rationale": existing_rationale}
+        if main_family_frequency_domain_reassessment is not None:
+            existing_rationale = list(claim_decision.get("rationale") or [])
+            existing_rationale.append(
+                "Newest superseding frequency-domain reassessment classification: "
+                f"{main_family_frequency_domain_reassessment.get('classification')}. This "
+                "fixed-hypothesis diagnostic preserves the negative independent time-domain "
+                "evidence and cannot establish an exact physical cycle; physicalCycleResolved "
+                "remains false.")
+            claim_decision = {"claim": claim_decision["claim"], "rationale": existing_rationale}
+
         # Finalizers summarize an append-only history.  The newest completed
         # science stage carrying an explicit recommendation is authoritative;
         # handler-specific variables above only preserve report compatibility.
@@ -9726,6 +9991,7 @@ def build_engine(
             ),
             "targetResidualAstrophysicalInterpretation": target_residual_astrophysical_interpretation,
             "mainFamilyTimeDomainRecurrence": main_family_time_domain_recurrence,
+            "mainFamilyFrequencyDomainReassessment": main_family_frequency_domain_reassessment,
             "targetResidualArchivalBaselineExtension": target_residual_archival_baseline_extension,
             "targetResidualPixelRecurrenceValidation": target_residual_pixel_recurrence,
             "targetResidualMultisectorSourceLocalization": target_residual_multisector_source,
@@ -10575,6 +10841,8 @@ def build_engine(
     )
     engine.register_handler("openstar.tess.main-family-time-domain-recurrence.analyze",
         main_family_time_domain_recurrence_stage)
+    engine.register_handler("openstar.tess.main-family-frequency-domain-reassessment.analyze",
+        main_family_frequency_domain_reassessment_stage)
     # All TESS handlers share this provider-to-workflow adapter.  Localization
     # builders call _download_tpf indirectly, so a centralized boundary also
     # protects new experiments from persisting MAST outages as NON_RETRYABLE.
