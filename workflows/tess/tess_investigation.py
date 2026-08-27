@@ -10308,7 +10308,6 @@ def build_engine(
             print("   detailed photometric mechanism unresolved: True")
             print("   automatic discovery claim: False")
             print("   authoritative next test: HUMAN_SCIENTIFIC_REVIEW")
-            print("   final physical mechanism and companion nature remain unresolved")
         print(f"   authoritative recommended next test: {recommended_next_test}")
         if residual_mode_localization is not None:
             residual_cross = residual_mode_localization.get("crossSector") or {}
