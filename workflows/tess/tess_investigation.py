@@ -127,6 +127,15 @@ from .tess_residual_phase_difference_image import (
     run_residual_phase_difference_imaging,
     interpret_residual_phase_difference_imaging,
 )
+from .tess_period_family_difference_image import (
+    PREPARE_HANDLER as PERIOD_FAMILY_DIFFERENCE_PREPARE_HANDLER,
+    RUN_HANDLER as PERIOD_FAMILY_DIFFERENCE_RUN_HANDLER,
+    INTERPRET_HANDLER as PERIOD_FAMILY_DIFFERENCE_INTERPRET_HANDLER,
+    verified_period_family_boundary,
+    prepare_period_family_difference_imaging,
+    run_period_family_difference_imaging,
+    interpret_period_family_difference_imaging,
+)
 from .tess_source_switching_temporal import (
     prepare_source_switching_temporal_model,
     run_source_switching_temporal_model,
@@ -4974,6 +4983,75 @@ def build_engine(
                 "openstar.tess.residual-phase-difference-imaging.interpret", {}, request.id),
             input_hashes={"preparation": sha256_json(preparation)},
             artifacts=(_artifact(path, "application/json"),))
+
+    def period_family_difference_image_prepare_stage(investigation, request):
+        frozen, ledger_hashes = verified_period_family_boundary(store, investigation)
+        preparation = prepare_period_family_difference_imaging(
+            frozen_boundary=frozen,
+            ledger_hashes=ledger_hashes,
+            output_dir=store.directory_for(investigation.id) / "artifacts",
+            investigation_id=investigation.id,
+        )
+        return StageOutcome(
+            result=preparation,
+            next_stage=StageRequest(
+                _next_stage_id(request.id, "run-period-family-difference-imaging"),
+                PERIOD_FAMILY_DIFFERENCE_RUN_HANDLER,
+                {},
+                request.id,
+            ),
+            input_hashes={
+                "frozenBoundary": sha256_json(frozen),
+                **{f"stageLedger:{stage_id}": value for stage_id, value in ledger_hashes.items()},
+            },
+            artifacts=(_artifact(Path(preparation["preparationPath"]), "application/json"),),
+        )
+
+    def period_family_difference_image_run_stage(investigation, request):
+        preparation = _latest_result_for_handler(
+            investigation, PERIOD_FAMILY_DIFFERENCE_PREPARE_HANDLER
+        )
+        if preparation is None:
+            raise RuntimeError("Period-family difference imaging requires its preparation stage.")
+        result = run_period_family_difference_imaging(
+            preparation, sector_inputs=request.parameters.get("sectorInputs")
+        )
+        path = Path(preparation["artifactRoot"]) / "run.json"
+        _write_json(path, result)
+        return StageOutcome(
+            result=result,
+            next_stage=StageRequest(
+                _next_stage_id(request.id, "interpret-period-family-difference-imaging"),
+                PERIOD_FAMILY_DIFFERENCE_INTERPRET_HANDLER,
+                {},
+                request.id,
+            ),
+            input_hashes={"preparation": sha256_json(preparation)},
+            artifacts=(_artifact(path, "application/json"),),
+        )
+
+    def period_family_difference_image_interpret_stage(investigation, request):
+        preparation = _latest_result_for_handler(
+            investigation, PERIOD_FAMILY_DIFFERENCE_PREPARE_HANDLER
+        )
+        run = _latest_result_for_handler(
+            investigation, PERIOD_FAMILY_DIFFERENCE_RUN_HANDLER
+        )
+        if preparation is None or run is None:
+            raise RuntimeError("Period-family difference imaging interpretation requires prepare and run.")
+        result = interpret_period_family_difference_imaging(preparation, run)
+        path = Path(preparation["artifactRoot"]) / "interpretation.json"
+        _write_json(path, result)
+        return StageOutcome(
+            result=result,
+            stop=True,
+            final_status="QUIESCENT_AWAITING_DATA",
+            input_hashes={
+                "preparation": sha256_json(preparation),
+                "run": sha256_json(run),
+            },
+            artifacts=(_artifact(path, "application/json"),),
+        )
 
     def residual_phase_difference_image_interpret_stage(investigation, request):
         preparation = _latest_result_for_handler(
@@ -9949,6 +10027,18 @@ def build_engine(
     engine.register_handler(
         "openstar.tess.residual-phase-difference-imaging.interpret",
         residual_phase_difference_image_interpret_stage,
+    )
+    engine.register_handler(
+        PERIOD_FAMILY_DIFFERENCE_PREPARE_HANDLER,
+        period_family_difference_image_prepare_stage,
+    )
+    engine.register_handler(
+        PERIOD_FAMILY_DIFFERENCE_RUN_HANDLER,
+        period_family_difference_image_run_stage,
+    )
+    engine.register_handler(
+        PERIOD_FAMILY_DIFFERENCE_INTERPRET_HANDLER,
+        period_family_difference_image_interpret_stage,
     )
     engine.register_handler(
         "openstar.tess.source-switching-temporal-model.prepare",

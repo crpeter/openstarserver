@@ -89,6 +89,33 @@ Content-Type: application/json
 {"nodeID":"worker-id","telemetry":{"deviceName":"Lab Mac","thermalState":"nominal","batteryLevel":0.82,"powerState":"charging","lowPowerMode":false,"osVersion":"15.0","appVersion":"1.0","computeState":"computing"}}
 ```
 
+## Manual unresolved-period-family localization
+
+`run_openstar_tess_period_family_localization.py` is an explicit, target-selected
+continuation for the narrow 12-stage boundary where targeted independent sectors
+all recover reliable but resolution-limited nearby peaks and the subsequent broad
+search finds no promotable family. It is not part of autonomous repair or branch
+planning.
+
+The default command is read-only. It verifies all 12 immutable stage ledgers and
+prints the frozen sectors and disposition without downloading TESS data or changing
+the investigation:
+
+```bash
+python run_openstar_tess_period_family_localization.py \
+  --state-dir ~/Documents/OpenStarScience/autonomous-sector-1-scale-1/state \
+  --investigation-id tess-tess-sector-scan-1-tic-238919539-tess-sector-1-tic-238919539
+```
+
+After reviewing that output, add `--execute` to append stages 013-015. The server
+uses each sector's already-persisted frequency only as a phase reference, downloads
+official TESS target pixels (with the existing TESScut fallback), and measures
+high-minus-low phase-image centroids with jackknife uncertainty. It performs no new
+Lomb-Scargle search and sends no TESS-specific work to compute workers. The result
+always retains `HUMAN_REVIEW_REQUIRED`, `physicalCycleResolved=false`, and
+`physicalMechanismResolved=false`; the localization outcome only determines the
+next conservative experiment.
+
 ## Targeted observation campaign
 
 Two Sector 1 deep investigations have reached a genuine external-observation boundary. OpenStar
