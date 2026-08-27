@@ -46,6 +46,10 @@ from .tess_hypotheses import (
 from .tess_identity import collect_identity, transient_required_catalog_failures
 from .tess_morphology import analyze_morphology
 from .tess_physical import analyze_physical_interpretation
+from .tess_binary_confirmation import (
+    analyze_binary_confirmation,
+    physical_interpretation_continuation,
+)
 from .tess_localization import localize_periodic_source
 from .tess_sector_archive import TessArchiveTransientError
 from .tess_multimode import (
@@ -2755,14 +2759,66 @@ def build_engine(
             if path:
                 input_hashes[f"independentSector{sector}"] = sha256_file(Path(path))
 
-        return StageOutcome(
-            result=interpretation,
-            next_stage=StageRequest(
+        if physical_interpretation_continuation(interpretation, morphology):
+            next_stage = StageRequest(
+                id=_next_stage_id(request.id, "binary-confirmation"),
+                handler_id="openstar.tess.binary-confirmation.analyze",
+                parameters={},
+                triggered_by_stage_id=request.id,
+            )
+        else:
+            next_stage = StageRequest(
                 id=_next_stage_id(request.id, "finalize"),
                 handler_id="openstar.tess.finalize",
                 parameters={"outputSuffix": "v20.5"},
                 triggered_by_stage_id=request.id,
-            ),
+            )
+
+        return StageOutcome(
+            result=interpretation,
+            next_stage=next_stage,
+            input_hashes=input_hashes,
+            artifacts=(_artifact(artifact_path, "application/json"),),
+        )
+
+    def binary_confirmation_stage(investigation, request):
+        prepared = _result(investigation, "001-prepare-target")
+        independent_prepare = _required_latest_result_for_handler(
+            investigation, "openstar.tess.independent.prepare")
+        morphology = _required_latest_result_for_handler(
+            investigation, "openstar.tess.morphology.analyze")
+        physical = _required_latest_result_for_handler(
+            investigation, "openstar.tess.physical.interpret")
+        result = analyze_binary_confirmation(
+            primary_dataset_path=prepared["datasetPath"],
+            independent_spec=independent_prepare,
+            morphology=morphology,
+            physical_interpretation=physical,
+        )
+        print("🌘 Replicating narrow events at the frozen physical clock")
+        print(f"   classification: {(result.get('independentEvidence') or {}).get('classification')}")
+        print(f"   coherent ephemeris: {(result.get('linearEphemeris') or {}).get('coherent')}")
+        print(f"   recommended next test: {result.get('recommendedNextTest')}")
+        artifact_path = (store.directory_for(investigation.id) / "artifacts" /
+                         "binary-confirmation" / "binary-confirmation-v1.json")
+        _write_json(artifact_path, result)
+        input_hashes = {
+            "physicalInterpretation": sha256_json(physical),
+            "morphology": sha256_json(morphology),
+            "primaryDataset": sha256_file(Path(prepared["datasetPath"])),
+            "independentPreparation": sha256_json(independent_prepare),
+        }
+        for item in independent_prepare.get("preparedSectors") or []:
+            if item.get("datasetPath"):
+                input_hashes[f"independentSector{item.get('sector')}"] = sha256_file(
+                    Path(item["datasetPath"]))
+        return StageOutcome(
+            result=result,
+            next_stage=StageRequest(
+                id=_next_stage_id(request.id, "finalize"),
+                handler_id="openstar.tess.finalize",
+                parameters={"outputSuffix": "binary-confirmation-v1"},
+                triggered_by_stage_id=request.id),
             input_hashes=input_hashes,
             artifacts=(_artifact(artifact_path, "application/json"),),
         )
@@ -10171,6 +10227,10 @@ def build_engine(
     engine.register_handler(
         "openstar.tess.physical.interpret",
         physical_interpretation_stage,
+    )
+    engine.register_handler(
+        "openstar.tess.binary-confirmation.analyze",
+        binary_confirmation_stage,
     )
     engine.register_handler(
         "openstar.tess.source-localization.analyze",
