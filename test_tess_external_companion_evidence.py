@@ -215,7 +215,12 @@ class ExternalCompanionEvidenceTests(unittest.TestCase):
             review = dict(self.review)
             stage = InvestigationStage("023-review", REVIEW_HANDLER_ID, "COMPLETE", "022-localize", {},
                                        result=review, artifacts=(artifact,))
-            investigation = type(investigation)(**{**investigation.__dict__, "stages": (stage,)})
+            audit = {"resultVersion": "openstar.tess-event-depth-attenuation-audit.v1",
+                     "status": "COMPLETE"}
+            audit["auditSHA256"] = sha256_json(audit)
+            audit_stage = InvestigationStage("025-audit", "openstar.tess.event-depth-attenuation.audit",
+                                              "COMPLETE", "024-depth-freeze", {}, result=audit)
+            investigation = type(investigation)(**{**investigation.__dict__, "stages": (stage, audit_stage)})
             store.save(investigation)
             engine = build_engine(store, SimpleNamespace(), poll_interval=0, timeout=None)
             engine.chain_stages = False
@@ -237,20 +242,50 @@ class ExternalCompanionEvidenceTests(unittest.TestCase):
         from workflows.tess.tess_external_companion_evidence import (
             FREEZE_HANDLER_ID, INTERPRET_HANDLER_ID, REVIEW_HANDLER_ID)
         from workflows.tess.tess_eclipse_event_localization import HANDLER_ID
+        from workflows.tess.tess_event_depth_accuracy import (
+            AUDIT_HANDLER_ID as DEPTH_AUDIT_HANDLER_ID,
+            FREEZE_HANDLER_ID as DEPTH_FREEZE_HANDLER_ID,
+        )
         from workflows.tess.tess_investigation import build_engine
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
             store = InvestigationStore(directory)
             investigation = store.create("external-lifecycle", "test", "1")
+            binary = {"linearEphemeris": {"coherent": True, "referenceEpoch": 1.0,
+                                           "refinedPeriodDays": 2.0, "timingSectors": [1, 2, 3]},
+                      "sectorResults": [{"usable": True, "dutyCycle": .05} for _ in range(3)],
+                      "catalogAnswerKeyUsed": False}
+            prepared_stage = InvestigationStage("001-prepare-target", "openstar.tess.prepare-target",
+                "COMPLETE", None, {}, result={"ticID": 42, "datasetID": "synthetic"})
+            binary_stage = InvestigationStage("021-binary", "openstar.tess.binary-confirmation.analyze",
+                                                "COMPLETE", None, {}, result=binary)
             localization_stage = InvestigationStage("022-localize", HANDLER_ID, "COMPLETE", None, {},
                                                     result=self.localization)
             investigation = type(investigation)(**{**investigation.__dict__,
-                                                    "stages": (localization_stage,)})
+                                                    "stages": (prepared_stage, binary_stage, localization_stage)})
             store.save(investigation)
             engine = build_engine(store, SimpleNamespace(), poll_interval=0, timeout=None)
             engine.chain_stages = False
             investigation, next_request = engine.run_stage(
                 investigation, StageRequest("023-review", REVIEW_HANDLER_ID, {}, "022-localize"),
                 software_id="test", software_version="1")
+            self.assertEqual(DEPTH_FREEZE_HANDLER_ID, next_request.handler_id)
+            photometry = {"resultVersion": "openstar.tess-event-depth-photometry-freeze.v1",
+                          "status": "FROZEN", "sectors": [], "freezeSHA256": "f" * 64}
+            with mock.patch("workflows.tess.tess_investigation.acquire_full_precision_photometry",
+                            return_value=photometry) as mast:
+                investigation, next_request = engine.run_stage(
+                    investigation, next_request, software_id="test", software_version="1")
+            mast.assert_called_once()
+            self.assertEqual(DEPTH_AUDIT_HANDLER_ID, next_request.handler_id)
+            audit = {"resultVersion": "openstar.tess-event-depth-attenuation-audit.v1",
+                     "status": "COMPLETE", "externalCatalogInformationUsed": False,
+                     "catalogAnswerKeyUsed": False}
+            audit["auditSHA256"] = sha256_json(audit)
+            with mock.patch("workflows.tess.tess_investigation.audit_depth_attenuation",
+                            return_value=audit) as auditor:
+                investigation, next_request = engine.run_stage(
+                    investigation, next_request, software_id="test", software_version="1")
+            self.assertEqual(photometry, auditor.call_args.args[0])
             self.assertEqual(FREEZE_HANDLER_ID, next_request.handler_id)
             frozen = self.freeze([self.row()])
             with mock.patch("workflows.tess.tess_investigation.acquire_external_evidence",
@@ -258,6 +293,9 @@ class ExternalCompanionEvidenceTests(unittest.TestCase):
                 investigation, next_request = engine.run_stage(
                     investigation, next_request, software_id="test", software_version="1")
             archive.assert_called_once()
+            external_freeze_stage = investigation.stages[-1]
+            self.assertEqual(audit["auditSHA256"],
+                             external_freeze_stage.provenance.input_hashes["eventDepthAttenuationAudit"])
             self.assertEqual(INTERPRET_HANDLER_ID, next_request.handler_id)
             # Restart at the durable completed freeze boundary interprets the persisted
             # response and cannot call acquisition again.

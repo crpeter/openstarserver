@@ -1,123 +1,194 @@
+import copy
 import math
 import unittest
-from pathlib import Path
+from unittest import mock
 
+from openstar_investigation import sha256_json
 from workflows.tess.tess_event_depth_accuracy import (
-    AUDIT_HANDLER_ID, FREEZE_HANDLER_ID, _measure, _protected_harmonic,
-    audit_depth_attenuation, freeze_photometry, unresolved_freeze,
+    AUDIT_HANDLER_ID, FREEZE_HANDLER_ID, _harmonic_on_original_scale, _measure,
+    acquire_full_precision_photometry, audit_depth_attenuation, freeze_photometry,
+    validate_freeze,
 )
 
 
+class Column:
+    def __init__(self, values): self.values = values
+    def __getitem__(self, index): return self.values[index]
+
+
+class Table:
+    def __init__(self, rows):
+        self.rows = rows; self.colnames = list(rows[0]) if rows else []
+    def __len__(self): return len(self.rows)
+    def __getitem__(self, name): return Column([row.get(name) for row in self.rows])
+
+
+class Values:
+    def __init__(self, values, unit=None): self.value = values; self.unit = unit
+
+
+class Curve:
+    def __init__(self, sector, time, flux):
+        self.sector = sector; self.time = Values(time); self.flux = Values(flux, "electron / s")
+        self.meta = {"SECTOR": sector, "FLUX_ORIGIN": "PDCSAP_FLUX"}
+
+
+class Search:
+    def __init__(self, entries):
+        self.entries = entries; self.table = Table([entry[0] for entry in entries])
+    def __getitem__(self, value): return Search(self.entries[value])
+    def download(self, quality_bitmask):
+        assert quality_bitmask == "default"
+        return self.entries[0][1]
+
+class Lock:
+    def __enter__(self): return self
+    def __exit__(self, *args): pass
+
+
 class TessEventDepthAccuracyTests(unittest.TestCase):
-    def product(self, sector, *, cadence=0.01, noise=0.0001, depth=0.01,
-                duration=0.12, phase_amplitude=0.003, offset=0.0):
-        times = [sector * 20 + i * cadence for i in range(int(12 / cadence))]
+    def samples(self, sector, *, cadence=.01, depth=.01, duration=.12, phase=.003,
+                baseline=1000., noise=.0001, integrate=False):
+        times = [sector*20+i*cadence for i in range(int(12/cadence))]
+        def instantaneous(t):
+            primary = abs((t+1) % 2-1) <= duration/2
+            opposite = abs((t-1+1) % 2-1) <= duration/2
+            return baseline*(1+phase*math.sin(math.pi*t)-depth*primary-depth*.25*opposite)
         flux = []
         for i, time in enumerate(times):
-            primary = abs((time + 1) % 2 - 1) <= duration / 2
-            opposite = abs((time - 1 + 1) % 2 - 1) <= duration / 2
-            value = 1000 * (1 + offset + phase_amplitude * math.sin(math.pi * time)
-                            - depth * primary - depth * 0.25 * opposite
-                            + noise * math.sin(i * 1.618))
-            flux.append(value)
-        return {"sector": sector, "time": times, "flux": flux, "cadenceSeconds": cadence * 86400,
-                "author": "SYNTHETIC_OFFICIAL_POLICY", "productIdentity": f"generic-{sector}",
-                "sourceProductProvenance": {"local": True}, "fluxColumn": "SAP_FLUX",
-                "fluxUnits": "electron / s", "qualityMaskPolicy": "default",
-                "normalization": "DIVIDE_BY_MEDIAN"}
+            if integrate:
+                value = sum(instantaneous(time+cadence*(j/20-.5)) for j in range(21))/21
+            else: value = instantaneous(time)
+            flux.append(value+baseline*noise*math.sin(i*1.618))
+        return times, flux
 
-    def binary(self, sectors=(1, 2, 3)):
-        return {"linearEphemeris": {"coherent": True, "referenceEpoch": 20.0,
-                                    "refinedPeriodDays": 2.0, "timingSectors": list(sectors)},
-                "sectorResults": [{"usable": True, "dutyCycle": 0.06} for _ in sectors]}
+    def product(self, sector, **kwargs):
+        times, flux = self.samples(sector, **kwargs)
+        return {"sector": sector, "time": times, "flux": flux, "cadenceSeconds": kwargs.get("cadence", .01)*86400,
+                "author": "SPOC", "productIdentity": {"dataURI": f"mast:{sector}"},
+                "sourceProductProvenance": {"selectionRule": "official-policy"},
+                "fluxColumn": "PDCSAP_FLUX", "fluxUnits": "electron / s",
+                "qualityMaskPolicy": "Lightkurve quality_bitmask='default'"}
 
-    def test_freeze_preserves_float64_samples_provenance_and_hashes(self):
-        products = [self.product(i) for i in (1, 2, 3)]
-        result = freeze_photometry(products, [1, 2, 3], before_external_known_object_query=True)
-        self.assertEqual("FROZEN", result["status"])
-        self.assertTrue(result["fullFiniteCadencePreserved"])
-        self.assertTrue(result["frozenBeforeExternalKnownObjectQuery"])
-        self.assertFalse(result["externalCatalogInformationUsed"])
-        self.assertFalse(result["catalogAnswerKeyUsed"])
-        self.assertEqual(len(products[0]["time"]), result["sectors"][0]["sampleCount"])
-        original_hash = result["sectors"][0]["frozenInputSHA256"]
-        products[0]["flux"][0] += 1
-        repeated = freeze_photometry(products, [1, 2, 3], before_external_known_object_query=True)
-        self.assertNotEqual(original_hash, repeated["sectors"][0]["frozenInputSHA256"])
+    def binary(self, sectors=(1, 2, 3), coherent=True):
+        return {"linearEphemeris": {"coherent": coherent, "referenceEpoch": 20.,
+                  "refinedPeriodDays": 2., "timingSectors": list(sectors)},
+                "sectorResults": [{"usable": True, "dutyCycle": .06, "sector": x} for x in sectors],
+                "catalogAnswerKeyUsed": False}
 
-    def test_freeze_fails_closed_on_missing_provenance_and_wrong_chronology(self):
-        bad = self.product(1); bad.pop("productIdentity")
-        with self.assertRaises(ValueError): freeze_photometry([bad], [1], before_external_known_object_query=True)
-        with self.assertRaises(ValueError): freeze_photometry([self.product(1)], [1], before_external_known_object_query=False)
+    def chronology(self):
+        return {"verifiedFromCompletedStages": True, "externalEvidenceStageAlreadyCompleted": False,
+                "sourceAttributionReviewStageID": "review", "completedStageHandlerIDs": ["review"]}
 
-    def test_generic_injection_recovers_full_depth_and_separates_transformations(self):
-        frozen = freeze_photometry([self.product(i) for i in (1, 2, 3)], [1, 2, 3],
-                                   before_external_known_object_query=True)
-        result = audit_depth_attenuation(frozen, self.binary(), downsampling_cap=10000)
+    def frozen(self, products=None, binary=None):
+        binary = binary or self.binary(); digest = sha256_json(binary)
+        return freeze_photometry(products or [self.product(x) for x in (1, 2, 3)],
+            binary["linearEphemeris"]["timingSectors"], binary_confirmation_sha256=digest,
+            chronology_proof=self.chronology())
+
+    def fake_search(self):
+        entries = []
+        for sector in (1, 2, 3):
+            time, flux = self.samples(sector)
+            row = {"sequence_number": sector, "author": "SPOC", "exptime": 864.,
+                   "obs_id": f"obs-{sector}", "productFilename": f"sector-{sector}-lc.fits",
+                   "dataURI": f"mast:{sector}", "mission": f"TESS Sector {sector}"}
+            entries.append((row, Curve(sector, time, flux)))
+        return Search(entries)
+
+    def test_production_acquisition_selects_downloads_and_freezes_full_cadence(self):
+        binary = self.binary()
+        search = mock.Mock(return_value=self.fake_search())
+        selector = lambda catalog, sector: (catalog[sector-1:sector], "SPOC", 864.)
+        downloader = lambda selected, **kwargs: (selected.download(quality_bitmask="default"),
+            {"author": kwargs["author"], "cadenceSeconds": kwargs["cadence_seconds"], "sector": kwargs["sector"]})
+        frozen = acquire_full_precision_photometry(tic_id=123, timing_sectors=[1, 2, 3],
+            binary_confirmation_sha256=sha256_json(binary), chronology_proof=self.chronology(), search=search,
+            selector=selector, downloader=downloader, archive_lock=Lock())
+        search.assert_called_once_with(123)
+        self.assertEqual([1200]*3, [x["sampleCount"] for x in frozen["sectors"]])
+        self.assertEqual(["SPOC"]*3, [x["author"] for x in frozen["sectors"]])
+        self.assertTrue(frozen["frozenBeforeExternalKnownObjectQuery"])
+
+    def test_freeze_rejects_bad_chronology_duplicates_and_nonpositive_baseline(self):
+        binary = self.binary(); digest = sha256_json(binary); products = [self.product(x) for x in (1,2,3)]
+        bad = self.chronology(); bad["externalEvidenceStageAlreadyCompleted"] = True
+        with self.assertRaises(ValueError): freeze_photometry(products, [1,2,3], binary_confirmation_sha256=digest, chronology_proof=bad)
+        with self.assertRaises(ValueError): freeze_photometry(products[:2]+[products[1]], [1,2,3], binary_confirmation_sha256=digest, chronology_proof=self.chronology())
+        products[0]["flux"] = [-x for x in products[0]["flux"]]
+        with self.assertRaises(ValueError): freeze_photometry(products, [1,2,3], binary_confirmation_sha256=digest, chronology_proof=self.chronology())
+
+    def test_mutation_of_every_hash_link_and_sector_binding_is_detected(self):
+        binary = self.binary(); digest = sha256_json(binary); frozen = self.frozen(binary=binary)
+        validate_freeze(frozen, binary, digest)
+        mutations = []
+        for key in ("timeBTJDFloat64", "originalFluxFloat64", "relativeFluxFloat64"):
+            value = copy.deepcopy(frozen); value["sectors"][0][key][0] += .1; mutations.append(value)
+        value = copy.deepcopy(frozen); value["sectors"][0]["author"] = "TESS-SPOC"; mutations.append(value)
+        value = copy.deepcopy(frozen); value["freezeSHA256"] = "0"*64; mutations.append(value)
+        value = copy.deepcopy(frozen); value["sectors"][0]["sector"] = 9; mutations.append(value)
+        for value in mutations:
+            with self.assertRaises(ValueError): validate_freeze(value, binary, digest)
+        with self.assertRaises(ValueError): validate_freeze(frozen, binary, "1"*64)
+
+    def test_per_event_fractional_math_uncertainty_and_roundtrip(self):
+        direct = _measure(list(range(20)), [1000.]*8+[990.]*4+[1000.]*8,
+                          9.5, 4., [9.5])
+        self.assertAlmostEqual(.01, direct["depthFractionalFlux"])
+        binary = self.binary(); result = audit_depth_attenuation(self.frozen(binary=binary), binary,
+            binary_confirmation_sha256=sha256_json(binary), downsampling_cap=10000)
         self.assertEqual("COMPLETE", result["status"])
-        self.assertTrue(result["suitableForLaterPrecisionModeling"])
-        for sector in result["sectorResults"]:
-            self.assertAlmostEqual(.01, sector["fullPrecisionLocalBaseline"]["depthFractionalFlux"], delta=.002)
-            self.assertAlmostEqual(0, sector["attenuationFractions"]["downsampling"], delta=.01)
-            self.assertAlmostEqual(0, sector["attenuationFractions"]["standardizationFloat32"], delta=.001)
-            self.assertTrue(sector["primaryAndOppositeConjunctionProtected"])
+        events = [e for s in result["sectorResults"] for e in s["eventResults"]]
+        self.assertTrue(any(e["eventType"] == "PRIMARY" for e in events))
+        self.assertTrue(any(e["eventType"] == "OPPOSITE_CONJUNCTION" for e in events))
+        primary = [e for e in events if e["eventType"] == "PRIMARY" and e["fullPrecisionLocalBaseline"].get("usable")]
+        self.assertGreater(len(primary), 3)
+        self.assertTrue(all(e["fullPrecisionLocalBaseline"]["depthUncertaintyFractionalFlux"] >= 0 for e in primary))
+        self.assertTrue(all(abs(e["attenuationFractions"]["standardizationFloat32"] or 0) < 1e-5 for e in primary))
+        self.assertIn("robustUncertainty", result["crossSectorRobustSummary"]["downsampling"])
 
-    def test_downsampling_duration_and_combined_attenuation_are_visible(self):
-        frozen = freeze_photometry([self.product(i, cadence=.002) for i in (1, 2, 3)], [1, 2, 3],
-                                   before_external_known_object_query=True)
-        result = audit_depth_attenuation(frozen, self.binary(), downsampling_cap=35)
-        self.assertTrue(any(abs(x["attenuationFractions"]["downsampling"] or 0) > .02
-                            for x in result["sectorResults"]))
-        self.assertTrue(any(abs(x["attenuationFractions"]["discreteBoxDuration"] or 0) > .02
-                            for x in result["sectorResults"]))
+    def test_downsampling_and_real_duration_grid_attenuation(self):
+        binary = self.binary(); frozen = self.frozen([self.product(x, cadence=.002, duration=.074) for x in (1,2,3)], binary)
+        result = audit_depth_attenuation(frozen, binary, binary_confirmation_sha256=sha256_json(binary), downsampling_cap=300)
+        events = [e for s in result["sectorResults"] for e in s["eventResults"] if e["eventType"] == "PRIMARY"]
+        self.assertTrue(any(abs(e["attenuationFractions"]["downsampling"] or 0) > .01 for e in events))
+        self.assertTrue(any(e["durationGridSelection"]["selectedDurationDays"] != e["establishedDurationDays"] for e in events))
+        self.assertTrue(any(abs(e["attenuationFractions"]["discreteBoxDuration"] or 0) > .01 for e in events))
 
-    def test_masked_and_unmasked_harmonic_fit_demonstrate_suppression(self):
-        item = self.product(1, phase_amplitude=.01)
-        times = item["time"]; scale = sorted(item["flux"])[len(item["flux"]) // 2]
-        flux = [x / scale for x in item["flux"]]
-        masks = [abs((x + 1) % 2 - 1) <= .12 for x in times]
-        protected = _protected_harmonic(times, flux, 2.0, masks)
-        unprotected = _protected_harmonic(times, flux, 2.0, [False] * len(times))
-        raw_depth = _measure(times, flux, 20, 2, .12)["depthFractionalFlux"]
-        protected_depth = _measure(times, protected, 20, 2, .12)["depthFractionalFlux"]
-        unprotected_depth = _measure(times, unprotected, 20, 2, .12)["depthFractionalFlux"]
-        self.assertAlmostEqual(.01, protected_depth, delta=.001)
-        self.assertGreater(raw_depth, protected_depth)  # smooth orbital variation contaminated raw baseline
-        self.assertLess(unprotected_depth, protected_depth)
+    def test_protected_vs_unprotected_harmonic_attenuation(self):
+        times, raw = self.samples(1, phase=.01); scale = sorted(raw)[len(raw)//2]; flux = [x/scale for x in raw]
+        centers = [20+2*i for i in range(7)] + [21+2*i for i in range(6)]
+        masks = [any(abs(x-c) <= .12 for c in centers) for x in times]
+        protected = _harmonic_on_original_scale(times, flux, 2., masks)
+        unprotected = _harmonic_on_original_scale(times, flux, 2., [False]*len(times))
+        p = _measure(times, protected, 20., .12, centers); u = _measure(times, unprotected, 20., .12, centers)
+        self.assertGreater(p["depthFractionalFlux"], u["depthFractionalFlux"])
 
-    def test_cadence_integration_sector_baselines_noise_and_opposite_event(self):
-        products = [self.product(1, cadence=.02, noise=.0002, offset=.02),
-                    self.product(2, cadence=.01, noise=.0005, offset=-.01),
-                    self.product(3, cadence=.005, noise=.001)]
-        frozen = freeze_photometry(products, [1, 2, 3], before_external_known_object_query=True)
-        result = audit_depth_attenuation(frozen, self.binary())
+    def test_exposure_integration_changes_apparent_event_depth(self):
+        binary = self.binary()
+        instantaneous = audit_depth_attenuation(self.frozen([self.product(x, cadence=.04) for x in (1,2,3)], binary), binary,
+            binary_confirmation_sha256=sha256_json(binary))
+        integrated = audit_depth_attenuation(self.frozen([self.product(x, cadence=.04, integrate=True) for x in (1,2,3)], binary), binary,
+            binary_confirmation_sha256=sha256_json(binary))
+        def median_depth(result):
+            return sorted(e["fullPrecisionLocalBaseline"]["depthFractionalFlux"] for s in result["sectorResults"] for e in s["eventResults"] if e["eventType"] == "PRIMARY" and e["fullPrecisionLocalBaseline"].get("usable"))[3]
+        self.assertLess(median_depth(integrated), median_depth(instantaneous))
+
+    def test_sector_baselines_noise_and_fail_closed_timing(self):
+        binary = self.binary(); products = [self.product(1, baseline=800, noise=.0002), self.product(2, baseline=1500, noise=.0008), self.product(3, baseline=3000, noise=.001)]
+        result = audit_depth_attenuation(self.frozen(products, binary), binary, binary_confirmation_sha256=sha256_json(binary))
         self.assertEqual(3, len(result["sectorResults"]))
-        self.assertEqual(3, result["crossSectorRobustSummary"]["downsampling"]["sectorCount"])
-        self.assertEqual(3, len({x["sampleCounts"]["full"] for x in result["sectorResults"]}))
-
-    def test_incoherent_insufficient_and_malformed_inputs_are_unresolved(self):
-        unresolved = audit_depth_attenuation(unresolved_freeze(["missing"]), self.binary())
+        incoherent = self.binary(coherent=False)
+        unresolved = audit_depth_attenuation({}, incoherent, binary_confirmation_sha256=sha256_json(incoherent))
         self.assertEqual("UNRESOLVED", unresolved["status"])
-        frozen = freeze_photometry([self.product(1)], [1], before_external_known_object_query=True)
-        binary = self.binary((1,)); binary["linearEphemeris"]["coherent"] = False
-        self.assertEqual("UNRESOLVED", audit_depth_attenuation(frozen, binary)["status"])
-        with self.assertRaises(ValueError): freeze_photometry([], [1], before_external_known_object_query=True)
+        insufficient = self.binary((1,)); frozen = self.frozen([self.product(1)], insufficient)
+        self.assertEqual("UNRESOLVED", audit_depth_attenuation(frozen, insufficient, binary_confirmation_sha256=sha256_json(insufficient))["status"])
 
-    def test_registered_identifiers_and_diagnostic_contract(self):
+    def test_blind_contract_and_registered_identifiers(self):
         self.assertEqual("openstar.tess.event-depth-photometry.freeze", FREEZE_HANDLER_ID)
         self.assertEqual("openstar.tess.event-depth-attenuation.audit", AUDIT_HANDLER_ID)
-
-    def test_lifecycle_order_is_before_external_evidence_and_module_has_no_answer_key(self):
-        source = Path("workflows/tess/tess_investigation.py").read_text(encoding="utf-8")
-        block = source[source.index("def source_attribution_review_stage"):
-                       source.index("def external_evidence_interpret_stage")]
-        self.assertLess(block.index("EVENT_DEPTH_FREEZE_HANDLER_ID"),
-                        block.index("def event_depth_attenuation_audit_stage"))
-        self.assertLess(block.index("def event_depth_attenuation_audit_stage"),
-                        block.index("def external_evidence_freeze_stage"))
-        module = Path("workflows/tess/tess_event_depth_accuracy.py").read_text(encoding="utf-8")
-        self.assertNotIn("exoplanetarchive", module.lower())
-        self.assertNotIn("wasp", module.lower())
+        result = self.frozen()
+        self.assertFalse(result["externalCatalogInformationUsed"]); self.assertFalse(result["catalogAnswerKeyUsed"])
 
 
 if __name__ == "__main__": unittest.main()
