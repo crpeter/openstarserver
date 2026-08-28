@@ -2815,6 +2815,135 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
                 )
                 self.assertEqual(expected_handler, request.handler_id)
 
+    def test_v2_resolved_time_frequency_routes_directly_to_dynamic_harmonics(self):
+        summary = {
+            "classification": "FAMILY_PHASE_EVOLUTION",
+            "physicalMechanismResolved": False,
+            "recommendedNextTest": "DYNAMIC_HARMONIC_MODELING",
+            "periodReference": {
+                "kind": "MORPHOLOGY_RESOLVED_PHYSICAL_PERIOD",
+                "physicalCycleResolved": True,
+                "periodDays": 7.25,
+            },
+        }
+        request = time_frequency_continuation(
+            summary, request_id="014-summarize-time-frequency")
+        self.assertEqual("openstar.tess.dynamic-harmonic.analyze", request.handler_id)
+        self.assertEqual(
+            "MORPHOLOGY_RESOLVED_TIME_FREQUENCY_RECOMMENDATION",
+            request.parameters["evidenceLineage"],
+        )
+
+        for period_reference in (
+            {**summary["periodReference"], "physicalCycleResolved": False},
+            {**summary["periodReference"], "kind": "UNRESOLVED_FAMILY_ANALYSIS_REFERENCE"},
+            {**summary["periodReference"], "periodDays": None},
+            {**summary["periodReference"], "periodDays": math.inf},
+            {**summary["periodReference"], "periodDays": 0},
+        ):
+            with self.subTest(period_reference=period_reference):
+                failed_closed = time_frequency_continuation(
+                    {**summary, "periodReference": period_reference},
+                    request_id="014-summarize-time-frequency",
+                )
+                self.assertEqual("openstar.tess.finalize", failed_closed.handler_id)
+
+    def test_direct_dynamic_harmonic_handler_uses_frozen_resolved_lineage(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        store = InvestigationStore(root / "investigations")
+        investigation = store.create("direct-dynamic", WORKFLOW_ID, WORKFLOW_VERSION)
+        period = 7.25
+        paths = []
+        for sector in range(4):
+            path = self._write_light_curve(root, f"sector-{sector}", sector, 0.1 * sector)
+            paths.append(str(path))
+        prepared = {"datasetPath": paths[0], "sourceProjectPath": str(root / "project.json")}
+        independent = {"preparedSectors": [
+            {"sector": sector, "datasetPath": paths[sector]} for sector in range(1, 4)
+        ]}
+        morphology = {
+            "physicalCycleResolved": True,
+            "resolvedPhysicalPeriodDays": period,
+        }
+        summary = {
+            "classification": "FAMILY_PHASE_EVOLUTION",
+            "physicalMechanismResolved": False,
+            "recommendedNextTest": "DYNAMIC_HARMONIC_MODELING",
+            "periodReference": {
+                "kind": "MORPHOLOGY_RESOLVED_PHYSICAL_PERIOD",
+                "physicalCycleResolved": True,
+                "periodDays": period,
+            },
+        }
+        for stage_id, handler, result in (
+            ("001-prepare-target", "openstar.tess.prepare-target", prepared),
+            ("006-prepare-independent", "openstar.tess.independent.prepare", independent),
+            ("010-morphology", "openstar.tess.morphology.analyze", morphology),
+            ("014-summarize-time-frequency", "openstar.tess.time-frequency.summarize", summary),
+        ):
+            investigation = self._complete(store, investigation, stage_id, handler, result)
+
+        request = time_frequency_continuation(
+            summary, request_id="014-summarize-time-frequency")
+        engine = build_engine(
+            store, coordinator=types.SimpleNamespace(), poll_interval=0.0, timeout=None)
+        engine.chain_stages = False
+        completed, next_request = engine.run_stage(
+            investigation, request, software_id="integration", software_version="20.30")
+        stage = completed.stages[-1]
+        self.assertEqual(
+            "MORPHOLOGY_RESOLVED_TIME_FREQUENCY_RECOMMENDATION",
+            stage.result["evidenceLineage"],
+        )
+        self.assertEqual(set(paths), {
+            item["datasetPath"] for item in stage.result["sectorFits"]
+        })
+        self.assertEqual({
+            "morphology": sha256_json(morphology),
+            "timeFrequencySummary": sha256_json(summary),
+            "primaryPreparation": sha256_json(prepared),
+            "independentPreparation": sha256_json(independent),
+        }, stage.provenance.input_hashes)
+        self.assertEqual("openstar.tess.time-frequency.prepare", next_request.handler_id)
+
+        restarted = store.load(completed.id)
+        target = InvestigationTarget("synthetic:direct-dynamic", restarted.id,
+                                     WORKFLOW_ID, WORKFLOW_VERSION)
+        self.assertEqual(next_request, plan_tess_branches(restarted, target)[0].experiment)
+
+    def test_direct_dynamic_harmonic_handler_rejects_inconsistent_period(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        store = InvestigationStore(root / "investigations")
+        investigation = store.create("inconsistent-dynamic", WORKFLOW_ID, WORKFLOW_VERSION)
+        path = self._write_light_curve(root, "primary", 1, 0.0)
+        evidence = (
+            ("001-prepare-target", "openstar.tess.prepare-target", {"datasetPath": str(path)}),
+            ("006-independent", "openstar.tess.independent.prepare",
+             {"preparedSectors": [{"datasetPath": str(path)}]}),
+            ("010-morphology", "openstar.tess.morphology.analyze",
+             {"physicalCycleResolved": True, "resolvedPhysicalPeriodDays": 8.0}),
+            ("014-time-frequency", "openstar.tess.time-frequency.summarize", {
+                "recommendedNextTest": "DYNAMIC_HARMONIC_MODELING",
+                "physicalMechanismResolved": False,
+                "periodReference": {"kind": "MORPHOLOGY_RESOLVED_PHYSICAL_PERIOD",
+                                    "physicalCycleResolved": True, "periodDays": 7.25},
+            }),
+        )
+        for stage_id, handler, result in evidence:
+            investigation = self._complete(store, investigation, stage_id, handler, result)
+        engine = build_engine(
+            store, coordinator=types.SimpleNamespace(), poll_interval=0.0, timeout=None)
+        engine.chain_stages = False
+        with self.assertRaisesRegex(RuntimeError, "consistent morphology-resolved"):
+            engine.run_stage(investigation, StageRequest(
+                "015-dynamic", "openstar.tess.dynamic-harmonic.analyze",
+                {"evidenceLineage": "MORPHOLOGY_RESOLVED_TIME_FREQUENCY_RECOMMENDATION"},
+                "014-time-frequency"), software_id="integration", software_version="20.30")
+
     def test_resolved_stable_time_frequency_summary_routes_to_physical_interpretation(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
