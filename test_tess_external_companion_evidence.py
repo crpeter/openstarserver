@@ -246,6 +246,10 @@ class ExternalCompanionEvidenceTests(unittest.TestCase):
             AUDIT_HANDLER_ID as DEPTH_AUDIT_HANDLER_ID,
             FREEZE_HANDLER_ID as DEPTH_FREEZE_HANDLER_ID,
         )
+        from workflows.tess.tess_joint_event_phase_model import (
+            HANDLER_ID as JOINT_MODEL_HANDLER_ID, RESULT_VERSION as JOINT_MODEL_VERSION,
+            validate_model_hash,
+        )
         from workflows.tess.tess_investigation import build_engine
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
             store = InvestigationStore(directory)
@@ -286,14 +290,32 @@ class ExternalCompanionEvidenceTests(unittest.TestCase):
             self.assertEqual(DEPTH_AUDIT_HANDLER_ID, next_request.handler_id)
             audit = {"resultVersion": "openstar.tess-event-depth-attenuation-audit.v1",
                      "status": "COMPLETE", "externalCatalogInformationUsed": False,
-                     "catalogAnswerKeyUsed": False}
+                     "catalogAnswerKeyUsed": False,
+                     "suitableForLaterPrecisionModeling": True,
+                     "recommendedNextTest": "JOINT_TRANSIT_ECLIPSE_PHASE_CURVE_MODELING"}
             audit["auditSHA256"] = sha256_json(audit)
             with mock.patch("workflows.tess.tess_investigation.audit_depth_attenuation",
                             return_value=audit) as auditor:
                 investigation, next_request = engine.run_stage(
                     investigation, next_request, software_id="test", software_version="1")
             self.assertEqual(photometry, auditor.call_args.args[0])
+            self.assertEqual(JOINT_MODEL_HANDLER_ID, next_request.handler_id)
+            model = {"resultVersion": JOINT_MODEL_VERSION, "status": "UNRESOLVED",
+                     "classification": "PRECISION_EMPIRICAL_TRANSIT_DEPTH_UNRESOLVED",
+                     "precisionEmpiricalTransitDepthResolved": False,
+                     "globalFit": {}, "resolutionGates": {},
+                     "unresolvedReasons": ["SYNTHETIC_FAIL_CLOSED_GATE"]}
+            model["modelSHA256"] = sha256_json(model)
+            with mock.patch("workflows.tess.tess_investigation.fit_joint_event_phase_model",
+                            return_value=model) as fitter, \
+                    mock.patch("workflows.tess.tess_investigation.acquire_external_evidence") as archive:
+                investigation, next_request = engine.run_stage(
+                    investigation, next_request, software_id="test", software_version="1")
+            fitter.assert_called_once(); archive.assert_not_called()
             self.assertEqual(FREEZE_HANDLER_ID, next_request.handler_id)
+            self.assertEqual("UNRESOLVED", investigation.stages[-1].result["status"])
+            self.assertEqual(model["modelSHA256"], validate_model_hash(investigation.stages[-1].result))
+            self.assertTrue(investigation.stages[-1].artifacts)
             frozen = self.freeze([self.row()])
             with mock.patch("workflows.tess.tess_investigation.acquire_external_evidence",
                             return_value=frozen) as archive:
@@ -303,6 +325,10 @@ class ExternalCompanionEvidenceTests(unittest.TestCase):
             external_freeze_stage = investigation.stages[-1]
             self.assertEqual(audit["auditSHA256"],
                              external_freeze_stage.provenance.input_hashes["eventDepthAttenuationAudit"])
+            self.assertEqual(model["modelSHA256"],
+                             external_freeze_stage.provenance.input_hashes["jointEventPhaseModel"])
+            self.assertEqual(model["modelSHA256"],
+                             external_freeze_stage.result["jointEventPhaseModelSHA256"])
             self.assertEqual(INTERPRET_HANDLER_ID, next_request.handler_id)
             # Restart at the durable completed freeze boundary interprets the persisted
             # response and cannot call acquisition again.

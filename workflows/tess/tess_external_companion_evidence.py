@@ -304,4 +304,5 @@ def interpret_external_evidence(frozen: dict[str, Any]) -> dict[str, Any]:
             "catalogAnswerKeyUsed": False, "physicalMechanismResolved": False, "companionNatureResolved": False,
             "recommendedNextTest": ("FINAL_COMPANION_EVIDENCE_SYNTHESIS" if resolved
                                     else "EXTERNAL_COMPANION_EVIDENCE_REVIEW"),
-            "externalEvidenceFreezeSHA256": sha256_json(frozen)}
+            "externalEvidenceFreezeSHA256": sha256_json(frozen),
+            "jointEventPhaseModelSHA256": frozen.get("jointEventPhaseModelSHA256")}

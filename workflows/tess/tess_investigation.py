@@ -76,6 +76,13 @@ from .tess_event_depth_accuracy import (
     audit_depth_attenuation,
     validate_audit_hash,
 )
+from .tess_joint_event_phase_model import (
+    HANDLER_ID as JOINT_EVENT_PHASE_MODEL_HANDLER_ID,
+    chronology_from_completed_stages,
+    fit_joint_event_phase_model,
+    model_required,
+    validate_model_hash,
+)
 from .tess_localization import localize_periodic_source
 from .tess_sector_archive import TessArchiveTransientError
 from .tess_multimode import (
@@ -122,6 +129,14 @@ from .tess_target_residual_mechanism_predictive_validation import (
     analyze_predictive_validation,
     v2013_lineage_matches,
 )
+
+
+def _joint_model_chronology_from_completed_stages(completed):
+    """Derive, rather than assert, the strict pre-model completed-stage proof."""
+    required_handlers = [SOURCE_ATTRIBUTION_REVIEW_HANDLER_ID, EVENT_DEPTH_FREEZE_HANDLER_ID,
+                         EVENT_DEPTH_AUDIT_HANDLER_ID]
+    return chronology_from_completed_stages(completed, required_handlers,
+        {EXTERNAL_EVIDENCE_FREEZE_HANDLER_ID, EXTERNAL_EVIDENCE_INTERPRET_HANDLER_ID})
 from .tess_target_residual_archival_baseline import (
     adjudicate_target, adjudicate_sector, build_archival_baseline_project,
     previously_consumed_tess_sectors, verify_frozen_science_lineage,
@@ -1905,6 +1920,7 @@ def _render_report(conclusion: dict[str, Any]) -> str:
             lines.append(f"- Sector {item.get('sector')}: author={item.get('author')}, cadence={item.get('cadenceSeconds')} s, baseline={item.get('baselineDays')} d, candidatePeriod={item.get('candidatePeriodDays')} d, candidateFrequency={item.get('candidateFrequency')}, CI={item.get('candidateFrequencyConfidenceInterval')}, classification={item.get('recurrenceClassification')}, supports={item.get('supportsHistoricalResidualFamily')}")
     source_review = conclusion.get("sourceAttributionReview")
     depth_audit = conclusion.get("eventDepthAttenuationAudit")
+    joint_model = conclusion.get("jointEventPhaseModel")
     external_companion = conclusion.get("externalCompanionEvidence")
     if source_review is not None:
         lines.extend([
@@ -1929,6 +1945,22 @@ def _render_report(conclusion: dict[str, Any]) -> str:
         ])
         for sector in depth_audit.get("sectorResults") or []:
             lines.append(f"- Sector {sector.get('sector')}: samples={sector.get('sampleCounts')}, events={sector.get('eventResults')}")
+    if joint_model is not None:
+        fitted = joint_model.get("globalFit") or {}
+        lines.extend([
+            "", "## Software-blind joint transit, eclipse, and orbital phase-curve model", "",
+            f"- Status/classification: {joint_model.get('status')} / {joint_model.get('classification')}",
+            f"- Mid-transit empirical deficit: {fitted.get('midTransitFractionalFluxDeficit')} ± {fitted.get('conservativeTransitDepthUncertainty')}",
+            f"- Equivalent-box transit depth: {fitted.get('equivalentBoxTransitDepthFractionalFlux')}",
+            f"- Opposite-conjunction eclipse: {fitted.get('oppositeConjunctionEclipseDepthFractionalFlux')} ({fitted.get('oppositeConjunctionEclipseStatus')})",
+            f"- Fundamental / second-harmonic phase status: {fitted.get('fundamentalPhaseCurveStatus')} / {fitted.get('secondHarmonicPhaseCurveStatus')}",
+            f"- Independent supporting sectors: {joint_model.get('independentSupportingSectorCount')}",
+            f"- Leave-one-sector-out stable: {(joint_model.get('resolutionGates') or {}).get('leaveOneSectorOutStable')}",
+            f"- Unresolved reasons: {joint_model.get('unresolvedReasons') or []}",
+            f"- Model SHA-256: {joint_model.get('modelSHA256')}",
+            "- This empirical model claims neither a companion radius nor a complete physical transit solution.",
+            "- Fundamental phase terms are not uniquely interpreted as reflection or thermal emission.",
+        ])
     if external_companion is not None:
         synthesis_complete = conclusion.get("finalCompanionEvidenceSynthesis") is not None
         lines.extend([
@@ -3076,11 +3108,42 @@ def build_engine(
         path = (store.directory_for(investigation.id) / "artifacts" / "event-depth-accuracy" /
                 "event-depth-attenuation-audit-v1.json")
         _write_json(path, result)
+        required = model_required(result)
+        return StageOutcome(result=result,
+            next_stage=StageRequest(_next_stage_id(request.id, "joint-event-phase-model" if required else "external-evidence-freeze"),
+                                    JOINT_EVENT_PHASE_MODEL_HANDLER_ID if required else EXTERNAL_EVIDENCE_FREEZE_HANDLER_ID, {}, request.id),
+            input_hashes={"photometryFreeze": sha256_json(freeze),
+                          "binaryConfirmation": binary_hash},
+            artifacts=(_artifact(path, "application/json"),))
+
+    def joint_event_phase_model_stage(investigation, request):
+        freeze = _required_latest_result_for_handler(investigation, EVENT_DEPTH_FREEZE_HANDLER_ID)
+        audit = _required_latest_result_for_handler(investigation, EVENT_DEPTH_AUDIT_HANDLER_ID)
+        binary = _required_latest_result_for_handler(investigation, "openstar.tess.binary-confirmation.analyze")
+        completed = [stage for stage in investigation.stages if stage.status == "COMPLETE"]
+        chronology = _joint_model_chronology_from_completed_stages(completed)
+        result = fit_joint_event_phase_model(freeze, binary, audit,
+            binary_confirmation_sha256=sha256_json(binary), chronology_proof=chronology)
+        global_fit = result.get("globalFit") or {}
+        print("🧮 Software-blind joint transit/eclipse/phase model")
+        print(f"   status/classification: {result.get('status')} / {result.get('classification')}")
+        print(f"   transit depth ± conservative uncertainty: {global_fit.get('midTransitFractionalFluxDeficit')} ± {global_fit.get('conservativeTransitDepthUncertainty')}")
+        print(f"   equivalent-box depth: {global_fit.get('equivalentBoxTransitDepthFractionalFlux')}")
+        print(f"   eclipse depth/status: {global_fit.get('oppositeConjunctionEclipseDepthFractionalFlux')} / {global_fit.get('oppositeConjunctionEclipseStatus')}")
+        print(f"   phase components: {global_fit.get('fundamentalPhaseCurveStatus')} / {global_fit.get('secondHarmonicPhaseCurveStatus')}")
+        print(f"   independent sectors: {result.get('independentSupportingSectorCount')}")
+        print(f"   jackknife stable: {(result.get('resolutionGates') or {}).get('leaveOneSectorOutStable')}")
+        print(f"   unresolved reasons: {result.get('unresolvedReasons') or []}")
+        print("   no radius or complete physical transit solution is claimed")
+        path = (store.directory_for(investigation.id) / "artifacts" / "joint-event-phase-model" /
+                "joint-transit-eclipse-phase-curve-model-v1.json")
+        _write_json(path, result)
         return StageOutcome(result=result,
             next_stage=StageRequest(_next_stage_id(request.id, "external-evidence-freeze"),
                                     EXTERNAL_EVIDENCE_FREEZE_HANDLER_ID, {}, request.id),
-            input_hashes={"photometryFreeze": sha256_json(freeze),
-                          "binaryConfirmation": binary_hash},
+            input_hashes={"photometryFreeze": freeze["freezeSHA256"],
+                          "eventDepthAttenuationAudit": audit["auditSHA256"],
+                          "binaryConfirmation": sha256_json(binary)},
             artifacts=(_artifact(path, "application/json"),))
 
     def external_evidence_freeze_stage(investigation, request):
@@ -3093,6 +3156,15 @@ def build_engine(
         input_hashes = {"sourceAttributionReview": sha256_json(review),
                         "sourceLocalization": review["sourceLocalizationSHA256"],
                         "eventDepthAttenuationAudit": audit_hash}
+        model = _latest_result_for_handler(investigation, JOINT_EVENT_PHASE_MODEL_HANDLER_ID)
+        if model_required(depth_audit):
+            if model is None:
+                raise ValueError("required joint event/phase model is missing before external query")
+            model_hash = validate_model_hash(model)
+            completed_handlers = [stage.handler_id for stage in investigation.stages if stage.status == "COMPLETE"]
+            if JOINT_EVENT_PHASE_MODEL_HANDLER_ID not in completed_handlers:
+                raise ValueError("joint event/phase model chronology is not proven")
+            input_hashes["jointEventPhaseModel"] = model_hash
         try:
             result = acquire_external_evidence(review)
         except ExternalEvidenceTransientError as error:
@@ -3101,6 +3173,8 @@ def build_engine(
                         "tapEndpoint": "NASA Exoplanet Archive TAP",
                         "failure": str(error)},
                 input_hashes=input_hashes, artifacts=review_stage.artifacts) from error
+        if model is not None:
+            result = {**result, "jointEventPhaseModelSHA256": validate_model_hash(model)}
         path = (store.directory_for(investigation.id) / "artifacts" /
                 "external-companion-evidence" / "external-response-v1.json")
         _write_json(path, result)
@@ -3134,7 +3208,8 @@ def build_engine(
         review = _required_latest_result_for_handler(investigation, SOURCE_ATTRIBUTION_REVIEW_HANDLER_ID)
         frozen = _required_latest_result_for_handler(investigation, EXTERNAL_EVIDENCE_FREEZE_HANDLER_ID)
         external = _required_latest_result_for_handler(investigation, EXTERNAL_EVIDENCE_INTERPRET_HANDLER_ID)
-        result = synthesize_companion_evidence(binary, localization, review, frozen, external)
+        model = _latest_result_for_handler(investigation, JOINT_EVENT_PHASE_MODEL_HANDLER_ID)
+        result = synthesize_companion_evidence(binary, localization, review, frozen, external, model)
         path = (store.directory_for(investigation.id) / "artifacts" /
                 "companion-evidence-synthesis" / "companion-evidence-synthesis-v1.json")
         _write_json(path, result)
@@ -3148,7 +3223,8 @@ def build_engine(
         print("   human scientific review recommended: True")
         hashes = {"binaryConfirmation": sha256_json(binary), "sourceLocalization": sha256_json(localization),
                   "sourceAttributionReview": sha256_json(review), "externalEvidenceFreeze": sha256_json(frozen),
-                  "externalCompanionEvidence": sha256_json(external)}
+                  "externalCompanionEvidence": sha256_json(external),
+                  **({"jointEventPhaseModel": validate_model_hash(model)} if model is not None else {})}
         return StageOutcome(result=result,
             next_stage=StageRequest(_next_stage_id(request.id, "finalize"), "openstar.tess.finalize",
                 {"outputSuffix": "companion-evidence-synthesis-v1"}, request.id),
@@ -8950,6 +9026,9 @@ def build_engine(
         event_depth_attenuation_audit = _latest_result_for_handler(
             investigation, EVENT_DEPTH_AUDIT_HANDLER_ID,
         )
+        joint_event_phase_model = _latest_result_for_handler(
+            investigation, JOINT_EVENT_PHASE_MODEL_HANDLER_ID,
+        )
         external_companion_evidence = _latest_result_for_handler(
             investigation, EXTERNAL_EVIDENCE_INTERPRET_HANDLER_ID,
         )
@@ -10230,6 +10309,7 @@ def build_engine(
             "eclipseEventSourceLocalization": eclipse_event_localization,
             "sourceAttributionReview": source_attribution_review,
             "eventDepthAttenuationAudit": event_depth_attenuation_audit,
+            "jointEventPhaseModel": joint_event_phase_model,
             "externalCompanionEvidence": external_companion_evidence,
             "finalCompanionEvidenceSynthesis": final_companion_evidence_synthesis,
             "sourceLocalization": source_localization,
@@ -10697,6 +10777,7 @@ def build_engine(
     engine.register_handler(SOURCE_ATTRIBUTION_REVIEW_HANDLER_ID, source_attribution_review_stage)
     engine.register_handler(EVENT_DEPTH_FREEZE_HANDLER_ID, event_depth_photometry_freeze_stage)
     engine.register_handler(EVENT_DEPTH_AUDIT_HANDLER_ID, event_depth_attenuation_audit_stage)
+    engine.register_handler(JOINT_EVENT_PHASE_MODEL_HANDLER_ID, joint_event_phase_model_stage)
     engine.register_handler(EXTERNAL_EVIDENCE_FREEZE_HANDLER_ID, external_evidence_freeze_stage)
     engine.register_handler(EXTERNAL_EVIDENCE_INTERPRET_HANDLER_ID, external_evidence_interpret_stage)
     engine.register_handler(COMPANION_SYNTHESIS_HANDLER_ID, companion_evidence_synthesis_stage)

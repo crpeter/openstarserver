@@ -10,6 +10,7 @@ from .tess_external_companion_evidence import (
     REVIEW_VERSION, canonical_gaia_dr3_id, canonical_tic_id,
     interpret_external_evidence, review_source_attribution,
 )
+from .tess_joint_event_phase_model import validate_model_hash
 
 RESULT_VERSION = "openstar.final-companion-evidence-synthesis.v1"
 HANDLER_ID = "openstar.tess.final-companion-evidence-synthesis"
@@ -33,7 +34,8 @@ def synthesize_companion_evidence(binary_confirmation: dict[str, Any],
                                   localization: dict[str, Any],
                                   source_review: dict[str, Any],
                                   frozen_external_response: dict[str, Any],
-                                  external_result: dict[str, Any]) -> dict[str, Any]:
+                                  external_result: dict[str, Any],
+                                  joint_event_phase_model: dict[str, Any] | None = None) -> dict[str, Any]:
     """Validate and synthesize immutable evidence; never repairs an invalid chain."""
     artifacts = (binary_confirmation, localization, source_review,
                  frozen_external_response, external_result)
@@ -88,6 +90,18 @@ def synthesize_companion_evidence(binary_confirmation: dict[str, Any],
     _require(external_result.get("resultVersion") == EXTERNAL_RESULT_VERSION
              and external_result.get("externalEvidenceFreezeSHA256") == sha256_json(frozen_external_response),
              "freeze/result hash chain mismatch")
+    model_hash = frozen_external_response.get("jointEventPhaseModelSHA256")
+    _require(model_hash is None or (isinstance(model_hash, str) and len(model_hash) == 64),
+             "invalid joint event/phase model hash")
+    _require(external_result.get("jointEventPhaseModelSHA256") == model_hash,
+             "joint model external-evidence hash chain mismatch")
+    if model_hash is not None:
+        _require(isinstance(joint_event_phase_model, dict)
+                 and validate_model_hash(joint_event_phase_model) == model_hash,
+                 "joint model artifact/hash chain mismatch")
+    else:
+        _require(joint_event_phase_model is None,
+                 "historical evidence unexpectedly includes a joint model")
     _require(external_result.get("externalCompanionEvidenceResolved") is True
              and external_result.get("recommendedNextTest") == "FINAL_COMPANION_EVIDENCE_SYNTHESIS",
              "external companion evidence is unresolved")
@@ -178,6 +192,7 @@ def synthesize_companion_evidence(binary_confirmation: dict[str, Any],
         "sourceAttributionReviewSHA256": sha256_json(source_review),
         "externalEvidenceFreezeSHA256": sha256_json(frozen_external_response),
         "externalCompanionEvidenceSHA256": sha256_json(external_result),
+        "jointEventPhaseModelSHA256": model_hash,
         "autonomousCompanionEvidenceComplete": True,
         "softwareBlindPhotometricEvidencePreserved": True, "externalKnownObjectCatalogUsed": True,
         "catalogAnswerKeyUsed": False, "companionNatureResolved": True,
