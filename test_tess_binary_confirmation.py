@@ -304,6 +304,34 @@ class BinaryConfirmationTests(unittest.TestCase):
         self.assertAlmostEqual(PERIOD, refined, places=8)
         self.assertLess(abs(refined - PERIOD), abs(biased_period - PERIOD) / 1000.0)
 
+    def test_independent_ephemeris_prevents_distant_primary_cycle_slip(self):
+        primary = self.root / "distant-primary.json"
+        primary.write_text(json.dumps(dataset(1, 1000.0)), encoding="utf-8")
+        sectors = []
+        for sector, origin in zip(range(2, 6), (5000.0, 5200.0, 5400.0, 5600.0)):
+            path = self.root / f"distant-{sector}.json"
+            path.write_text(json.dumps(dataset(sector, origin)), encoding="utf-8")
+            sectors.append({"sector": sector, "datasetPath": str(path)})
+        result = analyze_binary_confirmation(
+            primary_dataset_path=primary,
+            independent_spec={"preparedSectors": sectors},
+            morphology={
+                **self.morphology,
+                "resolvedPhysicalPeriodDays": PERIOD * 1.00036,
+            },
+            physical_interpretation=None,
+            entry_mode=MORPHOLOGY_EVENT_SCREEN_ENTRY,
+        )
+        ephemeris = result["linearEphemeris"]
+        self.assertTrue(ephemeris["coherent"])
+        self.assertTrue(ephemeris["primarySectorIncluded"])
+        self.assertTrue(ephemeris["primaryTimingConsistent"])
+        self.assertEqual(
+            "INDEPENDENT_REFINED_EPHEMERIS",
+            ephemeris["cycleAssignmentBasis"],
+        )
+        self.assertAlmostEqual(PERIOD, ephemeris["refinedPeriodDays"], places=8)
+
     def test_newest_science_recommendation_wins(self):
         stages = [
             InvestigationStage("1", "openstar.tess.time-frequency.summarize", "COMPLETE", None, {},
