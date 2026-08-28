@@ -3006,6 +3006,29 @@ def build_engine(
                     }
         print(f"   classification: {result.get('classification')}")
         print(f"   candidate period: {result.get('candidatePeriodDays')} days")
+        recurrence_gate = result.get("recurrenceSupportGate") or {}
+        pooled_gate = (
+            recurrence_gate
+            if recurrence_gate.get("mode") == "POOLED_SPLIT_RECURRENCE"
+            else recurrence_gate.get("pooledRecurrence") or {}
+        )
+        if pooled_gate.get("independentSectorCount", 0) >= 6:
+            print(f"   pooled recurrence mode: {pooled_gate.get('mode')}")
+            print(
+                "   pooled / early / late SNR: "
+                f"{pooled_gate.get('pooledIndependentSnr')} / "
+                f"{pooled_gate.get('earlyIndependentSnr')} / "
+                f"{pooled_gate.get('lateIndependentSnr')}"
+            )
+            print(
+                "   minimum leave-one-sector-out SNR: "
+                f"{pooled_gate.get('minimumObservedLeaveOneOutSnr')}"
+            )
+            print(
+                "   maximum phase offset / tolerance: "
+                f"{pooled_gate.get('maximumPhaseOffset')} / "
+                f"{pooled_gate.get('phaseCoherenceTolerance')}"
+            )
         print(
             "   supporting independent sectors: "
             f"{result.get('supportingIndependentSectors') or []}"
