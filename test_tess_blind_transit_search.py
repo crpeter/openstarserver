@@ -511,6 +511,94 @@ class BlindTransitSearchTests(unittest.TestCase):
         self.assertEqual("HUMAN_REVIEW_REQUIRED", result["claimDecision"]["claim"])
         self.assertEqual("HUMAN_SCIENTIFIC_REVIEW", result["recommendedNextTest"])
 
+    def test_joint_gate_accepts_coherent_near_threshold_independent_sectors(self):
+        results = [
+            {
+                "role": "PRIMARY", "sector": 9, "snr": 8.72, "usable": True,
+                "cycleCoverage": 20.0, "eventEpoch": 1000.2,
+                "durationDays": 0.05,
+            },
+            {
+                "role": "INDEPENDENT", "sector": 10, "snr": 6.60,
+                "usable": False, "cycleCoverage": 20.0, "eventEpoch": 1100.2,
+                "durationDays": 0.05,
+            },
+            {
+                "role": "INDEPENDENT", "sector": 11, "snr": 6.62,
+                "usable": False, "cycleCoverage": 20.0, "eventEpoch": 1200.2,
+                "durationDays": 0.05,
+            },
+        ]
+
+        primary, supporters, ephemeris, supported, gate = (
+            tess_blind_transit_search._evaluate_recurrence_support(results, 1.0)
+        )
+
+        self.assertTrue(primary)
+        self.assertTrue(supported)
+        self.assertEqual([11, 10], [item["sector"] for item in supporters])
+        self.assertTrue(ephemeris["coherent"])
+        self.assertEqual("JOINT_NEAR_THRESHOLD_SECTORS", gate["mode"])
+        self.assertGreaterEqual(
+            gate["jointRecurrenceSnr"], gate["minimumJointRecurrenceSnr"]
+        )
+
+    def test_joint_gate_fails_closed_without_two_independent_six_sigma_events(self):
+        results = [
+            {
+                "role": "PRIMARY", "sector": 9, "snr": 8.72, "usable": True,
+                "cycleCoverage": 20.0, "eventEpoch": 1000.2,
+                "durationDays": 0.05,
+            },
+            {
+                "role": "INDEPENDENT", "sector": 10, "snr": 6.60,
+                "usable": False, "cycleCoverage": 20.0, "eventEpoch": 1100.2,
+                "durationDays": 0.05,
+            },
+            {
+                "role": "INDEPENDENT", "sector": 11, "snr": 5.99,
+                "usable": False, "cycleCoverage": 20.0, "eventEpoch": 1200.2,
+                "durationDays": 0.05,
+            },
+        ]
+
+        _, supporters, ephemeris, supported, gate = (
+            tess_blind_transit_search._evaluate_recurrence_support(results, 1.0)
+        )
+
+        self.assertFalse(supported)
+        self.assertEqual([], supporters)
+        self.assertFalse(ephemeris["coherent"])
+        self.assertEqual("NOT_SATISFIED", gate["mode"])
+
+    def test_joint_gate_fails_closed_when_event_times_are_incoherent(self):
+        results = [
+            {
+                "role": "PRIMARY", "sector": 9, "snr": 8.72, "usable": True,
+                "cycleCoverage": 20.0, "eventEpoch": 1000.2,
+                "durationDays": 0.05,
+            },
+            {
+                "role": "INDEPENDENT", "sector": 10, "snr": 6.60,
+                "usable": False, "cycleCoverage": 20.0, "eventEpoch": 1100.2,
+                "durationDays": 0.05,
+            },
+            {
+                "role": "INDEPENDENT", "sector": 11, "snr": 6.62,
+                "usable": False, "cycleCoverage": 20.0, "eventEpoch": 1200.7,
+                "durationDays": 0.05,
+            },
+        ]
+
+        _, supporters, ephemeris, supported, gate = (
+            tess_blind_transit_search._evaluate_recurrence_support(results, 1.0)
+        )
+
+        self.assertFalse(supported)
+        self.assertEqual([], supporters)
+        self.assertFalse(ephemeris["coherent"])
+        self.assertEqual("NOT_SATISFIED", gate["mode"])
+
     def test_handler_id_is_stable(self):
         self.assertEqual("openstar.tess.blind-transit-search.analyze", HANDLER_ID)
 

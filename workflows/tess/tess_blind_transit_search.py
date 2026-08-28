@@ -15,12 +15,16 @@ from typing import Any
 
 
 HANDLER_ID = "openstar.tess.blind-transit-search.analyze"
-RESULT_VERSION = "1.1"
+RESULT_VERSION = "1.2"
 ENTRY_BOUNDARY = "FULL_CHARACTERIZATION_UNRESOLVED_BROAD_VARIABILITY"
 TARGETED_BOUNDARY_ENTRY = "FULL_CHARACTERIZATION_NONRECURRENT_BOUNDARY_PERIOD"
 UNRELIABLE_PRIMARY_ENTRY = "FULL_CHARACTERIZATION_NONRECURRENT_UNRELIABLE_PRIMARY"
 MINIMUM_INDEPENDENT_SECTORS = 2
 MINIMUM_SECTOR_SNR = 7.0
+MINIMUM_JOINT_SECTOR_SNR = 6.0
+MINIMUM_JOINT_RECURRENCE_SNR = (
+    MINIMUM_SECTOR_SNR * math.sqrt(1 + MINIMUM_INDEPENDENT_SECTORS)
+)
 MINIMUM_PERIOD_DAYS = 0.2
 MAXIMUM_PERIOD_DAYS = 10.0
 PHASE_BIN_COUNT = 200
@@ -182,9 +186,10 @@ def _sector_results_for_frequency(
     period = 1.0 / frequency
     results = []
     for sector, measurement in zip(sectors, measurements):
+        cycle_coverage = (sector["times"][-1] - sector["times"][0]) / period
         usable = bool(
             measurement["snr"] >= MINIMUM_SECTOR_SNR
-            and (sector["times"][-1] - sector["times"][0]) / period >= 2.0
+            and cycle_coverage >= 2.0
         )
         median_time = float(statistics.median(sector["times"]))
         epoch = (round(median_time / period - measurement["eventPhase"])
@@ -195,6 +200,7 @@ def _sector_results_for_frequency(
             "sector": sector["sector"],
             "datasetID": sector["datasetID"],
             "usable": usable,
+            "cycleCoverage": cycle_coverage,
             "eventEpoch": epoch,
             "sampleCount": len(sector["times"]),
             "originalTimeOriginDays": sector["origin"],
@@ -260,29 +266,108 @@ def _alternating_cycle_evidence(
 
 def _candidate_evidence(
     sectors: list[dict[str, Any]], frequency: float
-) -> tuple[list[dict[str, Any]], bool, list[dict[str, Any]], dict[str, Any], bool]:
+) -> tuple[
+    list[dict[str, Any]], bool, list[dict[str, Any]], dict[str, Any], bool,
+    dict[str, Any],
+]:
     period = 1.0 / frequency
     measurements = [
         _box_score(item["times"], item["residual"], item["sigma"], frequency)
         for item in sectors
     ]
     results = _sector_results_for_frequency(sectors, measurements, frequency)
-    primary_supported = any(
-        item["role"] == "PRIMARY" and item["usable"] for item in results
+    (
+        primary_supported, independent_supporters, ephemeris, supported,
+        support_gate,
+    ) = _evaluate_recurrence_support(results, period)
+    return (
+        results, primary_supported, independent_supporters, ephemeris, supported,
+        support_gate,
     )
-    independent_supporters = [
+
+
+def _evaluate_recurrence_support(
+    results: list[dict[str, Any]], period: float
+) -> tuple[bool, list[dict[str, Any]], dict[str, Any], bool, dict[str, Any]]:
+    """Apply strict-sector evidence first, then a conservative joint gate."""
+    primary = next((item for item in results if item["role"] == "PRIMARY"), None)
+    primary_supported = bool(primary and primary["usable"])
+    strict_independent = [
         item for item in results if item["role"] == "INDEPENDENT" and item["usable"]
     ]
-    timing = [item for item in results if item["usable"]]
-    ephemeris = _linear_ephemeris(timing, period) if len(timing) >= 3 else {
-        "coherent": False, "reason": "FEWER_THAN_THREE_TOTAL_SECTOR_EVENTS"
-    }
-    supported = bool(
-        primary_supported
-        and len(independent_supporters) >= MINIMUM_INDEPENDENT_SECTORS
-        and ephemeris.get("coherent") is True
+    strict_timing = [item for item in results if item["usable"]]
+    strict_ephemeris = (
+        _linear_ephemeris(strict_timing, period) if len(strict_timing) >= 3 else {
+            "coherent": False, "reason": "FEWER_THAN_THREE_TOTAL_SECTOR_EVENTS"
+        }
     )
-    return results, primary_supported, independent_supporters, ephemeris, supported
+    strict_supported = bool(
+        primary_supported
+        and len(strict_independent) >= MINIMUM_INDEPENDENT_SECTORS
+        and strict_ephemeris.get("coherent") is True
+    )
+    if strict_supported:
+        return primary_supported, strict_independent, strict_ephemeris, True, {
+            "mode": "STRICT_INDIVIDUAL_SECTORS",
+            "strictSectorSnrThreshold": MINIMUM_SECTOR_SNR,
+            "jointIndependentSectorSnrFloor": MINIMUM_JOINT_SECTOR_SNR,
+            "minimumJointRecurrenceSnr": MINIMUM_JOINT_RECURRENCE_SNR,
+            "linearEphemerisCoherent": True,
+        }
+
+    joint_candidates = sorted(
+        (
+            item for item in results
+            if item["role"] == "INDEPENDENT"
+            and item.get("cycleCoverage", 0.0) >= 2.0
+            and item["snr"] >= MINIMUM_JOINT_SECTOR_SNR
+        ),
+        key=lambda item: item["snr"],
+        reverse=True,
+    )
+    selected_joint = joint_candidates[:MINIMUM_INDEPENDENT_SECTORS]
+    joint_recurrence_snr = (
+        math.sqrt(
+            primary["snr"] ** 2
+            + sum(item["snr"] ** 2 for item in selected_joint)
+        )
+        if primary_supported and len(selected_joint) == MINIMUM_INDEPENDENT_SECTORS
+        else None
+    )
+    joint_ephemeris = (
+        _linear_ephemeris([primary, *selected_joint], period)
+        if joint_recurrence_snr is not None else {
+            "coherent": False, "reason": "FEWER_THAN_THREE_TOTAL_SECTOR_EVENTS"
+        }
+    )
+    # The joint path is only for near-threshold evidence.  If two independent
+    # sectors already passed the strict gate but disagreed in event timing, do
+    # not discard contradictory strict evidence by selecting a smaller subset.
+    joint_supported = bool(
+        primary_supported
+        and len(strict_independent) < MINIMUM_INDEPENDENT_SECTORS
+        and joint_recurrence_snr is not None
+        and joint_recurrence_snr >= MINIMUM_JOINT_RECURRENCE_SNR
+        and joint_ephemeris.get("coherent") is True
+    )
+    support_gate = {
+        "mode": (
+            "JOINT_NEAR_THRESHOLD_SECTORS" if joint_supported
+            else "NOT_SATISFIED"
+        ),
+        "strictSectorSnrThreshold": MINIMUM_SECTOR_SNR,
+        "jointIndependentSectorSnrFloor": MINIMUM_JOINT_SECTOR_SNR,
+        "minimumJointRecurrenceSnr": MINIMUM_JOINT_RECURRENCE_SNR,
+        "jointRecurrenceSnr": joint_recurrence_snr,
+        "selectedIndependentSectors": [item.get("sector") for item in selected_joint],
+        "selectedIndependentSectorSnrs": [item["snr"] for item in selected_joint],
+        "linearEphemerisCoherent": joint_ephemeris.get("coherent") is True,
+    }
+    if joint_supported:
+        return primary_supported, selected_joint, joint_ephemeris, True, support_gate
+    return (
+        primary_supported, strict_independent, strict_ephemeris, False, support_gate,
+    )
 
 
 def _resolve_alternating_cycle_alias(
@@ -325,13 +410,14 @@ def _resolve_alternating_cycle_alias(
             result["reason"] = "DOUBLE_PERIOD_OUTSIDE_SEARCH_RANGE"
         return frequency, result
 
-    _, _, doubled_independent, doubled_ephemeris, doubled_supported = (
+    _, _, doubled_independent, doubled_ephemeris, doubled_supported, doubled_gate = (
         _candidate_evidence(sectors, frequency / 2.0)
     )
     result["doublePeriodValidation"] = {
         "supported": doubled_supported,
         "supportingIndependentSectorCount": len(doubled_independent),
         "linearEphemeris": doubled_ephemeris,
+        "recurrenceSupportGate": doubled_gate,
     }
     if not doubled_supported:
         result["reason"] = "DOUBLE_PERIOD_FAILED_RECURRENCE_OR_EPHEMERIS_GATE"
@@ -477,7 +563,7 @@ def analyze_blind_transit_search(
     period = 1.0 / frequency
     (
         sector_results, primary_supported, independent_supporters,
-        ephemeris, supported,
+        ephemeris, supported, support_gate,
     ) = _candidate_evidence(sectors, frequency)
     refined = ephemeris.get("refinedPeriodDays") if supported else None
     return {
@@ -506,6 +592,7 @@ def analyze_blind_transit_search(
         "supportingIndependentSectors": [item.get("sector") for item in independent_supporters],
         "minimumSupportingIndependentSectors": MINIMUM_INDEPENDENT_SECTORS,
         "linearEphemeris": ephemeris,
+        "recurrenceSupportGate": support_gate,
         "searchGrid": {
             "minimumFrequencyPerDay": minimum,
             "maximumFrequencyPerDay": maximum,
