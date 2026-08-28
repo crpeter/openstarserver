@@ -15,7 +15,7 @@ from typing import Any
 
 
 HANDLER_ID = "openstar.tess.blind-transit-search.analyze"
-RESULT_VERSION = "1.2"
+RESULT_VERSION = "1.3"
 ENTRY_BOUNDARY = "FULL_CHARACTERIZATION_UNRESOLVED_BROAD_VARIABILITY"
 TARGETED_BOUNDARY_ENTRY = "FULL_CHARACTERIZATION_NONRECURRENT_BOUNDARY_PERIOD"
 UNRELIABLE_PRIMARY_ENTRY = "FULL_CHARACTERIZATION_NONRECURRENT_UNRELIABLE_PRIMARY"
@@ -25,6 +25,12 @@ MINIMUM_JOINT_SECTOR_SNR = 6.0
 MINIMUM_JOINT_RECURRENCE_SNR = (
     MINIMUM_SECTOR_SNR * math.sqrt(1 + MINIMUM_INDEPENDENT_SECTORS)
 )
+MINIMUM_POOLED_INDEPENDENT_SECTORS = 6
+MINIMUM_POOLED_INDEPENDENT_SNR = 10.0
+MINIMUM_POOLED_SPLIT_SNR = 5.5
+MINIMUM_POOLED_LEAVE_ONE_OUT_SNR = 8.5
+MINIMUM_POOLED_CONTRIBUTING_SECTORS = 4
+MINIMUM_POOLED_SECTOR_ALIGNED_SNR = 1.5
 MINIMUM_PERIOD_DAYS = 0.2
 MAXIMUM_PERIOD_DAYS = 10.0
 PHASE_BIN_COUNT = 200
@@ -180,6 +186,180 @@ def _box_score(times, residual, sigma: float, frequency: float) -> dict[str, Any
     }
 
 
+def _pooled_box_score(
+    sectors: list[dict[str, Any]], frequency: float
+) -> dict[str, Any]:
+    """Measure a shared clock after normalizing every sector by its scatter."""
+    import numpy as np
+
+    if not sectors:
+        return {"snr": 0.0, "periodDays": 1.0 / frequency}
+    times = np.concatenate([item["times"] for item in sectors])
+    residual = np.concatenate([
+        item["residual"] / item["sigma"] for item in sectors
+    ])
+    return _box_score(times, residual, 1.0, frequency)
+
+
+def _phase_distance(first: float, second: float) -> float:
+    difference = abs(first - second) % 1.0
+    return min(difference, 1.0 - difference)
+
+
+def _aligned_sector_measurement(
+    sector: dict[str, Any], frequency: float, event_phase: float,
+    duty_cycle: float,
+) -> dict[str, Any]:
+    """Score one sector at a fixed pooled phase without refitting its event."""
+    import numpy as np
+
+    phases = np.remainder(sector["times"] * frequency, 1.0)
+    distance = np.abs(phases - event_phase)
+    distance = np.minimum(distance, 1.0 - distance)
+    selected = distance <= duty_cycle / 2.0
+    count = int(np.count_nonzero(selected))
+    standardized = sector["residual"] / sector["sigma"]
+    depth = -float(np.mean(standardized[selected])) if count else 0.0
+    snr = depth * math.sqrt(count) if depth > 0 else 0.0
+    return {
+        "role": sector["role"],
+        "sector": sector["sector"],
+        "datasetID": sector["datasetID"],
+        "snr": snr,
+        "depthStandardized": depth,
+        "eventSampleCount": count,
+    }
+
+
+def _pooled_recurrence_evidence(
+    sectors: list[dict[str, Any]], sector_results: list[dict[str, Any]],
+    frequency: float,
+) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any], bool]:
+    """Fail closed unless weak events recur across time and survive jackknifing."""
+    independent = [item for item in sectors if item["role"] == "INDEPENDENT"]
+    period = 1.0 / frequency
+    unavailable = {
+        "mode": "NOT_SATISFIED",
+        "minimumIndependentSectorCount": MINIMUM_POOLED_INDEPENDENT_SECTORS,
+        "independentSectorCount": len(independent),
+        "minimumPooledIndependentSnr": MINIMUM_POOLED_INDEPENDENT_SNR,
+        "minimumSplitSnr": MINIMUM_POOLED_SPLIT_SNR,
+        "minimumLeaveOneOutSnr": MINIMUM_POOLED_LEAVE_ONE_OUT_SNR,
+        "minimumContributingSectorCount": MINIMUM_POOLED_CONTRIBUTING_SECTORS,
+        "catalogAnswerKeyUsed": False,
+    }
+    if len(independent) < MINIMUM_POOLED_INDEPENDENT_SECTORS:
+        unavailable["reason"] = "INSUFFICIENT_INDEPENDENT_SECTORS_FOR_POOLING"
+        return [], {
+            "coherent": False,
+            "reason": "POOLED_RECURRENCE_GATE_NOT_SATISFIED",
+        }, unavailable, False
+
+    ordered = sorted(
+        independent, key=lambda item: float(statistics.median(item["times"]))
+    )
+    midpoint = len(ordered) // 2
+    early, late = ordered[:midpoint], ordered[midpoint:]
+    pooled = _pooled_box_score(independent, frequency)
+    early_measurement = _pooled_box_score(early, frequency)
+    late_measurement = _pooled_box_score(late, frequency)
+    primary = next(
+        item for item in sector_results if item["role"] == "PRIMARY"
+    )
+    measurements = [primary, pooled, early_measurement, late_measurement]
+    phase_tolerance = 0.75 * max(
+        float(item.get("dutyCycle") or 0.0) for item in measurements
+    )
+    maximum_phase_offset = max(
+        _phase_distance(
+            float(primary["eventPhase"]), float(item["eventPhase"])
+        )
+        for item in measurements[1:]
+    )
+    aligned = [
+        _aligned_sector_measurement(
+            item, frequency, float(pooled["eventPhase"]),
+            float(pooled["dutyCycle"]),
+        )
+        for item in independent
+    ]
+    contributing = [
+        item for item in aligned
+        if item["snr"] >= MINIMUM_POOLED_SECTOR_ALIGNED_SNR
+    ]
+    early_ids = {item["datasetID"] for item in early}
+    late_ids = {item["datasetID"] for item in late}
+    contributing_early = [
+        item for item in contributing if item["datasetID"] in early_ids
+    ]
+    contributing_late = [
+        item for item in contributing if item["datasetID"] in late_ids
+    ]
+    leave_one_out = [
+        {
+            "omittedSector": omitted["sector"],
+            "snr": _pooled_box_score(
+                [item for item in independent if item is not omitted], frequency
+            )["snr"],
+        }
+        for omitted in independent
+    ]
+    minimum_leave_one_out = min(item["snr"] for item in leave_one_out)
+    combined_snr = math.sqrt(primary["snr"] ** 2 + pooled["snr"] ** 2)
+    supported = bool(
+        primary.get("usable") is True
+        and pooled["snr"] >= MINIMUM_POOLED_INDEPENDENT_SNR
+        and early_measurement["snr"] >= MINIMUM_POOLED_SPLIT_SNR
+        and late_measurement["snr"] >= MINIMUM_POOLED_SPLIT_SNR
+        and minimum_leave_one_out >= MINIMUM_POOLED_LEAVE_ONE_OUT_SNR
+        and len(contributing) >= MINIMUM_POOLED_CONTRIBUTING_SECTORS
+        and contributing_early
+        and contributing_late
+        and maximum_phase_offset <= phase_tolerance
+        and combined_snr >= MINIMUM_JOINT_RECURRENCE_SNR
+    )
+    gate = {
+        **unavailable,
+        "mode": "POOLED_SPLIT_RECURRENCE" if supported else "NOT_SATISFIED",
+        "pooledIndependentSnr": pooled["snr"],
+        "earlyIndependentSnr": early_measurement["snr"],
+        "lateIndependentSnr": late_measurement["snr"],
+        "combinedPrimaryAndPooledSnr": combined_snr,
+        "minimumCombinedRecurrenceSnr": MINIMUM_JOINT_RECURRENCE_SNR,
+        "minimumObservedLeaveOneOutSnr": minimum_leave_one_out,
+        "maximumPhaseOffset": maximum_phase_offset,
+        "phaseCoherenceTolerance": phase_tolerance,
+        "pooledEventPhase": pooled["eventPhase"],
+        "pooledDutyCycle": pooled["dutyCycle"],
+        "contributingIndependentSectors": [
+            item["sector"] for item in contributing
+        ],
+        "contributingEarlySectors": [item["sector"] for item in contributing_early],
+        "contributingLateSectors": [item["sector"] for item in contributing_late],
+        "alignedSectorEvidence": aligned,
+        "leaveOneSectorOut": leave_one_out,
+    }
+    if not supported:
+        return [], {
+            "coherent": False,
+            "reason": "POOLED_RECURRENCE_GATE_NOT_SATISFIED",
+        }, gate, False
+    contributing_ids = {item["datasetID"] for item in contributing}
+    supporting_results = [
+        item for item in sector_results
+        if item["role"] == "INDEPENDENT" and item["datasetID"] in contributing_ids
+    ]
+    ephemeris = {
+        "coherent": True,
+        "method": "SHARED_PHASE_EARLY_LATE_POOLED_RECURRENCE",
+        "refinedPeriodDays": period,
+        "referenceEpoch": pooled["eventPhase"] * period,
+        "maximumPhaseOffset": maximum_phase_offset,
+        "coherenceTolerancePhase": phase_tolerance,
+    }
+    return supporting_results, ephemeris, gate, True
+
+
 def _sector_results_for_frequency(
     sectors: list[dict[str, Any]], measurements: list[dict[str, Any]], frequency: float
 ) -> list[dict[str, Any]]:
@@ -280,6 +460,16 @@ def _candidate_evidence(
         primary_supported, independent_supporters, ephemeris, supported,
         support_gate,
     ) = _evaluate_recurrence_support(results, period)
+    if not supported:
+        (
+            pooled_supporters, pooled_ephemeris, pooled_gate, pooled_supported,
+        ) = _pooled_recurrence_evidence(sectors, results, frequency)
+        support_gate["pooledRecurrence"] = pooled_gate
+        if pooled_supported:
+            independent_supporters = pooled_supporters
+            ephemeris = pooled_ephemeris
+            supported = True
+            support_gate = pooled_gate
     return (
         results, primary_supported, independent_supporters, ephemeris, supported,
         support_gate,
@@ -456,7 +646,30 @@ def _search_grid(sectors: list[dict[str, Any]], minimum: float, maximum: float):
                 (result["snr"] for result in per_sector[1:]), reverse=True
             )
             required = [primary_snr, *independent_snrs[:MINIMUM_INDEPENDENT_SECTORS]]
-            combined.append(min(required) + 0.05 * sum(required))
+            if len(sectors) - 1 >= MINIMUM_POOLED_INDEPENDENT_SECTORS:
+                ordered = sorted(
+                    sectors[1:],
+                    key=lambda item: float(statistics.median(item["times"])),
+                )
+                midpoint = len(ordered) // 2
+                pooled_snr = _pooled_box_score(
+                    sectors[1:], float(frequency)
+                )["snr"]
+                early_snr = _pooled_box_score(
+                    ordered[:midpoint], float(frequency)
+                )["snr"]
+                late_snr = _pooled_box_score(
+                    ordered[midpoint:], float(frequency)
+                )["snr"]
+                pooled_score = (
+                    min(primary_snr, pooled_snr)
+                    + 0.05 * (primary_snr + pooled_snr)
+                    + 0.02 * (early_snr + late_snr)
+                )
+                strict_score = min(required) + 0.05 * sum(required)
+                combined.append(max(strict_score, pooled_score))
+            else:
+                combined.append(min(required) + 0.05 * sum(required))
             details.append(per_sector)
         return np.asarray(combined), details
 
@@ -599,7 +812,11 @@ def analyze_blind_transit_search(
             "coarseFrequencyStepPerDay": coarse_step,
             "fullObservationSpanDays": full_span,
             "fineFrequencyStepPerDay": fine_step,
-            "selectionSupportRule": "PRIMARY_PLUS_TWO_INDEPENDENT_SECTORS",
+            "selectionSupportRule": (
+                "PRIMARY_PLUS_TWO_INDEPENDENT_OR_POOLED_SPLIT_RECURRENCE"
+                if len(sectors) - 1 >= MINIMUM_POOLED_INDEPENDENT_SECTORS
+                else "PRIMARY_PLUS_TWO_INDEPENDENT_SECTORS"
+            ),
             "phaseBinCount": PHASE_BIN_COUNT,
             "dutyCycles": list(DUTY_CYCLES),
         },

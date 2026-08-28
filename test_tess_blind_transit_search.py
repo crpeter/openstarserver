@@ -81,6 +81,43 @@ class BlindTransitSearchTests(unittest.TestCase):
         broad = {"claimDecision": {"claim": "CANDIDATE_PERIOD"}}
         return paths[0], independent, morphology, broad
 
+    def _prepared_pooled_sectors(
+        self, *, period: float = 5.0, late_transits: bool = True
+    ):
+        import numpy as np
+
+        sectors = []
+        epoch = 0.37
+        specifications = [("PRIMARY", 1, 0.0, 1.8)] + [
+            (
+                "INDEPENDENT",
+                index + 2,
+                100.0 * (index + 1),
+                1.0 if late_transits or index < 4 else 0.0,
+            )
+            for index in range(8)
+        ]
+        for role, sector, origin, depth in specifications:
+            times = np.arange(origin, origin + 20.0, 0.01)
+            residual = np.zeros_like(times)
+            distance = np.abs(
+                np.remainder(times - epoch + period / 2.0, period)
+                - period / 2.0
+            )
+            residual[distance <= 0.025] -= depth
+            sectors.append({
+                "role": role,
+                "sector": sector,
+                "datasetID": f"sector-{sector}",
+                "times": times,
+                "residual": residual,
+                "sigma": 1.0,
+                "origin": origin,
+                "cadence": 0.01,
+                "detrendWindowSamples": 75,
+            })
+        return sectors
+
     def test_entry_gate_is_exact_and_requires_two_independent_sectors(self):
         morphology = {"physicalCycleResolved": False}
         independent = {
@@ -598,6 +635,54 @@ class BlindTransitSearchTests(unittest.TestCase):
         self.assertEqual([], supporters)
         self.assertFalse(ephemeris["coherent"])
         self.assertEqual("NOT_SATISFIED", gate["mode"])
+
+    def test_pooled_gate_accepts_weak_events_repeated_across_time(self):
+        sectors = self._prepared_pooled_sectors()
+
+        results, primary, supporters, ephemeris, supported, gate = (
+            tess_blind_transit_search._candidate_evidence(sectors, 0.2)
+        )
+
+        self.assertTrue(primary)
+        self.assertTrue(supported)
+        self.assertTrue(ephemeris["coherent"])
+        self.assertEqual("POOLED_SPLIT_RECURRENCE", gate["mode"])
+        self.assertGreaterEqual(
+            gate["pooledIndependentSnr"], gate["minimumPooledIndependentSnr"]
+        )
+        self.assertGreaterEqual(
+            gate["minimumObservedLeaveOneOutSnr"],
+            gate["minimumLeaveOneOutSnr"],
+        )
+        self.assertGreaterEqual(len(supporters), 4)
+        self.assertTrue(all(
+            not item["usable"] for item in results
+            if item["role"] == "INDEPENDENT"
+        ))
+        self.assertFalse(gate["catalogAnswerKeyUsed"])
+
+    def test_pooled_gate_rejects_events_missing_from_late_sectors(self):
+        sectors = self._prepared_pooled_sectors(late_transits=False)
+
+        _, _, supporters, ephemeris, supported, gate = (
+            tess_blind_transit_search._candidate_evidence(sectors, 0.2)
+        )
+
+        self.assertFalse(supported)
+        self.assertEqual([], supporters)
+        self.assertFalse(ephemeris["coherent"])
+        pooled = gate["pooledRecurrence"]
+        self.assertEqual("NOT_SATISFIED", pooled["mode"])
+        self.assertLess(pooled["lateIndependentSnr"], pooled["minimumSplitSnr"])
+
+    def test_pooled_search_grid_selects_shared_weak_clock(self):
+        sectors = self._prepared_pooled_sectors(period=5.0)
+
+        frequency, _, _, _, _, _ = tess_blind_transit_search._search_grid(
+            sectors, 0.15, 0.3
+        )
+
+        self.assertAlmostEqual(0.2, frequency, delta=0.001)
 
     def test_handler_id_is_stable(self):
         self.assertEqual("openstar.tess.blind-transit-search.analyze", HANDLER_ID)
