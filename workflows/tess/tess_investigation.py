@@ -2512,6 +2512,7 @@ def build_engine(
         interpreted["primaryBoundaryHit"] = (
             primary_analysis.get("primaryBoundaryHit") is True
         )
+        interpreted["primaryReliable"] = primary_analysis.get("primaryReliable")
         interpreted["contradictionPlan"] = contradiction_plan
         full_characterization_confirmed = (
             goal == "FULL_CHARACTERIZATION"

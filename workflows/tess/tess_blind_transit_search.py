@@ -18,6 +18,7 @@ HANDLER_ID = "openstar.tess.blind-transit-search.analyze"
 RESULT_VERSION = "1.0"
 ENTRY_BOUNDARY = "FULL_CHARACTERIZATION_UNRESOLVED_BROAD_VARIABILITY"
 TARGETED_BOUNDARY_ENTRY = "FULL_CHARACTERIZATION_NONRECURRENT_BOUNDARY_PERIOD"
+UNRELIABLE_PRIMARY_ENTRY = "FULL_CHARACTERIZATION_NONRECURRENT_UNRELIABLE_PRIMARY"
 MINIMUM_INDEPENDENT_SECTORS = 2
 MINIMUM_SECTOR_SNR = 7.0
 MINIMUM_PERIOD_DAYS = 0.2
@@ -53,10 +54,18 @@ def blind_transit_search_continuation(
         and contradiction.get("reason")
         == "insufficient-independent-evidence-for-broad-contradiction-search"
     )
+    unreliable_primary_spent = (
+        targeted_claim in {"CANDIDATE_PERIOD", "HUMAN_REVIEW_REQUIRED"}
+        and (targeted_interpretation or {}).get("primaryReliable") is False
+    )
     return (
         independent_spec.get("investigationGoal") == "FULL_CHARACTERIZATION"
         and len(prepared) >= MINIMUM_INDEPENDENT_SECTORS
-        and (broad_path_spent or targeted_boundary_spent)
+        and (
+            broad_path_spent
+            or targeted_boundary_spent
+            or unreliable_primary_spent
+        )
     )
 
 
@@ -320,7 +329,11 @@ def analyze_blind_transit_search(
         "experiment": "SOFTWARE_BLIND_MULTI_SECTOR_BOX_PERIOD_SEARCH",
         "entryBoundary": (
             ENTRY_BOUNDARY if broad_interpretation is not None
-            else TARGETED_BOUNDARY_ENTRY
+            else (
+                UNRELIABLE_PRIMARY_ENTRY
+                if (targeted_interpretation or {}).get("primaryReliable") is False
+                else TARGETED_BOUNDARY_ENTRY
+            )
         ),
         "classification": (
             "REPLICATED_BLIND_TRANSIT_LIKE_CANDIDATE" if supported

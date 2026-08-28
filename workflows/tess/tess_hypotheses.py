@@ -383,9 +383,18 @@ def plan(
             "The primary distributed search did not meet the reliable-period threshold.",
         )
         return {
-            "action": "STOP",
+            "action": (
+                "INDEPENDENT_SECTOR_FOLLOWUP"
+                if full_characterization and period is not None
+                else "STOP"
+            ),
             "claimDecision": claim.as_dict(),
             "reason": "primary-period-not-reliable",
+            **(
+                {"investigationGoal": investigation_goal}
+                if full_characterization
+                else {}
+            ),
         }
 
     if not analysis.get("catalogCoverageComplete"):

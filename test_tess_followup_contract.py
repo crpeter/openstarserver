@@ -79,6 +79,24 @@ class LowFrequencyFollowupContractTests(unittest.TestCase):
                          full["claimDecision"]["claim"])
         self.assertEqual("FULL_CHARACTERIZATION", full["investigationGoal"])
 
+    def test_unreliable_primary_continues_only_for_full_characterization(self):
+        analysis = {
+            "observedPeriodDays": 6.08,
+            "primaryReliable": False,
+            "primaryBoundaryHit": False,
+            "bestCatalogMatch": None,
+            "rotationSanity": {},
+        }
+
+        ordinary = plan(analysis, _identity())
+        full = plan(analysis, _identity(), "FULL_CHARACTERIZATION")
+
+        self.assertEqual(("STOP", "primary-period-not-reliable"),
+                         (ordinary["action"], ordinary["reason"]))
+        self.assertEqual("INDEPENDENT_SECTOR_FOLLOWUP", full["action"])
+        self.assertEqual("primary-period-not-reliable", full["reason"])
+        self.assertEqual("FULL_CHARACTERIZATION", full["investigationGoal"])
+
     def test_blind_b_shaped_harmonic_uses_independent_sector(self):
         analysis = analyze(
             _primary(0.8001069097176371),
