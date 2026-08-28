@@ -5,8 +5,10 @@ import unittest
 from pathlib import Path
 
 from workflows.tess.tess_binary_confirmation import (
+    MORPHOLOGY_EVENT_SCREEN_ENTRY,
     _sector,
     analyze_binary_confirmation,
+    morphology_event_screening_continuation,
     physical_interpretation_continuation,
 )
 from workflows.tess.tess_target_residual_astrophysical_interpretation import newest_authoritative_recommendation
@@ -41,7 +43,8 @@ class BinaryConfirmationTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
         self.morphology = {"physicalCycleResolved": True,
-                           "resolvedPhysicalPeriodDays": PERIOD}
+                           "resolvedPhysicalPeriodDays": PERIOD,
+                           "morphologyClass": "DOUBLE_WAVE_PHYSICAL_CYCLE_SUPPORTED"}
         self.physical = {"recommendedNextTest": "INDEPENDENT_BINARY_CONFIRMATION",
                          "physicalMechanismResolved": False,
                          "preferredPhotometricHypothesis": "BINARY_LIKE_DOUBLE_WAVE"}
@@ -227,6 +230,79 @@ class BinaryConfirmationTests(unittest.TestCase):
                            ("preferredPhotometricHypothesis", "ROTATION_LIKE")):
             changed = dict(self.physical); changed[key] = value
             self.assertFalse(physical_interpretation_continuation(changed, self.morphology))
+
+    def test_resolved_double_wave_enters_blind_event_screen_without_physical_label(self):
+        independent = {
+            "preparedSectors": [
+                {"datasetPath": f"sector-{sector}.json"}
+                for sector in range(2, 5)
+            ]
+        }
+        self.assertTrue(
+            morphology_event_screening_continuation(self.morphology, independent)
+        )
+        for changed in (
+            {**self.morphology, "physicalCycleResolved": False},
+            {**self.morphology, "resolvedPhysicalPeriodDays": float("nan")},
+            {**self.morphology, "morphologyClass": "RAW_CYCLE_SUPPORTED"},
+        ):
+            self.assertFalse(
+                morphology_event_screening_continuation(changed, independent)
+            )
+        self.assertFalse(
+            morphology_event_screening_continuation(
+                self.morphology,
+                {"preparedSectors": independent["preparedSectors"][:2]},
+            )
+        )
+
+        primary = self.root / "screen-primary.json"
+        primary.write_text(json.dumps(dataset(1, 1000.0)), encoding="utf-8")
+        sectors = []
+        for sector in range(2, 6):
+            path = self.root / f"screen-{sector}.json"
+            path.write_text(
+                json.dumps(dataset(sector, 1000.0 + (sector - 1) * 30.0)),
+                encoding="utf-8",
+            )
+            sectors.append({"sector": sector, "datasetPath": str(path)})
+        result = analyze_binary_confirmation(
+            primary_dataset_path=primary,
+            independent_spec={"preparedSectors": sectors},
+            morphology=self.morphology,
+            physical_interpretation=None,
+            entry_mode=MORPHOLOGY_EVENT_SCREEN_ENTRY,
+        )
+        self.assertEqual(MORPHOLOGY_EVENT_SCREEN_ENTRY, result["entryBoundary"])
+        self.assertEqual(
+            "REPLICATED_ECLIPSE_LIKE_EVENT_SUPPORTED",
+            result["independentEvidence"]["classification"],
+        )
+        self.assertFalse(result["catalogAnswerKeyUsed"])
+
+    def test_long_baseline_event_epochs_correct_a_biased_morphology_period(self):
+        primary = self.root / "accuracy-primary.json"
+        primary.write_text(json.dumps(dataset(1, 1000.0)), encoding="utf-8")
+        sectors = []
+        for sector, origin in zip(range(2, 6), (1200.0, 1400.0, 1600.0, 1800.0)):
+            path = self.root / f"accuracy-{sector}.json"
+            path.write_text(json.dumps(dataset(sector, origin)), encoding="utf-8")
+            sectors.append({"sector": sector, "datasetPath": str(path)})
+        biased_period = PERIOD * 1.00036
+        result = analyze_binary_confirmation(
+            primary_dataset_path=primary,
+            independent_spec={"preparedSectors": sectors},
+            morphology={
+                **self.morphology,
+                "resolvedPhysicalPeriodDays": biased_period,
+            },
+            physical_interpretation=None,
+            entry_mode=MORPHOLOGY_EVENT_SCREEN_ENTRY,
+        )
+        refined = result["linearEphemeris"]["refinedPeriodDays"]
+        self.assertGreater(abs(biased_period - PERIOD), 0.0007)
+        self.assertAlmostEqual(PERIOD, refined, places=8)
+        self.assertLess(abs(refined - PERIOD), abs(biased_period - PERIOD) / 1000.0)
 
     def test_newest_science_recommendation_wins(self):
         stages = [
