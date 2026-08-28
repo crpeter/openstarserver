@@ -7,7 +7,7 @@ import argparse
 import hashlib
 import json
 import re
-import shutil
+import tempfile
 from pathlib import Path
 
 import lightkurve as lk
@@ -29,7 +29,9 @@ from prepare_tess import (
 )
 
 
-FORBIDDEN_PROJECT_FRAGMENTS = ("wasp-18",)
+PREPARER_ID = "openstar.tess-known-target-blind-benchmark-preparer"
+PREPARER_SCHEMA_VERSION = 1
+OWNED_FILES = frozenset(("dataset.json", "project.json"))
 
 
 def _slug(value: str) -> str:
@@ -66,7 +68,11 @@ def select_product(tic: int, sector: int):
         )
     exposures = np.asarray([_exptime(fallback, i) for i in range(len(fallback))])
     finite = np.flatnonzero(np.isfinite(exposures))
-    index = int(finite[np.argmin(exposures[finite])]) if len(finite) else 0
+    if not len(finite):
+        raise RuntimeError(
+            f"TESS-SPOC products for TIC {tic}, Sector {sector} have no finite cadence."
+        )
+    index = int(finite[np.argmin(exposures[finite])])
     return fallback[index : index + 1], FALLBACK_AUTHOR, _exptime(fallback, index)
 
 
@@ -80,41 +86,97 @@ def _write_json(path: Path, value: dict) -> None:
     path.write_text(json.dumps(value, indent=2, allow_nan=False) + "\n", encoding="utf-8")
 
 
+def _owned_manifest(project_id: str) -> dict:
+    return {
+        "preparerID": PREPARER_ID,
+        "schemaVersion": PREPARER_SCHEMA_VERSION,
+        "ownedFiles": sorted(OWNED_FILES),
+        "projectID": project_id,
+    }
+
+
+def _validate_owned_output(output: Path, project_id: str) -> None:
+    """Fail closed unless output is exactly a directory created by this preparer."""
+    if output.is_symlink() or not output.is_dir():
+        raise RuntimeError("Safe overwrite requires a non-symlink output directory.")
+    entries = list(output.iterdir())
+    if {entry.name for entry in entries} != OWNED_FILES:
+        raise RuntimeError("Safe overwrite refuses missing or unexpected output entries.")
+    if any(entry.is_symlink() or not entry.is_file() for entry in entries):
+        raise RuntimeError("Safe overwrite requires exact regular owned files; symlinks are refused.")
+    try:
+        manifest = json.loads((output / "project.json").read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise RuntimeError("Safe overwrite refuses a malformed project.json.") from error
+    if not isinstance(manifest, dict) or manifest.get("preparer") != _owned_manifest(project_id):
+        raise RuntimeError("Safe overwrite ownership marker, schema, or project ID mismatch.")
+    if manifest.get("id") != project_id:
+        raise RuntimeError("Safe overwrite project ID mismatch.")
+
+
+def _remove_owned_directory(path: Path) -> None:
+    """Remove an already-validated owned directory without recursive deletion."""
+    for name in OWNED_FILES:
+        (path / name).unlink()
+    path.rmdir()
+
+
+def _validate_staged_output(stage: Path, output: Path, project_id: str) -> None:
+    _validate_owned_output(stage, project_id)
+    manifest = json.loads((stage / "project.json").read_text(encoding="utf-8"))
+    dataset = json.loads((stage / "dataset.json").read_text(encoding="utf-8"))
+    entry = manifest["datasets"][0]
+    if entry.get("path") != str((output / "dataset.json").resolve()):
+        raise RuntimeError("Staged manifest has an invalid final dataset path.")
+    if entry.get("ticID") != (dataset.get("source") or {}).get("ticID"):
+        raise RuntimeError("Staged manifest and dataset TIC IDs disagree.")
+    if hashlib.sha256((stage / "dataset.json").read_bytes()).hexdigest() != entry.get(
+        "datasetSHA256"
+    ):
+        raise RuntimeError("Staged dataset hash mismatch.")
+
+
 def prepare_benchmark(
     *, tic: int, primary_sector: int, blind_label: str, project_id: str,
     output_dir: str | Path, overwrite: bool = False,
 ) -> Path:
-    output = Path(output_dir).expanduser().resolve()
+    requested_output = Path(output_dir).expanduser()
+    if requested_output.is_symlink():
+        raise RuntimeError("Safe overwrite requires a non-symlink output directory.")
+    output = requested_output.resolve()
     manifest_path = output / "project.json"
     if output.exists():
         if not overwrite:
             raise FileExistsError(f"Output project already exists: {output}")
-        if not manifest_path.is_file():
-            raise RuntimeError("Safe overwrite requires an existing project.json marker.")
-        previous = json.loads(manifest_path.read_text(encoding="utf-8"))
-        if previous.get("id") != project_id:
-            raise RuntimeError("Safe overwrite refuses a project with a different id.")
-        shutil.rmtree(output)
+        _validate_owned_output(output, project_id)
 
-    selected, author, cadence = select_product(tic, primary_sector)
-    light_curve = selected.download(quality_bitmask="default")
-    if light_curve is None:
-        raise RuntimeError("The selected official TESS light curve could not be downloaded.")
-    actual_sector = getattr(light_curve, "sector", None)
-    if actual_sector is None:
-        actual_sector = getattr(light_curve, "meta", {}).get("SECTOR", primary_sector)
-    if int(actual_sector) != primary_sector:
-        raise RuntimeError(f"Downloaded Sector {actual_sector}; expected {primary_sector}.")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    stage = Path(tempfile.mkdtemp(prefix=f".{output.name}.prepare-", dir=output.parent))
+    backup = output.with_name(f".{output.name}.replace-backup")
+    if backup.exists() or backup.is_symlink():
+        stage.rmdir()
+        raise RuntimeError(f"Safe overwrite backup path already exists: {backup}")
 
-    original_count = len(light_curve)
-    finite_count = int(np.count_nonzero(
-        np.isfinite(np.asarray(light_curve.time.value, dtype=np.float64))
-        & np.isfinite(np.asarray(light_curve.flux.value, dtype=np.float64))
-    ))
-    times, flux, origin = prepare_light_curve(light_curve)
-    reference = calculate_astropy_reference(times, flux)
-    dataset_id = f"tess-tic-{tic}-sector-{primary_sector}"
-    dataset = {
+    try:
+        selected, author, cadence = select_product(tic, primary_sector)
+        light_curve = selected.download(quality_bitmask="default")
+        if light_curve is None:
+            raise RuntimeError("The selected official TESS light curve could not be downloaded.")
+        actual_sector = getattr(light_curve, "sector", None)
+        if actual_sector is None:
+            actual_sector = getattr(light_curve, "meta", {}).get("SECTOR", primary_sector)
+        if int(actual_sector) != primary_sector:
+            raise RuntimeError(f"Downloaded Sector {actual_sector}; expected {primary_sector}.")
+
+        original_count = len(light_curve)
+        finite_count = int(np.count_nonzero(
+            np.isfinite(np.asarray(light_curve.time.value, dtype=np.float64))
+            & np.isfinite(np.asarray(light_curve.flux.value, dtype=np.float64))
+        ))
+        times, flux, origin = prepare_light_curve(light_curve)
+        reference = calculate_astropy_reference(times, flux)
+        dataset_id = f"tess-tic-{tic}-sector-{primary_sector}"
+        dataset = {
         "id": dataset_id,
         "targetName": blind_label,
         "mission": "TESS",
@@ -137,20 +199,43 @@ def prepare_benchmark(
             "frequenciesPerWorkUnit": FREQUENCIES_PER_WORK_UNIT,
         },
         "reference": reference,
-    }
-    dataset_path = output / "dataset.json"
-    _write_json(dataset_path, dataset)
-    manifest = {
-        "id": project_id, "name": blind_label, "workloadID": WORKLOAD_ID,
-        "datasets": [{
-            "id": dataset_id, "path": "dataset.json", "targetName": blind_label,
+        }
+        staged_dataset_path = stage / "dataset.json"
+        _write_json(staged_dataset_path, dataset)
+        manifest = {
+            "id": project_id, "name": blind_label, "workloadID": WORKLOAD_ID,
+            "preparer": _owned_manifest(project_id),
+            "datasets": [{
+            "id": dataset_id, "path": str((output / "dataset.json").resolve()),
+            "targetName": blind_label,
             "ticID": tic, "sector": primary_sector, "author": author,
             "cadenceSeconds": cadence, "role": "blind",
-            "datasetSHA256": hashlib.sha256(dataset_path.read_bytes()).hexdigest(),
+            "datasetSHA256": hashlib.sha256(staged_dataset_path.read_bytes()).hexdigest(),
             "workUnitCount": expected_work_unit_count(),
-        }],
-    }
-    _write_json(manifest_path, manifest)
+            }],
+        }
+        _write_json(stage / "project.json", manifest)
+        _validate_staged_output(stage, output, project_id)
+
+        if output.exists():
+            output.rename(backup)
+        try:
+            stage.rename(output)
+        except BaseException:
+            if backup.exists() and not output.exists():
+                backup.rename(output)
+            raise
+        if backup.exists():
+            _remove_owned_directory(backup)
+    except BaseException:
+        if stage.exists():
+            entries = list(stage.iterdir())
+            if all(entry.name in OWNED_FILES and entry.is_file() and not entry.is_symlink()
+                   for entry in entries):
+                for entry in entries:
+                    entry.unlink()
+                stage.rmdir()
+        raise
     return manifest_path
 
 
@@ -174,9 +259,8 @@ def parse_args(argv=None):
         _slug(args.project_id)
     except ValueError as error:
         parser.error(f"invalid --project-id: {error}")
-    lowered = args.project_id.lower()
-    if any(fragment in lowered for fragment in FORBIDDEN_PROJECT_FRAGMENTS):
-        parser.error("--project-id refuses reuse of a prior benchmark family")
+    if args.project_id != _slug(args.project_id):
+        parser.error("--project-id must already be canonical lowercase [a-z0-9._-]")
     return args
 
 

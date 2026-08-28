@@ -10,8 +10,10 @@ The generic preparer downloads only the requested primary-sector light curve fro
 official MAST TESS products. It prefers a SPOC 120-second product and otherwise
 uses the shortest available TESS-SPOC product. The resulting manifest can be
 passed directly to the autonomous TESS runner. Use a new durable output directory;
-existing output is refused unless `--overwrite` is supplied, and overwrite is
-limited to a preparer-created project with the same project ID.
+existing output is refused unless `--overwrite` is supplied. Overwrite requires
+the preparer's exact ownership marker and schema, the same project ID, and exactly
+the two regular files owned by the preparer. A replacement is fully prepared in a
+sibling temporary directory before the existing benchmark is exchanged.
 
 Keep answer-key names, periods, epochs, depths, classifications, and expected
 follow-up sectors out of the arguments and paths. For example:
