@@ -78,6 +78,7 @@ from .tess_event_depth_accuracy import (
 )
 from .tess_joint_event_phase_model import (
     HANDLER_ID as JOINT_EVENT_PHASE_MODEL_HANDLER_ID,
+    chronology_from_completed_stages,
     fit_joint_event_phase_model,
     model_required,
     validate_model_hash,
@@ -128,6 +129,14 @@ from .tess_target_residual_mechanism_predictive_validation import (
     analyze_predictive_validation,
     v2013_lineage_matches,
 )
+
+
+def _joint_model_chronology_from_completed_stages(completed):
+    """Derive, rather than assert, the strict pre-model completed-stage proof."""
+    required_handlers = [SOURCE_ATTRIBUTION_REVIEW_HANDLER_ID, EVENT_DEPTH_FREEZE_HANDLER_ID,
+                         EVENT_DEPTH_AUDIT_HANDLER_ID]
+    return chronology_from_completed_stages(completed, required_handlers,
+        {EXTERNAL_EVIDENCE_FREEZE_HANDLER_ID, EXTERNAL_EVIDENCE_INTERPRET_HANDLER_ID})
 from .tess_target_residual_archival_baseline import (
     adjudicate_target, adjudicate_sector, build_archival_baseline_project,
     previously_consumed_tess_sectors, verify_frozen_science_lineage,
@@ -3112,23 +3121,7 @@ def build_engine(
         audit = _required_latest_result_for_handler(investigation, EVENT_DEPTH_AUDIT_HANDLER_ID)
         binary = _required_latest_result_for_handler(investigation, "openstar.tess.binary-confirmation.analyze")
         completed = [stage for stage in investigation.stages if stage.status == "COMPLETE"]
-        external = [stage for stage in completed if stage.handler_id in {
-            EXTERNAL_EVIDENCE_FREEZE_HANDLER_ID, EXTERNAL_EVIDENCE_INTERPRET_HANDLER_ID}]
-        required_handlers = [SOURCE_ATTRIBUTION_REVIEW_HANDLER_ID, EVENT_DEPTH_FREEZE_HANDLER_ID,
-                             EVENT_DEPTH_AUDIT_HANDLER_ID]
-        positions = [[index for index, stage in enumerate(completed)
-                      if stage.handler_id == handler] for handler in required_handlers]
-        verified = (all(len(items) == 1 for items in positions)
-                    and [items[0] for items in positions] == sorted(items[0] for items in positions)
-                    and not external)
-        chronology = {"verifiedFromCompletedStages": verified,
-            "externalEvidenceStageAlreadyCompleted": bool(external),
-            "requiredPreModelStageHandlerIDs": required_handlers,
-            "requiredPreModelStageIDs": [completed[items[0]].id if len(items) == 1 else None
-                                         for items in positions],
-            "requiredPreModelStageOccurrenceCounts": [len(items) for items in positions],
-            "completedStageHandlerIDs": [stage.handler_id for stage in completed],
-            "completedStageIDs": [stage.id for stage in completed]}
+        chronology = _joint_model_chronology_from_completed_stages(completed)
         result = fit_joint_event_phase_model(freeze, binary, audit,
             binary_confirmation_sha256=sha256_json(binary), chronology_proof=chronology)
         global_fit = result.get("globalFit") or {}

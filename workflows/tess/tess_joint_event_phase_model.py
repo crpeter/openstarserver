@@ -51,6 +51,24 @@ def model_required(audit: dict[str, Any]) -> bool:
             and audit.get("catalogAnswerKeyUsed") is False)
 
 
+def chronology_from_completed_stages(completed, required_handlers, external_handlers):
+    """Derive a strict, unique pre-model ledger proof from completed stages."""
+    required_handlers=list(required_handlers); external_handlers=set(external_handlers)
+    positions=[[index for index,stage in enumerate(completed) if stage.handler_id==handler]
+               for handler in required_handlers]
+    external=[stage for stage in completed if stage.handler_id in external_handlers]
+    unique_positions=[items[0] for items in positions if len(items)==1]
+    verified=(len(unique_positions)==len(required_handlers)
+              and unique_positions==sorted(unique_positions) and not external)
+    return {"verifiedFromCompletedStages":verified,
+        "externalEvidenceStageAlreadyCompleted":bool(external),
+        "requiredPreModelStageHandlerIDs":required_handlers,
+        "requiredPreModelStageIDs":[completed[items[0]].id if len(items)==1 else None for items in positions],
+        "requiredPreModelStageOccurrenceCounts":[len(items) for items in positions],
+        "completedStageHandlerIDs":[stage.handler_id for stage in completed],
+        "completedStageIDs":[stage.id for stage in completed]}
+
+
 def _template(phase, center: float, duration_phase: float, ingress_fraction: float,
               exposure_phase: float, *, integrate: bool = True):
     import numpy as np
@@ -125,23 +143,50 @@ def _validate_upstream(freeze,binary,audit,binary_hash):
     if audit.get("catalogAnswerKeyUsed") is not False or audit.get("externalCatalogInformationUsed") is not False:
         raise ValueError("AUDIT_BLINDNESS_GATE_FAILED")
     if not model_required(audit): raise ValueError("DEPTH_AUDIT_MODEL_GATE_NOT_SATISFIED")
+    if binary.get("catalogAnswerKeyUsed") is not False:
+        raise ValueError("BINARY_BLINDNESS_GATE_FAILED")
     independent=binary.get("independentEvidence") or {}; support=independent.get("supportingIndependentSectorCount")
     sectors=independent.get("supportingSectors")
     if independent.get("classification") != "REPLICATED_ECLIPSE_LIKE_EVENT_SUPPORTED":
         raise ValueError("INDEPENDENT_REPLICATION_CLASSIFICATION_MISMATCH")
     if (isinstance(support,bool) or not isinstance(support,int) or support<MIN_INDEPENDENT_SECTORS
-            or not isinstance(sectors,list) or support!=len(sectors) or len(set(sectors))!=len(sectors)):
+            or not isinstance(sectors,list) or support!=len(sectors)
+            or any(isinstance(value,bool) or not isinstance(value,int) or value<=0 for value in sectors)
+            or len(set(sectors))!=len(sectors)):
         raise ValueError("INDEPENDENT_SUPPORT_COUNT_OR_SECTOR_LIST_INVALID")
     if (independent.get("independentLinearEphemeris") or {}).get("coherent") is not True:
         raise ValueError("INDEPENDENT_EPHEMERIS_INCOHERENT")
     ephemeris=binary.get("linearEphemeris") or {}
     if ephemeris.get("coherent") is not True: raise ValueError("FINAL_EPHEMERIS_INCOHERENT")
-    matching={row.get("sector") for row in binary.get("sectorResults") or []
-              if row.get("role")=="INDEPENDENT" and row.get("usable") is True and row.get("sector") in sectors}
-    if len(matching)<MIN_INDEPENDENT_SECTORS or matching!=set(sectors):
+    independent_rows=[row for row in binary.get("sectorResults") or []
+                      if row.get("role")=="INDEPENDENT" and row.get("usable") is True]
+    row_sectors=[row.get("sector") for row in independent_rows]
+    if (any(isinstance(value,bool) or not isinstance(value,int) or value<=0 for value in row_sectors)
+            or len(row_sectors)!=len(set(row_sectors)) or len(row_sectors)!=len(sectors)
+            or set(row_sectors)!=set(sectors)):
         raise ValueError("INDEPENDENT_BINARY_SECTOR_RESULTS_INVALID")
     validate_freeze(freeze,binary,binary_hash)
     return list(sectors),ephemeris
+
+
+def _event_block_uncertainty(row,period,epoch,duration,ingress,offset):
+    """Within-sector orbit-block jackknife, independent of other sectors."""
+    import numpy as np
+    times=np.asarray(row["timeBTJDFloat64"],dtype=float)
+    cycles=np.floor((times-epoch)/period+.5).astype(int)
+    unique=sorted(set(int(value) for value in cycles))
+    estimates=[]
+    for cycle in unique:
+        keep=cycles!=cycle
+        if int(keep.sum())<20: continue
+        subset={**row,"timeBTJDFloat64":times[keep].tolist(),
+                "relativeFluxFloat64":np.asarray(row["relativeFluxFloat64"],dtype=float)[keep].tolist()}
+        fit=_solve([subset],period,epoch,duration,ingress,offset)
+        estimates.append(-fit["coefficients"]["transit"])
+    if len(estimates)<2: return 0.0,len(estimates)
+    mean=float(np.mean(estimates))
+    uncertainty=math.sqrt((len(estimates)-1)/len(estimates)*sum((value-mean)**2 for value in estimates))
+    return float(uncertainty),len(estimates)
 
 
 def fit_joint_event_phase_model(freeze,binary,audit,*,binary_confirmation_sha256,chronology_proof):
@@ -170,12 +215,17 @@ def fit_joint_event_phase_model(freeze,binary,audit,*,binary_confirmation_sha256
     per_sector=[]
     for row in rows:
         _,sd,si,so,one=_select([row],period,epoch,established)
+        block_uncertainty,block_count=_event_block_uncertainty(row,period,epoch,sd,si,so)
+        formal_uncertainty=one["uncertainties"]["transit"]
         per_sector.append({"sector":row["sector"],"role":"INDEPENDENT" if row["sector"] in independent else "PRIMARY",
             "transitDepthFractionalFlux":-one["coefficients"]["transit"],
-            "formalTransitDepthUncertainty":one["uncertainties"]["transit"],"selectedDurationDays":sd,
+            "formalTransitDepthUncertainty":formal_uncertainty,
+            "eventBlockTransitDepthUncertainty":block_uncertainty,
+            "consistencyTransitDepthUncertainty":max(formal_uncertainty,block_uncertainty,np.finfo(float).eps),
+            "eventBlockJackknifeCount":block_count,"selectedDurationDays":sd,
             "selectedIngressFraction":si,"sampleCount":one["sampleCount"],"conditionNumber":one["condition"]})
     independent_rows=[x for x in per_sector if x["role"]=="INDEPENDENT"]
-    weights=[1/max(x["formalTransitDepthUncertainty"]**2,np.finfo(float).eps) for x in independent_rows]
+    weights=[1/x["consistencyTransitDepthUncertainty"]**2 for x in independent_rows]
     weighted_depth=sum(w*x["transitDepthFractionalFlux"] for w,x in zip(weights,independent_rows))/sum(weights)
     heterogeneity=sum(w*(x["transitDepthFractionalFlux"]-weighted_depth)**2 for w,x in zip(weights,independent_rows))
     reduced_heterogeneity=heterogeneity/max(len(independent_rows)-1,1)
