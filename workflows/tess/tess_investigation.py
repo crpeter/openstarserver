@@ -47,7 +47,9 @@ from .tess_identity import collect_identity, transient_required_catalog_failures
 from .tess_morphology import analyze_morphology
 from .tess_physical import analyze_physical_interpretation
 from .tess_binary_confirmation import (
+    MORPHOLOGY_EVENT_SCREEN_ENTRY,
     analyze_binary_confirmation,
+    morphology_event_screening_continuation,
     physical_interpretation_continuation,
 )
 from .tess_eclipse_event_localization import (
@@ -2809,7 +2811,14 @@ def build_engine(
                 input_hashes[f"independentSector{sector}"] = sha256_file(Path(path))
 
         continuation = morphology.get("continuationEvidence") or {}
-        if continuation.get("timeFrequencyEvolutionWarranted"):
+        if morphology_event_screening_continuation(morphology, independent_prepare):
+            next_stage = StageRequest(
+                id=_next_stage_id(request.id, "periodic-event-screen"),
+                handler_id="openstar.tess.binary-confirmation.analyze",
+                parameters={"entryMode": MORPHOLOGY_EVENT_SCREEN_ENTRY},
+                triggered_by_stage_id=request.id,
+            )
+        elif continuation.get("timeFrequencyEvolutionWarranted"):
             next_stage = StageRequest(
                 id=_next_stage_id(request.id, "prepare-time-frequency"),
                 handler_id="openstar.tess.time-frequency.prepare",
@@ -2950,13 +2959,19 @@ def build_engine(
             investigation, "openstar.tess.independent.prepare")
         morphology = _required_latest_result_for_handler(
             investigation, "openstar.tess.morphology.analyze")
-        physical = _required_latest_result_for_handler(
+        entry_mode = request.parameters.get("entryMode") or "PHYSICAL_INTERPRETATION"
+        physical = _latest_result_for_handler(
             investigation, "openstar.tess.physical.interpret")
+        if entry_mode != MORPHOLOGY_EVENT_SCREEN_ENTRY and physical is None:
+            raise RuntimeError(
+                "Binary confirmation requires completed physical interpretation."
+            )
         result = analyze_binary_confirmation(
             primary_dataset_path=prepared["datasetPath"],
             independent_spec=independent_prepare,
             morphology=morphology,
             physical_interpretation=physical,
+            entry_mode=entry_mode,
         )
         print("🌘 Replicating narrow events at the frozen physical clock")
         print(f"   classification: {(result.get('independentEvidence') or {}).get('classification')}")
@@ -2968,23 +2983,56 @@ def build_engine(
                          "binary-confirmation" / "binary-confirmation-v2.json")
         _write_json(artifact_path, result)
         input_hashes = {
-            "physicalInterpretation": sha256_json(physical),
             "morphology": sha256_json(morphology),
             "primaryDataset": sha256_file(Path(prepared["datasetPath"])),
             "independentPreparation": sha256_json(independent_prepare),
         }
+        if physical is not None:
+            input_hashes["physicalInterpretation"] = sha256_json(physical)
+        if entry_mode == MORPHOLOGY_EVENT_SCREEN_ENTRY:
+            input_hashes["eventScreenEntryBoundary"] = sha256_json({
+                "entryMode": entry_mode,
+                "physicalCycleResolved": morphology.get("physicalCycleResolved"),
+                "morphologyClass": morphology.get("morphologyClass"),
+                "resolvedPhysicalPeriodDays": morphology.get(
+                    "resolvedPhysicalPeriodDays"
+                ),
+            })
         for item in independent_prepare.get("preparedSectors") or []:
             if item.get("datasetPath"):
                 input_hashes[f"independentSector{item.get('sector')}"] = sha256_file(
                     Path(item["datasetPath"]))
         qualifies = authoritative_binary_gate(result)
+        continuation = morphology.get("continuationEvidence") or {}
+        if qualifies:
+            next_stage = StageRequest(
+                id=_next_stage_id(
+                    request.id, "eclipse-event-source-localization-catalog-freeze"
+                ),
+                handler_id=ECLIPSE_LOCALIZATION_PREPARE_HANDLER_ID,
+                parameters={},
+                triggered_by_stage_id=request.id,
+            )
+        elif (
+            entry_mode == MORPHOLOGY_EVENT_SCREEN_ENTRY
+            and continuation.get("timeFrequencyEvolutionWarranted")
+        ):
+            next_stage = StageRequest(
+                id=_next_stage_id(request.id, "prepare-time-frequency"),
+                handler_id="openstar.tess.time-frequency.prepare",
+                parameters={"entryReason": continuation.get("entryReason")},
+                triggered_by_stage_id=request.id,
+            )
+        else:
+            next_stage = StageRequest(
+                id=_next_stage_id(request.id, "finalize"),
+                handler_id="openstar.tess.finalize",
+                parameters={"outputSuffix": "binary-confirmation-v2"},
+                triggered_by_stage_id=request.id,
+            )
         return StageOutcome(
             result=result,
-            next_stage=StageRequest(
-                id=_next_stage_id(request.id, "eclipse-event-source-localization-catalog-freeze" if qualifies else "finalize"),
-                handler_id=(ECLIPSE_LOCALIZATION_PREPARE_HANDLER_ID if qualifies else "openstar.tess.finalize"),
-                parameters={} if qualifies else {"outputSuffix": "binary-confirmation-v2"},
-                triggered_by_stage_id=request.id),
+            next_stage=next_stage,
             input_hashes=input_hashes,
             artifacts=(_artifact(artifact_path, "application/json"),),
         )
