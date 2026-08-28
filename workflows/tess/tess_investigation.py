@@ -10315,6 +10315,42 @@ def build_engine(
                 )
                 period_evidence["interpretation"] = "morphology-resolved-physical-cycle"
                 period_evidence["candidateSource"] = "multi-sector-morphology-discrimination"
+        if binary_confirmation is not None and authoritative_binary_gate(binary_confirmation):
+            ephemeris = binary_confirmation["linearEphemeris"]
+            refined_period = ephemeris.get("refinedPeriodDays")
+            reference_epoch = ephemeris.get("referenceEpoch")
+            try:
+                refined_period = float(refined_period)
+                reference_epoch = float(reference_epoch)
+            except (TypeError, ValueError) as error:
+                raise ValueError(
+                    "Authoritative binary confirmation lacks a finite refined ephemeris."
+                ) from error
+            if not (math.isfinite(refined_period) and refined_period > 0
+                    and math.isfinite(reference_epoch)):
+                raise ValueError(
+                    "Authoritative binary confirmation lacks a finite refined ephemeris."
+                )
+            period_evidence["morphologyResolvedPhysicalPeriodDays"] = (
+                period_evidence.get("physicalPeriodDays")
+            )
+            period_evidence["physicalCycleResolved"] = True
+            period_evidence["physicalPeriodDays"] = refined_period
+            period_evidence["resolvedPhysicalPeriodDays"] = refined_period
+            period_evidence["eventTimingReferenceEpoch"] = reference_epoch
+            period_evidence["eventTimingRmsOMinusCDays"] = ephemeris.get(
+                "rmsOMinusCDays"
+            )
+            period_evidence["eventTimingMaximumAbsoluteOMinusCDays"] = ephemeris.get(
+                "maximumAbsoluteOMinusCDays"
+            )
+            period_evidence["eventTimingSectors"] = ephemeris.get("timingSectors")
+            period_evidence["interpretation"] = (
+                "replicated-event-linear-ephemeris-refined-physical-cycle"
+            )
+            period_evidence["candidateSource"] = (
+                "multi-sector-replicated-event-timing-refinement"
+            )
         if source_localization is not None:
             cross = source_localization.get("crossSector") or {}
             period_evidence["sourceAssociation"] = cross.get("variableSignalOrigin")
