@@ -3089,9 +3089,13 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
             "MORPHOLOGY_RESOLVED_TIME_FREQUENCY_RECOMMENDATION",
             stage.result["evidenceLineage"],
         )
-        self.assertEqual(set(paths), {
-            item["datasetPath"] for item in stage.result["sectorFits"]
-        })
+        self.assertEqual(
+            {str(Path(path).resolve()) for path in paths},
+            {
+                str(Path(item["datasetPath"]).resolve())
+                for item in stage.result["sectorFits"]
+            },
+        )
         self.assertEqual({
             "morphology": sha256_json(morphology),
             "timeFrequencySummary": sha256_json(summary),
