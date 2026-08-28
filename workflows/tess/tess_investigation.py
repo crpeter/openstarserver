@@ -494,24 +494,36 @@ def time_frequency_continuation(summary: dict[str, Any], *, request_id: str) -> 
         == "LONG_BASELINE_NONSTATIONARY_MODE_MODELING"
         and summary.get("physicalMechanismResolved") is False
     )
+    run_dynamic_harmonic = (
+        summary.get("recommendedNextTest") == "DYNAMIC_HARMONIC_MODELING"
+        and summary.get("physicalMechanismResolved") is False
+        and period_reference.get("kind") == "MORPHOLOGY_RESOLVED_PHYSICAL_PERIOD"
+        and period_reference.get("physicalCycleResolved") is True
+        and math.isfinite(physical_period)
+        and physical_period > 0
+    )
     return StageRequest(
         id=_next_stage_id(
             request_id,
-            "mode-identification" if run_mode_identification else
+            "dynamic-harmonic-modeling" if run_dynamic_harmonic else
+            ("mode-identification" if run_mode_identification else
             ("prepare-nonstationary" if run_nonstationary else
-             ("physical-interpretation" if run_physical_interpretation else "finalize")),
+             ("physical-interpretation" if run_physical_interpretation else "finalize"))),
         ),
         handler_id=(
-            "openstar.tess.mode-identification.analyze" if run_mode_identification else
+            "openstar.tess.dynamic-harmonic.analyze" if run_dynamic_harmonic else
+            ("openstar.tess.mode-identification.analyze" if run_mode_identification else
             ("openstar.tess.nonstationary.prepare"
             if run_nonstationary
             else ("openstar.tess.physical.interpret"
                   if run_physical_interpretation
                   else "openstar.tess.finalize")
-            )
+            ))
         ),
-        parameters={} if (run_nonstationary or run_mode_identification
-                          or run_physical_interpretation) else {"outputSuffix": "v20.8"},
+        parameters=({"evidenceLineage": "MORPHOLOGY_RESOLVED_TIME_FREQUENCY_RECOMMENDATION"}
+                    if run_dynamic_harmonic else
+                    ({} if (run_nonstationary or run_mode_identification
+                            or run_physical_interpretation) else {"outputSuffix": "v20.8"})),
         triggered_by_stage_id=request_id,
     )
 
@@ -634,7 +646,12 @@ def dynamic_harmonic_continuation(summary: dict[str, Any], *, request_id: str) -
         handler_id=("openstar.tess.dynamic-harmonic.frequency-refinement" if refine else
                     ("openstar.tess.time-frequency.prepare" if residual else "openstar.tess.finalize")),
         parameters=({} if refine else
-                    ({"entryReason": "DYNAMIC_HARMONIC_RESIDUAL"} if residual else
+                    ({"entryReason": (
+                        "RESOLVED_DYNAMIC_HARMONIC_RESIDUAL"
+                        if summary.get("evidenceLineage") ==
+                        "MORPHOLOGY_RESOLVED_TIME_FREQUENCY_RECOMMENDATION"
+                        else "DYNAMIC_HARMONIC_RESIDUAL")}
+                     if residual else
                      {"outputSuffix": "v20.10-dynamic-harmonic"})),
         triggered_by_stage_id=request_id,
     )
@@ -3587,7 +3604,11 @@ def build_engine(
             "RESOLVED_NONSTATIONARY_MORPHOLOGY",  # persisted v2 compatibility
         }
         continuation = morphology.get("continuationEvidence") or {}
-        if entry_reason == "DYNAMIC_HARMONIC_RESIDUAL":
+        dynamic_residual_entry = entry_reason in {
+            "DYNAMIC_HARMONIC_RESIDUAL",
+            "RESOLVED_DYNAMIC_HARMONIC_RESIDUAL",
+        }
+        if dynamic_residual_entry:
             if (dynamic_harmonic is None
                     or dynamic_harmonic.get("recommendedNextTest") != "RESIDUAL_MULTIMODE_LOCALIZATION"):
                 raise RuntimeError("Dynamic residual time-frequency analysis was not recommended.")
@@ -3607,7 +3628,7 @@ def build_engine(
                 raise RuntimeError("v20.8 requires v20.7 to recommend TIME_FREQUENCY_EVOLUTION_ANALYSIS.")
             physical_period = float(morphology["resolvedPhysicalPeriodDays"])
             harmonic_orders = (1, 2)
-        if entry_reason != "DYNAMIC_HARMONIC_RESIDUAL":
+        if not dynamic_residual_entry:
             harmonic_orders = (1, 2)
         artifact_root = store.directory_for(investigation.id) / "artifacts"
         print("🪟 Preparing sliding-window residual time-frequency search")
@@ -3628,7 +3649,7 @@ def build_engine(
             investigation_id=investigation.id,
             harmonic_orders=harmonic_orders,
             workload_id=("openstar.lomb-scargle.v1"
-                         if entry_reason == "DYNAMIC_HARMONIC_RESIDUAL" else None),
+                         if dynamic_residual_entry else None),
         )
         spec["periodReference"] = {
             "periodDays": physical_period,
@@ -3639,7 +3660,7 @@ def build_engine(
             "physicalCycleResolved": not unresolved_reference,
         }
         spec["familySubtraction"] = {
-            "source": ("PERSISTED_DYNAMIC_HARMONIC_MODEL" if entry_reason == "DYNAMIC_HARMONIC_RESIDUAL"
+            "source": ("PERSISTED_DYNAMIC_HARMONIC_MODEL" if dynamic_residual_entry
                        else "ESTABLISHED_FUNDAMENTAL_AND_FIRST_HARMONIC"),
             "harmonicOrders": list(harmonic_orders),
             "frozenDatasetsReused": True,
@@ -3854,23 +3875,82 @@ def build_engine(
         )
 
     def dynamic_harmonic_stage(investigation, request):
-        mode = _latest_result_for_handler(investigation, "openstar.tess.mode-identification.analyze")
-        if mode is None or mode.get("recommendedNextTest") != "DYNAMIC_HARMONIC_MODELING":
-            raise RuntimeError("Dynamic harmonic modeling requires the persisted harmonic recommendation.")
-        family = mode.get("establishedPeriodFamily") or {}
-        period = family.get("referencePeriodDays")
-        paths = (mode.get("dataReuse") or {}).get("frozenDatasetPaths") or []
-        if period is None or not paths:
-            raise RuntimeError("Dynamic harmonic modeling requires frozen datasets and a family period.")
-        result = model_dynamic_harmonics(dataset_paths=paths, reference_period_days=float(period),
-                                         harmonic_orders=(1, 2, 3, 4))
+        if request.parameters.get("evidenceLineage") == \
+                "MORPHOLOGY_RESOLVED_TIME_FREQUENCY_RECOMMENDATION":
+            prepared = _result(investigation, "001-prepare-target")
+            independent = _latest_result_for_handler(
+                investigation, "openstar.tess.independent.prepare")
+            morphology = _latest_result_for_handler(
+                investigation, "openstar.tess.morphology.analyze")
+            time_frequency = _latest_result_for_handler(
+                investigation, "openstar.tess.time-frequency.summarize")
+            if not all(isinstance(item, dict) for item in
+                       (prepared, independent, morphology, time_frequency)):
+                raise RuntimeError(
+                    "Direct dynamic harmonic modeling requires persisted primary, "
+                    "independent, morphology, and time-frequency evidence.")
+            period_reference = time_frequency.get("periodReference") or {}
+            try:
+                period = float(period_reference.get("periodDays"))
+                morphology_period = float(morphology.get("resolvedPhysicalPeriodDays"))
+            except (TypeError, ValueError):
+                raise RuntimeError(
+                    "Direct dynamic harmonic modeling requires a resolved finite physical period.")
+            valid_recommendation = (
+                time_frequency.get("recommendedNextTest") == "DYNAMIC_HARMONIC_MODELING"
+                and time_frequency.get("physicalMechanismResolved") is False
+                and period_reference.get("kind") == "MORPHOLOGY_RESOLVED_PHYSICAL_PERIOD"
+                and period_reference.get("physicalCycleResolved") is True
+                and morphology.get("physicalCycleResolved") is True
+                and math.isfinite(period) and period > 0
+                and math.isfinite(morphology_period) and morphology_period > 0
+                and math.isclose(period, morphology_period, rel_tol=1e-9, abs_tol=1e-12)
+            )
+            independent_paths = [
+                item.get("datasetPath")
+                for item in independent.get("preparedSectors") or []
+            ]
+            paths = [prepared.get("datasetPath"), *independent_paths]
+            if not valid_recommendation:
+                raise RuntimeError(
+                    "Direct dynamic harmonic modeling requires a consistent "
+                    "morphology-resolved time-frequency period.")
+            if (not independent_paths or any(not isinstance(path, str) or
+                    not Path(path).is_file() for path in paths)):
+                raise RuntimeError(
+                    "Direct dynamic harmonic modeling requires available frozen datasets.")
+            result = model_dynamic_harmonics(
+                dataset_paths=paths, reference_period_days=period,
+                harmonic_orders=(1, 2, 3, 4))
+            result["evidenceLineage"] = \
+                "MORPHOLOGY_RESOLVED_TIME_FREQUENCY_RECOMMENDATION"
+            input_hashes = {
+                "morphology": sha256_json(morphology),
+                "timeFrequencySummary": sha256_json(time_frequency),
+                "primaryPreparation": sha256_json(prepared),
+                "independentPreparation": sha256_json(independent),
+            }
+        else:
+            # Retain the established mode-identification lineage unchanged.
+            mode = _latest_result_for_handler(
+                investigation, "openstar.tess.mode-identification.analyze")
+            if mode is None or mode.get("recommendedNextTest") != "DYNAMIC_HARMONIC_MODELING":
+                raise RuntimeError("Dynamic harmonic modeling requires the persisted harmonic recommendation.")
+            family = mode.get("establishedPeriodFamily") or {}
+            period = family.get("referencePeriodDays")
+            paths = (mode.get("dataReuse") or {}).get("frozenDatasetPaths") or []
+            if period is None or not paths:
+                raise RuntimeError("Dynamic harmonic modeling requires frozen datasets and a family period.")
+            result = model_dynamic_harmonics(dataset_paths=paths, reference_period_days=float(period),
+                                             harmonic_orders=(1, 2, 3, 4))
+            input_hashes = {"modeIdentification": sha256_json(mode)}
         artifact_path = (store.directory_for(investigation.id) / "artifacts" /
                          "dynamic-harmonic" / "dynamic-harmonic-v20.10.json")
         _write_json(artifact_path, result)
         return StageOutcome(
             result=result,
             next_stage=dynamic_harmonic_continuation(result, request_id=request.id),
-            input_hashes={"modeIdentification": sha256_json(mode)},
+            input_hashes=input_hashes,
             artifacts=(_artifact(artifact_path, "application/json"),),
         )
 
