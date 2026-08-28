@@ -4,6 +4,37 @@
 source .venv/bin/activate
 ```
 
+## Prepare a software-blind single-TIC benchmark
+
+The generic preparer downloads only the requested primary-sector light curve from
+official MAST TESS products. It prefers a SPOC 120-second product and otherwise
+uses the shortest available TESS-SPOC product. The resulting manifest can be
+passed directly to the autonomous TESS runner. Use a new durable output directory;
+existing output is refused unless `--overwrite` is supplied, and overwrite is
+limited to a preparer-created project with the same project ID.
+
+Keep answer-key names, periods, epochs, depths, classifications, and expected
+follow-up sectors out of the arguments and paths. For example:
+
+```bash
+python prepare_tess_known_target_blind_benchmark.py \
+  --tic 123456789 \
+  --primary-sector 12 \
+  --blind-label "Blind Target A" \
+  --project-id blind-target-a-v1 \
+  --output-dir ~/Documents/OpenStarScience/benchmarks/blind-target-a-v1/project
+
+python run_openstar_autonomous_tess.py \
+  --project ~/Documents/OpenStarScience/benchmarks/blind-target-a-v1/project/project.json \
+  --coordinator-url http://127.0.0.1:8080 \
+  --state-dir ~/Documents/OpenStarScience/benchmarks/blind-target-a-v1/state
+```
+
+The preparer freezes the existing autonomous-project quality mask, finite-sample
+filtering, normalization, Float32 representation, frequency grid, work-unit size,
+sample hashes, and Astropy references. It does not enumerate independent sectors;
+the autonomous identity and independent-sector stages retain that responsibility.
+
 ## Fleet dashboard sidecar
 
 The optional dashboard is a separate process. It only performs `GET` requests against the
