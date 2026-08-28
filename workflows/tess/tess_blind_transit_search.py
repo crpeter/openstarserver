@@ -17,6 +17,7 @@ from typing import Any
 HANDLER_ID = "openstar.tess.blind-transit-search.analyze"
 RESULT_VERSION = "1.0"
 ENTRY_BOUNDARY = "FULL_CHARACTERIZATION_UNRESOLVED_BROAD_VARIABILITY"
+TARGETED_BOUNDARY_ENTRY = "FULL_CHARACTERIZATION_NONRECURRENT_BOUNDARY_PERIOD"
 MINIMUM_INDEPENDENT_SECTORS = 2
 MINIMUM_SECTOR_SNR = 7.0
 MINIMUM_PERIOD_DAYS = 0.2
@@ -27,20 +28,35 @@ DUTY_CYCLES = (0.01, 0.015, 0.02, 0.03, 0.04, 0.05, 0.07, 0.10)
 
 
 def blind_transit_search_continuation(
-    morphology: dict[str, Any],
+    morphology: dict[str, Any] | None,
     independent_spec: dict[str, Any],
     broad_interpretation: dict[str, Any] | None,
+    targeted_interpretation: dict[str, Any] | None = None,
 ) -> bool:
-    """Enter only after the full-characterization variability branch is spent."""
+    """Enter after an exact unresolved full-characterization boundary."""
     prepared = [
         item for item in independent_spec.get("preparedSectors") or []
         if item.get("datasetPath")
     ]
+    broad_path_spent = (
+        broad_interpretation is not None
+        and morphology is not None
+        and morphology.get("physicalCycleResolved") is False
+    )
+    targeted_claim = ((targeted_interpretation or {}).get("claimDecision") or {}).get("claim")
+    contradiction = (targeted_interpretation or {}).get("contradictionPlan") or {}
+    targeted_boundary_spent = (
+        targeted_claim == "HUMAN_REVIEW_REQUIRED"
+        and (targeted_interpretation or {}).get("primaryBoundaryHit") is True
+        and (targeted_interpretation or {}).get("supportingSectorCount") == 0
+        and contradiction.get("action") == "STOP"
+        and contradiction.get("reason")
+        == "insufficient-independent-evidence-for-broad-contradiction-search"
+    )
     return (
         independent_spec.get("investigationGoal") == "FULL_CHARACTERIZATION"
-        and broad_interpretation is not None
-        and morphology.get("physicalCycleResolved") is False
         and len(prepared) >= MINIMUM_INDEPENDENT_SECTORS
+        and (broad_path_spent or targeted_boundary_spent)
     )
 
 
@@ -210,11 +226,13 @@ def _linear_ephemeris(sector_results: list[dict[str, Any]], input_period: float)
 
 def analyze_blind_transit_search(
     *, primary_dataset_path: str | Path, independent_spec: dict[str, Any],
-    morphology: dict[str, Any], broad_interpretation: dict[str, Any] | None,
+    morphology: dict[str, Any] | None,
+    broad_interpretation: dict[str, Any] | None,
+    targeted_interpretation: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Search a shared blind box period across primary plus frozen sectors."""
     if not blind_transit_search_continuation(
-        morphology, independent_spec, broad_interpretation
+        morphology, independent_spec, broad_interpretation, targeted_interpretation
     ):
         raise ValueError("authoritative blind-transit-search input gate is not satisfied")
 
@@ -300,7 +318,10 @@ def analyze_blind_transit_search(
     return {
         "resultVersion": RESULT_VERSION,
         "experiment": "SOFTWARE_BLIND_MULTI_SECTOR_BOX_PERIOD_SEARCH",
-        "entryBoundary": ENTRY_BOUNDARY,
+        "entryBoundary": (
+            ENTRY_BOUNDARY if broad_interpretation is not None
+            else TARGETED_BOUNDARY_ENTRY
+        ),
         "classification": (
             "REPLICATED_BLIND_TRANSIT_LIKE_CANDIDATE" if supported
             else "BLIND_TRANSIT_PERIOD_UNRESOLVED"
