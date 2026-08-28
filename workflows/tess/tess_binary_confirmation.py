@@ -223,10 +223,26 @@ def _sector(dataset: dict[str, Any], period: float, role: str) -> dict[str, Any]
     return result
 
 
-def _ephemeris(events: list[dict[str, Any]], input_period: float) -> dict[str, Any]:
+def _ephemeris(
+    events: list[dict[str, Any]],
+    input_period: float,
+    cycle_reference: tuple[float, float] | None = None,
+) -> dict[str, Any]:
     ordered = sorted(events, key=lambda item: item["eventEpoch"])
-    anchor = ordered[0]["eventEpoch"]
-    cycles = [round((item["eventEpoch"] - anchor) / input_period) for item in ordered]
+    if cycle_reference is None:
+        anchor = ordered[0]["eventEpoch"]
+        assignment_period = input_period
+        assignment_basis = "INPUT_PERIOD_FROM_EARLIEST_EVENT"
+    else:
+        anchor, assignment_period = map(float, cycle_reference)
+        if not (math.isfinite(anchor) and math.isfinite(assignment_period)
+                and assignment_period > 0):
+            return {"coherent": False, "reason": "INVALID_CYCLE_ASSIGNMENT_REFERENCE"}
+        assignment_basis = "INDEPENDENT_REFINED_EPHEMERIS"
+    cycles = [
+        round((item["eventEpoch"] - anchor) / assignment_period)
+        for item in ordered
+    ]
     if len(set(cycles)) != len(cycles):
         return {"coherent": False, "reason": "INTEGER_CYCLE_ASSIGNMENT_NOT_UNIQUE"}
     def fit(indices: list[int]) -> tuple[float, float]:
@@ -262,6 +278,9 @@ def _ephemeris(events: list[dict[str, Any]], input_period: float) -> dict[str, A
             "rmsOMinusCDays": math.sqrt(statistics.mean(value * value for value in residuals)),
             "maximumAbsoluteOMinusCDays": max(abs(value) for value in residuals),
             "leaveOneSectorOutPeriodSolutions": loso,
+            "cycleAssignmentBasis": assignment_basis,
+            "cycleAssignmentReferenceEpoch": anchor,
+            "cycleAssignmentReferencePeriodDays": assignment_period,
             "coherenceScale": "EVENT_DURATION_AND_INPUT_PERIOD"}
 
 
@@ -292,7 +311,14 @@ def analyze_binary_confirmation(*, primary_dataset_path: str | Path,
     ephemeris = independent_ephemeris
     if supported:
         timing_events = [item for item in results if item.get("usable")]
-        timing_attempt = _ephemeris(timing_events, period)
+        timing_attempt = _ephemeris(
+            timing_events,
+            period,
+            cycle_reference=(
+                independent_ephemeris["referenceEpoch"],
+                independent_ephemeris["refinedPeriodDays"],
+            ),
+        )
         primary_in_attempt = any(item["role"] == "PRIMARY" for item in timing_events)
         if timing_attempt.get("coherent") is True:
             ephemeris = timing_attempt
