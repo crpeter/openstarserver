@@ -52,6 +52,11 @@ from .tess_binary_confirmation import (
     morphology_event_screening_continuation,
     physical_interpretation_continuation,
 )
+from .tess_blind_transit_search import (
+    HANDLER_ID as BLIND_TRANSIT_SEARCH_HANDLER_ID,
+    analyze_blind_transit_search,
+    blind_transit_search_continuation,
+)
 from .tess_eclipse_event_localization import (
     HANDLER_ID as ECLIPSE_LOCALIZATION_HANDLER_ID,
     PREPARE_HANDLER_ID as ECLIPSE_LOCALIZATION_PREPARE_HANDLER_ID,
@@ -1051,6 +1056,30 @@ def _render_report(conclusion: dict[str, Any]) -> str:
                 f"halfDiff={double_metrics.get('halfCycleDifferenceRatio')}, "
                 f"rawSupport={item.get('supportsRawCycle')}, "
                 f"doubleSupport={item.get('supportsDoubleCycle')}"
+            )
+
+    blind_transit = conclusion.get("blindTransitSearch")
+    if blind_transit is not None:
+        ephemeris = blind_transit.get("linearEphemeris") or {}
+        lines.extend([
+            "",
+            "## Software-blind transit-period search",
+            "",
+            f"- Classification: {blind_transit.get('classification')}",
+            f"- Candidate period: {blind_transit.get('candidatePeriodDays')} days",
+            f"- Primary sector supported: {blind_transit.get('primarySectorSupported')}",
+            f"- Supporting independent sectors: {blind_transit.get('supportingIndependentSectors')}",
+            f"- Linear ephemeris coherent: {ephemeris.get('coherent')}",
+            f"- Companion nature resolved: {blind_transit.get('companionNatureResolved')}",
+            f"- Catalog answer key used: {blind_transit.get('catalogAnswerKeyUsed')}",
+            f"- Recommended next test: {blind_transit.get('recommendedNextTest')}",
+        ])
+        for item in blind_transit.get("sectorResults") or []:
+            lines.append(
+                "- Sector "
+                f"{item.get('sector')} ({item.get('role')}): "
+                f"SNR={item.get('snr')}, duration={item.get('durationDays')} d, "
+                f"usable={item.get('usable')}"
             )
 
     physical = conclusion.get("physicalInterpretation")
@@ -2832,6 +2861,15 @@ def build_engine(
                 parameters={"continuation": False},
                 triggered_by_stage_id=request.id,
             )
+        elif blind_transit_search_continuation(
+            morphology, independent_prepare, broad
+        ):
+            next_stage = StageRequest(
+                id=_next_stage_id(request.id, "blind-transit-period-search"),
+                handler_id=BLIND_TRANSIT_SEARCH_HANDLER_ID,
+                parameters={},
+                triggered_by_stage_id=request.id,
+            )
         else:
             next_stage = StageRequest(
                 id=_next_stage_id(request.id, "finalize"),
@@ -2843,6 +2881,63 @@ def build_engine(
         return StageOutcome(
             result=morphology,
             next_stage=next_stage,
+            input_hashes=input_hashes,
+            artifacts=(_artifact(artifact_path, "application/json"),),
+        )
+
+    def blind_transit_search_stage(investigation, request):
+        prepared = _result(investigation, "001-prepare-target")
+        independent_prepare = _required_latest_result_for_handler(
+            investigation, "openstar.tess.independent.prepare"
+        )
+        broad = _required_latest_result_for_handler(
+            investigation, "openstar.tess.independent.broad.interpret"
+        )
+        morphology = _required_latest_result_for_handler(
+            investigation, "openstar.tess.morphology.analyze"
+        )
+        print("🕳 Searching frozen sectors for a software-blind transit period")
+        print("   removing smooth local variability; no catalog period and no MAST download")
+        result = analyze_blind_transit_search(
+            primary_dataset_path=prepared["datasetPath"],
+            independent_spec=independent_prepare,
+            morphology=morphology,
+            broad_interpretation=broad,
+        )
+        print(f"   classification: {result.get('classification')}")
+        print(f"   candidate period: {result.get('candidatePeriodDays')} days")
+        print(
+            "   supporting independent sectors: "
+            f"{result.get('supportingIndependentSectors') or []}"
+        )
+        print(f"   ephemeris coherent: {(result.get('linearEphemeris') or {}).get('coherent')}")
+        print(f"   recommended next test: {result.get('recommendedNextTest')}")
+
+        artifact_path = (
+            store.directory_for(investigation.id)
+            / "artifacts"
+            / "blind-transit-search"
+            / "blind-transit-search-v1.json"
+        )
+        _write_json(artifact_path, result)
+        input_hashes = {
+            "broadIndependentInterpretation": sha256_json(broad),
+            "morphology": sha256_json(morphology),
+            "primaryDataset": sha256_file(Path(prepared["datasetPath"])),
+        }
+        for item in independent_prepare.get("preparedSectors") or []:
+            if item.get("datasetPath"):
+                input_hashes[f"independentSector{item.get('sector')}"] = sha256_file(
+                    Path(item["datasetPath"])
+                )
+        return StageOutcome(
+            result=result,
+            next_stage=StageRequest(
+                id=_next_stage_id(request.id, "finalize"),
+                handler_id="openstar.tess.finalize",
+                parameters={"outputSuffix": "blind-transit-search-v1"},
+                triggered_by_stage_id=request.id,
+            ),
             input_hashes=input_hashes,
             artifacts=(_artifact(artifact_path, "application/json"),),
         )
@@ -9177,6 +9272,9 @@ def build_engine(
             investigation,
             "openstar.tess.morphology.analyze",
         )
+        blind_transit_search = _latest_result_for_handler(
+            investigation, BLIND_TRANSIT_SEARCH_HANDLER_ID,
+        )
         physical_interpretation = _latest_result_for_handler(
             investigation,
             "openstar.tess.physical.interpret",
@@ -9329,7 +9427,17 @@ def build_engine(
             investigation, "openstar.tess.target-residual-pixel-recurrence.interpret",
         )
 
-        if harmonic_family_interpretation is not None:
+        if (blind_transit_search or {}).get("classification") == (
+            "REPLICATED_BLIND_TRANSIT_LIKE_CANDIDATE"
+        ):
+            claim_decision = blind_transit_search["claimDecision"]
+            selected_period = blind_transit_search.get("candidatePeriodDays")
+            selected_source = "software-blind-multi-sector-box-period-search"
+        elif blind_transit_search is not None:
+            claim_decision = blind_transit_search["claimDecision"]
+            selected_period = None
+            selected_source = None
+        elif harmonic_family_interpretation is not None:
             claim_decision = harmonic_family_interpretation["claimDecision"]
             selected_period = harmonic_family_interpretation.get("selectedPeriodDays")
             selected_source = harmonic_family_interpretation.get("selectedSource")
@@ -10315,6 +10423,23 @@ def build_engine(
                 )
                 period_evidence["interpretation"] = "morphology-resolved-physical-cycle"
                 period_evidence["candidateSource"] = "multi-sector-morphology-discrimination"
+        if (blind_transit_search or {}).get("classification") == (
+            "REPLICATED_BLIND_TRANSIT_LIKE_CANDIDATE"
+        ):
+            transit_period = blind_transit_search.get("candidatePeriodDays")
+            ephemeris = blind_transit_search.get("linearEphemeris") or {}
+            period_evidence.update({
+                "candidatePeriodDays": transit_period,
+                "candidateSource": "software-blind-multi-sector-box-period-search",
+                "recurrentPhotometricPeriodDays": transit_period,
+                "possiblePhysicalCycleDays": None,
+                "physicalCycleResolved": False,
+                "physicalPeriodDays": None,
+                "transitLikeEventPeriodDays": transit_period,
+                "transitLikeEventReferenceEpoch": ephemeris.get("referenceEpoch"),
+                "transitLikeEventTimingRmsOMinusCDays": ephemeris.get("rmsOMinusCDays"),
+                "interpretation": "replicated-transit-like-event-period-candidate",
+            })
         if binary_confirmation is not None and authoritative_binary_gate(binary_confirmation):
             ephemeris = binary_confirmation["linearEphemeris"]
             refined_period = ephemeris.get("refinedPeriodDays")
@@ -10508,6 +10633,7 @@ def build_engine(
             "independentBroadVerification": broad_interpretation,
             "independentHarmonicFamilyVerification": harmonic_family_interpretation,
             "morphology": morphology_interpretation,
+            "blindTransitSearch": blind_transit_search,
             "physicalInterpretation": physical_interpretation,
             "binaryConfirmation": binary_confirmation,
             "eclipseEventSourceLocalization": eclipse_event_localization,
@@ -10995,6 +11121,7 @@ def build_engine(
         "openstar.tess.morphology.analyze",
         morphology_stage,
     )
+    engine.register_handler(BLIND_TRANSIT_SEARCH_HANDLER_ID, blind_transit_search_stage)
     engine.register_handler(
         "openstar.tess.physical.interpret",
         physical_interpretation_stage,
