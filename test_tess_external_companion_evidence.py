@@ -300,10 +300,11 @@ class ExternalCompanionEvidenceTests(unittest.TestCase):
                     investigation, next_request, software_id="test", software_version="1")
             self.assertEqual(photometry, auditor.call_args.args[0])
             self.assertEqual(JOINT_MODEL_HANDLER_ID, next_request.handler_id)
-            model = {"resultVersion": JOINT_MODEL_VERSION, "status": "COMPLETE",
-                     "classification": "PRECISION_EMPIRICAL_TRANSIT_DEPTH_RESOLVED",
-                     "precisionEmpiricalTransitDepthResolved": True,
-                     "globalFit": {}, "resolutionGates": {}, "unresolvedReasons": []}
+            model = {"resultVersion": JOINT_MODEL_VERSION, "status": "UNRESOLVED",
+                     "classification": "PRECISION_EMPIRICAL_TRANSIT_DEPTH_UNRESOLVED",
+                     "precisionEmpiricalTransitDepthResolved": False,
+                     "globalFit": {}, "resolutionGates": {},
+                     "unresolvedReasons": ["SYNTHETIC_FAIL_CLOSED_GATE"]}
             model["modelSHA256"] = sha256_json(model)
             with mock.patch("workflows.tess.tess_investigation.fit_joint_event_phase_model",
                             return_value=model) as fitter, \
@@ -312,6 +313,7 @@ class ExternalCompanionEvidenceTests(unittest.TestCase):
                     investigation, next_request, software_id="test", software_version="1")
             fitter.assert_called_once(); archive.assert_not_called()
             self.assertEqual(FREEZE_HANDLER_ID, next_request.handler_id)
+            self.assertEqual("UNRESOLVED", investigation.stages[-1].result["status"])
             self.assertEqual(model["modelSHA256"], validate_model_hash(investigation.stages[-1].result))
             self.assertTrue(investigation.stages[-1].artifacts)
             frozen = self.freeze([self.row()])

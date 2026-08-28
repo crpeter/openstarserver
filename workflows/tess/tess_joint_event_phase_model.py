@@ -158,6 +158,12 @@ def _validate_upstream(freeze,binary,audit,binary_hash):
         raise ValueError("INDEPENDENT_EPHEMERIS_INCOHERENT")
     ephemeris=binary.get("linearEphemeris") or {}
     if ephemeris.get("coherent") is not True: raise ValueError("FINAL_EPHEMERIS_INCOHERENT")
+    validate_freeze(freeze,binary,binary_hash)
+    timing_sectors=ephemeris.get("timingSectors")
+    frozen_sectors=[row.get("sector") for row in freeze.get("sectors") or []]
+    if (not isinstance(timing_sectors,list) or not set(sectors).issubset(set(timing_sectors))
+            or not set(sectors).issubset(set(frozen_sectors))):
+        raise ValueError("INDEPENDENT_SUPPORT_SECTORS_NOT_IN_FROZEN_TIMING_SET")
     independent_rows=[row for row in binary.get("sectorResults") or []
                       if row.get("role")=="INDEPENDENT" and row.get("usable") is True]
     row_sectors=[row.get("sector") for row in independent_rows]
@@ -165,7 +171,6 @@ def _validate_upstream(freeze,binary,audit,binary_hash):
             or len(row_sectors)!=len(set(row_sectors)) or len(row_sectors)!=len(sectors)
             or set(row_sectors)!=set(sectors)):
         raise ValueError("INDEPENDENT_BINARY_SECTOR_RESULTS_INVALID")
-    validate_freeze(freeze,binary,binary_hash)
     return list(sectors),ephemeris
 
 
@@ -190,7 +195,6 @@ def _event_block_uncertainty(row,period,epoch,duration,ingress,offset):
 
 
 def fit_joint_event_phase_model(freeze,binary,audit,*,binary_confirmation_sha256,chronology_proof):
-    import numpy as np
     base={"resultVersion":RESULT_VERSION,"binaryConfirmationSHA256":binary_confirmation_sha256,
           "photometryFreezeSHA256":freeze.get("freezeSHA256"),"depthAttenuationAuditSHA256":audit.get("auditSHA256"),
           "externalCatalogInformationUsed":False,"catalogAnswerKeyUsed":False,"companionRadiusInferred":False,
@@ -209,6 +213,7 @@ def fit_joint_event_phase_model(freeze,binary,audit,*,binary_confirmation_sha256
         rows=list(freeze["sectors"]); established=float(audit["eventDurationDays"])
         if not math.isfinite(established) or established<=0: raise ValueError("INVALID_EVENT_DURATION")
     except (KeyError,TypeError,ValueError) as error: return _unresolved(base,[str(error)])
+    import numpy as np
 
     _,duration,ingress,offset,fit=_select(rows,period,epoch,established)
     depth=-fit["coefficients"]["transit"]; formal=fit["uncertainties"]["transit"]
@@ -225,7 +230,12 @@ def fit_joint_event_phase_model(freeze,binary,audit,*,binary_confirmation_sha256
             "eventBlockJackknifeCount":block_count,"selectedDurationDays":sd,
             "selectedIngressFraction":si,"sampleCount":one["sampleCount"],"conditionNumber":one["condition"]})
     independent_rows=[x for x in per_sector if x["role"]=="INDEPENDENT"]
+    if (set(row["sector"] for row in independent_rows) != set(independent)
+            or len(independent_rows) != len(independent)):
+        return _unresolved(base,["FITTED_INDEPENDENT_DIAGNOSTIC_SECTOR_BINDING_MISMATCH"])
     weights=[1/x["consistencyTransitDepthUncertainty"]**2 for x in independent_rows]
+    if not weights or not math.isfinite(sum(weights)) or sum(weights)<=0:
+        return _unresolved(base,["INVALID_INDEPENDENT_CONSISTENCY_WEIGHTS"])
     weighted_depth=sum(w*x["transitDepthFractionalFlux"] for w,x in zip(weights,independent_rows))/sum(weights)
     heterogeneity=sum(w*(x["transitDepthFractionalFlux"]-weighted_depth)**2 for w,x in zip(weights,independent_rows))
     reduced_heterogeneity=heterogeneity/max(len(independent_rows)-1,1)

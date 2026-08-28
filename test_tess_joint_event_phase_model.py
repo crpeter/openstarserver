@@ -15,11 +15,10 @@ from workflows.tess.tess_event_depth_accuracy import (
 )
 from workflows.tess.tess_joint_event_phase_model import chronology_from_completed_stages
 HAS_NUMPY = importlib.util.find_spec("numpy") is not None
-if HAS_NUMPY:
-    from workflows.tess.tess_joint_event_phase_model import (
-        HANDLER_ID, RESULT_VERSION, _select, _sha, fit_joint_event_phase_model,
-        validate_model_hash,
-    )
+from workflows.tess.tess_joint_event_phase_model import (
+    HANDLER_ID, RESULT_VERSION, _select, _sha, fit_joint_event_phase_model,
+    validate_model_hash,
+)
 
 
 @unittest.skipUnless(HAS_NUMPY, "NumPy required by joint event/phase model")
@@ -197,6 +196,19 @@ class JointEventPhaseModelTests(unittest.TestCase):
             self.assertEqual("UNRESOLVED", result["status"])
             validate_model_hash(result)
 
+    def test_supporting_sectors_outside_frozen_timing_set_fail_closed(self):
+        freeze,binary,audit,digest,chronology=self.inputs()
+        binary["independentEvidence"]["supportingSectors"]=[7,8,9]
+        binary["sectorResults"]=[{"sector":sector,"role":"INDEPENDENT","usable":True}
+                                 for sector in (7,8,9)]
+        digest=self.rebind(freeze,binary,audit)
+        result=fit_joint_event_phase_model(freeze,binary,audit,
+            binary_confirmation_sha256=digest,chronology_proof=chronology)
+        self.assertEqual("UNRESOLVED",result["status"])
+        self.assertIn("INDEPENDENT_SUPPORT_SECTORS_NOT_IN_FROZEN_TIMING_SET",
+                      result["unresolvedReasons"])
+        self.assertEqual(result["modelSHA256"],validate_model_hash(result))
+
     def test_bad_chronology_histories_fail_closed(self):
         for handlers in (["photometry-freeze", "depth-audit"],
                          ["depth-audit", "photometry-freeze", "source-review"],
@@ -238,6 +250,22 @@ class RegisteredChronologyCalculationTests(unittest.TestCase):
         for stages in cases:
             proof=chronology_from_completed_stages(stages,required,external)
             self.assertFalse(proof["verifiedFromCompletedStages"])
+
+
+class PreFitFailClosedRegressionTests(unittest.TestCase):
+    def test_out_of_freeze_support_never_reaches_numeric_fit(self):
+        fixture=JointEventPhaseModelTests()
+        freeze,binary,audit,digest,chronology=fixture.inputs()
+        binary["independentEvidence"]["supportingSectors"]=[7,8,9]
+        binary["sectorResults"]=[{"sector":sector,"role":"INDEPENDENT","usable":True}
+                                 for sector in (7,8,9)]
+        digest=fixture.rebind(freeze,binary,audit)
+        result=fit_joint_event_phase_model(freeze,binary,audit,
+            binary_confirmation_sha256=digest,chronology_proof=chronology)
+        self.assertEqual("UNRESOLVED",result["status"])
+        self.assertIn("INDEPENDENT_SUPPORT_SECTORS_NOT_IN_FROZEN_TIMING_SET",
+                      result["unresolvedReasons"])
+        validate_model_hash(result)
 
 
 if __name__ == "__main__": unittest.main()
