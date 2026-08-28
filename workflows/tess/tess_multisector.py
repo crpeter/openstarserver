@@ -33,7 +33,11 @@ class TessArchiveInfrastructureError(RuntimeError):
         self.diagnostics = diagnostics
 
 
-class TessSelectedProductDownloadError(RuntimeError):
+class TessSectorUnavailableError(RuntimeError):
+    """An expected sector-specific archive product/preparation limitation."""
+
+
+class TessSelectedProductDownloadError(TessSectorUnavailableError):
     """An official selected product could not be retrieved from MAST."""
 
 
@@ -115,7 +119,7 @@ def _exptime_seconds(value: Any) -> float | None:
 
 def _expected_unavailable_product(error: Exception) -> bool:
     """Whether a sector-specific archive row/product is validly unavailable."""
-    return isinstance(error, (RuntimeError, TessSelectedProductDownloadError))
+    return isinstance(error, TessSectorUnavailableError)
 
 
 def discover_official_sectors(tic_id: int) -> list[int]:
@@ -156,7 +160,9 @@ def _select_product_from_search(
 ):
     table = getattr(search, "table", None)
     if table is None or len(table) == 0:
-        raise RuntimeError("MAST returned no TESS light-curve products.")
+        raise TessSectorUnavailableError(
+            "MAST returned no TESS light-curve products."
+        )
 
     colnames = set(getattr(table, "colnames", []))
     candidates: list[tuple[int, float, int, str, Any]] = []
@@ -190,7 +196,7 @@ def _select_product_from_search(
         )
 
     if not candidates:
-        raise RuntimeError(
+        raise TessSectorUnavailableError(
             "No official SPOC/TESS-SPOC light curve found for "
             f"Sector {sector}."
         )
@@ -220,7 +226,7 @@ def _download_selected_sector(
         actual_sector = getattr(light_curve, "meta", {}).get("SECTOR")
     actual_sector = _int(actual_sector) or int(sector)
     if actual_sector != int(sector):
-        raise RuntimeError(
+        raise TessSectorUnavailableError(
             f"Downloaded unexpected sector for TIC {tic_id}: "
             f"requested={sector}, actual={actual_sector}."
         )
@@ -262,7 +268,9 @@ def _prepare_samples_float64(light_curve: Any) -> tuple[np.ndarray, np.ndarray, 
     flux64 = flux64[finite]
 
     if len(times64) < 32:
-        raise RuntimeError("Independent sector contains too few finite samples.")
+        raise TessSectorUnavailableError(
+            "Independent sector contains too few finite samples."
+        )
 
     order = np.argsort(times64)
     times64 = times64[order]
@@ -291,7 +299,9 @@ def _prepare_samples(light_curve: Any) -> tuple[np.ndarray, np.ndarray, dict[str
     flux_mean = float(np.mean(flux64))
     flux_stddev = float(np.std(flux64))
     if not math.isfinite(flux_stddev) or flux_stddev <= 0:
-        raise RuntimeError("Independent sector has invalid flux standard deviation.")
+        raise TessSectorUnavailableError(
+            "Independent sector has invalid flux standard deviation."
+        )
 
     normalized64 = (flux64 - flux_mean) / flux_stddev
     time_origin = raw["originalTimeOriginDays"]
@@ -301,7 +311,9 @@ def _prepare_samples(light_curve: Any) -> tuple[np.ndarray, np.ndarray, dict[str
     times[0] = np.float32(0.0)
 
     if not np.all(np.isfinite(times)) or not np.all(np.isfinite(flux)):
-        raise RuntimeError("Float32 conversion produced non-finite values.")
+        raise TessSectorUnavailableError(
+            "Float32 conversion produced non-finite values."
+        )
 
     baseline = float(times[-1] - times[0]) if len(times) > 1 else 0.0
     return times, flux, {

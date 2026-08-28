@@ -15,6 +15,7 @@ from openstar_investigation import InvestigationStage, InvestigationStore
 from workflows.tess.tess_autonomy import WORKFLOW_ID, repair_obsolete_terminal_wait
 from workflows.tess.tess_multisector import (
     TessArchiveInfrastructureError,
+    TessSectorUnavailableError,
     _MAST_LIGHTKURVE_LOCK,
     _exptime_seconds,
     _sector_from_search_row,
@@ -81,7 +82,7 @@ class TessMaskedArchiveMetadataTests(unittest.TestCase):
 
 
 class TessArchiveLifecycleTests(unittest.TestCase):
-    def _build(self, root, investigation_id):
+    def _build(self, root, investigation_id, candidate_sectors=None):
         project = root / "source.json"
         if not project.exists():
             project.write_text(json.dumps({"id": "source", "name": "source", "workloadID": "ls",
@@ -90,7 +91,7 @@ class TessArchiveLifecycleTests(unittest.TestCase):
             source_project_path=project,
             source_dataset_entry={"id": "target", "targetName": "target"},
             tic_id=1, primary_sector=1, target_period_days=2.0,
-            candidate_sectors=[2], output_dir=root / investigation_id,
+            candidate_sectors=candidate_sectors or [2], output_dir=root / investigation_id,
             investigation_id=investigation_id,
         )
 
@@ -151,12 +152,40 @@ class TessArchiveLifecycleTests(unittest.TestCase):
                 self._build(Path(temporary), "failed")
             self.assertEqual("archive-materialization", caught.exception.diagnostics["errors"][0]["operation"])
 
-    def test_unexpected_internal_exception_fails_preparation(self):
+    def test_typed_unavailable_sector_is_recorded_while_valid_sector_proceeds(self):
+        values = np.arange(40, dtype=np.float32)
+        prep = {
+            "originalSamples": 40, "distributedSamples": 40,
+            "originalTimeOriginDays": 0.0, "sourceFluxMean": 0.0,
+            "sourceFluxStddev": 1.0, "baselineDays": 39.0,
+        }
+
+        def select(_search, sector):
+            if sector == 3:
+                raise TessSectorUnavailableError("no usable Sector 3 product")
+            return object(), "SPOC", 120.0
+
         with tempfile.TemporaryDirectory() as temporary, \
              patch("workflows.tess.tess_multisector._search_lightcurves", return_value=object()), \
              patch("workflows.tess.tess_multisector._select_product_from_search",
-                   side_effect=AssertionError("broken selection invariant")):
-            with self.assertRaisesRegex(AssertionError, "broken selection invariant"):
+                   side_effect=select), \
+             patch("workflows.tess.tess_multisector._download_selected_sector",
+                   return_value=(object(), {})), \
+             patch("workflows.tess.tess_multisector._prepare_samples",
+                   return_value=(values, values, prep)):
+            result = self._build(Path(temporary), "partial", [2, 3])
+
+        self.assertTrue(result["available"])
+        self.assertEqual([2], [item["sector"] for item in result["preparedSectors"]])
+        self.assertEqual(3, result["errors"][0]["sector"])
+        self.assertIn("TessSectorUnavailableError", result["errors"][0]["error"])
+
+    def test_plain_runtime_error_fails_preparation(self):
+        with tempfile.TemporaryDirectory() as temporary, \
+             patch("workflows.tess.tess_multisector._search_lightcurves", return_value=object()), \
+             patch("workflows.tess.tess_multisector._select_product_from_search",
+                   side_effect=RuntimeError("broken internal invariant")):
+            with self.assertRaisesRegex(RuntimeError, "broken internal invariant"):
                 self._build(Path(temporary), "failed")
 
 
