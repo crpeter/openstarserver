@@ -99,6 +99,25 @@ class BlindTransitSearchTests(unittest.TestCase):
             morphology, {**independent, "preparedSectors": independent["preparedSectors"][:1]}, broad))
         self.assertFalse(blind_transit_search_continuation(morphology, independent, None))
 
+        targeted = {
+            "claimDecision": {"claim": "HUMAN_REVIEW_REQUIRED"},
+            "primaryBoundaryHit": True,
+            "supportingSectorCount": 0,
+            "contradictionPlan": {
+                "action": "STOP",
+                "reason": "insufficient-independent-evidence-for-broad-contradiction-search",
+            },
+        }
+        self.assertTrue(blind_transit_search_continuation(
+            None, independent, None, targeted
+        ))
+        self.assertFalse(blind_transit_search_continuation(
+            None, independent, None, {**targeted, "primaryBoundaryHit": False}
+        ))
+        self.assertFalse(blind_transit_search_continuation(
+            None, independent, None, {**targeted, "supportingSectorCount": 1}
+        ))
+
     def test_recovers_repeated_narrow_period_beneath_stronger_smooth_variability(self):
         with tempfile.TemporaryDirectory() as temporary:
             primary, independent, morphology, broad = self._inputs(Path(temporary))
@@ -121,6 +140,104 @@ class BlindTransitSearchTests(unittest.TestCase):
         self.assertFalse(result["catalogAnswerKeyUsed"])
         self.assertFalse(result["physicalCycleResolved"])
         self.assertFalse(result["companionNatureResolved"])
+
+    def test_recovers_from_nonrecurrent_primary_boundary_without_broad_morphology(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            primary, independent, _, _ = self._inputs(Path(temporary))
+            targeted = {
+                "claimDecision": {"claim": "HUMAN_REVIEW_REQUIRED"},
+                "primaryBoundaryHit": True,
+                "supportingSectorCount": 0,
+                "contradictionPlan": {
+                    "action": "STOP",
+                    "reason": "insufficient-independent-evidence-for-broad-contradiction-search",
+                },
+            }
+            result = analyze_blind_transit_search(
+                primary_dataset_path=primary,
+                independent_spec=independent,
+                morphology=None,
+                broad_interpretation=None,
+                targeted_interpretation=targeted,
+            )
+
+        self.assertEqual("FULL_CHARACTERIZATION_NONRECURRENT_BOUNDARY_PERIOD",
+                         result["entryBoundary"])
+        self.assertEqual("REPLICATED_BLIND_TRANSIT_LIKE_CANDIDATE",
+                         result["classification"])
+        self.assertAlmostEqual(2.21857567, result["candidatePeriodDays"], delta=0.003)
+        self.assertFalse(result["catalogAnswerKeyUsed"])
+
+    def test_boundary_dominated_independent_failure_routes_directly_to_blind_search(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = InvestigationStore(root / "investigations")
+            investigation = store.create("boundary-transit-route", WORKFLOW_ID,
+                                         WORKFLOW_VERSION)
+            primary = root / "primary.json"
+            primary.write_text("{}", encoding="utf-8")
+            prepared_sectors = []
+            datasets = []
+            for index, sector in enumerate((83, 82, 76, 75)):
+                path = root / f"sector-{sector}.json"
+                path.write_text("{}", encoding="utf-8")
+                prepared_sectors.append({
+                    "datasetID": f"sector-{sector}",
+                    "sector": sector,
+                    "baselineDays": 26.0,
+                    "datasetPath": str(path),
+                })
+                frequency = 0.2 if index == 0 else 0.1
+                datasets.append({
+                    "datasetID": f"sector-{sector}",
+                    "periodStatus": "RELIABLE" if index == 0 else "LOW_CONFIDENCE",
+                    "periodConfidence": "high" if index == 0 else "low",
+                    "candidatePeriodDays": 1.0 / frequency,
+                    "candidateFrequency": frequency,
+                    "candidateFrequencyConfidenceInterval": {
+                        "lower": frequency - 0.001,
+                        "upper": frequency + 0.001,
+                    },
+                })
+            for stage in (
+                ("001-prepare-target", "openstar.tess.prepare-target",
+                 {"datasetPath": str(primary)}),
+                ("004-hypotheses", "openstar.tess.hypotheses", {
+                    "observedPeriodDays": 10.0,
+                    "primaryBoundaryHit": True,
+                }),
+                ("005-independent", "openstar.tess.independent.prepare", {
+                    "investigationGoal": "FULL_CHARACTERIZATION",
+                    "targetPeriodDays": 10.0,
+                    "preparedSectors": prepared_sectors,
+                    "frequencySearch": {
+                        "minimumFrequency": 0.1,
+                        "maximumFrequency": 5.0,
+                        "frequencyStep": 0.000001,
+                    },
+                }),
+                ("006-independent-run", "openstar.tess.independent.run",
+                 {"datasets": datasets}),
+            ):
+                investigation = self._complete(store, investigation, *stage)
+            engine = build_engine(store, types.SimpleNamespace(), poll_interval=0,
+                                  timeout=None)
+            engine.chain_stages = False
+            completed, request = engine.run_stage(
+                investigation,
+                StageRequest("007-independent-interpret",
+                             "openstar.tess.independent.interpret", {},
+                             "006-independent-run"),
+                software_id="test", software_version="boundary-route",
+            )
+
+        result = completed.stages[-1].result
+        self.assertEqual("HUMAN_REVIEW_REQUIRED",
+                         result["claimDecision"]["claim"])
+        self.assertEqual(0, result["supportingSectorCount"])
+        self.assertTrue(result["primaryBoundaryHit"])
+        self.assertEqual("STOP", result["contradictionPlan"]["action"])
+        self.assertEqual(HANDLER_ID, request.handler_id)
 
     def test_smooth_variability_without_dips_fails_closed(self):
         with tempfile.TemporaryDirectory() as temporary:
