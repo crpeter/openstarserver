@@ -14,6 +14,7 @@ from typing import Any
 
 
 RESULT_VERSION = "2.0"
+MORPHOLOGY_EVENT_SCREEN_ENTRY = "MORPHOLOGY_RESOLVED_PERIODIC_EVENT_SCREEN"
 DURATION_FRACTIONS = (0.01, 0.015, 0.02, 0.03, 0.05, 0.08, 0.12)
 MIN_INDEPENDENT_SUPPORTERS = 3
 MIN_SAMPLES = 80
@@ -33,6 +34,34 @@ def physical_interpretation_continuation(physical: dict[str, Any],
             and physical.get("preferredPhotometricHypothesis") == "BINARY_LIKE_DOUBLE_WAVE"
             and morphology.get("physicalCycleResolved") is True
             and math.isfinite(period) and period > 0)
+
+
+def morphology_event_screening_continuation(
+    morphology: dict[str, Any], independent_spec: dict[str, Any]
+) -> bool:
+    """Screen a resolved double-wave clock for recurring narrow events first.
+
+    This is a cheap, frozen-data geometry test, not a binary classification.
+    A smooth double wave fails closed; a recurring narrow event may continue to
+    source localization and precision event modeling.
+    """
+    try:
+        period = float(morphology.get("resolvedPhysicalPeriodDays"))
+    except (TypeError, ValueError):
+        return False
+    prepared_count = sum(
+        1
+        for item in independent_spec.get("preparedSectors") or []
+        if item.get("datasetPath")
+    )
+    return (
+        morphology.get("physicalCycleResolved") is True
+        and morphology.get("morphologyClass")
+        == "DOUBLE_WAVE_PHYSICAL_CYCLE_SUPPORTED"
+        and math.isfinite(period)
+        and period > 0
+        and prepared_count >= MIN_INDEPENDENT_SUPPORTERS
+    )
 
 
 def _load(path: str | Path) -> dict[str, Any]:
@@ -238,8 +267,15 @@ def _ephemeris(events: list[dict[str, Any]], input_period: float) -> dict[str, A
 
 def analyze_binary_confirmation(*, primary_dataset_path: str | Path,
                                 independent_spec: dict[str, Any], morphology: dict[str, Any],
-                                physical_interpretation: dict[str, Any]) -> dict[str, Any]:
-    if not physical_interpretation_continuation(physical_interpretation, morphology):
+                                physical_interpretation: dict[str, Any] | None,
+                                entry_mode: str = "PHYSICAL_INTERPRETATION") -> dict[str, Any]:
+    morphology_screen = entry_mode == MORPHOLOGY_EVENT_SCREEN_ENTRY
+    if morphology_screen:
+        if not morphology_event_screening_continuation(morphology, independent_spec):
+            raise ValueError("authoritative morphology event-screen input gate is not satisfied")
+    elif not physical_interpretation_continuation(
+        physical_interpretation or {}, morphology
+    ):
         raise ValueError("authoritative binary-confirmation input gate is not satisfied")
     prepared = [item for item in independent_spec.get("preparedSectors") or []
                 if item.get("datasetPath")]
@@ -307,6 +343,8 @@ def analyze_binary_confirmation(*, primary_dataset_path: str | Path,
     for item in results:
         item.pop("_times", None); item.pop("_residual", None)
     return {"resultVersion": RESULT_VERSION, "experiment": "FIXED_PERIOD_ECLIPSE_GEOMETRY_REPLICATION",
+            "entryBoundary": (MORPHOLOGY_EVENT_SCREEN_ENTRY if morphology_screen
+                              else "PHYSICAL_INTERPRETATION_BINARY_RECOMMENDATION"),
             "physicalPeriodInputDays": period, "sectorResults": results,
             "independentEvidence": {"classification": (
                 "REPLICATED_ECLIPSE_LIKE_EVENT_SUPPORTED" if supported else
