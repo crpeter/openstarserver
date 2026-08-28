@@ -684,6 +684,35 @@ class BlindTransitSearchTests(unittest.TestCase):
 
         self.assertAlmostEqual(0.2, frequency, delta=0.001)
 
+    def test_short_long_period_transit_is_not_diluted_by_one_percent_floor(self):
+        import numpy as np
+
+        period = 10.0
+        frequency = 1.0 / period
+        times = np.arange(0.0, 30.0, 0.005)
+        residual = np.zeros_like(times)
+        distance = np.abs(
+            np.remainder(times - 0.37 + period / 2.0, period)
+            - period / 2.0
+        )
+        residual[distance <= 0.025] -= 1.0
+
+        measurement = tess_blind_transit_search._box_score(
+            times, residual, 1.0, frequency
+        )
+        with mock.patch.object(
+            tess_blind_transit_search,
+            "DUTY_CYCLES",
+            (0.01, 0.015, 0.02, 0.03, 0.04, 0.05, 0.07, 0.10),
+        ):
+            old_floor = tess_blind_transit_search._box_score(
+                times, residual, 1.0, frequency
+            )
+
+        self.assertLessEqual(measurement["dutyCycle"], 0.005)
+        self.assertLessEqual(measurement["durationDays"], 0.05)
+        self.assertGreater(measurement["snr"], 1.25 * old_floor["snr"])
+
     def test_handler_id_is_stable(self):
         self.assertEqual("openstar.tess.blind-transit-search.analyze", HANDLER_ID)
 
