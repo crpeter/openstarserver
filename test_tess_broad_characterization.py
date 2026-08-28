@@ -2972,6 +2972,78 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
                 {"evidenceLineage": "MORPHOLOGY_RESOLVED_TIME_FREQUENCY_RECOMMENDATION"},
                 "014-time-frequency"), software_id="integration", software_version="20.30")
 
+    def test_post_dynamic_time_frequency_does_not_repeat_dynamic_modeling(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        store = InvestigationStore(Path(temporary.name) / "investigations")
+        investigation = store.create("post-dynamic-stop", WORKFLOW_ID, WORKFLOW_VERSION)
+        period = 7.25
+        morphology = {
+            "physicalCycleResolved": True,
+            "resolvedPhysicalPeriodDays": period,
+        }
+        preparation = {
+            "periodReference": {
+                "kind": "MORPHOLOGY_RESOLVED_PHYSICAL_PERIOD",
+                "physicalCycleResolved": True,
+                "periodDays": period,
+            },
+            "familySubtraction": {
+                "source": "PERSISTED_DYNAMIC_HARMONIC_MODEL",
+                "harmonicOrders": [1, 2, 3, 4],
+            },
+        }
+        interpretation = {"windowResults": [], "familyTrack": []}
+        for stage_id, handler, result in (
+            ("010-morphology", "openstar.tess.morphology.analyze", morphology),
+            ("016-prepare-time-frequency", "openstar.tess.time-frequency.prepare", preparation),
+            ("018-interpret-time-frequency", "openstar.tess.time-frequency.interpret", interpretation),
+        ):
+            investigation = self._complete(store, investigation, stage_id, handler, result)
+
+        repeated_dynamic_recommendation = {
+            "classification": "FAMILY_PHASE_EVOLUTION",
+            "physicalMechanismResolved": False,
+            "recommendedNextTest": "DYNAMIC_HARMONIC_MODELING",
+            "residualEvolution": {
+                "classification": "NO_SIGNIFICANT_TIME_FREQUENCY_STRUCTURE",
+            },
+            "familyEvolution": {"classification": "FAMILY_PHASE_EVOLUTION"},
+            "acceptedFeatureCount": 0,
+            "windowCount": 15,
+        }
+        engine = build_engine(
+            store, coordinator=types.SimpleNamespace(), poll_interval=0.0, timeout=None,
+        )
+        engine.chain_stages = False
+        with mock.patch(
+            "workflows.tess.tess_investigation.summarize_time_frequency_evolution",
+            return_value=repeated_dynamic_recommendation,
+        ):
+            completed, next_request = engine.run_stage(
+                investigation,
+                StageRequest(
+                    "019-summarize-time-frequency",
+                    "openstar.tess.time-frequency.summarize",
+                    {},
+                    "018-interpret-time-frequency",
+                ),
+                software_id="integration",
+                software_version="20.30",
+            )
+
+        summary = completed.stages[-1].result
+        self.assertIsNone(summary["recommendedNextTest"])
+        self.assertEqual(
+            "POST_DYNAMIC_HARMONIC_RESIDUAL_TIME_FREQUENCY",
+            summary["evidenceLineage"],
+        )
+        self.assertEqual(
+            "DYNAMIC_HARMONIC_MODELING_ALREADY_APPLIED",
+            summary["continuationDisposition"],
+        )
+        self.assertEqual("openstar.tess.finalize", next_request.handler_id)
+
     def test_resolved_stable_time_frequency_summary_routes_to_physical_interpretation(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
