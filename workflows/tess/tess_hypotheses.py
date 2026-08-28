@@ -320,7 +320,6 @@ def plan(
             ),
             "claimDecision": claim.as_dict(),
             "reason": "catalog-period-match",
-            "catalogMatchTerminal": not full_characterization,
             **(
                 {"investigationGoal": investigation_goal}
                 if full_characterization else {}

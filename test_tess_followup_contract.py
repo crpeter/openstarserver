@@ -41,9 +41,8 @@ class LowFrequencyFollowupContractTests(unittest.TestCase):
 
         self.assertEqual(("STOP", "catalog-period-match"),
                          (ordinary["action"], ordinary["reason"]))
-        self.assertIs(ordinary["catalogMatchTerminal"], True)
+        self.assertEqual({"action", "claimDecision", "reason"}, set(ordinary))
         self.assertEqual("INDEPENDENT_SECTOR_FOLLOWUP", full["action"])
-        self.assertIs(full["catalogMatchTerminal"], False)
         self.assertEqual("KNOWN_PERIOD_RECOVERED",
                          full["claimDecision"]["claim"])
         self.assertEqual("FULL_CHARACTERIZATION", full["investigationGoal"])
