@@ -6,6 +6,7 @@ import sys
 import tempfile
 import types
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -92,7 +93,8 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
 
     def _independent_contradiction_fixture(self, root, *, relation="2x",
                                            completed_morphology=False,
-                                           recurrent=False):
+                                           recurrent=False,
+                                           investigation_goal=None):
         store = InvestigationStore(root / "investigations")
         investigation = store.create("synthetic-harmonic-routing", WORKFLOW_ID,
                                      WORKFLOW_VERSION)
@@ -121,6 +123,8 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
                 "frequencyStep": 0.0001,
             },
         }
+        if investigation_goal is not None:
+            independent["investigationGoal"] = investigation_goal
         candidate = analysis["observedPeriodDays"] if recurrent else 3.0
         run = {"datasets": [
             {"datasetID": f"sector-{sector}", "periodStatus": "RELIABLE",
@@ -167,6 +171,121 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
             _, request = self._run_independent_interpretation(investigation, engine)
             self.assertEqual("openstar.tess.morphology.analyze", request.handler_id)
             self.assertNotEqual("openstar.tess.independent.broad.prepare", request.handler_id)
+
+    def test_full_characterization_confirmation_routes_to_morphology(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            _, investigation, engine, _, _, _ = self._independent_contradiction_fixture(
+                Path(temporary), recurrent=True,
+                investigation_goal="FULL_CHARACTERIZATION",
+            )
+            completed, request = self._run_independent_interpretation(investigation, engine)
+            self.assertEqual("FULL_CHARACTERIZATION",
+                             completed.stages[-1].result["investigationGoal"])
+            self.assertEqual("openstar.tess.morphology.analyze", request.handler_id)
+            self.assertEqual("full-characterization-independent-confirmation",
+                             request.parameters["evidenceSource"])
+
+    def test_full_characterization_confirmation_without_family_uses_broad_search(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            _, investigation, engine, _, _, _ = self._independent_contradiction_fixture(
+                Path(temporary), relation="1x", recurrent=True,
+                investigation_goal="FULL_CHARACTERIZATION",
+            )
+            _, request = self._run_independent_interpretation(investigation, engine)
+            self.assertEqual("openstar.tess.independent.broad.prepare", request.handler_id)
+
+    def test_ordinary_confirmation_finalizes_and_inadequate_evidence_stays_unresolved(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            _, investigation, engine, _, _, _ = self._independent_contradiction_fixture(
+                Path(temporary), recurrent=True,
+            )
+            completed, request = self._run_independent_interpretation(investigation, engine)
+            self.assertEqual("openstar.tess.finalize", request.handler_id)
+            self.assertNotIn("investigationGoal", completed.stages[-1].result)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            _, investigation, engine, _, _, _ = self._independent_contradiction_fixture(
+                Path(temporary), relation="1x", recurrent=False,
+                investigation_goal="FULL_CHARACTERIZATION",
+            )
+            # Make the evidence inadequate rather than broad-search eligible.
+            run = next(stage for stage in investigation.stages
+                       if stage.handler_id == "openstar.tess.independent.run")
+            weak = {"datasets": [run.result["datasets"][0] | {
+                "periodStatus": "LOW_CONFIDENCE", "periodConfidence": "low"}]}
+            investigation = replace(investigation, stages=tuple(
+                replace(stage, result=weak) if stage is run else stage
+                for stage in investigation.stages))
+            completed, request = self._run_independent_interpretation(investigation, engine)
+            self.assertEqual("HUMAN_REVIEW_REQUIRED",
+                             completed.stages[-1].result["claimDecision"]["claim"])
+            self.assertEqual("openstar.tess.finalize", request.handler_id)
+
+    def test_schema_v2_goal_executes_planner_to_independent_preparation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = InvestigationStore(Path(temporary) / "investigations")
+            investigation = store.create("future-goal", WORKFLOW_ID, WORKFLOW_VERSION)
+            for stage_id, handler, result in (
+                ("001-prepare-target", "openstar.tess.prepare-target",
+                 {"investigationGoal": "FULL_CHARACTERIZATION"}),
+                ("003-catalog-identity", "openstar.tess.catalog-identity", {}),
+                ("004-hypotheses", "openstar.tess.hypotheses", {
+                    "observedPeriodDays": 2.0,
+                    "bestCatalogMatch": {"source": "generic-catalog"},
+                    "rotationSanity": {},
+                }),
+            ):
+                investigation = self._complete(store, investigation, stage_id, handler, result)
+            engine = build_engine(store, types.SimpleNamespace(), poll_interval=0, timeout=None)
+            engine.chain_stages = False
+            completed, request = engine.run_stage(
+                investigation,
+                StageRequest("005-planner", "openstar.tess.planner", {}, "004-hypotheses"),
+                software_id="test", software_version="schema-v2",
+            )
+            self.assertEqual("INDEPENDENT_SECTOR_FOLLOWUP",
+                             completed.stages[-1].result["action"])
+            self.assertEqual("FULL_CHARACTERIZATION",
+                             completed.stages[-1].result["investigationGoal"])
+            self.assertEqual("openstar.tess.independent.prepare", request.handler_id)
+
+    def test_compatibility_request_goal_enters_independent_preparation_result(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = InvestigationStore(root / "investigations")
+            investigation = store.create("legacy-goal", WORKFLOW_ID, WORKFLOW_VERSION)
+            project = root / "project.json"
+            dataset = root / "dataset.json"
+            project.write_text("{}")
+            dataset.write_text("{}")
+            for stage_id, handler, result in (
+                ("001-prepare-target", "openstar.tess.prepare-target", {
+                    "sourceProjectPath": str(project), "datasetPath": str(dataset),
+                    "sourceDatasetEntry": {"id": "generic"}, "ticID": 1, "sector": 1,
+                }),
+                ("003-catalog-identity", "openstar.tess.catalog-identity",
+                 {"tess": {"officialSectors": [1, 2]}}),
+                ("004-hypotheses", "openstar.tess.hypotheses",
+                 {"observedPeriodDays": 2.0}),
+                ("005-planner", "openstar.tess.planner",
+                 {"action": "STOP", "reason": "catalog-period-match"}),
+            ):
+                investigation = self._complete(store, investigation, stage_id, handler, result)
+            engine = build_engine(store, types.SimpleNamespace(), poll_interval=0, timeout=None)
+            engine.chain_stages = False
+            with mock.patch(
+                "workflows.tess.tess_investigation.build_independent_sector_project",
+                return_value={"available": False, "preparedSectors": [], "errors": []},
+            ):
+                completed, _ = engine.run_stage(
+                    investigation,
+                    StageRequest("007-prepare-independent-sectors",
+                        "openstar.tess.independent.prepare",
+                        {"investigationGoal": "FULL_CHARACTERIZATION"}, "006-finalize"),
+                    software_id="test", software_version="compatibility",
+                )
+            self.assertEqual("FULL_CHARACTERIZATION",
+                             completed.stages[-1].result["investigationGoal"])
 
     def test_direct_primary_morphology_uses_frozen_evidence_and_hashes(self):
         with tempfile.TemporaryDirectory() as temporary:

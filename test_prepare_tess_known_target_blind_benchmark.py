@@ -128,6 +128,14 @@ class BlindBenchmarkPreparerTests(unittest.TestCase):
             frozen = json.loads(Path(prepared["projectPath"]).read_text())
             self.assertEqual(frozen["datasets"][0], manifest["datasets"][0])
             self.assertEqual(
+                "FULL_CHARACTERIZATION",
+                manifest["datasets"][0]["investigationGoal"],
+            )
+            self.assertEqual("FULL_CHARACTERIZATION", prepared["investigationGoal"])
+            self.assertEqual(
+                "FULL_CHARACTERIZATION", frozen["investigation"]["goal"]
+            )
+            self.assertEqual(
                 manifest["datasets"][0]["datasetSHA256"],
                 hashlib.sha256(dataset_path.read_bytes()).hexdigest(),
             )

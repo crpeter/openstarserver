@@ -96,12 +96,15 @@ def build_single_target_primary(
             "purpose": "single-target-primary",
         },
     }
+    investigation_goal = entry.get("investigationGoal")
+    if investigation_goal is not None:
+        manifest["investigation"]["goal"] = investigation_goal
 
     output_dir = Path(output_dir)
     manifest_path = output_dir / "primary" / f"{_safe(project_id)}.json"
     _write_json(manifest_path, manifest)
 
-    return {
+    result = {
         "projectID": project_id,
         "projectPath": str(manifest_path.resolve()),
         "sourceProjectID": project["id"],
@@ -113,6 +116,9 @@ def build_single_target_primary(
         "sector": entry.get("sector") or (dataset.get("source") or {}).get("sector"),
         "sourceDatasetEntry": entry,
     }
+    if investigation_goal is not None:
+        result["investigationGoal"] = investigation_goal
+    return result
 
 
 def build_low_frequency_followup(

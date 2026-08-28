@@ -38,6 +38,111 @@ _MAIN_FAMILY_RECURRENCE_HANDLER = "openstar.tess.main-family-time-domain-recurre
 _MAIN_FAMILY_FREQUENCY_REASSESSMENT_HANDLER = (
     "openstar.tess.main-family-frequency-domain-reassessment.analyze")
 
+_KNOWN_TARGET_BLIND_PREPARER = "openstar.tess-known-target-blind-benchmark-preparer"
+
+
+def _repair_known_target_blind_full_characterization(
+    store: InvestigationStore, investigation: Investigation, control: dict
+) -> Investigation | None:
+    """Append follow-up only at the verified schema-v1 catalog-match boundary."""
+    expected_handlers = (
+        "openstar.tess.prepare-target",
+        "openstar.tess.primary-project.run",
+        "openstar.tess.catalog-identity",
+        "openstar.tess.hypotheses",
+        "openstar.tess.planner",
+        "openstar.tess.finalize",
+    )
+    stages = investigation.stages
+    if not (
+        investigation.status == "COMPLETE"
+        and control.get("schedulerAction") == "INVESTIGATION_COMPLETE"
+        and control.get("selectedExperiment") in (None, {})
+        and len(stages) == len(expected_handlers)
+        and tuple(stage.id for stage in stages) == (
+            "001-prepare-target", "002-primary-distributed-search",
+            "003-catalog-identity", "004-hypotheses", "005-planner", "006-finalize",
+        )
+        and tuple(stage.handler_id for stage in stages) == expected_handlers
+        and all(stage.status == "COMPLETE" for stage in stages)
+        and stages[0].triggered_by_stage_id is None
+        and all(stages[index].triggered_by_stage_id == stages[index - 1].id
+                for index in range(1, len(stages)))
+        and stages[-1].stop is True
+        and all(store.verified_terminal_stage_ledger_hash(investigation.id, stage)
+                for stage in stages)
+    ):
+        return None
+
+    prepared = stages[0].result or {}
+    planner = stages[4].result or {}
+    final = stages[5].result or {}
+    claim = final.get("claim")
+    if isinstance(claim, dict):
+        claim = claim.get("claim")
+    if not (
+        planner.get("action") == "STOP"
+        and planner.get("reason") == "catalog-period-match"
+        and claim == "KNOWN_PERIOD_RECOVERED"
+        and (prepared.get("sourceDatasetEntry") or {}).get("role") == "blind"
+    ):
+        return None
+
+    try:
+        project_path = Path(prepared["sourceProjectPath"])
+        dataset_path = Path(prepared["datasetPath"])
+        project = json.loads(project_path.read_text(encoding="utf-8"))
+        dataset_entry = prepared["sourceDatasetEntry"]
+        marker = project["preparer"]
+    except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    expected_marker = {
+        "preparerID": _KNOWN_TARGET_BLIND_PREPARER,
+        "schemaVersion": 1,
+        "ownedFiles": ["dataset.json", "project.json"],
+        "projectID": project.get("id"),
+    }
+    hashes = stages[0].provenance.input_hashes if stages[0].provenance else {}
+    if not project_path.is_file() or not dataset_path.is_file():
+        return None
+    if not (
+        marker == expected_marker
+        and project.get("datasets") == [dataset_entry]
+        and dataset_entry.get("role") == "blind"
+        and Path(str(dataset_entry.get("path"))).resolve() == dataset_path.resolve()
+        and dataset_entry.get("datasetSHA256") == sha256_file(dataset_path)
+        and hashes.get("sourceProjectManifest") == sha256_file(project_path)
+        and hashes.get("sourceDataset") == sha256_file(dataset_path)
+        and all(Path(artifact.path).is_file()
+                and sha256_file(artifact.path) == artifact.sha256
+                for stage in stages for artifact in stage.artifacts)
+        and (stages[2].provenance and
+             stages[2].provenance.input_hashes.get("primaryTargetResult")
+             == sha256_json(stages[1].result))
+        and (stages[3].provenance and
+             stages[3].provenance.input_hashes.get("identity")
+             == sha256_json(stages[2].result))
+        and (stages[4].provenance and
+             stages[4].provenance.input_hashes.get("hypothesisAnalysis")
+             == sha256_json(stages[3].result))
+        and (stages[5].provenance and
+             stages[5].provenance.input_hashes.get("planner")
+             == sha256_json(stages[4].result))
+    ):
+        return None
+
+    request = StageRequest(
+        id="007-prepare-independent-sectors",
+        handler_id="openstar.tess.independent.prepare",
+        parameters={"investigationGoal": "FULL_CHARACTERIZATION"},
+        triggered_by_stage_id=stages[-1].id,
+    )
+    return store.set_control_state(investigation, status="RUNNING", control_state={
+        "branchAssessments": [], "selectedExperiment": asdict(request),
+        "schedulerAction": "RUN_EXPERIMENT",
+        "recovery": "KNOWN_TARGET_BLIND_V1_FULL_CHARACTERIZATION_CONTINUATION",
+    })
+
 
 def _continue_finalized_main_family_frequency_reassessment(store, investigation, control,
         *, historical_path_resolver):
@@ -1681,6 +1786,11 @@ def repair_obsolete_terminal_wait(
         return investigation
 
     resolver = historical_path_resolver or NO_HISTORICAL_PATH_RELOCATION
+    benchmark_repair = _repair_known_target_blind_full_characterization(
+        store, investigation, control
+    )
+    if benchmark_repair is not None:
+        return benchmark_repair
     family_recovery = _recover_failed_v2014_family_ledger_compatibility(
         store, investigation, historical_path_resolver=resolver)
     if family_recovery is not None:

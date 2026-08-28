@@ -2133,11 +2133,12 @@ def build_engine(
         )
 
     def planner_stage(investigation, request):
+        prepared = _result(investigation, "001-prepare-target")
         identity = _latest_result_for_handler(investigation, "openstar.tess.catalog-identity")
         analysis = _latest_result_for_handler(investigation, "openstar.tess.hypotheses")
         if identity is None or analysis is None:
             raise RuntimeError("Planner requires completed identity and hypotheses.")
-        planned = plan(analysis, identity)
+        planned = plan(analysis, identity, prepared.get("investigationGoal"))
         print("🧭 Deterministic planner")
         print(f"   action: {planned['action']}")
         print(f"   reason: {planned['reason']}")
@@ -2354,6 +2355,13 @@ def build_engine(
                               "planner": sha256_json(planner)},
             ) from error
 
+        spec = dict(spec)
+        investigation_goal = (
+            prepared.get("investigationGoal")
+            or request.parameters.get("investigationGoal")
+        )
+        if investigation_goal is not None:
+            spec["investigationGoal"] = investigation_goal
         print(f"   prepared independent sectors: {[item.get('sector') for item in spec.get('preparedSectors') or []]}")
         if spec.get("errors"):
             print(f"   sector preparation errors: {len(spec['errors'])}")
@@ -2424,6 +2432,9 @@ def build_engine(
             project_status=run,
             independent_spec=spec,
         )
+        goal = spec.get("investigationGoal")
+        if goal is not None:
+            interpreted["investigationGoal"] = goal
         print("🔭 Independent-sector recurrence interpretation")
         print(f"   eligible sectors: {interpreted.get('eligibleSectorCount')}")
         print(f"   supporting sectors: {interpreted.get('supportingSectorCount')}")
@@ -2440,7 +2451,11 @@ def build_engine(
         print(f"   reliable sectors: {contradiction_plan.get('reliableSectorCount')}")
         print(f"   boundary hits: {contradiction_plan.get('boundaryHitCount')}")
 
-        if contradiction_plan["action"] == "BROAD_INDEPENDENT_SEARCH":
+        full_characterization_confirmed = (
+            goal == "FULL_CHARACTERIZATION"
+            and contradiction_plan["reason"] == "targeted-independent-recurrence-confirmed"
+        )
+        if contradiction_plan["action"] == "BROAD_INDEPENDENT_SEARCH" or full_characterization_confirmed:
             primary_analysis = _required_latest_result_for_handler(
                 investigation, "openstar.tess.hypotheses"
             )
@@ -2453,7 +2468,11 @@ def build_engine(
                     id=_next_stage_id(request.id, "morphology"),
                     handler_id="openstar.tess.morphology.analyze",
                     parameters={
-                        "evidenceSource": "primary-harmonic-contradiction",
+                        "evidenceSource": (
+                            "full-characterization-independent-confirmation"
+                            if full_characterization_confirmed
+                            else "primary-harmonic-contradiction"
+                        ),
                         "unresolvedFallback": "BROAD_INDEPENDENT_SEARCH",
                     },
                     triggered_by_stage_id=request.id,
@@ -2695,7 +2714,10 @@ def build_engine(
         family = ((harmonic or broad or {}).get("harmonicFamily") or {})
         primary_analysis = None
         direct_primary_family = False
-        if not family and request.parameters.get("evidenceSource") == "primary-harmonic-contradiction":
+        if not family and request.parameters.get("evidenceSource") in {
+            "primary-harmonic-contradiction",
+            "full-characterization-independent-confirmation",
+        }:
             primary_analysis = _required_latest_result_for_handler(
                 investigation, "openstar.tess.hypotheses"
             )
