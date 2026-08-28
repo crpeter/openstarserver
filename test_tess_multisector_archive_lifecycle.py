@@ -8,14 +8,76 @@ from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
+from astropy import units as u
+from astropy.table import MaskedColumn, Table
 
 from openstar_investigation import InvestigationStage, InvestigationStore
 from workflows.tess.tess_autonomy import WORKFLOW_ID, repair_obsolete_terminal_wait
 from workflows.tess.tess_multisector import (
     TessArchiveInfrastructureError,
     _MAST_LIGHTKURVE_LOCK,
+    _exptime_seconds,
+    _sector_from_search_row,
+    _select_product_from_search,
     build_independent_sector_project,
 )
+
+
+class _SearchResult:
+    def __init__(self, table, selected_indices=None):
+        self.table = table
+        self.selected_indices = selected_indices
+
+    def __getitem__(self, item):
+        indices = list(range(len(self.table)))[item]
+        if isinstance(indices, int):
+            indices = [indices]
+        return _SearchResult(self.table[item], indices)
+
+
+class TessMaskedArchiveMetadataTests(unittest.TestCase):
+    def test_masked_sequence_number_uses_mission_fallback(self):
+        table = Table()
+        table["sequence_number"] = MaskedColumn([1], mask=[True])
+        table["mission"] = ["TESS Sector 0105"]
+        self.assertEqual(105, _sector_from_search_row(table, 0))
+
+    def test_masked_sequence_number_without_fallback_is_unavailable(self):
+        table = Table()
+        table["sequence_number"] = MaskedColumn([1], mask=[True])
+        table["mission"] = MaskedColumn(["TESS Sector 1"], mask=[True])
+        self.assertIsNone(_sector_from_search_row(table, 0))
+
+    def test_masked_exptime_is_none_not_nan(self):
+        value = MaskedColumn([120.0], mask=[True], unit=u.s)[0]
+        self.assertTrue(np.ma.is_masked(value))
+        self.assertIsNone(_exptime_seconds(value))
+
+    def test_masked_irrelevant_rows_do_not_hide_deterministic_valid_product(self):
+        table = Table()
+        table["sequence_number"] = MaskedColumn(
+            [1, 105, 105, 105, 105], mask=[True, False, False, False, False]
+        )
+        table["mission"] = MaskedColumn(
+            ["irrelevant", "TESS Sector 105", "TESS Sector 105",
+             "TESS Sector 105", "TESS Sector 105"],
+            mask=[True, False, False, False, False],
+        )
+        table["author"] = ["QLP", "TESS-SPOC", "SPOC", "SPOC", "SPOC"]
+        table["exptime"] = MaskedColumn(
+            [600.0, 20.0, 120.0, 20.0, 20.0],
+            mask=[True, False, True, False, False], unit=u.s,
+        )
+
+        selected, author, cadence = _select_product_from_search(
+            _SearchResult(table), 105
+        )
+
+        # SPOC priority wins over TESS-SPOC, a finite cadence wins over the
+        # masked cadence, and row index 3 wins the equal-cadence tie.
+        self.assertEqual("SPOC", author)
+        self.assertEqual(20.0, cadence)
+        self.assertEqual([3], selected.selected_indices)
 
 
 class TessArchiveLifecycleTests(unittest.TestCase):
@@ -88,6 +150,14 @@ class TessArchiveLifecycleTests(unittest.TestCase):
             with self.assertRaises(TessArchiveInfrastructureError) as caught:
                 self._build(Path(temporary), "failed")
             self.assertEqual("archive-materialization", caught.exception.diagnostics["errors"][0]["operation"])
+
+    def test_unexpected_internal_exception_fails_preparation(self):
+        with tempfile.TemporaryDirectory() as temporary, \
+             patch("workflows.tess.tess_multisector._search_lightcurves", return_value=object()), \
+             patch("workflows.tess.tess_multisector._select_product_from_search",
+                   side_effect=AssertionError("broken selection invariant")):
+            with self.assertRaisesRegex(AssertionError, "broken selection invariant"):
+                self._build(Path(temporary), "failed")
 
 
 class TessClosedFileCompatibilityTests(unittest.TestCase):

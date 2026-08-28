@@ -57,6 +57,8 @@ def _safe(value: str) -> str:
 
 
 def _float(value: Any) -> float | None:
+    if value is None or np.ma.is_masked(value):
+        return None
     try:
         result = float(value)
     except (TypeError, ValueError):
@@ -65,6 +67,8 @@ def _float(value: Any) -> float | None:
 
 
 def _int(value: Any) -> int | None:
+    if value is None or np.ma.is_masked(value):
+        return None
     try:
         return int(value)
     except (TypeError, ValueError):
@@ -75,7 +79,7 @@ def _int(value: Any) -> int | None:
 
 
 def _sector_from_text(value: Any) -> int | None:
-    if value is None:
+    if value is None or np.ma.is_masked(value):
         return None
     match = re.search(r"sector\s*0*(\d+)", str(value), flags=re.IGNORECASE)
     return int(match.group(1)) if match else None
@@ -93,17 +97,25 @@ def _sector_from_search_row(table: Any, index: int) -> int | None:
 
 
 def _exptime_seconds(value: Any) -> float | None:
-    if value is None:
+    if value is None or np.ma.is_masked(value):
         return None
-    try:
+    if hasattr(value, "to_value"):
         from astropy import units as u
-        if hasattr(value, "to_value"):
-            return float(value.to_value(u.s))
-    except Exception:
-        pass
+
+        try:
+            return _float(value.to_value(u.s))
+        except (TypeError, ValueError):
+            return None
     if hasattr(value, "value"):
+        if np.ma.is_masked(value.value):
+            return None
         return _float(value.value)
     return _float(value)
+
+
+def _expected_unavailable_product(error: Exception) -> bool:
+    """Whether a sector-specific archive row/product is validly unavailable."""
+    return isinstance(error, (RuntimeError, TessSelectedProductDownloadError))
 
 
 def discover_official_sectors(tic_id: int) -> list[int]:
@@ -414,6 +426,8 @@ def build_independent_sector_project(
                     errors.append(diagnostic)
                     if _archive_io_failure(error):
                         infrastructure_errors.append(diagnostic)
+                    elif not _expected_unavailable_product(error):
+                        raise
     except Exception as error:
         diagnostic = {"sector": None, "operation": "archive-search",
                       "error": f"{type(error).__name__}: {error}"}
@@ -422,17 +436,7 @@ def build_independent_sector_project(
                 "MAST light-curve search is temporarily unavailable.",
                 {"candidateSectors": sectors, "preparedSectors": [], "errors": [diagnostic]},
             ) from error
-        return {
-            "available": False,
-            "projectID": None,
-            "projectPath": None,
-            "targetPeriodDays": float(target_period_days),
-            "primarySector": primary_sector,
-            "candidateSectors": sectors,
-            "preparedSectors": [],
-            "errors": [diagnostic],
-            "frequencySearch": frequency_search,
-        }
+        raise
 
     print(
         f"   sector preparation order: {selected_sectors}",
@@ -522,10 +526,7 @@ def build_independent_sector_project(
                 "sector": int(sector),
                 "error": error_text,
             })
-            print(
-                f"      skipped: {error_text}",
-                flush=True,
-            )
+            raise
 
     if not dataset_entries:
         return {
