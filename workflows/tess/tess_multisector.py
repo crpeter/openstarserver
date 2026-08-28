@@ -375,7 +375,13 @@ def build_independent_sector_project(
     candidate_sectors: list[int] | None,
     output_dir: str | Path,
     investigation_id: str,
+    maximum_sectors: int = MAX_INDEPENDENT_SECTORS,
+    excluded_sectors: list[int] | None = None,
+    artifact_subdirectory: str = "independent-sectors",
+    project_suffix: str = "independent-sectors-v1",
 ) -> dict[str, Any]:
+    if maximum_sectors < 1:
+        raise ValueError("maximum_sectors must be positive")
     source_project_path = Path(source_project_path).expanduser().resolve()
     with source_project_path.open("r", encoding="utf-8") as handle:
         source_project = json.load(handle)
@@ -409,6 +415,8 @@ def build_independent_sector_project(
             for value in sectors
             if value != int(primary_sector)
         ]
+    excluded = {int(value) for value in (excluded_sectors or [])}
+    sectors = [value for value in sectors if value not in excluded]
 
     sectors = _rank_independent_sectors(
         sectors,
@@ -416,12 +424,12 @@ def build_independent_sector_project(
     )
 
     frequency_search = _frequency_window(float(target_period_days))
-    artifact_root = Path(output_dir) / "independent-sectors"
+    artifact_root = Path(output_dir) / _safe(artifact_subdirectory)
     dataset_entries: list[dict[str, Any]] = []
     prepared_sectors: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
 
-    selected_sectors = sectors[:MAX_INDEPENDENT_SECTORS]
+    selected_sectors = sectors[:maximum_sectors]
 
     print(
         "   querying MAST light-curve catalog once for independent sectors...",
@@ -572,7 +580,7 @@ def build_independent_sector_project(
 
     project_id = (
         f"{source_project['id']}.investigation.{_safe(investigation_id)}."
-        "independent-sectors-v1"
+        f"{_safe(project_suffix)}"
     )
     manifest = {
         "id": project_id,

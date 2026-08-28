@@ -602,6 +602,106 @@ class BlindTransitSearchTests(unittest.TestCase):
     def test_handler_id_is_stable(self):
         self.assertEqual("openstar.tess.blind-transit-search.analyze", HANDLER_ID)
 
+    def test_unresolved_blind_search_freezes_additional_sectors_and_retries(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = InvestigationStore(root / "investigations")
+            investigation = store.create("adaptive-blind-search", WORKFLOW_ID,
+                                         WORKFLOW_VERSION)
+            source_project = root / "source-project.json"
+            source_project.write_text(json.dumps({
+                "id": "source", "name": "source", "workloadID": "ls",
+                "datasets": [],
+            }), encoding="utf-8")
+            primary = root / "primary.json"
+            primary.write_text("{}", encoding="utf-8")
+            existing = []
+            for sector in (2, 3):
+                path = root / f"sector-{sector}.json"
+                path.write_text("{}", encoding="utf-8")
+                existing.append({"sector": sector, "datasetPath": str(path)})
+            added_path = root / "sector-4.json"
+            added_path.write_text("{}", encoding="utf-8")
+            extension_project = root / "extension-project.json"
+            extension_project.write_text("{}", encoding="utf-8")
+
+            for stage in (
+                ("001-prepare-target", "openstar.tess.prepare-target", {
+                    "datasetPath": str(primary),
+                    "sourceProjectPath": str(source_project),
+                    "sourceDatasetEntry": {"id": "target", "targetName": "Blind"},
+                    "ticID": 1,
+                    "sector": 1,
+                }),
+                ("002-independent", "openstar.tess.independent.prepare", {
+                    "investigationGoal": "FULL_CHARACTERIZATION",
+                    "targetPeriodDays": 5.5,
+                    "candidateSectors": [2, 3, 4, 5, 6],
+                    "preparedSectors": existing,
+                }),
+                ("003-interpret", "openstar.tess.independent.interpret", {
+                    "claimDecision": {"claim": "HUMAN_REVIEW_REQUIRED"},
+                    "primaryReliable": False,
+                }),
+            ):
+                investigation = self._complete(store, investigation, *stage)
+
+            unresolved = {
+                "classification": "BLIND_TRANSIT_PERIOD_UNRESOLVED",
+                "coarseCandidatePeriodDays": 4.2,
+                "candidatePeriodDays": None,
+                "supportingIndependentSectors": [],
+                "linearEphemeris": {"coherent": False},
+                "recommendedNextTest": "HUMAN_SCIENTIFIC_REVIEW",
+            }
+            recovered = {
+                "classification": "REPLICATED_BLIND_TRANSIT_LIKE_CANDIDATE",
+                "candidatePeriodDays": 9.9,
+                "supportingIndependentSectors": [2, 4],
+                "linearEphemeris": {"coherent": True},
+                "recommendedNextTest": (
+                    "ADDITIONAL_INDEPENDENT_SECTOR_TRANSIT_CONFIRMATION"
+                ),
+            }
+            extension = {
+                "preparedSectors": [
+                    {"sector": 4, "datasetPath": str(added_path)}
+                ],
+                "projectPath": str(extension_project),
+            }
+            engine = build_engine(store, types.SimpleNamespace(), poll_interval=0,
+                                  timeout=None)
+            engine.chain_stages = False
+            with mock.patch(
+                "workflows.tess.tess_investigation.analyze_blind_transit_search",
+                side_effect=[unresolved, recovered],
+            ) as analyze_search, mock.patch(
+                "workflows.tess.tess_investigation.build_independent_sector_project",
+                return_value=extension,
+            ) as build_extension:
+                completed, next_request = engine.run_stage(
+                    investigation,
+                    StageRequest("004-blind", HANDLER_ID, {}, "003-interpret"),
+                    software_id="test", software_version="adaptive-extension",
+                )
+
+        result = completed.stages[-1].result
+        self.assertEqual("REPLICATED_BLIND_TRANSIT_LIKE_CANDIDATE",
+                         result["classification"])
+        self.assertEqual([4], result["adaptiveSectorExtension"][
+            "additionalPreparedSectors"])
+        self.assertFalse(result["adaptiveSectorExtension"]["catalogAnswerKeyUsed"])
+        self.assertEqual(2, analyze_search.call_count)
+        second_spec = analyze_search.call_args_list[1].kwargs["independent_spec"]
+        self.assertEqual([2, 3, 4], [
+            item["sector"] for item in second_spec["preparedSectors"]
+        ])
+        self.assertEqual(8, build_extension.call_args.kwargs["maximum_sectors"])
+        self.assertEqual([2, 3], sorted(
+            build_extension.call_args.kwargs["excluded_sectors"]
+        ))
+        self.assertEqual("openstar.tess.finalize", next_request.handler_id)
+
     def test_unresolved_full_characterization_morphology_routes_to_blind_search(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
