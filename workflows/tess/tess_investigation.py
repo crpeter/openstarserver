@@ -10462,7 +10462,35 @@ def build_engine(
             print(f"   binary-confirmation ephemeris coherent: {binary_ephemeris.get('coherent')}")
             print(f"   ephemeris timing sectors: {binary_ephemeris.get('timingSectors')}")
             print(f"   primary timing epoch included: {binary_ephemeris.get('primarySectorIncluded')}")
-            print(f"   opposite-conjunction evidence: {binary_opposite.get('classification')}")
+            if joint_event_phase_model is None:
+                print(f"   opposite-conjunction evidence: {binary_opposite.get('classification')}")
+            else:
+                print("   pre-joint binary opposite-conjunction evidence: "
+                      f"{binary_opposite.get('classification')}")
+        if joint_event_phase_model is not None:
+            joint_fit = joint_event_phase_model.get("globalFit") or {}
+            joint_gates = joint_event_phase_model.get("resolutionGates") or {}
+            print("   joint model status/classification: "
+                  f"{joint_event_phase_model.get('status')} / "
+                  f"{joint_event_phase_model.get('classification')}")
+            print("   empirical mid-transit deficit and conservative uncertainty: "
+                  f"{joint_fit.get('midTransitFractionalFluxDeficit')} ± "
+                  f"{joint_fit.get('conservativeTransitDepthUncertainty')}")
+            print("   equivalent-box transit depth: "
+                  f"{joint_fit.get('equivalentBoxTransitDepthFractionalFlux')}")
+            print("   opposite-conjunction eclipse depth/status: "
+                  f"{joint_fit.get('oppositeConjunctionEclipseDepthFractionalFlux')} / "
+                  f"{joint_fit.get('oppositeConjunctionEclipseStatus')}")
+            print("   fundamental phase status: "
+                  f"{joint_fit.get('fundamentalPhaseCurveStatus')}")
+            print("   second-harmonic phase status: "
+                  f"{joint_fit.get('secondHarmonicPhaseCurveStatus')}")
+            print("   independent supporting-sector count: "
+                  f"{joint_event_phase_model.get('independentSupportingSectorCount')}")
+            print("   leave-one-sector-out stable: "
+                  f"{joint_gates.get('leaveOneSectorOutStable')}")
+            print("   joint model unresolved reasons: "
+                  f"{joint_event_phase_model.get('unresolvedReasons') or []}")
         if source_attribution_review is not None:
             print(f"   source-attribution review: {source_attribution_review.get('classification')}")
             print("   recomputed independent source support: "

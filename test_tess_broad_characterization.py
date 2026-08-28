@@ -923,7 +923,7 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
                     self.assertIsNone(conclusion["selectedPeriodDays"])
 
     def test_actual_finalizer_uses_physical_then_binary_recommendation(self):
-        def run(include_binary):
+        def run(include_binary, joint_model=None):
             root = Path(tempfile.mkdtemp())
             self.addCleanup(lambda: __import__("shutil").rmtree(root, ignore_errors=True))
             store = InvestigationStore(root / "investigations")
@@ -952,6 +952,19 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
                     "oppositeConjunctionEvidence": {
                         "classification": "OPPOSITE_CONJUNCTION_EVENT_UNRESOLVED"},
                     "recommendedNextTest": "ECLIPSE_EVENT_SOURCE_LOCALIZATION"}))
+            if joint_model is not None:
+                stages.append(("023-joint", "openstar.tess.joint-event-phase-model.fit",
+                               joint_model))
+                stages.append(("024-synthesis",
+                               "openstar.tess.final-companion-evidence-synthesis", {
+                    "classification": "KNOWN_TARGET_ASSOCIATED_MASSIVE_COMPANION_SYNTHESIZED",
+                    "sourceRelationship": "TARGET_ASSOCIATED",
+                    "supportedCompanionMassRegime": "MASSIVE_PLANET_OR_BROWN_DWARF",
+                    "companionNatureResolved": True,
+                    "physicalMechanismResolved": False,
+                    "automaticDiscoveryClaim": False,
+                    "recommendedNextTest": "HUMAN_SCIENTIFIC_REVIEW",
+                }))
             for stage in stages:
                 investigation = self._complete(store, investigation, *stage)
             engine = build_engine(store, coordinator=types.SimpleNamespace(),
@@ -978,8 +991,82 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
         self.assertIn("REPLICATED_ECLIPSE_LIKE_EVENT_SUPPORTED", report)
         self.assertIn("eclipse-like replication: REPLICATED_ECLIPSE_LIKE_EVENT_SUPPORTED",
                       binary_console)
+        self.assertIn("opposite-conjunction evidence: OPPOSITE_CONJUNCTION_EVENT_UNRESOLVED",
+                      binary_console)
+        self.assertNotIn("pre-joint binary opposite-conjunction evidence", binary_console)
         self.assertIn("authoritative recommended next test: ECLIPSE_EVENT_SOURCE_LOCALIZATION",
                       binary_console)
+
+        resolved_joint = {
+            "status": "COMPLETE",
+            "classification": "PRECISION_EMPIRICAL_TRANSIT_DEPTH_RESOLVED",
+            "globalFit": {
+                "midTransitFractionalFluxDeficit": 0.0091,
+                "conservativeTransitDepthUncertainty": 0.0004,
+                "equivalentBoxTransitDepthFractionalFlux": 0.0087,
+                "oppositeConjunctionEclipseDepthFractionalFlux": 0.0012,
+                "oppositeConjunctionEclipseStatus": "RESOLVED",
+                "fundamentalPhaseCurveStatus": "RESOLVED",
+                "secondHarmonicPhaseCurveStatus": "RESOLVED",
+            },
+            "independentSupportingSectorCount": 4,
+            "resolutionGates": {"leaveOneSectorOutStable": True},
+            "unresolvedReasons": [],
+            "physicalMechanismResolved": False,
+            "modelSHA256": "fixture-model-hash",
+        }
+        joint, joint_console = run(True, resolved_joint)
+        joint_report = Path(joint["reportPath"]).read_text(encoding="utf-8")
+        self.assertEqual(resolved_joint, joint["jointEventPhaseModel"])
+        self.assertFalse(joint["physicalInterpretation"]["physicalMechanismResolved"])
+        self.assertEqual("HUMAN_SCIENTIFIC_REVIEW", joint["recommendedNextTest"])
+        self.assertEqual("KNOWN_TARGET_ASSOCIATED_MASSIVE_COMPANION_SYNTHESIZED",
+                         joint["finalCompanionEvidenceSynthesis"]["classification"])
+        self.assertFalse(joint["finalCompanionEvidenceSynthesis"]["physicalMechanismResolved"])
+        self.assertFalse(joint["automaticDiscoveryClaim"])
+        self.assertIn("authoritative recommended next test: HUMAN_SCIENTIFIC_REVIEW",
+                      joint_console)
+        self.assertIn("pre-joint binary opposite-conjunction evidence: "
+                      "OPPOSITE_CONJUNCTION_EVENT_UNRESOLVED", joint_console)
+        self.assertNotIn("   opposite-conjunction evidence: ", joint_console)
+        console_fields = (
+            "COMPLETE / PRECISION_EMPIRICAL_TRANSIT_DEPTH_RESOLVED", "0.0091 ± 0.0004",
+            "equivalent-box transit depth: 0.0087", "0.0012 / RESOLVED",
+            "fundamental phase status: RESOLVED", "second-harmonic phase status: RESOLVED",
+            "independent supporting-sector count: 4", "leave-one-sector-out stable: True",
+            "joint model unresolved reasons: []",
+        )
+        for field in console_fields:
+            self.assertIn(field, joint_console)
+        report_fields = (
+            "COMPLETE / PRECISION_EMPIRICAL_TRANSIT_DEPTH_RESOLVED", "0.0091 ± 0.0004",
+            "Equivalent-box transit depth: 0.0087", "0.0012 (RESOLVED)",
+            "RESOLVED / RESOLVED", "Independent supporting sectors: 4",
+            "Leave-one-sector-out stable: True", "Unresolved reasons: []",
+            "neither a companion radius nor a complete physical transit solution",
+        )
+        for field in report_fields:
+            self.assertIn(field, joint_report)
+
+        unresolved_joint = {
+            **resolved_joint,
+            "status": "UNRESOLVED",
+            "classification": "JOINT_EVENT_PHASE_MODEL_UNRESOLVED",
+            "globalFit": {**resolved_joint["globalFit"],
+                          "oppositeConjunctionEclipseStatus": "UNRESOLVED"},
+            "resolutionGates": {"leaveOneSectorOutStable": False},
+            "unresolvedReasons": ["LEAVE_ONE_SECTOR_OUT_UNSTABLE"],
+        }
+        unresolved, unresolved_console = run(True, unresolved_joint)
+        unresolved_report = Path(unresolved["reportPath"]).read_text(encoding="utf-8")
+        self.assertIn("UNRESOLVED / JOINT_EVENT_PHASE_MODEL_UNRESOLVED", unresolved_console)
+        self.assertIn("0.0012 / UNRESOLVED", unresolved_console)
+        self.assertIn("joint model unresolved reasons: ['LEAVE_ONE_SECTOR_OUT_UNSTABLE']",
+                      unresolved_console)
+        self.assertIn("0.0012 (UNRESOLVED)", unresolved_report)
+        self.assertIn("Unresolved reasons: ['LEAVE_ONE_SECTOR_OUT_UNSTABLE']",
+                      unresolved_report)
+        self.assertEqual(unresolved_joint, unresolved["jointEventPhaseModel"])
 
     def test_broad_continuation_executes_existing_morphology_handler(self):
         temporary = tempfile.TemporaryDirectory()
