@@ -248,13 +248,30 @@ def _rank_independent_sectors(
         return unique
 
     primary = int(primary_sector)
-    return sorted(
+    nearest = sorted(
         unique,
-        key=lambda sector: (
-            -abs(sector - primary),
-            sector,
-        ),
+        key=lambda sector: (abs(sector - primary), sector),
     )
+    farthest = sorted(
+        unique,
+        key=lambda sector: (-abs(sector - primary), sector),
+    )
+
+    # Preserve a long temporal baseline without spending the entire bounded
+    # follow-up budget on the newest/farthest observations.  Alternating the
+    # two rankings freezes both a nearby repeat and a distant confirmation,
+    # which is more representative when signal quality evolves by sector.
+    ranked: list[int] = []
+    used: set[int] = set()
+    for index in range(len(unique)):
+        for ranking in (farthest, nearest):
+            if index >= len(ranking):
+                continue
+            sector = ranking[index]
+            if sector not in used:
+                ranked.append(sector)
+                used.add(sector)
+    return ranked
 
 
 
