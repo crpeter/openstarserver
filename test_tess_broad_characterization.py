@@ -347,6 +347,160 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
             self.assertNotEqual("openstar.tess.physical.interpret",
                                 next_request.handler_id)
 
+    def test_resolved_double_wave_screens_periodic_events_before_time_frequency(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _, investigation, engine, _, _, _ = self._independent_contradiction_fixture(
+                root
+            )
+            investigation, request = self._run_independent_interpretation(
+                investigation, engine
+            )
+            third_path = root / "sector-4.json"
+            third_path.write_text(
+                json.dumps({"times": [0.0, 1.0], "flux": [1.0, 1.0]}),
+                encoding="utf-8",
+            )
+            independent_stage = next(
+                stage for stage in investigation.stages
+                if stage.handler_id == "openstar.tess.independent.prepare"
+            )
+            expanded_independent = {
+                **independent_stage.result,
+                "preparedSectors": [
+                    *(independent_stage.result.get("preparedSectors") or []),
+                    {
+                        "datasetID": "sector-4",
+                        "sector": 4,
+                        "baselineDays": 100.0,
+                        "datasetPath": str(third_path),
+                    },
+                ],
+            }
+            investigation = replace(
+                investigation,
+                stages=tuple(
+                    replace(stage, result=expanded_independent)
+                    if stage is independent_stage else stage
+                    for stage in investigation.stages
+                ),
+            )
+            morphology = {
+                "physicalCycleResolved": True,
+                "resolvedPhysicalPeriodDays": 8.0,
+                "morphologyClass": "DOUBLE_WAVE_PHYSICAL_CYCLE_SUPPORTED",
+                "continuationEvidence": {
+                    "timeFrequencyEvolutionWarranted": True,
+                    "entryReason": "RESOLVED_MORPHOLOGY_EVOLUTION_FOLLOWUP",
+                },
+                "sectorResults": [],
+            }
+            with mock.patch(
+                "workflows.tess.tess_investigation.analyze_morphology",
+                return_value=morphology,
+            ):
+                _, next_request = engine.run_stage(
+                    investigation,
+                    request,
+                    software_id="integration",
+                    software_version="periodic-event-screen-routing",
+                )
+            self.assertEqual(
+                "openstar.tess.binary-confirmation.analyze",
+                next_request.handler_id,
+            )
+            self.assertEqual(
+                "MORPHOLOGY_RESOLVED_PERIODIC_EVENT_SCREEN",
+                next_request.parameters["entryMode"],
+            )
+
+    def test_unresolved_periodic_event_screen_falls_back_to_original_time_frequency_path(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = InvestigationStore(root / "investigations")
+            investigation = store.create(
+                "periodic-event-screen-fallback", WORKFLOW_ID, WORKFLOW_VERSION
+            )
+            primary = root / "primary.json"
+            primary.write_text("{}", encoding="utf-8")
+            prepared_sectors = []
+            for sector in (2, 3, 4):
+                path = root / f"sector-{sector}.json"
+                path.write_text("{}", encoding="utf-8")
+                prepared_sectors.append(
+                    {"sector": sector, "datasetPath": str(path)}
+                )
+            morphology = {
+                "physicalCycleResolved": True,
+                "resolvedPhysicalPeriodDays": 8.0,
+                "morphologyClass": "DOUBLE_WAVE_PHYSICAL_CYCLE_SUPPORTED",
+                "continuationEvidence": {
+                    "timeFrequencyEvolutionWarranted": True,
+                    "entryReason": "RESOLVED_MORPHOLOGY_EVOLUTION_FOLLOWUP",
+                },
+            }
+            for stage_id, handler, result in (
+                ("001-prepare-target", "openstar.tess.prepare-target", {
+                    "datasetPath": str(primary),
+                }),
+                ("006-prepare-independent", "openstar.tess.independent.prepare", {
+                    "preparedSectors": prepared_sectors,
+                }),
+                ("010-morphology", "openstar.tess.morphology.analyze", morphology),
+            ):
+                investigation = self._complete(
+                    store, investigation, stage_id, handler, result
+                )
+            engine = build_engine(
+                store, types.SimpleNamespace(), poll_interval=0.0, timeout=None
+            )
+            engine.chain_stages = False
+            unresolved = {
+                "resultVersion": "2.0",
+                "entryBoundary": "MORPHOLOGY_RESOLVED_PERIODIC_EVENT_SCREEN",
+                "independentEvidence": {
+                    "classification": "ECLIPSE_LIKE_EVENT_UNRESOLVED",
+                    "supportingIndependentSectorCount": 0,
+                },
+                "linearEphemeris": {"coherent": False},
+                "recommendedNextTest": "BINARY_ROTATION_EXTERNAL_EVIDENCE",
+                "catalogAnswerKeyUsed": False,
+                "physicalMechanismResolved": False,
+                "companionNatureResolved": False,
+            }
+            with mock.patch(
+                "workflows.tess.tess_investigation.analyze_binary_confirmation",
+                return_value=unresolved,
+            ) as analyze_mock:
+                completed, next_request = engine.run_stage(
+                    investigation,
+                    StageRequest(
+                        "011-periodic-event-screen",
+                        "openstar.tess.binary-confirmation.analyze",
+                        {"entryMode": "MORPHOLOGY_RESOLVED_PERIODIC_EVENT_SCREEN"},
+                        "010-morphology",
+                    ),
+                    software_id="integration",
+                    software_version="periodic-event-screen-fallback",
+                )
+            self.assertEqual(
+                "openstar.tess.time-frequency.prepare", next_request.handler_id
+            )
+            self.assertEqual(
+                "RESOLVED_MORPHOLOGY_EVOLUTION_FOLLOWUP",
+                next_request.parameters["entryReason"],
+            )
+            analyze_mock.assert_called_once_with(
+                primary_dataset_path=str(primary),
+                independent_spec={"preparedSectors": prepared_sectors},
+                morphology=morphology,
+                physical_interpretation=None,
+                entry_mode="MORPHOLOGY_RESOLVED_PERIODIC_EVENT_SCREEN",
+            )
+            hashes = completed.stages[-1].provenance.input_hashes
+            self.assertNotIn("physicalInterpretation", hashes)
+            self.assertIn("eventScreenEntryBoundary", hashes)
+
     def test_nonharmonic_success_and_completed_morphology_do_not_reroute(self):
         cases = (
             {"relation": "1x", "expected": "openstar.tess.independent.broad.prepare"},
