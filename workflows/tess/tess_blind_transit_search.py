@@ -15,7 +15,7 @@ from typing import Any
 
 
 HANDLER_ID = "openstar.tess.blind-transit-search.analyze"
-RESULT_VERSION = "1.3"
+RESULT_VERSION = "1.4"
 ENTRY_BOUNDARY = "FULL_CHARACTERIZATION_UNRESOLVED_BROAD_VARIABILITY"
 TARGETED_BOUNDARY_ENTRY = "FULL_CHARACTERIZATION_NONRECURRENT_BOUNDARY_PERIOD"
 UNRELIABLE_PRIMARY_ENTRY = "FULL_CHARACTERIZATION_NONRECURRENT_UNRELIABLE_PRIMARY"
@@ -31,11 +31,14 @@ MINIMUM_POOLED_SPLIT_SNR = 5.5
 MINIMUM_POOLED_LEAVE_ONE_OUT_SNR = 8.5
 MINIMUM_POOLED_CONTRIBUTING_SECTORS = 4
 MINIMUM_POOLED_SECTOR_ALIGNED_SNR = 1.5
+MAXIMUM_TRANSIT_CLAIM_DUTY_CYCLE = 0.07
 MINIMUM_PERIOD_DAYS = 0.2
 MAXIMUM_PERIOD_DAYS = 10.0
 PHASE_BIN_COUNT = 400
 OVERSAMPLING = 8.0
-MAXIMUM_FINE_GRID_SIZE = 2001
+COARSE_FAMILY_COUNT = 12
+JOINT_REFINEMENT_FAMILY_COUNT = 4
+JOINT_REFINEMENT_HALF_WIDTH_STEPS = 12
 MINIMUM_PARITY_CYCLES = 2
 MINIMUM_PARITY_SNR_SEPARATION = 4.0
 MAXIMUM_ALTERNATE_PARITY_SNR_FRACTION = 0.5
@@ -201,6 +204,163 @@ def _pooled_box_score(
         item["residual"] / item["sigma"] for item in sectors
     ])
     return _box_score(times, residual, 1.0, frequency)
+
+
+def _phase_box_arrays(sector: dict[str, Any], frequency: float, width: int):
+    """Return fixed-phase box counts, depths, and SNRs for one sector."""
+    import numpy as np
+
+    phases = np.remainder(sector["times"] * frequency, 1.0)
+    indices = np.minimum(
+        (phases * PHASE_BIN_COUNT).astype(int), PHASE_BIN_COUNT - 1
+    )
+    counts = np.bincount(indices, minlength=PHASE_BIN_COUNT).astype(float)
+    sums = np.bincount(
+        indices, weights=sector["residual"], minlength=PHASE_BIN_COUNT
+    )
+    doubled_counts = np.concatenate((counts, counts))
+    doubled_sums = np.concatenate((sums, sums))
+    count_prefix = np.concatenate(([0.0], np.cumsum(doubled_counts)))
+    sum_prefix = np.concatenate(([0.0], np.cumsum(doubled_sums)))
+    inside_count = (
+        count_prefix[width:width + PHASE_BIN_COUNT]
+        - count_prefix[:PHASE_BIN_COUNT]
+    )
+    inside_sum = (
+        sum_prefix[width:width + PHASE_BIN_COUNT]
+        - sum_prefix[:PHASE_BIN_COUNT]
+    )
+    valid = inside_count >= 5
+    depth = np.zeros(PHASE_BIN_COUNT, dtype=float)
+    depth[valid] = -inside_sum[valid] / inside_count[valid]
+    snr = np.zeros(PHASE_BIN_COUNT, dtype=float)
+    positive = valid & (depth > 0)
+    snr[positive] = (
+        depth[positive] * np.sqrt(inside_count[positive]) / sector["sigma"]
+    )
+    return inside_count, depth, snr
+
+
+def _joint_box_score(
+    sectors: list[dict[str, Any]], frequency: float
+) -> tuple[float, list[dict[str, Any]], dict[str, Any]]:
+    """Rank one shared period, epoch, and duration across normalized sectors.
+
+    A loud event in one sector cannot choose the epoch.  The strict objective
+    requires the primary and two independent sectors at the same phase.  With
+    enough sectors, a second robust objective requires evidence in both the
+    early and late halves and caps every sector's ranking contribution.  Claim
+    thresholds remain the responsibility of the existing recurrence gates.
+    """
+    import numpy as np
+
+    if not sectors:
+        return 0.0, [], {
+            "method": "SHARED_PERIOD_EPOCH_DURATION_BOX_SEARCH",
+            "frequencyPerDay": frequency,
+        }
+    if sectors[0]["role"] != "PRIMARY":
+        raise ValueError("joint transit search requires the primary sector first")
+
+    period = 1.0 / frequency
+    independent_indices = [
+        index for index, item in enumerate(sectors)
+        if item["role"] == "INDEPENDENT"
+    ]
+    ordered_independent = sorted(
+        independent_indices,
+        key=lambda index: float(statistics.median(sectors[index]["times"])),
+    )
+    midpoint = len(ordered_independent) // 2
+    early_indices = ordered_independent[:midpoint]
+    late_indices = ordered_independent[midpoint:]
+    best = None
+
+    for duty in DUTY_CYCLES:
+        width = max(1, int(round(duty * PHASE_BIN_COUNT)))
+        profiles = [
+            _phase_box_arrays(item, frequency, width) for item in sectors
+        ]
+        snrs = np.stack([item[2] for item in profiles])
+        primary_snr = snrs[0]
+
+        if len(independent_indices) >= MINIMUM_INDEPENDENT_SECTORS:
+            independent_snrs = np.sort(snrs[independent_indices], axis=0)
+            top = independent_snrs[-1]
+            second = independent_snrs[-MINIMUM_INDEPENDENT_SECTORS]
+            strict_score = (
+                np.minimum(primary_snr, second)
+                + 0.05 * (primary_snr + top + second)
+            )
+        else:
+            strict_score = np.zeros(PHASE_BIN_COUNT, dtype=float)
+
+        pooled_score = np.zeros(PHASE_BIN_COUNT, dtype=float)
+        if len(independent_indices) >= MINIMUM_POOLED_INDEPENDENT_SECTORS:
+            capped = np.minimum(snrs, MINIMUM_SECTOR_SNR)
+
+            def robust(indices):
+                if not indices:
+                    return np.zeros(PHASE_BIN_COUNT, dtype=float)
+                return np.sqrt(np.sum(capped[indices] ** 2, axis=0))
+
+            all_independent = robust(independent_indices)
+            early = robust(early_indices)
+            late = robust(late_indices)
+            pooled_score = (
+                np.minimum(np.minimum(primary_snr, early), late)
+                + 0.02 * (primary_snr + all_independent + early + late)
+            )
+
+        objective = np.maximum(strict_score, pooled_score)
+        start = int(np.argmax(objective))
+        candidate = (
+            float(objective[start]),
+            float(primary_snr[start]),
+            int(np.count_nonzero(snrs[independent_indices, start] > 0.0)),
+            -width,
+            -start,
+        )
+        if best is None or candidate > best[0]:
+            best = (candidate, width, start, profiles, strict_score, pooled_score)
+
+    if best is None:  # pragma: no cover - DUTY_CYCLES is a nonempty contract
+        return 0.0, [], {
+            "method": "SHARED_PERIOD_EPOCH_DURATION_BOX_SEARCH",
+            "frequencyPerDay": frequency,
+        }
+
+    candidate, width, start, profiles, strict_score, pooled_score = best
+    event_phase = ((start + width / 2.0) / PHASE_BIN_COUNT) % 1.0
+    duty_cycle = width / PHASE_BIN_COUNT
+    measurements = []
+    for sector, (counts, depths, snrs) in zip(sectors, profiles):
+        measurements.append({
+            "snr": float(snrs[start]),
+            "periodDays": period,
+            "frequencyPerDay": frequency,
+            "eventPhase": event_phase,
+            "dutyCycle": duty_cycle,
+            "durationDays": duty_cycle * period,
+            "depthStandardized": float(depths[start]),
+            "eventSampleCount": int(counts[start]),
+            "depthIsPhysical": False,
+        })
+    audit = {
+        "method": "SHARED_PERIOD_EPOCH_DURATION_BOX_SEARCH",
+        "frequencyPerDay": frequency,
+        "periodDays": period,
+        "eventPhase": event_phase,
+        "dutyCycle": duty_cycle,
+        "durationDays": duty_cycle * period,
+        "objectiveScore": candidate[0],
+        "strictObjectiveScore": float(strict_score[start]),
+        "pooledSplitObjectiveScore": float(pooled_score[start]),
+        "perSectorNormalization": "ROBUST_SCATTER",
+        "pooledRankingSnrCapPerSector": MINIMUM_SECTOR_SNR,
+        "maximumClaimDutyCycle": MAXIMUM_TRANSIT_CLAIM_DUTY_CYCLE,
+    }
+    return candidate[0], measurements, audit
 
 
 def _phase_distance(first: float, second: float) -> float:
@@ -372,6 +532,7 @@ def _sector_results_for_frequency(
         usable = bool(
             measurement["snr"] >= MINIMUM_SECTOR_SNR
             and cycle_coverage >= 2.0
+            and measurement["dutyCycle"] <= MAXIMUM_TRANSIT_CLAIM_DUTY_CYCLE
         )
         median_time = float(statistics.median(sector["times"]))
         epoch = (round(median_time / period - measurement["eventPhase"])
@@ -453,10 +614,7 @@ def _candidate_evidence(
     dict[str, Any],
 ]:
     period = 1.0 / frequency
-    measurements = [
-        _box_score(item["times"], item["residual"], item["sigma"], frequency)
-        for item in sectors
-    ]
+    _, measurements, _ = _joint_box_score(sectors, frequency)
     results = _sector_results_for_frequency(sectors, measurements, frequency)
     (
         primary_supported, independent_supporters, ephemeris, supported,
@@ -628,7 +786,7 @@ def _search_grid(sectors: list[dict[str, Any]], minimum: float, maximum: float):
         float(item["times"][0]) for item in sectors
     )
     coarse_step = 1.0 / (longest_baseline * OVERSAMPLING)
-    requested_fine_step = 1.0 / (full_span * OVERSAMPLING)
+    requested_fine_step = min(DUTY_CYCLES) / (full_span * OVERSAMPLING)
     coarse = np.arange(minimum, maximum + 0.5 * coarse_step, coarse_step)
 
     def evaluate(frequencies):
@@ -675,18 +833,70 @@ def _search_grid(sectors: list[dict[str, Any]], minimum: float, maximum: float):
             details.append(per_sector)
         return np.asarray(combined), details
 
-    coarse_scores, _ = evaluate(coarse)
-    center = float(coarse[int(np.argmax(coarse_scores))])
-    lower = max(minimum, center - coarse_step)
-    upper = min(maximum, center + coarse_step)
-    requested_count = int(math.ceil((upper - lower) / requested_fine_step)) + 1
-    fine_count = min(MAXIMUM_FINE_GRID_SIZE, max(201, requested_count))
-    fine = np.linspace(lower, upper, fine_count)
-    fine_scores, fine_details = evaluate(fine)
-    index = int(np.argmax(fine_scores))
-    actual_fine_step = float(fine[1] - fine[0]) if fine.size > 1 else 0.0
+    coarse_scores, coarse_details = evaluate(coarse)
+    ranked_indices = np.argsort(coarse_scores)[::-1]
+    family_indices = []
+    for raw_index in ranked_indices:
+        index = int(raw_index)
+        if any(abs(index - selected) <= 1 for selected in family_indices):
+            continue
+        family_indices.append(index)
+        if len(family_indices) >= COARSE_FAMILY_COUNT:
+            break
+
+    hypotheses = []
+    for index in family_indices:
+        center = float(coarse[index])
+        hypotheses.append(center)
+        measurements = coarse_details[index]
+        event_epochs = []
+        for sector, measurement in zip(sectors, measurements):
+            median_time = float(statistics.median(sector["times"]))
+            phase = float(measurement["eventPhase"])
+            epoch = (round(median_time * center - phase) + phase) / center
+            event_epochs.append(epoch)
+        for first in range(len(event_epochs)):
+            for second in range(first + 1, len(event_epochs)):
+                separation = event_epochs[second] - event_epochs[first]
+                cycles = round(separation * center)
+                if cycles == 0:
+                    continue
+                frequency = cycles / separation
+                if (
+                    minimum <= frequency <= maximum
+                    and abs(frequency - center) <= coarse_step
+                ):
+                    hypotheses.append(float(frequency))
+
+    resolution = max(requested_fine_step, np.finfo(float).eps)
+    unique = {}
+    for frequency in hypotheses:
+        unique.setdefault(round(frequency / resolution), frequency)
+
+    ranked_joint = []
+    for frequency in unique.values():
+        score, measurements, _ = _joint_box_score(sectors, frequency)
+        ranked_joint.append((score, frequency, measurements))
+    ranked_joint.sort(key=lambda item: (item[0], -item[1]), reverse=True)
+
+    refined = []
+    for _, center, _ in ranked_joint[:JOINT_REFINEMENT_FAMILY_COUNT]:
+        for offset in range(
+            -JOINT_REFINEMENT_HALF_WIDTH_STEPS,
+            JOINT_REFINEMENT_HALF_WIDTH_STEPS + 1,
+        ):
+            frequency = center + offset * requested_fine_step
+            if minimum <= frequency <= maximum:
+                score, measurements, _ = _joint_box_score(sectors, frequency)
+                refined.append((score, frequency, measurements))
+    if not refined:
+        refined = ranked_joint
+    score, frequency, measurements = max(
+        refined, key=lambda item: (item[0], -item[1])
+    )
+    actual_fine_step = requested_fine_step
     return (
-        float(fine[index]), float(fine_scores[index]), fine_details[index],
+        float(frequency), float(score), measurements,
         coarse_step, actual_fine_step, full_span,
     )
 
@@ -775,7 +985,7 @@ def analyze_blind_transit_search(
     frequency, alias_resolution = _resolve_alternating_cycle_alias(
         sectors, measurements, frequency, minimum
     )
-    period = 1.0 / frequency
+    _, _, joint_search = _joint_box_score(sectors, frequency)
     (
         sector_results, primary_supported, independent_supporters,
         ephemeris, supported, support_gate,
@@ -800,6 +1010,7 @@ def analyze_blind_transit_search(
         "coarseCandidatePeriodDays": raw_period,
         "candidateFrequencyPerDay": (1.0 / refined if refined else None),
         "combinedRecurrenceScore": combined_score,
+        "jointTransitSearch": joint_search,
         "alternatingCycleAliasResolution": alias_resolution,
         "sectorResults": sector_results,
         "primarySectorSupported": primary_supported,
@@ -814,10 +1025,13 @@ def analyze_blind_transit_search(
             "coarseFrequencyStepPerDay": coarse_step,
             "fullObservationSpanDays": full_span,
             "fineFrequencyStepPerDay": fine_step,
+            "frequencyResolutionBasis": (
+                "MINIMUM_TRANSIT_DUTY_CYCLE_OVER_FULL_OBSERVATION_SPAN"
+            ),
             "selectionSupportRule": (
-                "PRIMARY_PLUS_TWO_INDEPENDENT_OR_POOLED_SPLIT_RECURRENCE"
+                "SHARED_PERIOD_EPOCH_DURATION_PRIMARY_PLUS_TWO_INDEPENDENT_OR_POOLED_SPLIT"
                 if len(sectors) - 1 >= MINIMUM_POOLED_INDEPENDENT_SECTORS
-                else "PRIMARY_PLUS_TWO_INDEPENDENT_SECTORS"
+                else "SHARED_PERIOD_EPOCH_DURATION_PRIMARY_PLUS_TWO_INDEPENDENT"
             ),
             "phaseBinCount": PHASE_BIN_COUNT,
             "dutyCycles": list(DUTY_CYCLES),
