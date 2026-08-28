@@ -473,6 +473,10 @@ def time_frequency_continuation(summary: dict[str, Any], *, request_id: str) -> 
     """Continue only the explicitly recommended, still-unresolved experiment."""
 
     period_reference = summary.get("periodReference") or {}
+    post_dynamic_harmonic_residual = (
+        summary.get("evidenceLineage")
+        == "POST_DYNAMIC_HARMONIC_RESIDUAL_TIME_FREQUENCY"
+    )
     try:
         physical_period = float(period_reference.get("periodDays"))
     except (TypeError, ValueError):
@@ -497,6 +501,7 @@ def time_frequency_continuation(summary: dict[str, Any], *, request_id: str) -> 
     run_dynamic_harmonic = (
         summary.get("recommendedNextTest") == "DYNAMIC_HARMONIC_MODELING"
         and summary.get("physicalMechanismResolved") is False
+        and not post_dynamic_harmonic_residual
         and period_reference.get("kind") == "MORPHOLOGY_RESOLVED_PHYSICAL_PERIOD"
         and period_reference.get("physicalCycleResolved") is True
         and math.isfinite(physical_period)
@@ -3799,6 +3804,19 @@ def build_engine(
             interpretation=interpreted,
             physical_period_days=float(analysis_period),
         )
+        post_dynamic_harmonic_residual = (
+            (preparation.get("familySubtraction") or {}).get("source")
+            == "PERSISTED_DYNAMIC_HARMONIC_MODEL"
+        )
+        if post_dynamic_harmonic_residual:
+            summary["evidenceLineage"] = (
+                "POST_DYNAMIC_HARMONIC_RESIDUAL_TIME_FREQUENCY"
+            )
+            if summary.get("recommendedNextTest") == "DYNAMIC_HARMONIC_MODELING":
+                summary["recommendedNextTest"] = None
+                summary["continuationDisposition"] = (
+                    "DYNAMIC_HARMONIC_MODELING_ALREADY_APPLIED"
+                )
         unresolved_reference = dynamic_reference or not bool(morphology.get("physicalCycleResolved"))
         summary["periodReference"] = {
             "periodDays": float(analysis_period),
