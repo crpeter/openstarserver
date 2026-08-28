@@ -2155,15 +2155,16 @@ def build_engine(
         identity = _latest_result_for_handler(investigation, "openstar.tess.catalog-identity")
         if identity is None:
             raise RuntimeError("Hypotheses require completed catalog identity.")
+        primary_search = (
+            _load_json(Path(prepared["datasetPath"])).get("frequencySearch") or {}
+        )
         analysis = analyze(
             primary,
             identity,
             observation_baseline_days=prepared.get("observationBaselineDays"),
-            primary_minimum_frequency=(
-                (_load_json(Path(prepared["datasetPath"])).get("frequencySearch") or {}).get(
-                    "minimumFrequency"
-                )
-            ),
+            primary_minimum_frequency=primary_search.get("minimumFrequency"),
+            primary_maximum_frequency=primary_search.get("maximumFrequency"),
+            primary_frequency_step=primary_search.get("frequencyStep"),
         )
         print("🧠 Deterministic TESS hypotheses evaluated")
         print(f"   reliable primary: {analysis.get('primaryReliable')}")
@@ -2498,20 +2499,35 @@ def build_engine(
         contradiction_plan = plan_independent_contradiction_resolution(
             interpreted
         )
+        primary_analysis = _required_latest_result_for_handler(
+            investigation, "openstar.tess.hypotheses"
+        )
         print("🧭 Independent contradiction planner")
         print(f"   action: {contradiction_plan['action']}")
         print(f"   reason: {contradiction_plan['reason']}")
         print(f"   reliable sectors: {contradiction_plan.get('reliableSectorCount')}")
         print(f"   boundary hits: {contradiction_plan.get('boundaryHitCount')}")
 
+        interpreted = dict(interpreted)
+        interpreted["primaryBoundaryHit"] = (
+            primary_analysis.get("primaryBoundaryHit") is True
+        )
+        interpreted["contradictionPlan"] = contradiction_plan
         full_characterization_confirmed = (
             goal == "FULL_CHARACTERIZATION"
             and contradiction_plan["reason"] == "targeted-independent-recurrence-confirmed"
         )
-        if contradiction_plan["action"] == "BROAD_INDEPENDENT_SEARCH" or full_characterization_confirmed:
-            primary_analysis = _required_latest_result_for_handler(
-                investigation, "openstar.tess.hypotheses"
+        boundary_failure_transit_fallback = blind_transit_search_continuation(
+            None, spec, None, interpreted
+        )
+        if boundary_failure_transit_fallback:
+            next_stage = StageRequest(
+                id=_next_stage_id(request.id, "blind-transit-period-search"),
+                handler_id=BLIND_TRANSIT_SEARCH_HANDLER_ID,
+                parameters={},
+                triggered_by_stage_id=request.id,
             )
+        elif contradiction_plan["action"] == "BROAD_INDEPENDENT_SEARCH" or full_characterization_confirmed:
             primary_family = _primary_harmonic_morphology_family(primary_analysis)
             morphology_already_completed = _latest_result_for_handler(
                 investigation, "openstar.tess.morphology.analyze"
@@ -2545,8 +2561,6 @@ def build_engine(
                 triggered_by_stage_id=request.id,
             )
 
-        interpreted = dict(interpreted)
-        interpreted["contradictionPlan"] = contradiction_plan
         return StageOutcome(
             result=interpreted,
             next_stage=next_stage,
@@ -2890,11 +2904,14 @@ def build_engine(
         independent_prepare = _required_latest_result_for_handler(
             investigation, "openstar.tess.independent.prepare"
         )
-        broad = _required_latest_result_for_handler(
+        broad = _latest_result_for_handler(
             investigation, "openstar.tess.independent.broad.interpret"
         )
-        morphology = _required_latest_result_for_handler(
+        morphology = _latest_result_for_handler(
             investigation, "openstar.tess.morphology.analyze"
+        )
+        targeted = _latest_result_for_handler(
+            investigation, "openstar.tess.independent.interpret"
         )
         print("🕳 Searching frozen sectors for a software-blind transit period")
         print("   removing smooth local variability; no catalog period and no MAST download")
@@ -2903,6 +2920,7 @@ def build_engine(
             independent_spec=independent_prepare,
             morphology=morphology,
             broad_interpretation=broad,
+            targeted_interpretation=targeted,
         )
         print(f"   classification: {result.get('classification')}")
         print(f"   candidate period: {result.get('candidatePeriodDays')} days")
@@ -2920,11 +2938,13 @@ def build_engine(
             / "blind-transit-search-v1.json"
         )
         _write_json(artifact_path, result)
-        input_hashes = {
-            "broadIndependentInterpretation": sha256_json(broad),
-            "morphology": sha256_json(morphology),
-            "primaryDataset": sha256_file(Path(prepared["datasetPath"])),
-        }
+        input_hashes = {"primaryDataset": sha256_file(Path(prepared["datasetPath"]))}
+        if broad is not None:
+            input_hashes["broadIndependentInterpretation"] = sha256_json(broad)
+        if morphology is not None:
+            input_hashes["morphology"] = sha256_json(morphology)
+        if targeted is not None:
+            input_hashes["targetedIndependentInterpretation"] = sha256_json(targeted)
         for item in independent_prepare.get("preparedSectors") or []:
             if item.get("datasetPath"):
                 input_hashes[f"independentSector{item.get('sector')}"] = sha256_file(
