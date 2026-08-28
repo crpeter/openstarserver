@@ -231,6 +231,56 @@ class BlindTransitSearchTests(unittest.TestCase):
         self.assertAlmostEqual(2.21857567, result["candidatePeriodDays"], delta=0.003)
         self.assertFalse(result["catalogAnswerKeyUsed"])
 
+    def test_ignores_nonrecurring_independent_sectors_when_required_support_recurs(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            specifications = (
+                (8, 1000.0, True),
+                (35, 1700.0, True),
+                (62, 2400.0, True),
+                (89, 3100.0, False),
+                (99, 3400.0, False),
+            )
+            paths = [
+                self._dataset(root, sector=sector, origin=origin, transit=transit)
+                for sector, origin, transit in specifications
+            ]
+            independent = {
+                "investigationGoal": "FULL_CHARACTERIZATION",
+                "preparedSectors": [
+                    {"sector": sector, "datasetPath": str(path)}
+                    for (sector, _, _), path in zip(specifications[1:], paths[1:])
+                ],
+            }
+            targeted = {
+                "claimDecision": {"claim": "HUMAN_REVIEW_REQUIRED"},
+                "primaryReliable": False,
+            }
+            result = analyze_blind_transit_search(
+                primary_dataset_path=paths[0],
+                independent_spec=independent,
+                morphology=None,
+                broad_interpretation=None,
+                targeted_interpretation=targeted,
+            )
+
+        self.assertEqual("REPLICATED_BLIND_TRANSIT_LIKE_CANDIDATE",
+                         result["classification"])
+        self.assertAlmostEqual(2.21857567, result["candidatePeriodDays"], delta=0.003)
+        self.assertTrue(result["primarySectorSupported"])
+        self.assertEqual([35, 62], result["supportingIndependentSectors"])
+        self.assertTrue(result["linearEphemeris"]["coherent"])
+        self.assertGreater(result["searchGrid"]["fullObservationSpanDays"], 2000.0)
+        self.assertLess(
+            result["searchGrid"]["fineFrequencyStepPerDay"],
+            result["searchGrid"]["coarseFrequencyStepPerDay"],
+        )
+        self.assertEqual(
+            "PRIMARY_PLUS_TWO_INDEPENDENT_SECTORS",
+            result["searchGrid"]["selectionSupportRule"],
+        )
+        self.assertFalse(result["catalogAnswerKeyUsed"])
+
     def test_boundary_dominated_independent_failure_routes_directly_to_blind_search(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

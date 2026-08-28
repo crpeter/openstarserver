@@ -25,6 +25,7 @@ MINIMUM_PERIOD_DAYS = 0.2
 MAXIMUM_PERIOD_DAYS = 10.0
 PHASE_BIN_COUNT = 200
 OVERSAMPLING = 8.0
+MAXIMUM_FINE_GRID_SIZE = 2001
 DUTY_CYCLES = (0.01, 0.015, 0.02, 0.03, 0.04, 0.05, 0.07, 0.10)
 
 
@@ -172,12 +173,48 @@ def _box_score(times, residual, sigma: float, frequency: float) -> dict[str, Any
     }
 
 
+def _sector_results_for_frequency(
+    sectors: list[dict[str, Any]], measurements: list[dict[str, Any]], frequency: float
+) -> list[dict[str, Any]]:
+    period = 1.0 / frequency
+    results = []
+    for sector, measurement in zip(sectors, measurements):
+        usable = bool(
+            measurement["snr"] >= MINIMUM_SECTOR_SNR
+            and (sector["times"][-1] - sector["times"][0]) / period >= 2.0
+        )
+        median_time = float(statistics.median(sector["times"]))
+        epoch = (round(median_time / period - measurement["eventPhase"])
+                 + measurement["eventPhase"]) * period
+        results.append({
+            **measurement,
+            "role": sector["role"],
+            "sector": sector["sector"],
+            "datasetID": sector["datasetID"],
+            "usable": usable,
+            "eventEpoch": epoch,
+            "sampleCount": len(sector["times"]),
+            "originalTimeOriginDays": sector["origin"],
+            "detrending": {
+                "method": "SAVITZKY_GOLAY_LOCAL_BASELINE",
+                "windowDays": 0.75,
+                "windowSamples": sector["detrendWindowSamples"],
+                "cadenceDays": sector["cadence"],
+            },
+        })
+    return results
+
+
 def _search_grid(sectors: list[dict[str, Any]], minimum: float, maximum: float):
     import numpy as np
 
     longest_baseline = max(float(item["times"][-1] - item["times"][0]) for item in sectors)
-    step = 1.0 / (longest_baseline * OVERSAMPLING)
-    coarse = np.arange(minimum, maximum + 0.5 * step, step)
+    full_span = max(float(item["times"][-1]) for item in sectors) - min(
+        float(item["times"][0]) for item in sectors
+    )
+    coarse_step = 1.0 / (longest_baseline * OVERSAMPLING)
+    requested_fine_step = 1.0 / (full_span * OVERSAMPLING)
+    coarse = np.arange(minimum, maximum + 0.5 * coarse_step, coarse_step)
 
     def evaluate(frequencies):
         combined = []
@@ -187,21 +224,33 @@ def _search_grid(sectors: list[dict[str, Any]], minimum: float, maximum: float):
                 _box_score(item["times"], item["residual"], item["sigma"], float(frequency))
                 for item in sectors
             ]
-            # The weakest sector is authoritative for recurrence.  A small
-            # all-sector term breaks near-ties without allowing one unusually
-            # deep sector to overpower a non-detection elsewhere.
-            snrs = [result["snr"] for result in per_sector]
-            combined.append(min(snrs) + 0.05 * sum(snrs))
+            # Candidate selection must match the claim gate: the primary plus
+            # two independent sectors.  Requiring every available sector to
+            # score well lets one noisy or transit-free sector hide a real
+            # recurrence that already satisfies the evidence contract.
+            primary_snr = per_sector[0]["snr"]
+            independent_snrs = sorted(
+                (result["snr"] for result in per_sector[1:]), reverse=True
+            )
+            required = [primary_snr, *independent_snrs[:MINIMUM_INDEPENDENT_SECTORS]]
+            combined.append(min(required) + 0.05 * sum(required))
             details.append(per_sector)
         return np.asarray(combined), details
 
     coarse_scores, _ = evaluate(coarse)
-    best_frequency = float(coarse[int(np.argmax(coarse_scores))])
-    fine = np.linspace(max(minimum, best_frequency - step),
-                       min(maximum, best_frequency + step), 201)
+    center = float(coarse[int(np.argmax(coarse_scores))])
+    lower = max(minimum, center - coarse_step)
+    upper = min(maximum, center + coarse_step)
+    requested_count = int(math.ceil((upper - lower) / requested_fine_step)) + 1
+    fine_count = min(MAXIMUM_FINE_GRID_SIZE, max(201, requested_count))
+    fine = np.linspace(lower, upper, fine_count)
     fine_scores, fine_details = evaluate(fine)
     index = int(np.argmax(fine_scores))
-    return float(fine[index]), float(fine_scores[index]), fine_details[index], step
+    actual_fine_step = float(fine[1] - fine[0]) if fine.size > 1 else 0.0
+    return (
+        float(fine[index]), float(fine_scores[index]), fine_details[index],
+        coarse_step, actual_fine_step, full_span,
+    )
 
 
 def _linear_ephemeris(sector_results: list[dict[str, Any]], input_period: float) -> dict[str, Any]:
@@ -280,39 +329,17 @@ def analyze_blind_transit_search(
     if not (math.isfinite(minimum) and math.isfinite(maximum) and 0 < minimum < maximum):
         raise ValueError("primary frozen frequency search does not overlap the transit search")
 
-    frequency, combined_score, measurements, coarse_step = _search_grid(
-        sectors, minimum, maximum
-    )
+    (
+        frequency, combined_score, measurements, coarse_step,
+        fine_step, full_span,
+    ) = _search_grid(sectors, minimum, maximum)
     period = 1.0 / frequency
-    sector_results = []
-    for sector, measurement in zip(sectors, measurements):
-        usable = bool(
-            measurement["snr"] >= MINIMUM_SECTOR_SNR
-            and (sector["times"][-1] - sector["times"][0]) / period >= 2.0
-        )
-        median_time = float(statistics.median(sector["times"]))
-        epoch = (round(median_time / period - measurement["eventPhase"])
-                 + measurement["eventPhase"]) * period
-        sector_results.append({
-            **measurement,
-            "role": sector["role"],
-            "sector": sector["sector"],
-            "datasetID": sector["datasetID"],
-            "usable": usable,
-            "eventEpoch": epoch,
-            "sampleCount": len(sector["times"]),
-            "originalTimeOriginDays": sector["origin"],
-            "detrending": {
-                "method": "SAVITZKY_GOLAY_LOCAL_BASELINE",
-                "windowDays": 0.75,
-                "windowSamples": sector["detrendWindowSamples"],
-                "cadenceDays": sector["cadence"],
-            },
-        })
+    sector_results = _sector_results_for_frequency(sectors, measurements, frequency)
 
     primary_supported = any(item["role"] == "PRIMARY" and item["usable"] for item in sector_results)
     independent_supporters = [
-        item for item in sector_results if item["role"] == "INDEPENDENT" and item["usable"]
+        item for item in sector_results
+        if item["role"] == "INDEPENDENT" and item["usable"]
     ]
     timing = [item for item in sector_results if item["usable"]]
     ephemeris = _linear_ephemeris(timing, period) if len(timing) >= 3 else {
@@ -353,6 +380,9 @@ def analyze_blind_transit_search(
             "minimumFrequencyPerDay": minimum,
             "maximumFrequencyPerDay": maximum,
             "coarseFrequencyStepPerDay": coarse_step,
+            "fullObservationSpanDays": full_span,
+            "fineFrequencyStepPerDay": fine_step,
+            "selectionSupportRule": "PRIMARY_PLUS_TWO_INDEPENDENT_SECTORS",
             "phaseBinCount": PHASE_BIN_COUNT,
             "dutyCycles": list(DUTY_CYCLES),
         },
