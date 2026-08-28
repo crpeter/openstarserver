@@ -297,7 +297,11 @@ def analyze(
     }
 
 
-def plan(analysis: dict[str, Any], identity: dict[str, Any]) -> dict[str, Any]:
+def plan(
+    analysis: dict[str, Any],
+    identity: dict[str, Any],
+    investigation_goal: str | None = None,
+) -> dict[str, Any]:
     period = _float(analysis.get("observedPeriodDays"))
     best_match = analysis.get("bestCatalogMatch")
     rotation = analysis.get("rotationSanity") or {}
@@ -309,10 +313,18 @@ def plan(analysis: dict[str, Any], identity: dict[str, Any]) -> dict[str, Any]:
             "OpenStar recovered a period consistent with an external catalog period or its 0.5x/2x harmonic relation.",
             f"Best catalog source: {best_match.get('source')}",
         )
+        full_characterization = investigation_goal == "FULL_CHARACTERIZATION"
         return {
-            "action": "STOP",
+            "action": (
+                "INDEPENDENT_SECTOR_FOLLOWUP" if full_characterization else "STOP"
+            ),
             "claimDecision": claim.as_dict(),
             "reason": "catalog-period-match",
+            "catalogMatchTerminal": not full_characterization,
+            **(
+                {"investigationGoal": investigation_goal}
+                if full_characterization else {}
+            ),
         }
 
     if not analysis.get("primaryReliable"):

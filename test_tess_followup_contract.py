@@ -29,6 +29,25 @@ def _primary(preferred_period):
 
 
 class LowFrequencyFollowupContractTests(unittest.TestCase):
+    def test_catalog_match_is_terminal_only_without_full_characterization_goal(self):
+        analysis = {
+            "observedPeriodDays": 2.0,
+            "bestCatalogMatch": {"source": "generic-catalog"},
+            "rotationSanity": {},
+        }
+
+        ordinary = plan(analysis, _identity())
+        full = plan(analysis, _identity(), "FULL_CHARACTERIZATION")
+
+        self.assertEqual(("STOP", "catalog-period-match"),
+                         (ordinary["action"], ordinary["reason"]))
+        self.assertIs(ordinary["catalogMatchTerminal"], True)
+        self.assertEqual("INDEPENDENT_SECTOR_FOLLOWUP", full["action"])
+        self.assertIs(full["catalogMatchTerminal"], False)
+        self.assertEqual("KNOWN_PERIOD_RECOVERED",
+                         full["claimDecision"]["claim"])
+        self.assertEqual("FULL_CHARACTERIZATION", full["investigationGoal"])
+
     def test_blind_b_shaped_harmonic_uses_independent_sector(self):
         analysis = analyze(
             _primary(0.8001069097176371),

@@ -30,7 +30,8 @@ from prepare_tess import (
 
 
 PREPARER_ID = "openstar.tess-known-target-blind-benchmark-preparer"
-PREPARER_SCHEMA_VERSION = 1
+PREPARER_SCHEMA_VERSION = 2
+INVESTIGATION_GOAL = "FULL_CHARACTERIZATION"
 OWNED_FILES = frozenset(("dataset.json", "project.json"))
 
 
@@ -210,6 +211,7 @@ def prepare_benchmark(
             "targetName": blind_label,
             "ticID": tic, "sector": primary_sector, "author": author,
             "cadenceSeconds": cadence, "role": "blind",
+            "investigationGoal": INVESTIGATION_GOAL,
             "datasetSHA256": hashlib.sha256(staged_dataset_path.read_bytes()).hexdigest(),
             "workUnitCount": expected_work_unit_count(),
             }],
