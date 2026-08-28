@@ -237,6 +237,11 @@ model comparisons run coordinator-local. Only heavy frequency searches are sent
 to generic workers as `openstar.lomb-scargle.v1`; workers contain no TESS or
 survey logic.
 
+Exact duplicate product metadata is deduplicated canonically. Conflicting
+author, mission, cadence, or observation-epoch metadata for the same eligible
+sector fails closed as `CONFLICTING_PRODUCT_METADATA`; catalog input order can
+never decide the frozen epoch assignment. Selection never reads flux.
+
 External surveys are tried in preregistered priority order. The first provider
 passing coverage, season, band, quality, and persisted catalog-neighbor blending
 gates is frozen with its raw response and SHA-256 provenance. ASAS-SN Sky Patrol
@@ -271,10 +276,25 @@ Install the coordinator-only, pinned interface with
 `skypatrol==0.6.21` for this adapter; it is not a worker dependency.
 
 External follow-up is an append-only prepare/run/interpret sequence. Preparation
-freezes the provider priority, family window, target identity, quality contract,
-and authoritative catalog-neighbor evidence. Run separately freezes and ledgers
+freezes the provider priority, family window, target identity, authoritative
+catalog-neighbor evidence, and the complete versioned analysis method. The
+method contract includes coverage gates, season definition, period grid,
+held-out-season procedure, predictive and null thresholds, stability and alias
+rules, uncertainty floors, and band agreement. Its hash is verified before a
+provider is constructed or any flux is analyzed. Run separately freezes and ledgers
 the provider coverage response, canonical raw response, cleaned measurements,
 quality-filter counts, and acquisition metadata. Interpret binds both stage
 results and preserves
 physical-cycle and physical-mechanism resolution as false. Recovery reuses
 byte-identical artifacts and rejects a mismatched frozen hash.
+
+Provider configuration, transient transport failure, operational unavailability,
+and malformed provider data remain operational outcomes. Only a successfully
+parsed provider response that fails the frozen measurement, baseline, season,
+phase-coverage, or band gates is `EXTERNAL_DATA_INSUFFICIENT`.
+
+Period-family admission performs semantic validation in addition to SHA-256
+verification. A matching hash proves immutability, while the shared validator
+separately requires supported versions, finite positive periods, an increasing
+acceptance window containing the frozen family, a supported observable, and
+unique positive integer sectors.

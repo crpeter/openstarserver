@@ -139,7 +139,9 @@ from .tess_period_family_difference_image import (
 )
 from .external_long_baseline import (
     ASASSNSkyPatrolProvider, ProviderConfigurationUnavailable,
-    ProviderTransientError, run_external_experiment,
+    ProviderTransientError, external_method_contract_sha256,
+    freeze_external_method_contract, run_external_experiment,
+    validate_external_method_contract,
 )
 from .period_family_followup import (
     DIFFERENCE_TRIGGER,
@@ -5464,9 +5466,13 @@ def build_engine(
         identity = _latest_result_for_handler(investigation, "openstar.tess.catalog-identity") or {}
         metadata = ((identity.get("tic") or {}).get("metadata") or {})
         gaia_context = extract_gaia_context(identity)
+        method_contract = freeze_external_method_contract(window)
+        method_contract_sha256 = external_method_contract_sha256(method_contract)
         result = {"version":"openstar.external-long-baseline-preparation.v2",
             "semanticBoundary":boundary, "familyWindowDays":window,
             "periodFamilyContract":contract,"periodFamilyContractSHA256":sha256_json(contract),
+            "methodContract":method_contract,
+            "methodContractSHA256":method_contract_sha256,
             "target":{"ticID":identity.get("ticID"),"gaiaDR3SourceID":gaia_context.get("targetGaiaDR3SourceID"),
                       "raDeg":metadata.get("raDeg"),"decDeg":metadata.get("decDeg")},
             "gaiaContext":gaia_context, "catalogNeighbors":gaia_context.get("neighbors"),
@@ -5485,20 +5491,33 @@ def build_engine(
             "openstar.tess.external-long-baseline.prepare")
         if preparation is None: raise RuntimeError("External run requires preregistration.")
         window=preparation.get("familyWindowDays")
-        if not (isinstance(window,list) and len(window)==2):
-            result={"operationalOutcome":"MALFORMED_PREREGISTRATION","analysisAvailable":False}
+        method_contract=preparation.get("methodContract")
+        try:
+            validate_external_method_contract(method_contract)
+            method_hash=external_method_contract_sha256(method_contract)
+            if preparation.get("methodContractSHA256") != method_hash:
+                raise RuntimeError("External method contract hash mismatch.")
+            expected=freeze_external_method_contract(window,method_contract)
+            if expected != method_contract:
+                raise RuntimeError("External method contract does not match the frozen family window.")
+        except (RuntimeError, TypeError, ValueError) as exc:
+            result={"operationalOutcome":"MALFORMED_PREREGISTRATION",
+                    "analysisAvailable":False,"reason":str(exc)}
         else:
             try: providers=[ASASSNSkyPatrolProvider.from_environment()]
             except ProviderConfigurationUnavailable as exc:
                 result={"operationalOutcome":"PROVIDER_CONFIGURATION_UNAVAILABLE",
-                        "analysisAvailable":False,"reason":str(exc),"credentialsPersisted":False}
+                        "analysisAvailable":False,"reason":str(exc),"credentialsPersisted":False,
+                        "methodContract":method_contract,
+                        "methodContractSHA256":method_hash}
             except ProviderTransientError as exc:
                 raise RetryableExecutionError(str(exc)) from exc
             else:
                 try:
                     result=run_external_experiment(target=preparation["target"],family_window=window,
                         neighbors=preparation.get("catalogNeighbors"),providers=providers,
-                        artifact_root=store.directory_for(investigation.id)/"artifacts"/"external-long-baseline")
+                        artifact_root=store.directory_for(investigation.id)/"artifacts"/"external-long-baseline",
+                        contract=method_contract)
                 except ProviderTransientError as exc:
                     raise RetryableExecutionError(str(exc)) from exc
         path=store.directory_for(investigation.id)/"artifacts"/"external-long-baseline"/"analysis.json"

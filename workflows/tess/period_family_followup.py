@@ -22,6 +22,10 @@ SUPPORTED_CADENCE_SECONDS = 120
 
 POLICY_VERSION = "openstar.period-family-followup-policy.v2"
 CONTRACT_VERSION = "openstar.period-family-contract.v1"
+SUPPORTED_OBSERVABLE_DEFINITIONS = {
+    "persisted-sector-period-phase-reference",
+    "persisted-period-family-phase-reference",
+}
 
 
 def _finite(value: Any) -> float | None:
@@ -201,38 +205,115 @@ def build_period_family_followup_recommendation(
     }
 
 
+def _positive_finite(name: str, value: Any) -> float:
+    if isinstance(value, bool):
+        raise RuntimeError(f"Frozen period-family contract has invalid {name}.")
+    number = _finite(value)
+    if number is None or number <= 0:
+        raise RuntimeError(f"Frozen period-family contract has invalid {name}.")
+    return number
+
+
+def validate_period_family_contract(contract: dict[str, Any]) -> dict[str, Any]:
+    """Reject hash-valid contracts whose scientific semantics are invalid."""
+    if not isinstance(contract, dict):
+        raise RuntimeError("Frozen period-family contract must be an object.")
+    if contract.get("schemaVersion") != CONTRACT_VERSION:
+        raise RuntimeError("Unsupported period-family contract schema version.")
+    if contract.get("selectionPolicyVersion") != POLICY_VERSION:
+        raise RuntimeError("Unsupported period-family selection policy version.")
+    if not isinstance(contract.get("originStageID"), str) or not contract["originStageID"].strip():
+        raise RuntimeError("Frozen period-family contract requires an origin stage.")
+
+    primary = _positive_finite("primaryPeriodDays", contract.get("primaryPeriodDays"))
+    center = _positive_finite("familyCenterDays", contract.get("familyCenterDays"))
+    members = contract.get("periodFamilyMembersDays")
+    if not isinstance(members, list) or not members:
+        raise RuntimeError("Frozen period-family contract requires family members.")
+    normalized_members = [_positive_finite("periodFamilyMembersDays", value)
+                          for value in members]
+    if len(normalized_members) != len(set(normalized_members)):
+        raise RuntimeError("Frozen period-family contract contains duplicate family members.")
+
+    window = contract.get("acceptanceWindowDays")
+    if not isinstance(window, list) or len(window) != 2:
+        raise RuntimeError("Frozen period-family contract requires two window bounds.")
+    lower = _positive_finite("acceptanceWindowDays", window[0])
+    upper = _positive_finite("acceptanceWindowDays", window[1])
+    if lower >= upper:
+        raise RuntimeError("Frozen period-family acceptance window is not increasing.")
+    if any(value < lower or value > upper
+           for value in [primary, center, *normalized_members]):
+        raise RuntimeError("Frozen period-family values fall outside the acceptance window.")
+
+    sectors = contract.get("consumedSectors")
+    if not isinstance(sectors, list) or not sectors:
+        raise RuntimeError("Frozen period-family contract requires consumed sectors.")
+    if any(isinstance(value, bool) or not isinstance(value, int) or value <= 0
+           for value in sectors):
+        raise RuntimeError("Frozen period-family contract contains an invalid sector.")
+    if len(sectors) != len(set(sectors)):
+        raise RuntimeError("Frozen period-family contract contains duplicate sectors.")
+
+    if contract.get("observableDefinition") not in SUPPORTED_OBSERVABLE_DEFINITIONS:
+        raise RuntimeError("Unsupported period-family observable definition.")
+    return contract
+
+
 def freeze_period_family_contract(evidence: dict[str, Any], origin_stage_id: str) -> dict[str, Any]:
     family = evidence.get("frozenPeriodFamily") or evidence.get("periodFamilyContract") or {}
+    primary_period = family.get("primaryPeriodDays")
+    if primary_period is None:
+        primary_period = (family.get("primaryDetection") or {}).get("periodDays")
+    members = family.get("periodFamilyMembersDays")
+    if members is None:
+        members = [primary_period,
+                   *[item.get("periodDays")
+                     for item in family.get("independentSectorDetections") or []]]
+    sectors = family.get("consumedSectors")
+    if sectors is None:
+        sectors = [(family.get("primaryDetection") or {}).get("sector"),
+                   *[item.get("sector")
+                     for item in family.get("independentSectorDetections") or []]]
     contract = {"schemaVersion": CONTRACT_VERSION,
         "originStageID": family.get("originStageID") or origin_stage_id,
-        "primaryPeriodDays": family.get("primaryPeriodDays") or (family.get("primaryDetection") or {}).get("periodDays"),
+        "primaryPeriodDays": primary_period,
         "familyCenterDays": family.get("familyCenterDays"),
-        "periodFamilyMembersDays": family.get("periodFamilyMembersDays") or
-            [family.get("primaryPeriodDays") or
-             (family.get("primaryDetection") or {}).get("periodDays"),
-             *[x.get("periodDays") for x in family.get("independentSectorDetections") or []]],
-        "acceptanceWindowDays": family.get("acceptanceWindowDays") or family.get("familyAcceptanceWindowDays"),
-        "consumedSectors": family.get("consumedSectors") or
-            [(family.get("primaryDetection") or {}).get("sector"),
-             *[x.get("sector") for x in family.get("independentSectorDetections") or []]],
+        "periodFamilyMembersDays": members,
+        "acceptanceWindowDays": (family.get("acceptanceWindowDays")
+                                 if family.get("acceptanceWindowDays") is not None
+                                 else family.get("familyAcceptanceWindowDays")),
+        "consumedSectors": sectors,
         "observableDefinition": family.get("observableDefinition") or "persisted-period-family-phase-reference",
         "selectionPolicyVersion": POLICY_VERSION}
-    contract["periodFamilyMembersDays"] = sorted({float(value) for value in
-        contract["periodFamilyMembersDays"] if _finite(value) is not None})
-    contract["consumedSectors"] = sorted({int(value) for value in
-        contract["consumedSectors"] if value is not None})
-    if not (contract["primaryPeriodDays"] and contract["familyCenterDays"]
-            and isinstance(contract["acceptanceWindowDays"], list)
-            and len(contract["acceptanceWindowDays"]) == 2
-            and contract["periodFamilyMembersDays"]):
-        raise RuntimeError("Frozen period-family contract is incomplete.")
-    return contract
+    if not isinstance(contract["periodFamilyMembersDays"], list):
+        raise RuntimeError("Frozen period-family contract requires family members.")
+    if not isinstance(contract["consumedSectors"], list):
+        raise RuntimeError("Frozen period-family contract requires consumed sectors.")
+    contract["primaryPeriodDays"] = _positive_finite(
+        "primaryPeriodDays", contract["primaryPeriodDays"])
+    contract["familyCenterDays"] = _positive_finite(
+        "familyCenterDays", contract["familyCenterDays"])
+    contract["periodFamilyMembersDays"] = sorted(
+        _positive_finite("periodFamilyMembersDays", value)
+        for value in contract["periodFamilyMembersDays"]
+    )
+    window = contract["acceptanceWindowDays"]
+    if not isinstance(window, list) or len(window) != 2:
+        raise RuntimeError("Frozen period-family contract requires two window bounds.")
+    contract["acceptanceWindowDays"] = [
+        _positive_finite("acceptanceWindowDays", value) for value in window
+    ]
+    if any(isinstance(value, bool) or not isinstance(value, int)
+           for value in contract["consumedSectors"]):
+        raise RuntimeError("Frozen period-family contract contains an invalid sector.")
+    contract["consumedSectors"] = sorted(contract["consumedSectors"])
+    return validate_period_family_contract(contract)
 
 
 def verified_contract(result: dict[str, Any]) -> dict[str, Any]:
     contract = result.get("periodFamilyContract")
-    if not isinstance(contract, dict) or contract.get("schemaVersion") != CONTRACT_VERSION:
-        raise RuntimeError("Missing versioned period-family contract.")
+    validate_period_family_contract(contract)
     if result.get("periodFamilyContractSHA256") != sha256_json(contract):
         raise RuntimeError("Frozen period-family contract hash mismatch.")
     return contract
@@ -313,33 +394,81 @@ def select_untouched_sectors(catalog_sectors: Iterable[dict[str, Any]],
     """
     consumed = {int(x) for x in consumed_sectors}
     eligible, rejected = [], []
-    products = list(catalog_sectors)
-    seen_sectors: set[int] = set()
-    for raw in sorted(products, key=lambda x: int(x.get("sector") or 10**9)):
-        if raw.get("sector") is None:
-            rejected.append({"sector": None, "reason": "missing-sector"})
+    grouped: dict[int, list[tuple[str, str, float | None, int | None]]] = {}
+    for raw in catalog_sectors:
+        try:
+            if (not isinstance(raw.get("sector"), int)
+                    or isinstance(raw.get("sector"), bool)
+                    or raw["sector"] <= 0):
+                raise ValueError
+            sector = raw["sector"]
+        except (AttributeError, TypeError, ValueError):
+            rejected.append({"sector": None, "reason": "missing-or-invalid-sector"})
             continue
-        sector = int(raw["sector"])
-        reason = None
+        if sector in consumed:
+            rejected.append({"sector": sector,
+                             "reason": "already-consumed-by-time-domain-observable"})
+            continue
         observation_year = raw.get("observationYear", raw.get("year"))
-        if sector in seen_sectors:
-            reason = "duplicate-sector-product"
-        elif sector in consumed:
-            reason = "already-consumed-by-time-domain-observable"
-        elif str(raw.get("author") or "").upper() != SUPPORTED_AUTHOR:
+        try:
+            if (observation_year is not None
+                    and (not isinstance(observation_year, int)
+                         or isinstance(observation_year, bool))):
+                raise ValueError
+            year = observation_year
+            if isinstance(raw.get("exptimeSeconds"), bool):
+                raise ValueError
+            cadence = (float(raw.get("exptimeSeconds"))
+                       if raw.get("exptimeSeconds") is not None else None)
+        except (TypeError, ValueError):
+            year, cadence = None, None
+        signature = (
+            str(raw.get("author") or "").upper(),
+            str(raw.get("mission") or SUPPORTED_MISSION).upper(),
+            cadence,
+            year,
+        )
+        grouped.setdefault(sector, []).append(signature)
+
+    conflicts = []
+    canonical: list[tuple[int, tuple[str, str, float | None, int | None]]] = []
+    for sector, signatures in sorted(grouped.items()):
+        unique = sorted(set(signatures), key=repr)
+        if len(unique) > 1:
+            conflicts.append({"sector": sector,
+                              "reason": "conflicting-sector-product-metadata"})
+            continue
+        canonical.append((sector, unique[0]))
+        rejected.extend({"sector": sector, "reason": "duplicate-sector-product"}
+                        for _ in signatures[1:])
+    rejected.sort(key=lambda item: (
+        item["sector"] is None,
+        item["sector"] if item["sector"] is not None else 0,
+        item["reason"],
+    ))
+    if conflicts:
+        return {"policyVersion": POLICY_VERSION,
+                "status": "CONFLICTING_PRODUCT_METADATA",
+                "selectedSectors": [], "rejectedSectors": rejected + conflicts,
+                "conflictingSectors": [item["sector"] for item in conflicts],
+                "selectionRule": "reject-conflicting-sector-metadata-before-epoch-selection",
+                "fluxInspectedDuringSelection": False}
+
+    for sector, (author, mission, cadence, observation_year) in canonical:
+        reason = None
+        if author != SUPPORTED_AUTHOR:
             reason = "unsupported-author"
-        elif not str(raw.get("mission") or SUPPORTED_MISSION).upper().startswith(SUPPORTED_MISSION):
+        elif not mission.startswith(SUPPORTED_MISSION):
             reason = "unsupported-mission"
-        elif int(raw.get("exptimeSeconds") or 0) != SUPPORTED_CADENCE_SECONDS:
+        elif cadence != SUPPORTED_CADENCE_SECONDS:
             reason = "unsupported-cadence"
         elif observation_year is None:
             reason = "missing-observation-epoch-metadata"
         if reason:
             rejected.append({"sector": sector, "reason": reason})
         else:
-            seen_sectors.add(sector)
-            eligible.append({**raw, "sector": sector,
-                             "epoch": f"CALENDAR_YEAR_{int(observation_year)}"})
+            eligible.append({"sector": sector,
+                             "epoch": f"CALENDAR_YEAR_{observation_year}"})
     by_epoch: dict[str, list[dict[str, Any]]] = {}
     for item in eligible:
         by_epoch.setdefault(item["epoch"], []).append(item)

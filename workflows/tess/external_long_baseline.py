@@ -10,6 +10,7 @@ import hashlib
 import importlib.metadata
 import json
 import math
+from copy import deepcopy
 from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,6 +19,7 @@ from typing import Any, Protocol
 import numpy as np
 
 SUPPORTED_SKYPATROL_VERSION = "0.6.21"
+EXTERNAL_METHOD_SCHEMA_VERSION = "openstar.external-long-baseline-method.v1"
 
 class ProviderTransientError(RuntimeError): pass
 class ProviderUnavailable(RuntimeError): pass
@@ -59,7 +61,9 @@ class ASASSNSkyPatrolProvider:
                         "band": str(row["band"]), "quality": str(row.get("quality", "GOOD")),
                         "sourceID": (str(row["asasSnID"]) if row.get("asasSnID") is not None
                                      else None)}
-                if not all(math.isfinite(item[k]) for k in ("time", "flux", "uncertainty")):
+                if (not all(math.isfinite(item[k]) for k in ("time", "flux", "uncertainty"))
+                        or item["uncertainty"] <= 0 or not item["band"]
+                        or not item["quality"]):
                     raise ValueError
                 result.append(item)
             return result
@@ -181,21 +185,164 @@ def _angular_separation_arcsec(ra1: float, dec1: float, ra2: float, dec2: float)
     return math.degrees(math.acos(max(-1.0, min(1.0, value)))) * 3600.0
 
 
-DEFAULT_CONTRACT = {"minimumMeasurements": 80, "minimumBaselineDays": 730.0,
-                    "minimumSeasons": 3, "acceptedBands": ["g", "V"],
-                    "acceptedQualityFlags": ["G", "GOOD"], "minimumPhaseBins": 6,
-                    "maximumNeighborFluxFraction": 0.10}
+DEFAULT_METHOD_CONTRACT = {
+    "schemaVersion": EXTERNAL_METHOD_SCHEMA_VERSION,
+    "observable": "blocked-seasonal-phase-prediction",
+    "minimumMeasurements": 80,
+    "minimumBaselineDays": 730.0,
+    "minimumSeasons": 3,
+    "acceptedBands": ["g", "V"],
+    "acceptedQualityFlags": ["G", "GOOD"],
+    "minimumPhaseBins": 6,
+    "maximumNeighborFluxFraction": 0.10,
+    "providerApertureArcsec": 16.0,
+    "seasonGapDays": 90.0,
+    "periodGridPointCount": 401,
+    "heldOutSeasonProcedure": "leave-one-season-out",
+    "minimumMeasurementUncertainty": 1e-9,
+    "predictiveModelParameterCount": 3,
+    "maximumReplicatedPredictiveReducedChiSquare": 9.0,
+    "maximumStablePredictiveReducedChiSquare": 4.0,
+    "minimumNullFractionalImprovement": 0.10,
+    "maximumStablePhaseRangeRadians": 0.30,
+    "aliasFrequencyOffsetsCyclesPerDay": [
+        {"label": "DAILY_PLUS", "offset": 1.0},
+        {"label": "DAILY_MINUS", "offset": -1.0},
+        {"label": "YEARLY_PLUS", "offset": 1.0 / 365.25},
+        {"label": "YEARLY_MINUS", "offset": -1.0 / 365.25},
+    ],
+    "aliasAmbiguityMinimumDeltaChiSquare": 1.0,
+    "aliasAmbiguityBestChiSquareFraction": 0.01,
+    "jackknifePercentiles": [16.0, 84.0],
+    "profileDeltaChiSquare": 1.0,
+    "gridResolutionFloorFraction": 0.5,
+    "bandAgreementAbsoluteFloorDays": 2e-4,
+    "bandAgreementUncertaintyMultiplier": 1.0,
+}
+# Historical callers imported this name.  It now identifies the complete,
+# versioned scientific method rather than coverage gates alone.
+DEFAULT_CONTRACT = DEFAULT_METHOD_CONTRACT
+
+
+def _method_hash(contract: dict[str, Any]) -> str:
+    encoded = json.dumps(contract, sort_keys=True, separators=(",", ":"),
+                         ensure_ascii=False, allow_nan=False).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def external_method_contract_sha256(contract: dict[str, Any]) -> str:
+    validate_external_method_contract(contract)
+    return _method_hash(contract)
+
+
+def freeze_external_method_contract(
+    family_window: list[float], overrides: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build and validate every decision parameter before provider access."""
+    if not isinstance(family_window, list) or len(family_window) != 2:
+        raise RuntimeError("External family window requires two bounds.")
+    try:
+        lower, upper = (float(value) for value in family_window)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("External family window is invalid.") from exc
+    if not all(math.isfinite(value) and value > 0 for value in (lower, upper)) or lower >= upper:
+        raise RuntimeError("External family window must be finite, positive, and increasing.")
+    contract = deepcopy(DEFAULT_METHOD_CONTRACT)
+    if overrides:
+        unknown = set(overrides) - set(contract) - {"frozenFamilyCenterDays"}
+        if unknown:
+            raise RuntimeError(f"Unsupported external method fields: {sorted(unknown)}")
+        contract.update(deepcopy(overrides))
+    contract["frozenFamilyCenterDays"] = (lower + upper) / 2.0
+    validate_external_method_contract(contract)
+    return contract
+
+
+def validate_external_method_contract(contract: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(contract, dict) or contract.get("schemaVersion") != EXTERNAL_METHOD_SCHEMA_VERSION:
+        raise RuntimeError("Unsupported external-analysis method contract.")
+    if contract.get("observable") != "blocked-seasonal-phase-prediction":
+        raise RuntimeError("Unsupported external-analysis observable.")
+    positive = (
+        "minimumMeasurements", "minimumBaselineDays", "minimumSeasons",
+        "minimumPhaseBins", "providerApertureArcsec", "seasonGapDays",
+        "periodGridPointCount", "minimumMeasurementUncertainty",
+        "predictiveModelParameterCount", "maximumReplicatedPredictiveReducedChiSquare",
+        "maximumStablePredictiveReducedChiSquare", "aliasAmbiguityMinimumDeltaChiSquare",
+        "jackknifePercentiles", "profileDeltaChiSquare", "gridResolutionFloorFraction",
+        "bandAgreementAbsoluteFloorDays", "bandAgreementUncertaintyMultiplier",
+        "frozenFamilyCenterDays",
+    )
+    for key in positive:
+        values = contract.get(key)
+        values = values if isinstance(values, list) else [values]
+        if not values or any(isinstance(value, bool) or not isinstance(value, (int, float))
+                             or not math.isfinite(float(value)) or float(value) <= 0
+                             for value in values):
+            raise RuntimeError(f"Invalid external-analysis method field: {key}")
+    for key in ("minimumMeasurements", "minimumSeasons", "minimumPhaseBins",
+                "periodGridPointCount", "predictiveModelParameterCount"):
+        value = contract[key]
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise RuntimeError(f"External-analysis method field must be an integer: {key}")
+    bounded = ("maximumNeighborFluxFraction", "minimumNullFractionalImprovement",
+               "maximumStablePhaseRangeRadians", "aliasAmbiguityBestChiSquareFraction")
+    for key in bounded:
+        value = contract.get(key)
+        if (isinstance(value, bool) or not isinstance(value, (int, float))
+                or not math.isfinite(float(value)) or float(value) < 0):
+            raise RuntimeError(f"Invalid external-analysis method field: {key}")
+    if int(contract["periodGridPointCount"]) < 2:
+        raise RuntimeError("External period grid requires at least two points.")
+    if contract["maximumStablePredictiveReducedChiSquare"] > contract[
+            "maximumReplicatedPredictiveReducedChiSquare"]:
+        raise RuntimeError("Stable prediction threshold cannot exceed replication threshold.")
+    if contract["minimumNullFractionalImprovement"] > 1:
+        raise RuntimeError("Null-model improvement threshold cannot exceed one.")
+    if contract["gridResolutionFloorFraction"] > 1:
+        raise RuntimeError("Grid resolution floor fraction cannot exceed one.")
+    percentiles = contract["jackknifePercentiles"]
+    if (len(percentiles) != 2 or not 0 < percentiles[0] < percentiles[1] < 100):
+        raise RuntimeError("Jackknife percentiles must be increasing and inside (0, 100).")
+    if contract["heldOutSeasonProcedure"] != "leave-one-season-out":
+        raise RuntimeError("Unsupported held-out-season procedure.")
+    if not contract.get("acceptedBands") or not contract.get("acceptedQualityFlags"):
+        raise RuntimeError("External method requires accepted bands and quality flags.")
+    for key in ("acceptedBands", "acceptedQualityFlags"):
+        values = contract[key]
+        if (not isinstance(values, list) or any(not isinstance(value, str) or not value
+                                                for value in values)
+                or len(values) != len(set(values))):
+            raise RuntimeError(f"Invalid external-analysis method field: {key}")
+    aliases = contract.get("aliasFrequencyOffsetsCyclesPerDay")
+    if not isinstance(aliases, list) or not aliases:
+        raise RuntimeError("External method requires alias definitions.")
+    labels = set()
+    for item in aliases:
+        if (not isinstance(item, dict) or not isinstance(item.get("label"), str)
+                or not item["label"] or item["label"] in labels
+                or isinstance(item.get("offset"), bool)
+                or not isinstance(item.get("offset"), (int, float))
+                or not math.isfinite(float(item["offset"])) or float(item["offset"]) == 0):
+            raise RuntimeError("Invalid external alias definition.")
+        labels.add(item["label"])
+    return contract
 
 
 def run_external_experiment(*, target: dict[str, Any], family_window: list[float],
                             neighbors: list[dict[str, Any]], providers: list[PhotometryProvider],
                             artifact_root: Path, contract: dict[str, Any] | None = None) -> dict[str, Any]:
     """Select the first objectively usable provider and freeze its raw response."""
-    policy = {**DEFAULT_CONTRACT, **(contract or {}),
-              "frozenFamilyCenterDays": float(sum(family_window) / 2.0)}; attempts = []
+    policy = freeze_external_method_contract(family_window, contract)
+    method_hash = _method_hash(policy)
+    attempts = []
     # Freeze the family before any provider call.
-    preregistration = {"familyWindowDays": list(family_window), "providerPriority": [p.name for p in providers],
-                       "qualityContract": policy, "observable": "blocked-seasonal-phase-prediction"}
+    preregistration = {"familyWindowDays": list(family_window),
+                       "providerPriority": [p.name for p in providers],
+                       "methodContract": policy,
+                       "methodContractSHA256": method_hash,
+                       "qualityContract": policy,
+                       "observable": policy["observable"]}
     root = Path(artifact_root); root.mkdir(parents=True, exist_ok=True)
     preregistration_path = root / "execution-preregistration.json"
     _write_once_json(preregistration_path, preregistration)
@@ -203,31 +350,44 @@ def run_external_experiment(*, target: dict[str, Any], family_window: list[float
     if neighbors is None:
         result = _decision("EXTERNAL_CONTAMINATION_AMBIGUOUS", attempts, None,
                            "Authoritative catalog-neighbor evidence is missing.", False, False, False)
+        result.update({"methodContract": policy, "methodContractSHA256": method_hash})
         return _complete_execution_result(result, artifacts, analysis_available=False)
     try:
         crowding = sum(float(n["fluxFraction"]) for n in neighbors
-                       if float(n["separationArcsec"]) <= float(n.get("providerRadiusArcsec", 16.0)))
+                       if float(n["separationArcsec"]) <= float(
+                           n.get("providerRadiusArcsec", policy["providerApertureArcsec"])))
     except (KeyError, TypeError, ValueError):
         result = _decision("EXTERNAL_CONTAMINATION_AMBIGUOUS", attempts, None,
                            "Catalog-neighbor evidence is incomplete.", False, False, False)
+        result.update({"methodContract": policy, "methodContractSHA256": method_hash})
         return _complete_execution_result(result, artifacts, analysis_available=False)
     if not math.isfinite(crowding):
         result = _decision("EXTERNAL_CONTAMINATION_AMBIGUOUS", attempts, None,
                            "Catalog-neighbor flux evidence is non-finite.", False, False, False)
+        result.update({"methodContract": policy, "methodContractSHA256": method_hash})
         return _complete_execution_result(result, artifacts, analysis_available=False)
     if crowding > policy["maximumNeighborFluxFraction"]:
         result = _decision("EXTERNAL_CONTAMINATION_AMBIGUOUS", attempts, None,
                            "Persisted catalog neighbors exceed the external-survey blending gate.", False, False, False)
         result["crowdingFluxFraction"] = crowding
+        result.update({"methodContract": policy, "methodContractSHA256": method_hash})
         return _complete_execution_result(result, artifacts, analysis_available=False)
+    saw_scientific_insufficiency = False
+    provider_failure: tuple[str, str] | None = None
     for provider in providers:
         try:
             coverage = provider.coverage(target)
+            if not isinstance(coverage, dict) or not isinstance(coverage.get("available"), bool):
+                raise MalformedProviderData("Provider coverage response is malformed")
             coverage_path = root / f"{provider.name.lower()}-coverage.json"
             _write_once_json(coverage_path, coverage)
             artifacts.append(_artifact_manifest_entry(coverage_path, "PROVIDER_COVERAGE"))
             if coverage.get("available") is not True:
-                attempts.append({"provider": provider.name, "availability": "UNAVAILABLE", "rejectionReason": coverage.get("reason")}); continue
+                attempts.append({"provider": provider.name, "availability": "UNAVAILABLE",
+                                 "rejectionReason": coverage.get("reason")})
+                provider_failure = ("EXTERNAL_PROVIDER_UNAVAILABLE",
+                                    "No preregistered provider covers this target.")
+                continue
             request_parameters = {"familyWindowDays": family_window,
                                   "acceptedBands": policy["acceptedBands"],
                                   "acceptedQualityFlags": policy["acceptedQualityFlags"],
@@ -240,6 +400,7 @@ def run_external_experiment(*, target: dict[str, Any], family_window: list[float
             else: raw_path.write_bytes(raw)
             artifacts.append(_artifact_manifest_entry(raw_path, "RAW_PROVIDER_RESPONSE"))
             parsed = provider.parse(raw)
+            _validate_parsed_measurements(parsed)
             selected_source = coverage.get("selectedSource")
             parsed_sources = {row.get("sourceID") for row in parsed if row.get("sourceID") is not None}
             if selected_source is not None and parsed_sources != {str(selected_source)}:
@@ -259,6 +420,7 @@ def run_external_experiment(*, target: dict[str, Any], family_window: list[float
             _write_once_json(quality_path, quality)
             artifacts.append(_artifact_manifest_entry(quality_path, "OBJECTIVE_QUALITY_GATE"))
             if quality["status"] != "QUALIFIED":
+                saw_scientific_insufficiency = True
                 attempts.append({"provider": provider.name, "availability": "AVAILABLE",
                                  "rejectionReason": quality["reason"]})
                 continue
@@ -280,13 +442,49 @@ def run_external_experiment(*, target: dict[str, Any], family_window: list[float
             result["cleanedMeasurementsPath"] = str(cleaned_path)
             result["cleanedMeasurementsSHA256"] = hashlib.sha256(cleaned_path.read_bytes()).hexdigest()
             result["qualityContract"] = policy
+            result["methodContract"] = policy
+            result["methodContractSHA256"] = method_hash
             result["catalogNeighbors"] = neighbors
             return _complete_execution_result(result, artifacts, analysis_available=True)
-        except (ProviderUnavailable, MalformedProviderData) as exc:
-            attempts.append({"provider": provider.name, "availability": "UNAVAILABLE", "rejectionReason": str(exc)})
-    result = _decision("EXTERNAL_DATA_INSUFFICIENT", attempts, None,
-                       "No preregistered provider passed objective availability gates.", False, False, False)
+        except ProviderUnavailable as exc:
+            attempts.append({"provider": provider.name, "availability": "OPERATIONALLY_UNAVAILABLE",
+                             "rejectionReason": str(exc)})
+            provider_failure = ("EXTERNAL_PROVIDER_UNAVAILABLE", str(exc))
+        except MalformedProviderData as exc:
+            attempts.append({"provider": provider.name, "availability": "INVALID_RESPONSE",
+                             "rejectionReason": str(exc)})
+            provider_failure = ("EXTERNAL_PROVIDER_DATA_INVALID", str(exc))
+    if saw_scientific_insufficiency:
+        classification = "EXTERNAL_DATA_INSUFFICIENT"
+        rationale = "Valid provider data failed the frozen scientific coverage contract."
+    elif provider_failure is not None:
+        classification, rationale = provider_failure
+    else:
+        classification = "EXTERNAL_PROVIDER_UNAVAILABLE"
+        rationale = "No preregistered provider was configured."
+    result = _decision(classification, attempts, None, rationale, False, False, False)
+    result["methodContract"] = policy
+    result["methodContractSHA256"] = method_hash
     return _complete_execution_result(result, artifacts, analysis_available=False)
+
+
+def _validate_parsed_measurements(rows: Any) -> None:
+    if not isinstance(rows, list):
+        raise MalformedProviderData("Provider measurements are not a list")
+    for row in rows:
+        if not isinstance(row, dict):
+            raise MalformedProviderData("Provider measurement is not an object")
+        try:
+            time = float(row["time"])
+            flux = float(row["flux"])
+            uncertainty = float(row["uncertainty"])
+            band = str(row["band"])
+            quality = str(row["quality"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise MalformedProviderData("Provider measurement schema is incomplete") from exc
+        if (not all(math.isfinite(value) for value in (time, flux, uncertainty))
+                or uncertainty <= 0 or not band or not quality):
+            raise MalformedProviderData("Provider measurement values are invalid")
 
 
 def _artifact_manifest_entry(path: Path, role: str) -> dict[str, Any]:
@@ -314,8 +512,9 @@ def _write_once_json(path: Path, value: dict[str, Any]) -> None:
     path.write_bytes(encoded)
 
 
-def analyze_seasonal_coherence(rows, family_window, policy=DEFAULT_CONTRACT):
+def analyze_seasonal_coherence(rows, family_window, policy=None):
     """Analyze calibrated bands separately and require agreement."""
+    policy = freeze_external_method_contract(family_window, policy)
     bands=sorted({str(r["band"]) for r in rows})
     if not bands:
         return _decision("EXTERNAL_DATA_INSUFFICIENT",[],None,"No accepted photometric band.",False,False,False)
@@ -332,14 +531,18 @@ def analyze_seasonal_coherence(rows, family_window, policy=DEFAULT_CONTRACT):
                  if item.get("bestPeriodDays") is not None]
         tolerances=[float(item.get("periodUncertaintyDays") or 0.0)
                     for item in qualified.values()]
-        if len(periods)>1 and max(periods)-min(periods)>max(2e-4,sum(tolerances)):
+        tolerance = max(policy["bandAgreementAbsoluteFloorDays"],
+                        policy["bandAgreementUncertaintyMultiplier"] * sum(tolerances))
+        if len(periods)>1 and max(periods)-min(periods)>tolerance:
             result=_decision("EXTERNAL_PIPELINE_OR_BAND_DEPENDENT",[],None,
                              "Accepted bands select incompatible periods.",False,False,False)
     result["bandResults"]=results; result["bandsAnalyzedSeparately"]=True
+    result["methodContract"] = policy
+    result["methodContractSHA256"] = _method_hash(policy)
     return result
 
 
-def _analyze_single_band(rows, family_window, policy=DEFAULT_CONTRACT):
+def _analyze_single_band(rows, family_window, policy):
     """Narrow frozen-family fit with blocked prediction in every season."""
     coverage=objective_coverage(rows,{**policy,
         "frozenFamilyCenterDays":float(sum(family_window)/2.0)})
@@ -351,24 +554,26 @@ def _analyze_single_band(rows, family_window, policy=DEFAULT_CONTRACT):
     times=np.array([r["time"] for r in rows],dtype=float)
     flux=np.array([r["flux"] for r in rows],dtype=float)
     err=np.array([r["uncertainty"] for r in rows],dtype=float)
-    # A new season begins at an objective 90-day sampling gap.
+    season_gap = float(policy["seasonGapDays"])
     order=np.argsort(times); season_ids=np.zeros(len(times),dtype=int); current=0
     for left,right in zip(order[:-1],order[1:]):
-        if times[right]-times[left] >= 90.0: current += 1
+        if times[right]-times[left] >= season_gap: current += 1
         season_ids[right]=current
     seasons=season_ids; unique=np.unique(seasons)
     # Fixed finite grid is a narrow preregistered fit, not a blind period search.
-    grid=np.linspace(float(family_window[0]), float(family_window[1]), 401)
+    grid=np.linspace(float(family_window[0]), float(family_window[1]),
+                     int(policy["periodGridPointCount"]))
+    uncertainty_floor = float(policy["minimumMeasurementUncertainty"])
     def score(period, mask):
         x=np.column_stack([np.ones(mask.sum()), np.sin(2*np.pi*times[mask]/period), np.cos(2*np.pi*times[mask]/period)])
-        w=1/np.maximum(err[mask],1e-9)
+        w=1/np.maximum(err[mask],uncertainty_floor)
         beta=np.linalg.lstsq(x*w[:,None],flux[mask]*w,rcond=None)[0]
-        residual=(flux[mask]-x@beta)/np.maximum(err[mask],1e-9)
+        residual=(flux[mask]-x@beta)/np.maximum(err[mask],uncertainty_floor)
         return beta,float(np.sum(residual**2))
     def predict_chi2(period,beta,mask):
         x=np.column_stack([np.ones(mask.sum()),np.sin(2*np.pi*times[mask]/period),
                            np.cos(2*np.pi*times[mask]/period)])
-        return float(np.sum(((flux[mask]-x@beta)/np.maximum(err[mask],1e-9))**2))
+        return float(np.sum(((flux[mask]-x@beta)/np.maximum(err[mask],uncertainty_floor))**2))
     full=np.ones(len(times),dtype=bool)
     profile=np.array([score(float(p),full)[1] for p in grid])
     best_index=int(np.argmin(profile)); period=float(grid[best_index])
@@ -380,13 +585,14 @@ def _analyze_single_band(rows, family_window, policy=DEFAULT_CONTRACT):
         fold_period=float(grid[int(np.argmin(train_profile))]); jack.append(fold_period)
         beta,_=score(fold_period,train)
         signal_chi2=predict_chi2(fold_period,beta,test)
-        train_weights=1/np.maximum(err[train],1e-9)**2
+        train_weights=1/np.maximum(err[train],uncertainty_floor)**2
         null_level=float(np.average(flux[train],weights=train_weights))
-        null_chi2=float(np.sum(((flux[test]-null_level)/np.maximum(err[test],1e-9))**2))
+        null_chi2=float(np.sum(((flux[test]-null_level)/np.maximum(err[test],uncertainty_floor))**2))
         folds.append({"heldOutSeason":int(held),"trainingSeasonCount":int(len(unique)-1),
                       "selectedPeriodDays":fold_period,"testMeasurementCount":int(test.sum()),
                       "signalChiSquare":signal_chi2,"nullChiSquare":null_chi2,
-                      "predictiveReducedChiSquare":signal_chi2/max(1,int(test.sum())-3)})
+                      "predictiveReducedChiSquare":signal_chi2/max(
+                          1, int(test.sum())-int(policy["predictiveModelParameterCount"]))})
     predictive=float(np.median([item["predictiveReducedChiSquare"] for item in folds]))
     signal_total=float(sum(item["signalChiSquare"] for item in folds))
     null_total=float(sum(item["nullChiSquare"] for item in folds))
@@ -403,17 +609,23 @@ def _analyze_single_band(rows, family_window, policy=DEFAULT_CONTRACT):
     phase_range=float(np.ptp(unwrapped)); amplitude_range=float(np.ptp([x["amplitude"] for x in seasonal]))
     candidate_frequency=1.0/period
     alias_periods=[]
-    for label,delta in (("DAILY_PLUS",1.0),("DAILY_MINUS",-1.0),
-                        ("YEARLY_PLUS",1.0/365.25),("YEARLY_MINUS",-1.0/365.25)):
+    for alias in policy["aliasFrequencyOffsetsCyclesPerDay"]:
+        label, delta = alias["label"], float(alias["offset"])
         frequency=candidate_frequency+delta
         if frequency>0:
             alias_period=1.0/frequency
             alias_periods.append({"alias":label,"periodDays":alias_period,
                                   "chiSquare":score(alias_period,full)[1]})
-    alias_threshold=best_chi2+max(1.0,0.01*best_chi2)
+    alias_threshold=best_chi2+max(
+        float(policy["aliasAmbiguityMinimumDeltaChiSquare"]),
+        float(policy["aliasAmbiguityBestChiSquareFraction"])*best_chi2)
     alias_ambiguous=any(item["chiSquare"]<=alias_threshold for item in alias_periods)
-    replicated=predictive <= 9.0 and null_improvement >= 0.10
-    stable=replicated and predictive <= 4.0 and phase_range <= 0.30 and not alias_ambiguous
+    replicated=(predictive <= policy["maximumReplicatedPredictiveReducedChiSquare"]
+                and null_improvement >= policy["minimumNullFractionalImprovement"])
+    stable=(replicated
+            and predictive <= policy["maximumStablePredictiveReducedChiSquare"]
+            and phase_range <= policy["maximumStablePhaseRangeRadians"]
+            and not alias_ambiguous)
     if alias_ambiguous and replicated:
         classification="EXTERNAL_ALIAS_AMBIGUOUS"
     elif stable:
@@ -429,19 +641,22 @@ def _analyze_single_band(rows, family_window, policy=DEFAULT_CONTRACT):
     # spacing.  Each leave-one-season-out fit is an independent long-baseline
     # perturbation of the shared-clock estimate.
     failures=[]
-    interval=[float(np.percentile(jack,16)),float(np.percentile(jack,84))] if len(jack)>=3 else [None,None]
+    percentiles = policy["jackknifePercentiles"]
+    interval=[float(np.percentile(jack,percentiles[0])),
+              float(np.percentile(jack,percentiles[1]))] if len(jack)>=3 else [None,None]
     grid_resolution=float(grid[1]-grid[0])
     jackknife_half_width=((interval[1]-interval[0])/2 if interval[0] is not None else None)
     # A finite profile grid cannot support precision below half a cell.  Report
     # that resolution floor explicitly instead of false zero precision when all
     # seasonal jackknife optima occupy the same cell.
-    profile_mask=profile<=best_chi2+1.0
+    profile_mask=profile<=best_chi2+float(policy["profileDeltaChiSquare"])
     profile_interval=[float(grid[profile_mask][0]),float(grid[profile_mask][-1])]
     profile_half_width=max(period-profile_interval[0],profile_interval[1]-period,
-                           grid_resolution/2)
-    uncertainty=(max(jackknife_half_width or 0.0,profile_half_width,grid_resolution/2))
+                           grid_resolution*policy["gridResolutionFloorFraction"])
+    resolution_floor=grid_resolution*policy["gridResolutionFloorFraction"]
+    uncertainty=(max(jackknife_half_width or 0.0,profile_half_width,resolution_floor))
     result.update({"bestPeriodDays": float(period), "periodGridStepDays": float(grid[1]-grid[0]), "predictiveReducedChiSquare": predictive,
-                   "periodUncertaintyDays": uncertainty, "periodUncertainty":{"method":"leave-one-season-out-jackknife-plus-delta-chi-square-profile","successfulResamples":len(jack),"jackknifeIntervalDays":interval,"jackknifeHalfWidthDays":jackknife_half_width,"profileLikelihood68IntervalDays":profile_interval,"profileHalfWidthDays":profile_half_width,"gridResolutionFloorDays":grid_resolution/2,"failures":failures,"frozenFamilyWindowDays":family_window},
+                   "periodUncertaintyDays": uncertainty, "periodUncertainty":{"method":"leave-one-season-out-jackknife-plus-delta-chi-square-profile","successfulResamples":len(jack),"jackknifeIntervalDays":interval,"jackknifeHalfWidthDays":jackknife_half_width,"profileLikelihood68IntervalDays":profile_interval,"profileHalfWidthDays":profile_half_width,"gridResolutionFloorDays":resolution_floor,"failures":failures,"frozenFamilyWindowDays":family_window},
                    "seasonalPhaseOC":seasonal,"seasonalPhaseRangeRadians":phase_range,"seasonalAmplitudeRange":amplitude_range,
                    "seasonCount": int(len(unique)), "measurementCount": len(rows),
                    "blockedSeasonFolds":folds,"allSeasonsHeldOut":len(folds)==len(unique),
@@ -463,7 +678,8 @@ def objective_coverage(rows, policy):
     times=sorted(float(r["time"]) for r in rows)
     if times[-1]-times[0] < policy["minimumBaselineDays"]:
         return {"status":"REJECTED","reason":"insufficient-baseline"}
-    seasons=1+sum(b-a>=90.0 for a,b in zip(times,times[1:]))
+    season_gap = float(policy["seasonGapDays"])
+    seasons=1+sum(b-a>=season_gap for a,b in zip(times,times[1:]))
     if seasons < policy["minimumSeasons"]:
         return {"status":"REJECTED","reason":"insufficient-seasons"}
     bands={r["band"] for r in rows}
@@ -473,7 +689,7 @@ def objective_coverage(rows, policy):
     period=float(policy.get("frozenFamilyCenterDays") or 1.0)
     season=0; grouped={0:[]}
     for index,time in enumerate(times):
-        if index and time-times[index-1]>=90.0:
+        if index and time-times[index-1]>=season_gap:
             season+=1; grouped[season]=[]
         grouped[season].append(time)
     bins=int(policy["minimumPhaseBins"])
@@ -490,6 +706,8 @@ def objective_coverage(rows, policy):
 def _decision(classification, attempts, selected, rationale, replicated, stable, evolving):
     next_tests = {
         "EXTERNAL_DATA_INSUFFICIENT": "MANUAL_EXTERNAL_DATA_REVIEW",
+        "EXTERNAL_PROVIDER_UNAVAILABLE": "RETRY_OR_CONFIGURE_EXTERNAL_PROVIDER",
+        "EXTERNAL_PROVIDER_DATA_INVALID": "REVIEW_EXTERNAL_PROVIDER_ADAPTER",
         "EXTERNAL_CONTAMINATION_AMBIGUOUS": "HIGHER_RESOLUTION_SOURCE_LOCALIZATION",
         "EXTERNAL_ALIAS_AMBIGUOUS": "INDEPENDENT_SAMPLING_WINDOW_PHOTOMETRY",
         "EXTERNAL_PIPELINE_OR_BAND_DEPENDENT": "INDEPENDENT_CALIBRATED_BAND_PHOTOMETRY",

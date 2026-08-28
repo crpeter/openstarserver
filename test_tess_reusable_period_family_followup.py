@@ -1,5 +1,6 @@
 import json
 import math
+from copy import deepcopy
 import sys
 import tempfile
 import types
@@ -18,13 +19,16 @@ from workflows.tess.period_family_followup import (
     extract_gaia_context,
     freeze_period_family_contract,
     select_untouched_sectors,
+    validate_period_family_contract,
+    verified_contract,
 )
 from workflows.tess.tess_autonomy import plan_tess_branches
 from workflows.tess.tess_investigation import build_engine
 from workflows.tess.external_long_baseline import (
     ASASSNSkyPatrolProvider, MalformedProviderData, OfficialASASSNTransport,
-    ProviderConfigurationUnavailable, ProviderUnavailable,
-    analyze_seasonal_coherence, run_external_experiment,
+    ProviderConfigurationUnavailable, ProviderTransientError, ProviderUnavailable,
+    analyze_seasonal_coherence, external_method_contract_sha256,
+    freeze_external_method_contract, run_external_experiment,
 )
 
 
@@ -32,6 +36,14 @@ class Transport:
     def __init__(self, rows, available=True): self.rows=rows; self.available=available
     def coverage(self, target): return {"available": self.available, "product":"asas-sn-lightcurve-v1"}
     def acquire(self, target, request): return json.dumps(self.rows).encode()
+
+
+class MalformedTransport(Transport):
+    def acquire(self, target, request): return b"not-json"
+
+
+class TransientTransport(Transport):
+    def coverage(self, target): raise ProviderTransientError("temporary outage")
 
 
 def rows(evolving=False):
@@ -113,6 +125,48 @@ class ReusableFollowupTests(unittest.TestCase):
         self.assertFalse(first["fluxInspectedDuringSelection"])
         self.assertEqual(first["rejectedSectors"][0]["reason"],"already-consumed-by-time-domain-observable")
         self.assertEqual(select_untouched_sectors(catalog,[3,40])["status"],"INSUFFICIENT_EPOCH_COVERAGE")
+
+        exact_duplicate=catalog+[dict(catalog[0])]
+        forward=select_untouched_sectors(exact_duplicate,[3])
+        backward=select_untouched_sectors(reversed(exact_duplicate),[3])
+        self.assertEqual(forward,backward)
+        self.assertEqual(forward["status"],"SELECTED")
+
+        conflict=catalog+[{**catalog[0],"observationYear":2022}]
+        forward=select_untouched_sectors(conflict,[3])
+        backward=select_untouched_sectors(reversed(conflict),[3])
+        self.assertEqual(forward,backward)
+        self.assertEqual(forward["status"],"CONFLICTING_PRODUCT_METADATA")
+        self.assertEqual(forward["selectedSectors"],[])
+        self.assertFalse(forward["fluxInspectedDuringSelection"])
+
+    def test_period_family_contract_requires_valid_semantics_and_hash(self):
+        family={"originStageID":"stage","primaryPeriodDays":4.55,
+            "familyCenterDays":4.54,"periodFamilyMembersDays":[4.51,4.55],
+            "familyAcceptanceWindowDays":[4.4,4.7],"consumedSectors":[1,2],
+            "observableDefinition":"persisted-sector-period-phase-reference"}
+        contract=freeze_period_family_contract({"frozenPeriodFamily":family},"stage")
+        self.assertIs(validate_period_family_contract(contract),contract)
+        self.assertEqual(verified_contract({"periodFamilyContract":contract,
+            "periodFamilyContractSHA256":sha256_json(contract)}),contract)
+
+        invalid=[]
+        for mutate in (
+            lambda value: value.update(acceptanceWindowDays=[4.7,4.4]),
+            lambda value: value.update(primaryPeriodDays=0),
+            lambda value: value.update(familyCenterDays=float("nan")),
+            lambda value: value.update(periodFamilyMembersDays=[4.51,9.0]),
+            lambda value: value.update(consumedSectors=[1,1]),
+            lambda value: value.update(consumedSectors=[1,True]),
+            lambda value: value.update(schemaVersion="unsupported"),
+            lambda value: value.pop("originStageID"),
+        ):
+            candidate=deepcopy(contract); mutate(candidate); invalid.append(candidate)
+        for candidate in invalid:
+            with self.subTest(candidate=candidate):
+                with self.assertRaises(RuntimeError):
+                    verified_contract({"periodFamilyContract":candidate,
+                        "periodFamilyContractSHA256":sha256_json(candidate)})
 
     def test_three_semantic_autonomy_routes_and_quiescence(self):
         target=InvestigationTarget("x","inv","openstar.workflow.tess-investigation.v1","20.2",{})
@@ -212,6 +266,9 @@ class ReusableFollowupTests(unittest.TestCase):
                 "openstar.tess.external-long-baseline.prepare",{},investigation.stages[-1].id)
             investigation,next_request=engine.run_stage(investigation,request,
                 software_id="test",software_version="1")
+            external_preparation=investigation.stages[-1].result
+            self.assertEqual(external_preparation["methodContractSHA256"],
+                external_method_contract_sha256(external_preparation["methodContract"]))
             with mock.patch("workflows.tess.tess_investigation.ASASSNSkyPatrolProvider.from_environment",
                             side_effect=ProviderConfigurationUnavailable("not installed")):
                 investigation,next_request=engine.run_stage(investigation,next_request,
@@ -251,10 +308,54 @@ class ReusableFollowupTests(unittest.TestCase):
                     artifact_root=Path(d))
         with self.assertRaises(ProviderUnavailable): ASASSNSkyPatrolProvider().coverage({})
         with self.assertRaises(MalformedProviderData): ASASSNSkyPatrolProvider(Transport([])).parse(b"bad")
+        for provider,classification in (
+            (ASASSNSkyPatrolProvider(),"EXTERNAL_PROVIDER_UNAVAILABLE"),
+            (ASASSNSkyPatrolProvider(MalformedTransport([])),
+             "EXTERNAL_PROVIDER_DATA_INVALID"),
+        ):
+            with self.subTest(classification=classification), tempfile.TemporaryDirectory() as d:
+                result=run_external_experiment(target={},family_window=[4.5,4.6],
+                    neighbors=[],providers=[provider],artifact_root=Path(d))
+                self.assertEqual(result["classification"],classification)
+                self.assertNotEqual(result["classification"],"EXTERNAL_DATA_INSUFFICIENT")
+        with tempfile.TemporaryDirectory() as d, self.assertRaises(ProviderTransientError):
+            run_external_experiment(target={},family_window=[4.5,4.6],neighbors=[],
+                providers=[ASASSNSkyPatrolProvider(TransientTransport([]))],
+                artifact_root=Path(d))
         with tempfile.TemporaryDirectory() as d:
             result=run_external_experiment(target={},family_window=[4.5,4.6],
                 neighbors=[{"separationArcsec":2,"fluxFraction":.5}],providers=[provider],artifact_root=Path(d))
             self.assertEqual(result["classification"],"EXTERNAL_CONTAMINATION_AMBIGUOUS")
+
+    def test_external_method_is_frozen_hashed_consumed_and_recovery_safe(self):
+        window=[4.5,4.6]
+        default=freeze_external_method_contract(window)
+        strict_thresholds={"maximumReplicatedPredictiveReducedChiSquare":1e-30,
+            "maximumStablePredictiveReducedChiSquare":1e-30}
+        changed=freeze_external_method_contract(window,strict_thresholds)
+        self.assertNotEqual(external_method_contract_sha256(default),
+                            external_method_contract_sha256(changed))
+        restricted=analyze_seasonal_coherence(rows(),window,strict_thresholds)
+        self.assertEqual(restricted["classification"],"EXTERNAL_RECURRENCE_NOT_REPLICATED")
+        self.assertEqual(
+            restricted["methodContract"]["maximumReplicatedPredictiveReducedChiSquare"],
+            1e-30)
+
+        provider=ASASSNSkyPatrolProvider(Transport(rows()))
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d)
+            result=run_external_experiment(target={},family_window=window,neighbors=[],
+                providers=[provider],artifact_root=root)
+            preregistration=json.loads(
+                (root/"execution-preregistration.json").read_text(encoding="utf-8"))
+            self.assertEqual(preregistration["methodContractSHA256"],
+                external_method_contract_sha256(preregistration["methodContract"]))
+            self.assertEqual(result["methodContractSHA256"],
+                             preregistration["methodContractSHA256"])
+            with self.assertRaises(RuntimeError):
+                run_external_experiment(target={},family_window=window,neighbors=[],
+                    providers=[provider],artifact_root=root,
+                    contract=strict_thresholds)
 
     def test_real_gaia_schema_isolated_crowded_and_ambiguous(self):
         identity={"gaiaDR3":{"nearest":{"sourceID":"target"},
