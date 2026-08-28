@@ -14,6 +14,7 @@ from typing import Any
 
 
 RESULT_VERSION = "2.0"
+MORPHOLOGY_EVENT_SCREEN_ENTRY = "MORPHOLOGY_RESOLVED_PERIODIC_EVENT_SCREEN"
 DURATION_FRACTIONS = (0.01, 0.015, 0.02, 0.03, 0.05, 0.08, 0.12)
 MIN_INDEPENDENT_SUPPORTERS = 3
 MIN_SAMPLES = 80
@@ -33,6 +34,34 @@ def physical_interpretation_continuation(physical: dict[str, Any],
             and physical.get("preferredPhotometricHypothesis") == "BINARY_LIKE_DOUBLE_WAVE"
             and morphology.get("physicalCycleResolved") is True
             and math.isfinite(period) and period > 0)
+
+
+def morphology_event_screening_continuation(
+    morphology: dict[str, Any], independent_spec: dict[str, Any]
+) -> bool:
+    """Screen a resolved double-wave clock for recurring narrow events first.
+
+    This is a cheap, frozen-data geometry test, not a binary classification.
+    A smooth double wave fails closed; a recurring narrow event may continue to
+    source localization and precision event modeling.
+    """
+    try:
+        period = float(morphology.get("resolvedPhysicalPeriodDays"))
+    except (TypeError, ValueError):
+        return False
+    prepared_count = sum(
+        1
+        for item in independent_spec.get("preparedSectors") or []
+        if item.get("datasetPath")
+    )
+    return (
+        morphology.get("physicalCycleResolved") is True
+        and morphology.get("morphologyClass")
+        == "DOUBLE_WAVE_PHYSICAL_CYCLE_SUPPORTED"
+        and math.isfinite(period)
+        and period > 0
+        and prepared_count >= MIN_INDEPENDENT_SUPPORTERS
+    )
 
 
 def _load(path: str | Path) -> dict[str, Any]:
@@ -194,10 +223,26 @@ def _sector(dataset: dict[str, Any], period: float, role: str) -> dict[str, Any]
     return result
 
 
-def _ephemeris(events: list[dict[str, Any]], input_period: float) -> dict[str, Any]:
+def _ephemeris(
+    events: list[dict[str, Any]],
+    input_period: float,
+    cycle_reference: tuple[float, float] | None = None,
+) -> dict[str, Any]:
     ordered = sorted(events, key=lambda item: item["eventEpoch"])
-    anchor = ordered[0]["eventEpoch"]
-    cycles = [round((item["eventEpoch"] - anchor) / input_period) for item in ordered]
+    if cycle_reference is None:
+        anchor = ordered[0]["eventEpoch"]
+        assignment_period = input_period
+        assignment_basis = "INPUT_PERIOD_FROM_EARLIEST_EVENT"
+    else:
+        anchor, assignment_period = map(float, cycle_reference)
+        if not (math.isfinite(anchor) and math.isfinite(assignment_period)
+                and assignment_period > 0):
+            return {"coherent": False, "reason": "INVALID_CYCLE_ASSIGNMENT_REFERENCE"}
+        assignment_basis = "INDEPENDENT_REFINED_EPHEMERIS"
+    cycles = [
+        round((item["eventEpoch"] - anchor) / assignment_period)
+        for item in ordered
+    ]
     if len(set(cycles)) != len(cycles):
         return {"coherent": False, "reason": "INTEGER_CYCLE_ASSIGNMENT_NOT_UNIQUE"}
     def fit(indices: list[int]) -> tuple[float, float]:
@@ -233,13 +278,23 @@ def _ephemeris(events: list[dict[str, Any]], input_period: float) -> dict[str, A
             "rmsOMinusCDays": math.sqrt(statistics.mean(value * value for value in residuals)),
             "maximumAbsoluteOMinusCDays": max(abs(value) for value in residuals),
             "leaveOneSectorOutPeriodSolutions": loso,
+            "cycleAssignmentBasis": assignment_basis,
+            "cycleAssignmentReferenceEpoch": anchor,
+            "cycleAssignmentReferencePeriodDays": assignment_period,
             "coherenceScale": "EVENT_DURATION_AND_INPUT_PERIOD"}
 
 
 def analyze_binary_confirmation(*, primary_dataset_path: str | Path,
                                 independent_spec: dict[str, Any], morphology: dict[str, Any],
-                                physical_interpretation: dict[str, Any]) -> dict[str, Any]:
-    if not physical_interpretation_continuation(physical_interpretation, morphology):
+                                physical_interpretation: dict[str, Any] | None,
+                                entry_mode: str = "PHYSICAL_INTERPRETATION") -> dict[str, Any]:
+    morphology_screen = entry_mode == MORPHOLOGY_EVENT_SCREEN_ENTRY
+    if morphology_screen:
+        if not morphology_event_screening_continuation(morphology, independent_spec):
+            raise ValueError("authoritative morphology event-screen input gate is not satisfied")
+    elif not physical_interpretation_continuation(
+        physical_interpretation or {}, morphology
+    ):
         raise ValueError("authoritative binary-confirmation input gate is not satisfied")
     prepared = [item for item in independent_spec.get("preparedSectors") or []
                 if item.get("datasetPath")]
@@ -256,7 +311,14 @@ def analyze_binary_confirmation(*, primary_dataset_path: str | Path,
     ephemeris = independent_ephemeris
     if supported:
         timing_events = [item for item in results if item.get("usable")]
-        timing_attempt = _ephemeris(timing_events, period)
+        timing_attempt = _ephemeris(
+            timing_events,
+            period,
+            cycle_reference=(
+                independent_ephemeris["referenceEpoch"],
+                independent_ephemeris["refinedPeriodDays"],
+            ),
+        )
         primary_in_attempt = any(item["role"] == "PRIMARY" for item in timing_events)
         if timing_attempt.get("coherent") is True:
             ephemeris = timing_attempt
@@ -307,6 +369,8 @@ def analyze_binary_confirmation(*, primary_dataset_path: str | Path,
     for item in results:
         item.pop("_times", None); item.pop("_residual", None)
     return {"resultVersion": RESULT_VERSION, "experiment": "FIXED_PERIOD_ECLIPSE_GEOMETRY_REPLICATION",
+            "entryBoundary": (MORPHOLOGY_EVENT_SCREEN_ENTRY if morphology_screen
+                              else "PHYSICAL_INTERPRETATION_BINARY_RECOMMENDATION"),
             "physicalPeriodInputDays": period, "sectorResults": results,
             "independentEvidence": {"classification": (
                 "REPLICATED_ECLIPSE_LIKE_EVENT_SUPPORTED" if supported else
