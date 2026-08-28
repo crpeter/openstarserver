@@ -10,6 +10,7 @@ from openstar_investigation import InvestigationStage, InvestigationStore
 from openstar_workflow import StageRequest
 from workflows.tess.tess_autonomy import WORKFLOW_ID, WORKFLOW_VERSION
 from workflows.tess.tess_investigation import build_engine
+from workflows.tess import tess_blind_transit_search
 
 from workflows.tess.tess_blind_transit_search import (
     HANDLER_ID,
@@ -31,8 +32,7 @@ class BlindTransitSearchTests(unittest.TestCase):
         return store.complete_current_stage(investigation, terminal)
 
     def _dataset(self, root: Path, *, sector: int, origin: float,
-                 transit: bool = True) -> Path:
-        period = 2.21857567
+                 transit: bool = True, period: float = 2.21857567) -> Path:
         epoch = 1000.37
         duration = 0.08
         relative_times = [0.01 * index for index in range(2601)]
@@ -176,6 +176,77 @@ class BlindTransitSearchTests(unittest.TestCase):
         self.assertFalse(result["catalogAnswerKeyUsed"])
         self.assertFalse(result["physicalCycleResolved"])
         self.assertFalse(result["companionNatureResolved"])
+        self.assertEqual(
+            "RETAIN_BASE_PERIOD",
+            result["alternatingCycleAliasResolution"]["decision"],
+        )
+
+    def test_promotes_half_period_alias_when_only_alternating_cycles_transit(self):
+        true_period = 3.731
+        half_frequency = 2.0 / true_period
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = [
+                self._dataset(
+                    root, sector=sector, origin=origin, period=true_period
+                )
+                for sector, origin in ((8, 1000.0), (35, 1700.0), (62, 2400.0))
+            ]
+            independent = {
+                "investigationGoal": "FULL_CHARACTERIZATION",
+                "preparedSectors": [
+                    {"sector": sector, "datasetPath": str(path)}
+                    for sector, path in zip((35, 62), paths[1:])
+                ],
+            }
+
+            def forced_half_period(sectors, minimum, maximum):
+                measurements = [
+                    tess_blind_transit_search._box_score(
+                        item["times"], item["residual"], item["sigma"],
+                        half_frequency,
+                    )
+                    for item in sectors
+                ]
+                full_span = max(item["times"][-1] for item in sectors) - min(
+                    item["times"][0] for item in sectors
+                )
+                return (
+                    half_frequency, 10.0, measurements, 0.001, 0.000001,
+                    float(full_span),
+                )
+
+            with mock.patch.object(
+                tess_blind_transit_search, "_search_grid",
+                side_effect=forced_half_period,
+            ):
+                result = analyze_blind_transit_search(
+                    primary_dataset_path=paths[0],
+                    independent_spec=independent,
+                    morphology=None,
+                    broad_interpretation=None,
+                    targeted_interpretation={
+                        "claimDecision": {"claim": "HUMAN_REVIEW_REQUIRED"},
+                        "primaryReliable": False,
+                    },
+                )
+
+        self.assertEqual("REPLICATED_BLIND_TRANSIT_LIKE_CANDIDATE",
+                         result["classification"])
+        self.assertAlmostEqual(true_period, result["candidatePeriodDays"], delta=0.003)
+        self.assertAlmostEqual(true_period / 2.0,
+                               result["coarseCandidatePeriodDays"], delta=1e-9)
+        alias = result["alternatingCycleAliasResolution"]
+        self.assertEqual("PROMOTE_DOUBLE_PERIOD", alias["decision"])
+        self.assertEqual(
+            "TRANSITS_OCCUR_ON_ONLY_ONE_ALTERNATING_CYCLE_PARITY",
+            alias["reason"],
+        )
+        self.assertTrue(alias["doublePeriodValidation"]["supported"])
+        self.assertTrue(all(
+            item["decisiveAlternatingEvents"] for item in alias["sectorEvidence"]
+        ))
+        self.assertFalse(result["catalogAnswerKeyUsed"])
 
     def test_recovers_from_nonrecurrent_primary_boundary_without_broad_morphology(self):
         with tempfile.TemporaryDirectory() as temporary:

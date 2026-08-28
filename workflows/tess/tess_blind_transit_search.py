@@ -15,7 +15,7 @@ from typing import Any
 
 
 HANDLER_ID = "openstar.tess.blind-transit-search.analyze"
-RESULT_VERSION = "1.0"
+RESULT_VERSION = "1.1"
 ENTRY_BOUNDARY = "FULL_CHARACTERIZATION_UNRESOLVED_BROAD_VARIABILITY"
 TARGETED_BOUNDARY_ENTRY = "FULL_CHARACTERIZATION_NONRECURRENT_BOUNDARY_PERIOD"
 UNRELIABLE_PRIMARY_ENTRY = "FULL_CHARACTERIZATION_NONRECURRENT_UNRELIABLE_PRIMARY"
@@ -26,6 +26,9 @@ MAXIMUM_PERIOD_DAYS = 10.0
 PHASE_BIN_COUNT = 200
 OVERSAMPLING = 8.0
 MAXIMUM_FINE_GRID_SIZE = 2001
+MINIMUM_PARITY_CYCLES = 2
+MINIMUM_PARITY_SNR_SEPARATION = 4.0
+MAXIMUM_ALTERNATE_PARITY_SNR_FRACTION = 0.5
 DUTY_CYCLES = (0.01, 0.015, 0.02, 0.03, 0.04, 0.05, 0.07, 0.10)
 
 
@@ -205,6 +208,140 @@ def _sector_results_for_frequency(
     return results
 
 
+def _alternating_cycle_evidence(
+    sector: dict[str, Any], measurement: dict[str, Any], period: float
+) -> dict[str, Any]:
+    """Measure whether a candidate clock contains events on only one parity."""
+    import numpy as np
+
+    event_phase = float(measurement["eventPhase"])
+    duty_cycle = float(measurement["dutyCycle"])
+    cycle_coordinates = sector["times"] / period - event_phase
+    cycle_numbers = np.rint(cycle_coordinates).astype(np.int64)
+    distance = np.abs(cycle_coordinates - cycle_numbers)
+    inside = distance <= duty_cycle / 2.0
+    parities = []
+    for parity in (0, 1):
+        selected = inside & (np.remainder(cycle_numbers, 2) == parity)
+        count = int(np.count_nonzero(selected))
+        observed_cycles = int(np.unique(cycle_numbers[selected]).size)
+        depth = -float(np.mean(sector["residual"][selected])) if count else 0.0
+        snr = depth * math.sqrt(count) / sector["sigma"] if depth > 0 else 0.0
+        parities.append({
+            "parity": parity,
+            "snr": snr,
+            "depthStandardized": depth,
+            "eventSampleCount": count,
+            "observedCycleCount": observed_cycles,
+        })
+
+    dominant, alternate = sorted(parities, key=lambda item: item["snr"], reverse=True)
+    sufficiently_observed = all(
+        item["observedCycleCount"] >= MINIMUM_PARITY_CYCLES for item in parities
+    )
+    decisive = bool(
+        sufficiently_observed
+        and dominant["snr"] >= MINIMUM_SECTOR_SNR
+        and dominant["snr"] - alternate["snr"] >= MINIMUM_PARITY_SNR_SEPARATION
+        and alternate["snr"]
+        <= MAXIMUM_ALTERNATE_PARITY_SNR_FRACTION * dominant["snr"]
+    )
+    return {
+        "role": sector["role"],
+        "sector": sector["sector"],
+        "datasetID": sector["datasetID"],
+        "decisiveAlternatingEvents": decisive,
+        "dominantParity": dominant["parity"],
+        "dominantParitySnr": dominant["snr"],
+        "alternateParitySnr": alternate["snr"],
+        "parities": parities,
+    }
+
+
+def _candidate_evidence(
+    sectors: list[dict[str, Any]], frequency: float
+) -> tuple[list[dict[str, Any]], bool, list[dict[str, Any]], dict[str, Any], bool]:
+    period = 1.0 / frequency
+    measurements = [
+        _box_score(item["times"], item["residual"], item["sigma"], frequency)
+        for item in sectors
+    ]
+    results = _sector_results_for_frequency(sectors, measurements, frequency)
+    primary_supported = any(
+        item["role"] == "PRIMARY" and item["usable"] for item in results
+    )
+    independent_supporters = [
+        item for item in results if item["role"] == "INDEPENDENT" and item["usable"]
+    ]
+    timing = [item for item in results if item["usable"]]
+    ephemeris = _linear_ephemeris(timing, period) if len(timing) >= 3 else {
+        "coherent": False, "reason": "FEWER_THAN_THREE_TOTAL_SECTOR_EVENTS"
+    }
+    supported = bool(
+        primary_supported
+        and len(independent_supporters) >= MINIMUM_INDEPENDENT_SECTORS
+        and ephemeris.get("coherent") is True
+    )
+    return results, primary_supported, independent_supporters, ephemeris, supported
+
+
+def _resolve_alternating_cycle_alias(
+    sectors: list[dict[str, Any]], measurements: list[dict[str, Any]],
+    frequency: float, minimum_frequency: float,
+) -> tuple[float, dict[str, Any]]:
+    """Promote P to 2P only when alternating-cycle and recurrence gates agree."""
+    period = 1.0 / frequency
+    doubled_period = 2.0 * period
+    audit = [
+        _alternating_cycle_evidence(sector, measurement, period)
+        for sector, measurement in zip(sectors, measurements)
+    ]
+    primary_decisive = any(
+        item["role"] == "PRIMARY" and item["decisiveAlternatingEvents"]
+        for item in audit
+    )
+    independent_decisive = [
+        item for item in audit
+        if item["role"] == "INDEPENDENT" and item["decisiveAlternatingEvents"]
+    ]
+    eligible = bool(
+        doubled_period <= MAXIMUM_PERIOD_DAYS
+        and frequency / 2.0 >= minimum_frequency
+        and primary_decisive
+        and len(independent_decisive) >= MINIMUM_INDEPENDENT_SECTORS
+    )
+    result = {
+        "testedBasePeriodDays": period,
+        "testedDoublePeriodDays": doubled_period,
+        "decision": "RETAIN_BASE_PERIOD",
+        "reason": "ALTERNATING_CYCLE_EVIDENCE_NOT_DECISIVE",
+        "minimumParityCycles": MINIMUM_PARITY_CYCLES,
+        "minimumParitySnrSeparation": MINIMUM_PARITY_SNR_SEPARATION,
+        "maximumAlternateParitySnrFraction": MAXIMUM_ALTERNATE_PARITY_SNR_FRACTION,
+        "sectorEvidence": audit,
+    }
+    if not eligible:
+        if doubled_period > MAXIMUM_PERIOD_DAYS or frequency / 2.0 < minimum_frequency:
+            result["reason"] = "DOUBLE_PERIOD_OUTSIDE_SEARCH_RANGE"
+        return frequency, result
+
+    _, _, doubled_independent, doubled_ephemeris, doubled_supported = (
+        _candidate_evidence(sectors, frequency / 2.0)
+    )
+    result["doublePeriodValidation"] = {
+        "supported": doubled_supported,
+        "supportingIndependentSectorCount": len(doubled_independent),
+        "linearEphemeris": doubled_ephemeris,
+    }
+    if not doubled_supported:
+        result["reason"] = "DOUBLE_PERIOD_FAILED_RECURRENCE_OR_EPHEMERIS_GATE"
+        return frequency, result
+
+    result["decision"] = "PROMOTE_DOUBLE_PERIOD"
+    result["reason"] = "TRANSITS_OCCUR_ON_ONLY_ONE_ALTERNATING_CYCLE_PARITY"
+    return frequency / 2.0, result
+
+
 def _search_grid(sectors: list[dict[str, Any]], minimum: float, maximum: float):
     import numpy as np
 
@@ -333,23 +470,15 @@ def analyze_blind_transit_search(
         frequency, combined_score, measurements, coarse_step,
         fine_step, full_span,
     ) = _search_grid(sectors, minimum, maximum)
-    period = 1.0 / frequency
-    sector_results = _sector_results_for_frequency(sectors, measurements, frequency)
-
-    primary_supported = any(item["role"] == "PRIMARY" and item["usable"] for item in sector_results)
-    independent_supporters = [
-        item for item in sector_results
-        if item["role"] == "INDEPENDENT" and item["usable"]
-    ]
-    timing = [item for item in sector_results if item["usable"]]
-    ephemeris = _linear_ephemeris(timing, period) if len(timing) >= 3 else {
-        "coherent": False, "reason": "FEWER_THAN_THREE_TOTAL_SECTOR_EVENTS"
-    }
-    supported = (
-        primary_supported
-        and len(independent_supporters) >= MINIMUM_INDEPENDENT_SECTORS
-        and ephemeris.get("coherent") is True
+    raw_period = 1.0 / frequency
+    frequency, alias_resolution = _resolve_alternating_cycle_alias(
+        sectors, measurements, frequency, minimum
     )
+    period = 1.0 / frequency
+    (
+        sector_results, primary_supported, independent_supporters,
+        ephemeris, supported,
+    ) = _candidate_evidence(sectors, frequency)
     refined = ephemeris.get("refinedPeriodDays") if supported else None
     return {
         "resultVersion": RESULT_VERSION,
@@ -367,9 +496,10 @@ def analyze_blind_transit_search(
             else "BLIND_TRANSIT_PERIOD_UNRESOLVED"
         ),
         "candidatePeriodDays": refined,
-        "coarseCandidatePeriodDays": period,
+        "coarseCandidatePeriodDays": raw_period,
         "candidateFrequencyPerDay": (1.0 / refined if refined else None),
         "combinedRecurrenceScore": combined_score,
+        "alternatingCycleAliasResolution": alias_resolution,
         "sectorResults": sector_results,
         "primarySectorSupported": primary_supported,
         "supportingIndependentSectorCount": len(independent_supporters),
