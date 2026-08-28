@@ -15,15 +15,20 @@ from typing import Any
 
 
 HANDLER_ID = "openstar.tess.blind-transit-search.analyze"
-RESULT_VERSION = "1.0"
+RESULT_VERSION = "1.1"
 ENTRY_BOUNDARY = "FULL_CHARACTERIZATION_UNRESOLVED_BROAD_VARIABILITY"
 TARGETED_BOUNDARY_ENTRY = "FULL_CHARACTERIZATION_NONRECURRENT_BOUNDARY_PERIOD"
+UNRELIABLE_PRIMARY_ENTRY = "FULL_CHARACTERIZATION_NONRECURRENT_UNRELIABLE_PRIMARY"
 MINIMUM_INDEPENDENT_SECTORS = 2
 MINIMUM_SECTOR_SNR = 7.0
 MINIMUM_PERIOD_DAYS = 0.2
 MAXIMUM_PERIOD_DAYS = 10.0
 PHASE_BIN_COUNT = 200
 OVERSAMPLING = 8.0
+MAXIMUM_FINE_GRID_SIZE = 2001
+MINIMUM_PARITY_CYCLES = 2
+MINIMUM_PARITY_SNR_SEPARATION = 4.0
+MAXIMUM_ALTERNATE_PARITY_SNR_FRACTION = 0.5
 DUTY_CYCLES = (0.01, 0.015, 0.02, 0.03, 0.04, 0.05, 0.07, 0.10)
 
 
@@ -53,10 +58,18 @@ def blind_transit_search_continuation(
         and contradiction.get("reason")
         == "insufficient-independent-evidence-for-broad-contradiction-search"
     )
+    unreliable_primary_spent = (
+        targeted_claim in {"CANDIDATE_PERIOD", "HUMAN_REVIEW_REQUIRED"}
+        and (targeted_interpretation or {}).get("primaryReliable") is False
+    )
     return (
         independent_spec.get("investigationGoal") == "FULL_CHARACTERIZATION"
         and len(prepared) >= MINIMUM_INDEPENDENT_SECTORS
-        and (broad_path_spent or targeted_boundary_spent)
+        and (
+            broad_path_spent
+            or targeted_boundary_spent
+            or unreliable_primary_spent
+        )
     )
 
 
@@ -163,12 +176,182 @@ def _box_score(times, residual, sigma: float, frequency: float) -> dict[str, Any
     }
 
 
+def _sector_results_for_frequency(
+    sectors: list[dict[str, Any]], measurements: list[dict[str, Any]], frequency: float
+) -> list[dict[str, Any]]:
+    period = 1.0 / frequency
+    results = []
+    for sector, measurement in zip(sectors, measurements):
+        usable = bool(
+            measurement["snr"] >= MINIMUM_SECTOR_SNR
+            and (sector["times"][-1] - sector["times"][0]) / period >= 2.0
+        )
+        median_time = float(statistics.median(sector["times"]))
+        epoch = (round(median_time / period - measurement["eventPhase"])
+                 + measurement["eventPhase"]) * period
+        results.append({
+            **measurement,
+            "role": sector["role"],
+            "sector": sector["sector"],
+            "datasetID": sector["datasetID"],
+            "usable": usable,
+            "eventEpoch": epoch,
+            "sampleCount": len(sector["times"]),
+            "originalTimeOriginDays": sector["origin"],
+            "detrending": {
+                "method": "SAVITZKY_GOLAY_LOCAL_BASELINE",
+                "windowDays": 0.75,
+                "windowSamples": sector["detrendWindowSamples"],
+                "cadenceDays": sector["cadence"],
+            },
+        })
+    return results
+
+
+def _alternating_cycle_evidence(
+    sector: dict[str, Any], measurement: dict[str, Any], period: float
+) -> dict[str, Any]:
+    """Measure whether a candidate clock contains events on only one parity."""
+    import numpy as np
+
+    event_phase = float(measurement["eventPhase"])
+    duty_cycle = float(measurement["dutyCycle"])
+    cycle_coordinates = sector["times"] / period - event_phase
+    cycle_numbers = np.rint(cycle_coordinates).astype(np.int64)
+    distance = np.abs(cycle_coordinates - cycle_numbers)
+    inside = distance <= duty_cycle / 2.0
+    parities = []
+    for parity in (0, 1):
+        selected = inside & (np.remainder(cycle_numbers, 2) == parity)
+        count = int(np.count_nonzero(selected))
+        observed_cycles = int(np.unique(cycle_numbers[selected]).size)
+        depth = -float(np.mean(sector["residual"][selected])) if count else 0.0
+        snr = depth * math.sqrt(count) / sector["sigma"] if depth > 0 else 0.0
+        parities.append({
+            "parity": parity,
+            "snr": snr,
+            "depthStandardized": depth,
+            "eventSampleCount": count,
+            "observedCycleCount": observed_cycles,
+        })
+
+    dominant, alternate = sorted(parities, key=lambda item: item["snr"], reverse=True)
+    sufficiently_observed = all(
+        item["observedCycleCount"] >= MINIMUM_PARITY_CYCLES for item in parities
+    )
+    decisive = bool(
+        sufficiently_observed
+        and dominant["snr"] >= MINIMUM_SECTOR_SNR
+        and dominant["snr"] - alternate["snr"] >= MINIMUM_PARITY_SNR_SEPARATION
+        and alternate["snr"]
+        <= MAXIMUM_ALTERNATE_PARITY_SNR_FRACTION * dominant["snr"]
+    )
+    return {
+        "role": sector["role"],
+        "sector": sector["sector"],
+        "datasetID": sector["datasetID"],
+        "decisiveAlternatingEvents": decisive,
+        "dominantParity": dominant["parity"],
+        "dominantParitySnr": dominant["snr"],
+        "alternateParitySnr": alternate["snr"],
+        "parities": parities,
+    }
+
+
+def _candidate_evidence(
+    sectors: list[dict[str, Any]], frequency: float
+) -> tuple[list[dict[str, Any]], bool, list[dict[str, Any]], dict[str, Any], bool]:
+    period = 1.0 / frequency
+    measurements = [
+        _box_score(item["times"], item["residual"], item["sigma"], frequency)
+        for item in sectors
+    ]
+    results = _sector_results_for_frequency(sectors, measurements, frequency)
+    primary_supported = any(
+        item["role"] == "PRIMARY" and item["usable"] for item in results
+    )
+    independent_supporters = [
+        item for item in results if item["role"] == "INDEPENDENT" and item["usable"]
+    ]
+    timing = [item for item in results if item["usable"]]
+    ephemeris = _linear_ephemeris(timing, period) if len(timing) >= 3 else {
+        "coherent": False, "reason": "FEWER_THAN_THREE_TOTAL_SECTOR_EVENTS"
+    }
+    supported = bool(
+        primary_supported
+        and len(independent_supporters) >= MINIMUM_INDEPENDENT_SECTORS
+        and ephemeris.get("coherent") is True
+    )
+    return results, primary_supported, independent_supporters, ephemeris, supported
+
+
+def _resolve_alternating_cycle_alias(
+    sectors: list[dict[str, Any]], measurements: list[dict[str, Any]],
+    frequency: float, minimum_frequency: float,
+) -> tuple[float, dict[str, Any]]:
+    """Promote P to 2P only when alternating-cycle and recurrence gates agree."""
+    period = 1.0 / frequency
+    doubled_period = 2.0 * period
+    audit = [
+        _alternating_cycle_evidence(sector, measurement, period)
+        for sector, measurement in zip(sectors, measurements)
+    ]
+    primary_decisive = any(
+        item["role"] == "PRIMARY" and item["decisiveAlternatingEvents"]
+        for item in audit
+    )
+    independent_decisive = [
+        item for item in audit
+        if item["role"] == "INDEPENDENT" and item["decisiveAlternatingEvents"]
+    ]
+    eligible = bool(
+        doubled_period <= MAXIMUM_PERIOD_DAYS
+        and frequency / 2.0 >= minimum_frequency
+        and primary_decisive
+        and len(independent_decisive) >= MINIMUM_INDEPENDENT_SECTORS
+    )
+    result = {
+        "testedBasePeriodDays": period,
+        "testedDoublePeriodDays": doubled_period,
+        "decision": "RETAIN_BASE_PERIOD",
+        "reason": "ALTERNATING_CYCLE_EVIDENCE_NOT_DECISIVE",
+        "minimumParityCycles": MINIMUM_PARITY_CYCLES,
+        "minimumParitySnrSeparation": MINIMUM_PARITY_SNR_SEPARATION,
+        "maximumAlternateParitySnrFraction": MAXIMUM_ALTERNATE_PARITY_SNR_FRACTION,
+        "sectorEvidence": audit,
+    }
+    if not eligible:
+        if doubled_period > MAXIMUM_PERIOD_DAYS or frequency / 2.0 < minimum_frequency:
+            result["reason"] = "DOUBLE_PERIOD_OUTSIDE_SEARCH_RANGE"
+        return frequency, result
+
+    _, _, doubled_independent, doubled_ephemeris, doubled_supported = (
+        _candidate_evidence(sectors, frequency / 2.0)
+    )
+    result["doublePeriodValidation"] = {
+        "supported": doubled_supported,
+        "supportingIndependentSectorCount": len(doubled_independent),
+        "linearEphemeris": doubled_ephemeris,
+    }
+    if not doubled_supported:
+        result["reason"] = "DOUBLE_PERIOD_FAILED_RECURRENCE_OR_EPHEMERIS_GATE"
+        return frequency, result
+
+    result["decision"] = "PROMOTE_DOUBLE_PERIOD"
+    result["reason"] = "TRANSITS_OCCUR_ON_ONLY_ONE_ALTERNATING_CYCLE_PARITY"
+    return frequency / 2.0, result
+
+
 def _search_grid(sectors: list[dict[str, Any]], minimum: float, maximum: float):
     import numpy as np
 
     longest_baseline = max(float(item["times"][-1] - item["times"][0]) for item in sectors)
-    step = 1.0 / (longest_baseline * OVERSAMPLING)
-    coarse = np.arange(minimum, maximum + 0.5 * step, step)
+    full_span = max(float(item["times"][-1]) for item in sectors) - min(
+        float(item["times"][0]) for item in sectors
+    )
+    coarse_step = 1.0 / (longest_baseline * OVERSAMPLING)
+    requested_fine_step = 1.0 / (full_span * OVERSAMPLING)
+    coarse = np.arange(minimum, maximum + 0.5 * coarse_step, coarse_step)
 
     def evaluate(frequencies):
         combined = []
@@ -178,21 +361,33 @@ def _search_grid(sectors: list[dict[str, Any]], minimum: float, maximum: float):
                 _box_score(item["times"], item["residual"], item["sigma"], float(frequency))
                 for item in sectors
             ]
-            # The weakest sector is authoritative for recurrence.  A small
-            # all-sector term breaks near-ties without allowing one unusually
-            # deep sector to overpower a non-detection elsewhere.
-            snrs = [result["snr"] for result in per_sector]
-            combined.append(min(snrs) + 0.05 * sum(snrs))
+            # Candidate selection must match the claim gate: the primary plus
+            # two independent sectors.  Requiring every available sector to
+            # score well lets one noisy or transit-free sector hide a real
+            # recurrence that already satisfies the evidence contract.
+            primary_snr = per_sector[0]["snr"]
+            independent_snrs = sorted(
+                (result["snr"] for result in per_sector[1:]), reverse=True
+            )
+            required = [primary_snr, *independent_snrs[:MINIMUM_INDEPENDENT_SECTORS]]
+            combined.append(min(required) + 0.05 * sum(required))
             details.append(per_sector)
         return np.asarray(combined), details
 
     coarse_scores, _ = evaluate(coarse)
-    best_frequency = float(coarse[int(np.argmax(coarse_scores))])
-    fine = np.linspace(max(minimum, best_frequency - step),
-                       min(maximum, best_frequency + step), 201)
+    center = float(coarse[int(np.argmax(coarse_scores))])
+    lower = max(minimum, center - coarse_step)
+    upper = min(maximum, center + coarse_step)
+    requested_count = int(math.ceil((upper - lower) / requested_fine_step)) + 1
+    fine_count = min(MAXIMUM_FINE_GRID_SIZE, max(201, requested_count))
+    fine = np.linspace(lower, upper, fine_count)
     fine_scores, fine_details = evaluate(fine)
     index = int(np.argmax(fine_scores))
-    return float(fine[index]), float(fine_scores[index]), fine_details[index], step
+    actual_fine_step = float(fine[1] - fine[0]) if fine.size > 1 else 0.0
+    return (
+        float(fine[index]), float(fine_scores[index]), fine_details[index],
+        coarse_step, actual_fine_step, full_span,
+    )
 
 
 def _linear_ephemeris(sector_results: list[dict[str, Any]], input_period: float) -> dict[str, Any]:
@@ -271,65 +466,40 @@ def analyze_blind_transit_search(
     if not (math.isfinite(minimum) and math.isfinite(maximum) and 0 < minimum < maximum):
         raise ValueError("primary frozen frequency search does not overlap the transit search")
 
-    frequency, combined_score, measurements, coarse_step = _search_grid(
-        sectors, minimum, maximum
+    (
+        frequency, combined_score, measurements, coarse_step,
+        fine_step, full_span,
+    ) = _search_grid(sectors, minimum, maximum)
+    raw_period = 1.0 / frequency
+    frequency, alias_resolution = _resolve_alternating_cycle_alias(
+        sectors, measurements, frequency, minimum
     )
     period = 1.0 / frequency
-    sector_results = []
-    for sector, measurement in zip(sectors, measurements):
-        usable = bool(
-            measurement["snr"] >= MINIMUM_SECTOR_SNR
-            and (sector["times"][-1] - sector["times"][0]) / period >= 2.0
-        )
-        median_time = float(statistics.median(sector["times"]))
-        epoch = (round(median_time / period - measurement["eventPhase"])
-                 + measurement["eventPhase"]) * period
-        sector_results.append({
-            **measurement,
-            "role": sector["role"],
-            "sector": sector["sector"],
-            "datasetID": sector["datasetID"],
-            "usable": usable,
-            "eventEpoch": epoch,
-            "sampleCount": len(sector["times"]),
-            "originalTimeOriginDays": sector["origin"],
-            "detrending": {
-                "method": "SAVITZKY_GOLAY_LOCAL_BASELINE",
-                "windowDays": 0.75,
-                "windowSamples": sector["detrendWindowSamples"],
-                "cadenceDays": sector["cadence"],
-            },
-        })
-
-    primary_supported = any(item["role"] == "PRIMARY" and item["usable"] for item in sector_results)
-    independent_supporters = [
-        item for item in sector_results if item["role"] == "INDEPENDENT" and item["usable"]
-    ]
-    timing = [item for item in sector_results if item["usable"]]
-    ephemeris = _linear_ephemeris(timing, period) if len(timing) >= 3 else {
-        "coherent": False, "reason": "FEWER_THAN_THREE_TOTAL_SECTOR_EVENTS"
-    }
-    supported = (
-        primary_supported
-        and len(independent_supporters) >= MINIMUM_INDEPENDENT_SECTORS
-        and ephemeris.get("coherent") is True
-    )
+    (
+        sector_results, primary_supported, independent_supporters,
+        ephemeris, supported,
+    ) = _candidate_evidence(sectors, frequency)
     refined = ephemeris.get("refinedPeriodDays") if supported else None
     return {
         "resultVersion": RESULT_VERSION,
         "experiment": "SOFTWARE_BLIND_MULTI_SECTOR_BOX_PERIOD_SEARCH",
         "entryBoundary": (
             ENTRY_BOUNDARY if broad_interpretation is not None
-            else TARGETED_BOUNDARY_ENTRY
+            else (
+                UNRELIABLE_PRIMARY_ENTRY
+                if (targeted_interpretation or {}).get("primaryReliable") is False
+                else TARGETED_BOUNDARY_ENTRY
+            )
         ),
         "classification": (
             "REPLICATED_BLIND_TRANSIT_LIKE_CANDIDATE" if supported
             else "BLIND_TRANSIT_PERIOD_UNRESOLVED"
         ),
         "candidatePeriodDays": refined,
-        "coarseCandidatePeriodDays": period,
+        "coarseCandidatePeriodDays": raw_period,
         "candidateFrequencyPerDay": (1.0 / refined if refined else None),
         "combinedRecurrenceScore": combined_score,
+        "alternatingCycleAliasResolution": alias_resolution,
         "sectorResults": sector_results,
         "primarySectorSupported": primary_supported,
         "supportingIndependentSectorCount": len(independent_supporters),
@@ -340,6 +510,9 @@ def analyze_blind_transit_search(
             "minimumFrequencyPerDay": minimum,
             "maximumFrequencyPerDay": maximum,
             "coarseFrequencyStepPerDay": coarse_step,
+            "fullObservationSpanDays": full_span,
+            "fineFrequencyStepPerDay": fine_step,
+            "selectionSupportRule": "PRIMARY_PLUS_TWO_INDEPENDENT_SECTORS",
             "phaseBinCount": PHASE_BIN_COUNT,
             "dutyCycles": list(DUTY_CYCLES),
         },

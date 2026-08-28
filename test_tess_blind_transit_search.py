@@ -10,9 +10,11 @@ from openstar_investigation import InvestigationStage, InvestigationStore
 from openstar_workflow import StageRequest
 from workflows.tess.tess_autonomy import WORKFLOW_ID, WORKFLOW_VERSION
 from workflows.tess.tess_investigation import build_engine
+from workflows.tess import tess_blind_transit_search
 
 from workflows.tess.tess_blind_transit_search import (
     HANDLER_ID,
+    UNRELIABLE_PRIMARY_ENTRY,
     analyze_blind_transit_search,
     blind_transit_search_continuation,
 )
@@ -30,8 +32,7 @@ class BlindTransitSearchTests(unittest.TestCase):
         return store.complete_current_stage(investigation, terminal)
 
     def _dataset(self, root: Path, *, sector: int, origin: float,
-                 transit: bool = True) -> Path:
-        period = 2.21857567
+                 transit: bool = True, period: float = 2.21857567) -> Path:
         epoch = 1000.37
         duration = 0.08
         relative_times = [0.01 * index for index in range(2601)]
@@ -118,6 +119,41 @@ class BlindTransitSearchTests(unittest.TestCase):
             None, independent, None, {**targeted, "supportingSectorCount": 1}
         ))
 
+        unreliable = {
+            **targeted,
+            "primaryBoundaryHit": False,
+            "primaryReliable": False,
+        }
+        self.assertTrue(blind_transit_search_continuation(
+            None, independent, None, unreliable
+        ))
+        self.assertTrue(blind_transit_search_continuation(
+            None,
+            independent,
+            None,
+            {
+                **unreliable,
+                "contradictionPlan": {
+                    "action": "BROAD_INDEPENDENT_SEARCH",
+                    "reason": "alternate-reliable-structure",
+                },
+            },
+        ))
+        self.assertFalse(blind_transit_search_continuation(
+            None, independent, None, {**unreliable, "primaryReliable": None}
+        ))
+        self.assertTrue(blind_transit_search_continuation(
+            None,
+            independent,
+            None,
+            {
+                **unreliable,
+                "claimDecision": {"claim": "CANDIDATE_PERIOD"},
+                "supportingSectorCount": 1,
+                "requiredSupportingSectorCount": 2,
+            },
+        ))
+
     def test_recovers_repeated_narrow_period_beneath_stronger_smooth_variability(self):
         with tempfile.TemporaryDirectory() as temporary:
             primary, independent, morphology, broad = self._inputs(Path(temporary))
@@ -140,6 +176,77 @@ class BlindTransitSearchTests(unittest.TestCase):
         self.assertFalse(result["catalogAnswerKeyUsed"])
         self.assertFalse(result["physicalCycleResolved"])
         self.assertFalse(result["companionNatureResolved"])
+        self.assertEqual(
+            "RETAIN_BASE_PERIOD",
+            result["alternatingCycleAliasResolution"]["decision"],
+        )
+
+    def test_promotes_half_period_alias_when_only_alternating_cycles_transit(self):
+        true_period = 3.731
+        half_frequency = 2.0 / true_period
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = [
+                self._dataset(
+                    root, sector=sector, origin=origin, period=true_period
+                )
+                for sector, origin in ((8, 1000.0), (35, 1700.0), (62, 2400.0))
+            ]
+            independent = {
+                "investigationGoal": "FULL_CHARACTERIZATION",
+                "preparedSectors": [
+                    {"sector": sector, "datasetPath": str(path)}
+                    for sector, path in zip((35, 62), paths[1:])
+                ],
+            }
+
+            def forced_half_period(sectors, minimum, maximum):
+                measurements = [
+                    tess_blind_transit_search._box_score(
+                        item["times"], item["residual"], item["sigma"],
+                        half_frequency,
+                    )
+                    for item in sectors
+                ]
+                full_span = max(item["times"][-1] for item in sectors) - min(
+                    item["times"][0] for item in sectors
+                )
+                return (
+                    half_frequency, 10.0, measurements, 0.001, 0.000001,
+                    float(full_span),
+                )
+
+            with mock.patch.object(
+                tess_blind_transit_search, "_search_grid",
+                side_effect=forced_half_period,
+            ):
+                result = analyze_blind_transit_search(
+                    primary_dataset_path=paths[0],
+                    independent_spec=independent,
+                    morphology=None,
+                    broad_interpretation=None,
+                    targeted_interpretation={
+                        "claimDecision": {"claim": "HUMAN_REVIEW_REQUIRED"},
+                        "primaryReliable": False,
+                    },
+                )
+
+        self.assertEqual("REPLICATED_BLIND_TRANSIT_LIKE_CANDIDATE",
+                         result["classification"])
+        self.assertAlmostEqual(true_period, result["candidatePeriodDays"], delta=0.003)
+        self.assertAlmostEqual(true_period / 2.0,
+                               result["coarseCandidatePeriodDays"], delta=1e-9)
+        alias = result["alternatingCycleAliasResolution"]
+        self.assertEqual("PROMOTE_DOUBLE_PERIOD", alias["decision"])
+        self.assertEqual(
+            "TRANSITS_OCCUR_ON_ONLY_ONE_ALTERNATING_CYCLE_PARITY",
+            alias["reason"],
+        )
+        self.assertTrue(alias["doublePeriodValidation"]["supported"])
+        self.assertTrue(all(
+            item["decisiveAlternatingEvents"] for item in alias["sectorEvidence"]
+        ))
+        self.assertFalse(result["catalogAnswerKeyUsed"])
 
     def test_recovers_from_nonrecurrent_primary_boundary_without_broad_morphology(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -166,6 +273,83 @@ class BlindTransitSearchTests(unittest.TestCase):
         self.assertEqual("REPLICATED_BLIND_TRANSIT_LIKE_CANDIDATE",
                          result["classification"])
         self.assertAlmostEqual(2.21857567, result["candidatePeriodDays"], delta=0.003)
+        self.assertFalse(result["catalogAnswerKeyUsed"])
+
+    def test_recovers_from_nonrecurrent_unreliable_primary(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            primary, independent, _, _ = self._inputs(Path(temporary))
+            targeted = {
+                "claimDecision": {"claim": "HUMAN_REVIEW_REQUIRED"},
+                "primaryBoundaryHit": False,
+                "primaryReliable": False,
+                "supportingSectorCount": 0,
+                "contradictionPlan": {
+                    "action": "STOP",
+                    "reason": "insufficient-independent-evidence-for-broad-contradiction-search",
+                },
+            }
+            result = analyze_blind_transit_search(
+                primary_dataset_path=primary,
+                independent_spec=independent,
+                morphology=None,
+                broad_interpretation=None,
+                targeted_interpretation=targeted,
+            )
+
+        self.assertEqual(UNRELIABLE_PRIMARY_ENTRY, result["entryBoundary"])
+        self.assertEqual("REPLICATED_BLIND_TRANSIT_LIKE_CANDIDATE",
+                         result["classification"])
+        self.assertAlmostEqual(2.21857567, result["candidatePeriodDays"], delta=0.003)
+        self.assertFalse(result["catalogAnswerKeyUsed"])
+
+    def test_ignores_nonrecurring_independent_sectors_when_required_support_recurs(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            specifications = (
+                (8, 1000.0, True),
+                (35, 1700.0, True),
+                (62, 2400.0, True),
+                (89, 3100.0, False),
+                (99, 3400.0, False),
+            )
+            paths = [
+                self._dataset(root, sector=sector, origin=origin, transit=transit)
+                for sector, origin, transit in specifications
+            ]
+            independent = {
+                "investigationGoal": "FULL_CHARACTERIZATION",
+                "preparedSectors": [
+                    {"sector": sector, "datasetPath": str(path)}
+                    for (sector, _, _), path in zip(specifications[1:], paths[1:])
+                ],
+            }
+            targeted = {
+                "claimDecision": {"claim": "HUMAN_REVIEW_REQUIRED"},
+                "primaryReliable": False,
+            }
+            result = analyze_blind_transit_search(
+                primary_dataset_path=paths[0],
+                independent_spec=independent,
+                morphology=None,
+                broad_interpretation=None,
+                targeted_interpretation=targeted,
+            )
+
+        self.assertEqual("REPLICATED_BLIND_TRANSIT_LIKE_CANDIDATE",
+                         result["classification"])
+        self.assertAlmostEqual(2.21857567, result["candidatePeriodDays"], delta=0.003)
+        self.assertTrue(result["primarySectorSupported"])
+        self.assertEqual([35, 62], result["supportingIndependentSectors"])
+        self.assertTrue(result["linearEphemeris"]["coherent"])
+        self.assertGreater(result["searchGrid"]["fullObservationSpanDays"], 2000.0)
+        self.assertLess(
+            result["searchGrid"]["fineFrequencyStepPerDay"],
+            result["searchGrid"]["coarseFrequencyStepPerDay"],
+        )
+        self.assertEqual(
+            "PRIMARY_PLUS_TWO_INDEPENDENT_SECTORS",
+            result["searchGrid"]["selectionSupportRule"],
+        )
         self.assertFalse(result["catalogAnswerKeyUsed"])
 
     def test_boundary_dominated_independent_failure_routes_directly_to_blind_search(self):
@@ -237,6 +421,78 @@ class BlindTransitSearchTests(unittest.TestCase):
         self.assertEqual(0, result["supportingSectorCount"])
         self.assertTrue(result["primaryBoundaryHit"])
         self.assertEqual("STOP", result["contradictionPlan"]["action"])
+        self.assertEqual(HANDLER_ID, request.handler_id)
+
+    def test_unreliable_primary_routes_to_blind_search_before_broad_variability(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = InvestigationStore(root / "investigations")
+            investigation = store.create("unreliable-transit-route", WORKFLOW_ID,
+                                         WORKFLOW_VERSION)
+            primary = root / "primary.json"
+            primary.write_text("{}", encoding="utf-8")
+            prepared_sectors = []
+            datasets = []
+            for sector, frequency in ((35, 0.5), (62, 1.0 / 3.0)):
+                path = root / f"sector-{sector}.json"
+                path.write_text("{}", encoding="utf-8")
+                prepared_sectors.append({
+                    "datasetID": f"sector-{sector}",
+                    "sector": sector,
+                    "baselineDays": 24.0,
+                    "datasetPath": str(path),
+                })
+                datasets.append({
+                    "datasetID": f"sector-{sector}",
+                    "periodStatus": "RELIABLE",
+                    "periodConfidence": "high",
+                    "candidatePeriodDays": 1.0 / frequency,
+                    "candidateFrequency": frequency,
+                    "candidateFrequencyConfidenceInterval": {
+                        "lower": frequency - 0.001,
+                        "upper": frequency + 0.001,
+                    },
+                })
+            for stage in (
+                ("001-prepare-target", "openstar.tess.prepare-target",
+                 {"datasetPath": str(primary)}),
+                ("004-hypotheses", "openstar.tess.hypotheses", {
+                    "observedPeriodDays": 6.08,
+                    "primaryBoundaryHit": False,
+                    "primaryReliable": False,
+                }),
+                ("005-independent", "openstar.tess.independent.prepare", {
+                    "investigationGoal": "FULL_CHARACTERIZATION",
+                    "targetPeriodDays": 6.08,
+                    "preparedSectors": prepared_sectors,
+                    "frequencySearch": {
+                        "minimumFrequency": 0.1,
+                        "maximumFrequency": 5.0,
+                        "frequencyStep": 0.000001,
+                    },
+                }),
+                ("006-independent-run", "openstar.tess.independent.run",
+                 {"datasets": datasets}),
+            ):
+                investigation = self._complete(store, investigation, *stage)
+            engine = build_engine(store, types.SimpleNamespace(), poll_interval=0,
+                                  timeout=None)
+            engine.chain_stages = False
+            completed, request = engine.run_stage(
+                investigation,
+                StageRequest("007-independent-interpret",
+                             "openstar.tess.independent.interpret", {},
+                             "006-independent-run"),
+                software_id="test", software_version="unreliable-route",
+            )
+
+        result = completed.stages[-1].result
+        self.assertEqual("HUMAN_REVIEW_REQUIRED",
+                         result["claimDecision"]["claim"])
+        self.assertEqual(0, result["supportingSectorCount"])
+        self.assertFalse(result["primaryReliable"])
+        self.assertEqual("BROAD_INDEPENDENT_SEARCH",
+                         result["contradictionPlan"]["action"])
         self.assertEqual(HANDLER_ID, request.handler_id)
 
     def test_smooth_variability_without_dips_fails_closed(self):
