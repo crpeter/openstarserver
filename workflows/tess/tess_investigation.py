@@ -3114,8 +3114,19 @@ def build_engine(
         completed = [stage for stage in investigation.stages if stage.status == "COMPLETE"]
         external = [stage for stage in completed if stage.handler_id in {
             EXTERNAL_EVIDENCE_FREEZE_HANDLER_ID, EXTERNAL_EVIDENCE_INTERPRET_HANDLER_ID}]
-        chronology = {"verifiedFromCompletedStages": True,
+        required_handlers = [SOURCE_ATTRIBUTION_REVIEW_HANDLER_ID, EVENT_DEPTH_FREEZE_HANDLER_ID,
+                             EVENT_DEPTH_AUDIT_HANDLER_ID]
+        positions = [[index for index, stage in enumerate(completed)
+                      if stage.handler_id == handler] for handler in required_handlers]
+        verified = (all(len(items) == 1 for items in positions)
+                    and [items[0] for items in positions] == sorted(items[0] for items in positions)
+                    and not external)
+        chronology = {"verifiedFromCompletedStages": verified,
             "externalEvidenceStageAlreadyCompleted": bool(external),
+            "requiredPreModelStageHandlerIDs": required_handlers,
+            "requiredPreModelStageIDs": [completed[items[0]].id if len(items) == 1 else None
+                                         for items in positions],
+            "requiredPreModelStageOccurrenceCounts": [len(items) for items in positions],
             "completedStageHandlerIDs": [stage.handler_id for stage in completed],
             "completedStageIDs": [stage.id for stage in completed]}
         result = fit_joint_event_phase_model(freeze, binary, audit,
@@ -3204,7 +3215,8 @@ def build_engine(
         review = _required_latest_result_for_handler(investigation, SOURCE_ATTRIBUTION_REVIEW_HANDLER_ID)
         frozen = _required_latest_result_for_handler(investigation, EXTERNAL_EVIDENCE_FREEZE_HANDLER_ID)
         external = _required_latest_result_for_handler(investigation, EXTERNAL_EVIDENCE_INTERPRET_HANDLER_ID)
-        result = synthesize_companion_evidence(binary, localization, review, frozen, external)
+        model = _latest_result_for_handler(investigation, JOINT_EVENT_PHASE_MODEL_HANDLER_ID)
+        result = synthesize_companion_evidence(binary, localization, review, frozen, external, model)
         path = (store.directory_for(investigation.id) / "artifacts" /
                 "companion-evidence-synthesis" / "companion-evidence-synthesis-v1.json")
         _write_json(path, result)
@@ -3218,7 +3230,8 @@ def build_engine(
         print("   human scientific review recommended: True")
         hashes = {"binaryConfirmation": sha256_json(binary), "sourceLocalization": sha256_json(localization),
                   "sourceAttributionReview": sha256_json(review), "externalEvidenceFreeze": sha256_json(frozen),
-                  "externalCompanionEvidence": sha256_json(external)}
+                  "externalCompanionEvidence": sha256_json(external),
+                  **({"jointEventPhaseModel": validate_model_hash(model)} if model is not None else {})}
         return StageOutcome(result=result,
             next_stage=StageRequest(_next_stage_id(request.id, "finalize"), "openstar.tess.finalize",
                 {"outputSuffix": "companion-evidence-synthesis-v1"}, request.id),

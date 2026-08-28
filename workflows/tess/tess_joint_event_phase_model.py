@@ -1,8 +1,7 @@
-"""Software-blind coordinator-side joint empirical event/phase modelling.
+"""Coordinator-side, software-blind joint empirical event/phase modelling.
 
-The fitter deliberately operates on the immutable Float64 cadence arrays.  It
-has no archive client and no target identity: fixed ephemerides and generic
-trapezoids are the only scientific assumptions made here.
+Only immutable full-cadence Float64 photometry and its verified scientific
+provenance enter this module.  It has deliberately no archive or catalog client.
 """
 from __future__ import annotations
 
@@ -11,7 +10,7 @@ import json
 import math
 from typing import Any
 
-from .tess_event_depth_accuracy import validate_audit_hash, validate_freeze
+from .tess_event_depth_accuracy import AUDIT_VERSION, validate_audit_hash, validate_freeze
 
 HANDLER_ID = "openstar.tess.joint-event-phase-model.fit"
 RESULT_VERSION = "openstar.tess-joint-transit-eclipse-phase-curve-model.v1"
@@ -20,6 +19,9 @@ INGRESS_FRACTIONS = (0.10, 0.20, 0.30, 0.40)
 SECONDARY_PHASE_OFFSETS = (-0.02, 0.0, 0.02)
 MIN_INDEPENDENT_SECTORS = 3
 MAX_CONDITION_NUMBER = 1.0e10
+MAX_REDUCED_HETEROGENEITY = 4.0
+MAX_FRACTIONAL_SECTOR_DEVIATION = 0.50
+MAX_FRACTIONAL_JACKKNIFE_MOVEMENT = 0.25
 
 
 def _sha(value: Any) -> str:
@@ -41,184 +43,218 @@ def validate_model_hash(value: dict[str, Any]) -> str:
 
 
 def model_required(audit: dict[str, Any]) -> bool:
-    return (audit.get("status") == "COMPLETE"
+    return (audit.get("resultVersion") == AUDIT_VERSION
+            and audit.get("status") == "COMPLETE"
             and audit.get("suitableForLaterPrecisionModeling") is True
             and audit.get("recommendedNextTest") == "JOINT_TRANSIT_ECLIPSE_PHASE_CURVE_MODELING"
             and audit.get("externalCatalogInformationUsed") is False
             and audit.get("catalogAnswerKeyUsed") is False)
 
 
-def _template(phase: np.ndarray, center: float, duration_phase: float,
-              ingress_fraction: float, exposure_phase: float) -> np.ndarray:
+def _template(phase, center: float, duration_phase: float, ingress_fraction: float,
+              exposure_phase: float, *, integrate: bool = True):
     import numpy as np
-    # Eleven midpoint samples make the exposure convolution deterministic and
-    # preserve mixed-cadence integrations without constructing huge matrices.
-    offsets = (np.arange(11, dtype=float) + .5) / 11 - .5
-    p = ((phase[:, None] + offsets * exposure_phase - center + .5) % 1) - .5
-    distance = np.abs(p); half = duration_phase / 2
-    ingress = max(half * ingress_fraction, np.finfo(float).eps)
-    instantaneous = np.clip((half - distance) / ingress, 0, 1)
-    return instantaneous.mean(axis=1)
+    offsets = ((np.arange(11, dtype=float)+.5)/11-.5) if integrate else np.array([0.])
+    p = ((phase[:, None]+offsets*exposure_phase-center+.5)%1)-.5
+    half = duration_phase/2; ramp = max(half*ingress_fraction, np.finfo(float).eps)
+    return np.clip((half-np.abs(p))/ramp, 0, 1).mean(axis=1)
 
 
-def _matrix(rows: list[dict[str, Any]], period: float, epoch: float, duration: float,
-            ingress: float, secondary_offset: float, include_transit: bool = True) -> tuple[np.ndarray, np.ndarray, list[slice]]:
+def _matrix(rows, period, epoch, duration, ingress, secondary_offset, components, *, integrate=True):
     import numpy as np
-    blocks, values, slices, start = [], [], [], 0
-    count = len(rows)
+    blocks, values, slices, start = [], [], [], 0; count = len(rows)
+    names = [name for name in ("transit", "eclipse", "fundamentalSine", "fundamentalCosine",
+                                "secondSine", "secondCosine") if name in components]
     for index, row in enumerate(rows):
-        time = np.asarray(row["timeBTJDFloat64"], dtype=float)
-        flux = np.asarray(row["relativeFluxFloat64"], dtype=float)
-        phase = ((time - epoch) / period) % 1
-        exposure = float(row["cadenceSeconds"]) / 86400 / period
-        primary = _template(phase, 0, duration / period, ingress, exposure)
-        secondary = _template(phase, .5 + secondary_offset, duration / period, ingress, exposure)
-        angle = 2*np.pi*phase
-        local = (time - np.median(time)) / max(np.ptp(time), period)
-        base = np.zeros((len(time), 2*count)); base[:, 2*index] = 1; base[:, 2*index+1] = local
-        columns = ([primary] if include_transit else []) + [secondary, np.sin(angle), np.cos(angle),
-                   np.sin(2*angle), np.cos(2*angle)]
-        blocks.append(np.column_stack(columns + [base])); values.append(flux)
-        slices.append(slice(start, start+len(time))); start += len(time)
-    return np.vstack(blocks), np.concatenate(values), slices
+        time=np.asarray(row["timeBTJDFloat64"], dtype=float); flux=np.asarray(row["relativeFluxFloat64"], dtype=float)
+        phase=((time-epoch)/period)%1; exposure=float(row["cadenceSeconds"])/86400/period; angle=2*np.pi*phase
+        columns={"transit": _template(phase,0,duration/period,ingress,exposure,integrate=integrate),
+                 "eclipse": _template(phase,.5+secondary_offset,duration/period,ingress,exposure,integrate=integrate),
+                 "fundamentalSine":np.sin(angle), "fundamentalCosine":np.cos(angle),
+                 "secondSine":np.sin(2*angle), "secondCosine":np.cos(2*angle)}
+        base=np.zeros((len(time),2*count)); base[:,2*index]=1
+        base[:,2*index+1]=(time-np.median(time))/max(float(np.ptp(time)),period)
+        blocks.append(np.column_stack([columns[name] for name in names]+[base])); values.append(flux)
+        slices.append(slice(start,start+len(time))); start += len(time)
+    return np.vstack(blocks),np.concatenate(values),slices,names
 
 
-def _solve(rows: list[dict[str, Any]], period: float, epoch: float, duration: float,
-           ingress: float, secondary_offset: float, include_transit: bool = True) -> dict[str, Any]:
+def _solve(rows, period, epoch, duration, ingress, secondary_offset, components=None, *, integrate=True):
     import numpy as np
-    matrix, flux, slices = _matrix(rows, period, epoch, duration, ingress, secondary_offset, include_transit)
-    # Initial residual clipping applies only far from both events. Event samples
-    # always retain unit weight, preventing real deficits from clipping themselves.
-    beta, _, rank, singular = np.linalg.lstsq(matrix, flux, rcond=None)
-    residual = flux-matrix@beta
-    phase = np.concatenate([((np.asarray(r["timeBTJDFloat64"])-epoch)/period) % 1 for r in rows])
-    protected = (np.abs((phase+.5)%1-.5) <= duration/period
-                 ) | (np.abs((phase-.5-secondary_offset+.5)%1-.5) <= duration/period)
-    med = np.median(residual[~protected]) if np.any(~protected) else 0
-    scale = 1.4826*np.median(np.abs(residual[~protected]-med)) if np.any(~protected) else 0
-    keep = protected | (np.abs(residual-med) <= 5*max(scale, np.finfo(float).eps))
-    weighted = matrix[keep]; selected = flux[keep]
-    beta, _, rank, singular = np.linalg.lstsq(weighted, selected, rcond=None)
-    residual = flux-matrix@beta; rss = float(residual@residual)
-    dof = max(int(keep.sum())-matrix.shape[1], 1); variance = float((residual[keep]@residual[keep])/dof)
-    covariance = np.linalg.pinv(weighted.T@weighted)*variance
-    condition = float(singular[0]/singular[-1]) if len(singular) and singular[-1] > 0 else math.inf
-    bic = len(flux)*math.log(max(rss/len(flux), np.finfo(float).tiny))+matrix.shape[1]*math.log(len(flux))
-    return {"beta": beta, "covariance": covariance, "residual": residual, "rss": rss, "bic": bic,
-            "condition": condition, "rank": int(rank), "columnCount": matrix.shape[1], "slices": slices,
-            "retained": int(keep.sum()), "sampleCount": len(flux)}
+    components=set(components or {"transit","eclipse","fundamentalSine","fundamentalCosine","secondSine","secondCosine"})
+    matrix,flux,slices,names=_matrix(rows,period,epoch,duration,ingress,secondary_offset,components,integrate=integrate)
+    beta,_,rank,singular=np.linalg.lstsq(matrix,flux,rcond=None); residual=flux-matrix@beta
+    phase=np.concatenate([((np.asarray(r["timeBTJDFloat64"])-epoch)/period)%1 for r in rows])
+    protected=(np.abs((phase+.5)%1-.5)<=duration/period)|(np.abs((phase-.5-secondary_offset+.5)%1-.5)<=duration/period)
+    outside=residual[~protected]; med=np.median(outside) if len(outside) else 0
+    scale=1.4826*np.median(np.abs(outside-med)) if len(outside) else 0
+    keep=protected|(np.abs(residual-med)<=5*max(scale,np.finfo(float).eps))
+    selected_matrix=matrix[keep]; selected_flux=flux[keep]
+    beta,_,rank,singular=np.linalg.lstsq(selected_matrix,selected_flux,rcond=None)
+    residual=flux-matrix@beta; rss=float(residual@residual); dof=max(int(keep.sum())-matrix.shape[1],1)
+    covariance=np.linalg.pinv(selected_matrix.T@selected_matrix)*float((residual[keep]@residual[keep])/dof)
+    condition=float(singular[0]/singular[-1]) if len(singular) and singular[-1]>0 else math.inf
+    bic=len(flux)*math.log(max(rss/len(flux),np.finfo(float).tiny))+matrix.shape[1]*math.log(len(flux))
+    coefficients={name:float(beta[i]) for i,name in enumerate(names)}
+    uncertainties={name:float(math.sqrt(max(covariance[i,i],0))) for i,name in enumerate(names)}
+    return {"coefficients":coefficients,"uncertainties":uncertainties,"covariance":covariance,"rss":rss,"bic":float(bic),
+            "condition":condition,"rank":int(rank),"columnCount":matrix.shape[1],"retained":int(keep.sum()),
+            "sampleCount":len(flux),"eventCadencesProtectedFromClipping":True}
 
 
-def _unresolved(base: dict[str, Any], reasons: list[str]) -> dict[str, Any]:
-    return _finalize({**base, "status": "UNRESOLVED", "classification": "PRECISION_EMPIRICAL_TRANSIT_DEPTH_UNRESOLVED",
-        "precisionEmpiricalTransitDepthResolved": False, "unresolvedReasons": sorted(set(reasons)),
-        "recommendedNextTest": "ADDITIONAL_PRECISION_PHOTOMETRY", "workflowNextStage": "EXTERNAL_EVIDENCE_FREEZE"})
-
-
-def fit_joint_event_phase_model(freeze: dict[str, Any], binary: dict[str, Any], audit: dict[str, Any], *,
-                                binary_confirmation_sha256: str, chronology_proof: dict[str, Any]) -> dict[str, Any]:
-    """Fit a deterministic joint model after validating every upstream binding."""
-    import numpy as np
-    base = {"resultVersion": RESULT_VERSION, "binaryConfirmationSHA256": binary_confirmation_sha256,
-        "photometryFreezeSHA256": freeze.get("freezeSHA256"), "depthAttenuationAuditSHA256": audit.get("auditSHA256"),
-        "externalCatalogInformationUsed": False, "catalogAnswerKeyUsed": False,
-        "companionRadiusInferred": False, "planetToStarRadiusRatioInferred": False,
-        "limbDarkenedPhysicalGeometryClaimed": False, "stellarDensityInferred": False,
-        "fullPhysicalTransitSolutionClaimed": False, "uniqueReflectionThermalInterpretationClaimed": False,
-        "automaticDiscoveryClaimed": False, "chronologyProof": chronology_proof}
-    try:
-        if not model_required(audit): raise ValueError("DEPTH_AUDIT_MODEL_GATE_NOT_SATISFIED")
-        validate_audit_hash(audit); validate_freeze(freeze, binary, binary_confirmation_sha256)
-        if audit.get("binaryConfirmationSHA256") != binary_confirmation_sha256:
-            raise ValueError("AUDIT_BINARY_HASH_BINDING_MISMATCH")
-        chronology = chronology_proof
-        handlers = chronology.get("completedStageHandlerIDs") or []
-        if (chronology.get("verifiedFromCompletedStages") is not True
-                or chronology.get("externalEvidenceStageAlreadyCompleted") is not False
-                or any("external-companion-evidence" in str(x) for x in handlers)):
-            raise ValueError("MODEL_BEFORE_EXTERNAL_QUERY_CHRONOLOGY_UNPROVEN")
-        ephemeris = binary["linearEphemeris"]; period = float(ephemeris["refinedPeriodDays"]); epoch = float(ephemeris["referenceEpoch"])
-        if ephemeris.get("coherent") is not True or not math.isfinite(period) or period <= 0 or not math.isfinite(epoch):
-            raise ValueError("INVALID_FROZEN_EPHEMERIS")
-        supporting = list((binary.get("independentEvidence") or {}).get("supportingSectors") or [])
-        rows = list(freeze["sectors"]); eligible = [r["sector"] for r in rows]
-        independent = [x for x in supporting if x in eligible]
-        if len(set(independent)) < MIN_INDEPENDENT_SECTORS: raise ValueError("INSUFFICIENT_INDEPENDENT_SUPPORTING_SECTORS")
-        established = float(audit["eventDurationDays"])
-    except (KeyError, TypeError, ValueError) as error:
-        return _unresolved(base, [str(error)])
-
-    candidates = []
+def _select(rows,period,epoch,established,components=None,*,integrate=True):
+    candidates=[]
     for multiplier in DURATION_MULTIPLIERS:
         for ingress in INGRESS_FRACTIONS:
             for offset in SECONDARY_PHASE_OFFSETS:
-                duration = established*multiplier
-                fit = _solve(rows, period, epoch, duration, ingress, offset)
-                candidates.append((fit["bic"], duration, ingress, offset, fit))
-    _, duration, ingress, offset, fit = min(candidates, key=lambda x: (x[0], x[1], x[2], abs(x[3])))
-    beta = fit["beta"]; depth = float(-beta[0]); eclipse = float(-beta[1])
-    formal = float(math.sqrt(max(fit["covariance"][0, 0], 0)))
-    no_transit = _solve(rows, period, epoch, duration, ingress, offset, False)
-    delta_bic = float(no_transit["bic"]-fit["bic"])
-    jackknife, jk_depths = [], []
-    for sector in independent:
-        subset = [row for row in rows if row["sector"] != sector]
-        value = _solve(subset, period, epoch, duration, ingress, offset)
-        estimate = float(-value["beta"][0]); jk_depths.append(estimate)
-        jackknife.append({"omittedIndependentSector": sector, "transitDepthFractionalFlux": estimate,
-                          "conditionNumber": value["condition"]})
-    jk_unc = float(math.sqrt((len(jk_depths)-1)/len(jk_depths)*sum((x-np.mean(jk_depths))**2 for x in jk_depths)))
-    per_sector, sector_depths = [], []
+                fit=_solve(rows,period,epoch,established*multiplier,ingress,offset,components,integrate=integrate)
+                candidates.append((fit["bic"],established*multiplier,ingress,offset,fit))
+    return min(candidates,key=lambda x:(x[0],x[1],x[2],abs(x[3])))
+
+
+def _unresolved(base,reasons):
+    return _finalize({**base,"status":"UNRESOLVED","classification":"PRECISION_EMPIRICAL_TRANSIT_DEPTH_UNRESOLVED",
+        "precisionEmpiricalTransitDepthResolved":False,"unresolvedReasons":sorted(set(reasons)),
+        "recommendedNextTest":"ADDITIONAL_PRECISION_PHOTOMETRY","workflowNextStage":"EXTERNAL_EVIDENCE_FREEZE"})
+
+
+def _validate_upstream(freeze,binary,audit,binary_hash):
+    if audit.get("resultVersion") != AUDIT_VERSION: raise ValueError("AUDIT_RESULT_VERSION_MISMATCH")
+    validate_audit_hash(audit)
+    if audit.get("binaryConfirmationSHA256") != binary_hash: raise ValueError("AUDIT_BINARY_HASH_BINDING_MISMATCH")
+    if audit.get("catalogAnswerKeyUsed") is not False or audit.get("externalCatalogInformationUsed") is not False:
+        raise ValueError("AUDIT_BLINDNESS_GATE_FAILED")
+    if not model_required(audit): raise ValueError("DEPTH_AUDIT_MODEL_GATE_NOT_SATISFIED")
+    independent=binary.get("independentEvidence") or {}; support=independent.get("supportingIndependentSectorCount")
+    sectors=independent.get("supportingSectors")
+    if independent.get("classification") != "REPLICATED_ECLIPSE_LIKE_EVENT_SUPPORTED":
+        raise ValueError("INDEPENDENT_REPLICATION_CLASSIFICATION_MISMATCH")
+    if (isinstance(support,bool) or not isinstance(support,int) or support<MIN_INDEPENDENT_SECTORS
+            or not isinstance(sectors,list) or support!=len(sectors) or len(set(sectors))!=len(sectors)):
+        raise ValueError("INDEPENDENT_SUPPORT_COUNT_OR_SECTOR_LIST_INVALID")
+    if (independent.get("independentLinearEphemeris") or {}).get("coherent") is not True:
+        raise ValueError("INDEPENDENT_EPHEMERIS_INCOHERENT")
+    ephemeris=binary.get("linearEphemeris") or {}
+    if ephemeris.get("coherent") is not True: raise ValueError("FINAL_EPHEMERIS_INCOHERENT")
+    matching={row.get("sector") for row in binary.get("sectorResults") or []
+              if row.get("role")=="INDEPENDENT" and row.get("usable") is True and row.get("sector") in sectors}
+    if len(matching)<MIN_INDEPENDENT_SECTORS or matching!=set(sectors):
+        raise ValueError("INDEPENDENT_BINARY_SECTOR_RESULTS_INVALID")
+    validate_freeze(freeze,binary,binary_hash)
+    return list(sectors),ephemeris
+
+
+def fit_joint_event_phase_model(freeze,binary,audit,*,binary_confirmation_sha256,chronology_proof):
+    import numpy as np
+    base={"resultVersion":RESULT_VERSION,"binaryConfirmationSHA256":binary_confirmation_sha256,
+          "photometryFreezeSHA256":freeze.get("freezeSHA256"),"depthAttenuationAuditSHA256":audit.get("auditSHA256"),
+          "externalCatalogInformationUsed":False,"catalogAnswerKeyUsed":False,"companionRadiusInferred":False,
+          "planetToStarRadiusRatioInferred":False,"limbDarkenedPhysicalGeometryClaimed":False,"stellarDensityInferred":False,
+          "fullPhysicalTransitSolutionClaimed":False,"uniqueReflectionThermalInterpretationClaimed":False,
+          "automaticDiscoveryClaimed":False,"chronologyProof":chronology_proof}
+    try:
+        independent,ephemeris=_validate_upstream(freeze,binary,audit,binary_confirmation_sha256)
+        handlers=chronology_proof.get("completedStageHandlerIDs") or []
+        if (chronology_proof.get("verifiedFromCompletedStages") is not True
+                or chronology_proof.get("externalEvidenceStageAlreadyCompleted") is not False
+                or any("external-companion-evidence" in str(x) for x in handlers)):
+            raise ValueError("MODEL_BEFORE_EXTERNAL_QUERY_CHRONOLOGY_UNPROVEN")
+        period=float(ephemeris["refinedPeriodDays"]); epoch=float(ephemeris["referenceEpoch"])
+        if not math.isfinite(period) or period<=0 or not math.isfinite(epoch): raise ValueError("INVALID_FROZEN_EPHEMERIS")
+        rows=list(freeze["sectors"]); established=float(audit["eventDurationDays"])
+        if not math.isfinite(established) or established<=0: raise ValueError("INVALID_EVENT_DURATION")
+    except (KeyError,TypeError,ValueError) as error: return _unresolved(base,[str(error)])
+
+    _,duration,ingress,offset,fit=_select(rows,period,epoch,established)
+    depth=-fit["coefficients"]["transit"]; formal=fit["uncertainties"]["transit"]
+    per_sector=[]
     for row in rows:
-        one = _solve([row], period, epoch, duration, ingress, offset); d = float(-one["beta"][0])
-        sector_depths.append(d); per_sector.append({"sector": row["sector"], "role": "INDEPENDENT" if row["sector"] in independent else "PRIMARY",
-            "transitDepthFractionalFlux": d, "sampleCount": one["sampleCount"], "conditionNumber": one["condition"]})
-    scatter = float(np.std(sector_depths, ddof=1)/math.sqrt(len(sector_depths))) if len(sector_depths)>1 else 0
-    conservative = max(formal, jk_unc, scatter, np.finfo(float).eps)
-    equivalent = depth*(1-ingress/2)
-    boundary = (duration in (established*DURATION_MULTIPLIERS[0], established*DURATION_MULTIPLIERS[-1])
-                or ingress in (INGRESS_FRACTIONS[0], INGRESS_FRACTIONS[-1]) or offset in (SECONDARY_PHASE_OFFSETS[0], SECONDARY_PHASE_OFFSETS[-1]))
-    independent_depths = [p["transitDepthFractionalFlux"] for p in per_sector if p["role"] == "INDEPENDENT"]
-    consistency = bool(independent_depths and max(abs(x-depth) for x in independent_depths) <= max(5*conservative, .5*depth))
-    stability = bool(jk_depths and max(abs(x-depth) for x in jk_depths) <= max(3*conservative, .35*depth))
-    gates = {"positiveFiniteTransitDepth": math.isfinite(depth) and depth > 0,
-        "adequateTransitSignificance": depth/conservative >= 5, "atLeastThreeIndependentSupportingSectors": len(set(independent)) >= 3,
-        "crossSectorDepthConsistency": consistency, "leaveOneSectorOutStable": stability,
-        "acceptableFitConditioning": fit["condition"] <= MAX_CONDITION_NUMBER and fit["rank"] == fit["columnCount"],
-        "adequatePrimaryAndBaselineCoverage": all(p["sampleCount"] >= 20 for p in per_sector),
-        "nonlinearSolutionNotBoundaryPinned": not boundary, "finitePositiveUncertainty": math.isfinite(conservative) and conservative > 0,
-        "meaningfulNoTransitImprovement": delta_bic >= 10}
-    unresolved = [name for name, passed in gates.items() if not passed]
-    eclipse_unc = float(math.sqrt(max(fit["covariance"][1, 1], 0))); eclipse_resolved = eclipse > 0 and eclipse_unc > 0 and eclipse/eclipse_unc >= 3
-    phase = beta[2:6]; phase_unc = np.sqrt(np.maximum(np.diag(fit["covariance"])[2:6], 0))
-    fundamental_resolved = bool(np.linalg.norm(phase[:2]) >= 3*np.linalg.norm(phase_unc[:2]))
-    second_resolved = bool(np.linalg.norm(phase[2:]) >= 3*np.linalg.norm(phase_unc[2:]))
-    result = {**base, "status": "COMPLETE" if not unresolved else "UNRESOLVED",
-        "classification": "PRECISION_EMPIRICAL_TRANSIT_DEPTH_RESOLVED" if not unresolved else "PRECISION_EMPIRICAL_TRANSIT_DEPTH_UNRESOLVED",
-        "precisionEmpiricalTransitDepthResolved": not unresolved, "unresolvedReasons": unresolved,
-        "frozenPeriodDays": period, "frozenReferenceEpochBTJD": epoch, "timingSectors": eligible,
-        "independentSupportingSectors": independent, "independentSupportingSectorCount": len(set(independent)),
-        "modelSpecification": {"primaryTemplate": "SHARED_EXPOSURE_INTEGRATED_TRAPEZOID", "oppositeConjunctionTemplate": "SHARED_EXPOSURE_INTEGRATED_TRAPEZOID",
-            "phaseTerms": ["ORBITAL_SINE", "ORBITAL_COSINE", "TWICE_ORBITAL_SINE", "TWICE_ORBITAL_COSINE"],
-            "perSectorBaseline": "INTERCEPT_PLUS_LINEAR_TIME", "durationMultipliers": list(DURATION_MULTIPLIERS),
-            "ingressEgressFractionsOfHalfDuration": list(INGRESS_FRACTIONS), "secondaryPhaseOffsetGrid": list(SECONDARY_PHASE_OFFSETS),
-            "exposureIntegration": "ELEVEN_DETERMINISTIC_MIDPOINT_SUBEXPOSURES_PER_FULL_CADENCE", "ephemerisHeldFixed": True},
-        "globalFit": {"midTransitFractionalFluxDeficit": depth, "conservativeTransitDepthUncertainty": conservative,
-            "equivalentBoxTransitDepthFractionalFlux": equivalent, "oppositeConjunctionEclipseDepthFractionalFlux": eclipse,
-            "oppositeConjunctionEclipseUncertainty": eclipse_unc, "oppositeConjunctionEclipseStatus": "RESOLVED" if eclipse_resolved else "UNRESOLVED",
-            "orbitalFrequencySineCoefficient": float(phase[0]), "orbitalFrequencyCosineCoefficient": float(phase[1]),
-            "twiceOrbitalFrequencySineCoefficient": float(phase[2]), "twiceOrbitalFrequencyCosineCoefficient": float(phase[3]),
-            "fundamentalPhaseCurveStatus": "RESOLVED" if fundamental_resolved else "UNRESOLVED", "secondHarmonicPhaseCurveStatus": "RESOLVED" if second_resolved else "UNRESOLVED",
-            "eventDurationDays": duration, "ingressEgressDurationDays": duration*ingress/2, "secondaryPhaseOffset": offset},
-        "uncertaintyDiagnostics": {"formalCovarianceTransitUncertainty": formal, "independentSectorJackknifeUncertainty": jk_unc,
-            "sectorScatterUncertainty": scatter, "conservativeRule": "MAX_FORMAL_JACKKNIFE_SECTOR_SCATTER"},
-        "perSectorDiagnostics": per_sector, "independentSectorJackknife": jackknife,
-        "nestedModelComparisons": {"noTransitBIC": no_transit["bic"], "jointModelBIC": fit["bic"], "deltaBICForTransit": delta_bic},
-        "resolutionGates": gates, "fitDiagnostics": {"conditionNumber": fit["condition"], "retainedSampleCount": fit["retained"], "sampleCount": fit["sampleCount"],
-            "eventCadencesProtectedFromClipping": True}, "modelRanBeforeExternalKnownObjectQuery": True,
-        "workflowNextStage": "EXTERNAL_EVIDENCE_FREEZE", "recommendedNextTest": "EXTERNAL_EVIDENCE_FREEZE" if not unresolved else "ADDITIONAL_PRECISION_PHOTOMETRY"}
+        _,sd,si,so,one=_select([row],period,epoch,established)
+        per_sector.append({"sector":row["sector"],"role":"INDEPENDENT" if row["sector"] in independent else "PRIMARY",
+            "transitDepthFractionalFlux":-one["coefficients"]["transit"],
+            "formalTransitDepthUncertainty":one["uncertainties"]["transit"],"selectedDurationDays":sd,
+            "selectedIngressFraction":si,"sampleCount":one["sampleCount"],"conditionNumber":one["condition"]})
+    independent_rows=[x for x in per_sector if x["role"]=="INDEPENDENT"]
+    weights=[1/max(x["formalTransitDepthUncertainty"]**2,np.finfo(float).eps) for x in independent_rows]
+    weighted_depth=sum(w*x["transitDepthFractionalFlux"] for w,x in zip(weights,independent_rows))/sum(weights)
+    heterogeneity=sum(w*(x["transitDepthFractionalFlux"]-weighted_depth)**2 for w,x in zip(weights,independent_rows))
+    reduced_heterogeneity=heterogeneity/max(len(independent_rows)-1,1)
+    fractional_sector_deviation=max(abs(x["transitDepthFractionalFlux"]-weighted_depth) for x in independent_rows)/max(abs(weighted_depth),np.finfo(float).eps)
+    consistency=(reduced_heterogeneity<=MAX_REDUCED_HETEROGENEITY and fractional_sector_deviation<=MAX_FRACTIONAL_SECTOR_DEVIATION)
+
+    jackknife=[]
+    for sector in independent:
+        subset=[row for row in rows if row["sector"]!=sector]
+        _,jd,ji,jo,jfit=_select(subset,period,epoch,established)
+        jackknife.append({"omittedIndependentSector":sector,"transitDepthFractionalFlux":-jfit["coefficients"]["transit"],
+            "formalTransitDepthUncertainty":jfit["uncertainties"]["transit"],"selectedDurationDays":jd,
+            "selectedIngressFraction":ji,"selectedSecondaryPhaseOffset":jo,"conditionNumber":jfit["condition"]})
+    jk_depths=[x["transitDepthFractionalFlux"] for x in jackknife]
+    jk_unc=math.sqrt((len(jk_depths)-1)/len(jk_depths)*sum((x-np.mean(jk_depths))**2 for x in jk_depths))
+    geometry_stable=all(abs(x["selectedDurationDays"]-duration)<=established*.15 and abs(x["selectedIngressFraction"]-ingress)<=.10 for x in jackknife)
+    movement=max(abs(x-depth) for x in jk_depths)
+    # This threshold contains neither jackknife nor sector scatter: disagreement cannot authorize itself.
+    stability_scale=max(3*formal,MAX_FRACTIONAL_JACKKNIFE_MOVEMENT*abs(depth),np.finfo(float).eps)
+    stability=geometry_stable and movement<=stability_scale
+    sector_depths=[x["transitDepthFractionalFlux"] for x in per_sector]
+    sector_scatter=float(np.std(sector_depths,ddof=1)/math.sqrt(len(sector_depths))) if len(sector_depths)>1 else 0
+    conservative=max(formal,jk_unc,sector_scatter,np.finfo(float).eps)
+
+    all_components={"transit","eclipse","fundamentalSine","fundamentalCosine","secondSine","secondCosine"}
+    comparisons={}
+    for label,removed in (("noTransit",{"transit"}),("noEclipse",{"eclipse"}),
+                          ("noFundamentalPhase",{"fundamentalSine","fundamentalCosine"}),
+                          ("noSecondHarmonic",{"secondSine","secondCosine"})):
+        nested=_solve(rows,period,epoch,duration,ingress,offset,all_components-removed)
+        comparisons[label]={"bic":nested["bic"],"deltaBICVersusJoint":nested["bic"]-fit["bic"]}
+    comparisons["jointModelBIC"]=fit["bic"]
+    primary_boundary=(duration in (established*DURATION_MULTIPLIERS[0],established*DURATION_MULTIPLIERS[-1])
+                      or ingress in (INGRESS_FRACTIONS[0],INGRESS_FRACTIONS[-1]))
+    secondary_boundary=offset in (SECONDARY_PHASE_OFFSETS[0],SECONDARY_PHASE_OFFSETS[-1])
+    gates={"positiveFiniteTransitDepth":math.isfinite(depth) and depth>0,"adequateTransitSignificance":depth/conservative>=5,
+           "atLeastThreeIndependentSupportingSectors":len(independent)>=3,"crossSectorDepthConsistency":consistency,
+           "leaveOneSectorOutStable":stability,"acceptableFitConditioning":fit["condition"]<=MAX_CONDITION_NUMBER and fit["rank"]==fit["columnCount"],
+           "adequatePrimaryAndBaselineCoverage":all(x["sampleCount"]>=20 for x in per_sector),
+           "primaryDurationIngressNotBoundaryPinned":not primary_boundary,"finitePositiveUncertainty":math.isfinite(conservative) and conservative>0,
+           "meaningfulNoTransitImprovement":comparisons["noTransit"]["deltaBICVersusJoint"]>=10}
+    reasons=[]
+    reason_names={"crossSectorDepthConsistency":"CROSS_SECTOR_DEPTH_INCONSISTENCY",
+                  "leaveOneSectorOutStable":"LEAVE_ONE_SECTOR_OUT_INSTABILITY",
+                  "primaryDurationIngressNotBoundaryPinned":"PRIMARY_GEOMETRY_BOUNDARY_PINNED"}
+    for name,passed in gates.items():
+        if not passed: reasons.append(reason_names.get(name,name))
+    eclipse=-fit["coefficients"]["eclipse"]; eclipse_unc=fit["uncertainties"]["eclipse"]
+    eclipse_resolved=(not secondary_boundary and eclipse>0 and eclipse_unc>0 and eclipse/eclipse_unc>=3
+                      and comparisons["noEclipse"]["deltaBICVersusJoint"]>=6)
+    fs=np.array([fit["coefficients"]["fundamentalSine"],fit["coefficients"]["fundamentalCosine"]]); fu=np.array([fit["uncertainties"]["fundamentalSine"],fit["uncertainties"]["fundamentalCosine"]])
+    ss=np.array([fit["coefficients"]["secondSine"],fit["coefficients"]["secondCosine"]]); su=np.array([fit["uncertainties"]["secondSine"],fit["uncertainties"]["secondCosine"]])
+    fundamental=bool(np.linalg.norm(fs)>=3*np.linalg.norm(fu) and comparisons["noFundamentalPhase"]["deltaBICVersusJoint"]>=6)
+    second=bool(np.linalg.norm(ss)>=3*np.linalg.norm(su) and comparisons["noSecondHarmonic"]["deltaBICVersusJoint"]>=6)
+    result={**base,"status":"COMPLETE" if not reasons else "UNRESOLVED",
+      "classification":"PRECISION_EMPIRICAL_TRANSIT_DEPTH_RESOLVED" if not reasons else "PRECISION_EMPIRICAL_TRANSIT_DEPTH_UNRESOLVED",
+      "precisionEmpiricalTransitDepthResolved":not reasons,"unresolvedReasons":reasons,"frozenPeriodDays":period,"frozenReferenceEpochBTJD":epoch,
+      "timingSectors":[r["sector"] for r in rows],"independentSupportingSectors":independent,"independentSupportingSectorCount":len(independent),
+      "modelSpecification":{"primaryTemplate":"SHARED_EXPOSURE_INTEGRATED_TRAPEZOID","oppositeConjunctionTemplate":"SHARED_EXPOSURE_INTEGRATED_TRAPEZOID",
+        "phaseTerms":["ORBITAL_SINE","ORBITAL_COSINE","TWICE_ORBITAL_SINE","TWICE_ORBITAL_COSINE"],"perSectorBaseline":"INTERCEPT_PLUS_LINEAR_TIME",
+        "durationMultipliers":list(DURATION_MULTIPLIERS),"ingressEgressFractionsOfHalfDuration":list(INGRESS_FRACTIONS),"secondaryPhaseOffsetGrid":list(SECONDARY_PHASE_OFFSETS),
+        "exposureIntegration":"ELEVEN_DETERMINISTIC_MIDPOINT_SUBEXPOSURES_PER_FULL_CADENCE","ephemerisHeldFixed":True},
+      "globalFit":{"midTransitFractionalFluxDeficit":depth,"conservativeTransitDepthUncertainty":conservative,
+        "equivalentBoxTransitDepthFractionalFlux":depth*(1-ingress/2),"oppositeConjunctionEclipseDepthFractionalFlux":eclipse,
+        "oppositeConjunctionEclipseUncertainty":eclipse_unc,"oppositeConjunctionEclipseStatus":"RESOLVED" if eclipse_resolved else "UNRESOLVED",
+        "orbitalFrequencySineCoefficient":float(fs[0]),"orbitalFrequencyCosineCoefficient":float(fs[1]),
+        "twiceOrbitalFrequencySineCoefficient":float(ss[0]),"twiceOrbitalFrequencyCosineCoefficient":float(ss[1]),
+        "fundamentalPhaseCurveStatus":"RESOLVED" if fundamental else "UNRESOLVED","secondHarmonicPhaseCurveStatus":"RESOLVED" if second else "UNRESOLVED",
+        "eventDurationDays":duration,"ingressEgressDurationDays":duration*ingress/2,"secondaryPhaseOffset":offset},
+      "uncertaintyDiagnostics":{"formalCovarianceTransitUncertainty":formal,"independentSectorJackknifeUncertainty":jk_unc,"sectorScatterUncertainty":sector_scatter,
+        "conservativeRule":"MAX_FORMAL_JACKKNIFE_SECTOR_SCATTER","gateStatisticsExcludeTestedScatter":True},
+      "crossSectorConsistencyDiagnostics":{"weightedMeanDepth":weighted_depth,"chiSquare":heterogeneity,"reducedChiSquare":reduced_heterogeneity,
+        "maximumFractionalDeviation":fractional_sector_deviation,"maximumReducedChiSquare":MAX_REDUCED_HETEROGENEITY,"maximumFractionalDeviationAllowed":MAX_FRACTIONAL_SECTOR_DEVIATION},
+      "jackknifeStabilityDiagnostics":{"maximumDepthMovement":movement,"independentAcceptanceScale":stability_scale,"geometryStable":geometry_stable},
+      "perSectorDiagnostics":per_sector,"independentSectorJackknife":jackknife,"nestedModelComparisons":comparisons,"resolutionGates":gates,
+      "componentResolutionGates":{"secondaryPhaseOffsetNotBoundaryPinned":not secondary_boundary,"eclipseEvidenceIndependentOfTransit":True,"phaseEvidenceIndependentOfTransit":True},
+      "fitDiagnostics":{"conditionNumber":fit["condition"],"retainedSampleCount":fit["retained"],"sampleCount":fit["sampleCount"],"eventCadencesProtectedFromClipping":True},
+      "modelRanBeforeExternalKnownObjectQuery":True,"workflowNextStage":"EXTERNAL_EVIDENCE_FREEZE",
+      "recommendedNextTest":"EXTERNAL_EVIDENCE_FREEZE" if not reasons else "ADDITIONAL_PRECISION_PHOTOMETRY"}
     return _finalize(result)
 
-
-# Stable descriptive alias for callers that prefer the scientific verb.
-model_joint_transit_eclipse_phase_curve = fit_joint_event_phase_model
+model_joint_transit_eclipse_phase_curve=fit_joint_event_phase_model
