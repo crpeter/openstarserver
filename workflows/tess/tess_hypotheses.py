@@ -196,6 +196,8 @@ def analyze(
     *,
     observation_baseline_days: float | None = None,
     primary_minimum_frequency: float | None = None,
+    primary_maximum_frequency: float | None = None,
+    primary_frequency_step: float | None = None,
 ) -> dict[str, Any]:
     period = primary_period_days(primary)
 
@@ -214,10 +216,36 @@ def analyze(
     harmonic_candidates = primary.get("harmonicCandidates") or []
     preferred_relation = primary.get("preferredPhysicalPeriodRelation") or "1x"
     raw_candidate_period = _float(primary.get("candidatePeriodDays"))
+    raw_candidate_frequency = _float(primary.get("candidateFrequency"))
+    if (
+        raw_candidate_frequency is None
+        and raw_candidate_period is not None
+        and raw_candidate_period > 0
+    ):
+        raw_candidate_frequency = 1.0 / raw_candidate_period
+    minimum_primary_frequency = _float(primary_minimum_frequency)
+    maximum_primary_frequency = _float(primary_maximum_frequency)
+    primary_step = _float(primary_frequency_step)
+    primary_boundary_hit = False
+    primary_boundary = None
+    if (
+        raw_candidate_frequency is not None
+        and minimum_primary_frequency is not None
+        and maximum_primary_frequency is not None
+        and maximum_primary_frequency > minimum_primary_frequency
+    ):
+        span = maximum_primary_frequency - minimum_primary_frequency
+        guard = max((primary_step or 0.0) * 4.0, span * 0.002, 1e-12)
+        if raw_candidate_frequency <= minimum_primary_frequency + guard:
+            primary_boundary_hit = True
+            primary_boundary = "minimum"
+        elif raw_candidate_frequency >= maximum_primary_frequency - guard:
+            primary_boundary_hit = True
+            primary_boundary = "maximum"
+    reliable = reliable and not primary_boundary_hit
     preferred_coverage = cycle_coverage(period, observation_baseline_days)
     raw_coverage = cycle_coverage(raw_candidate_period, observation_baseline_days)
 
-    minimum_primary_frequency = _float(primary_minimum_frequency)
     preferred_frequency = 1.0 / period if period is not None and period > 0 else None
     harmonic_low_frequency_applicable = (
         preferred_relation != "1x"
@@ -271,6 +299,8 @@ def analyze(
 
     return {
         "primaryReliable": reliable,
+        "primaryBoundaryHit": primary_boundary_hit,
+        "primaryBoundary": primary_boundary,
         "periodStatus": status,
         "periodConfidence": confidence,
         "observedPeriodDays": period,
@@ -306,6 +336,28 @@ def plan(
     best_match = analysis.get("bestCatalogMatch")
     rotation = analysis.get("rotationSanity") or {}
     query_errors = identity.get("queryErrors") or []
+    full_characterization = investigation_goal == "FULL_CHARACTERIZATION"
+
+    if analysis.get("primaryBoundaryHit") is True:
+        claim = decision(
+            "HUMAN_REVIEW_REQUIRED",
+            "The primary periodogram winner landed on the search-grid boundary and is not a reliable isolated period.",
+            "A full-characterization investigation may use independent frozen sectors to test whether another signal class recurs.",
+        )
+        return {
+            "action": (
+                "INDEPENDENT_SECTOR_FOLLOWUP"
+                if full_characterization and period is not None
+                else "STOP"
+            ),
+            "claimDecision": claim.as_dict(),
+            "reason": "primary-period-search-boundary",
+            **(
+                {"investigationGoal": investigation_goal}
+                if full_characterization
+                else {}
+            ),
+        }
 
     if best_match is not None:
         claim = decision(
@@ -313,7 +365,6 @@ def plan(
             "OpenStar recovered a period consistent with an external catalog period or its 0.5x/2x harmonic relation.",
             f"Best catalog source: {best_match.get('source')}",
         )
-        full_characterization = investigation_goal == "FULL_CHARACTERIZATION"
         return {
             "action": (
                 "INDEPENDENT_SECTOR_FOLLOWUP" if full_characterization else "STOP"
