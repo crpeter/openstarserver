@@ -81,6 +81,43 @@ class BlindTransitSearchTests(unittest.TestCase):
         broad = {"claimDecision": {"claim": "CANDIDATE_PERIOD"}}
         return paths[0], independent, morphology, broad
 
+    def _prepared_pooled_sectors(
+        self, *, period: float = 5.0, late_transits: bool = True
+    ):
+        import numpy as np
+
+        sectors = []
+        epoch = 0.37
+        specifications = [("PRIMARY", 1, 0.0, 1.8)] + [
+            (
+                "INDEPENDENT",
+                index + 2,
+                100.0 * (index + 1),
+                1.0 if late_transits or index < 4 else 0.0,
+            )
+            for index in range(8)
+        ]
+        for role, sector, origin, depth in specifications:
+            times = np.arange(origin, origin + 20.0, 0.01)
+            residual = np.zeros_like(times)
+            distance = np.abs(
+                np.remainder(times - epoch + period / 2.0, period)
+                - period / 2.0
+            )
+            residual[distance <= 0.025] -= depth
+            sectors.append({
+                "role": role,
+                "sector": sector,
+                "datasetID": f"sector-{sector}",
+                "times": times,
+                "residual": residual,
+                "sigma": 1.0,
+                "origin": origin,
+                "cadence": 0.01,
+                "detrendWindowSamples": 75,
+            })
+        return sectors
+
     def test_entry_gate_is_exact_and_requires_two_independent_sectors(self):
         morphology = {"physicalCycleResolved": False}
         independent = {
@@ -599,8 +636,185 @@ class BlindTransitSearchTests(unittest.TestCase):
         self.assertFalse(ephemeris["coherent"])
         self.assertEqual("NOT_SATISFIED", gate["mode"])
 
+    def test_pooled_gate_accepts_weak_events_repeated_across_time(self):
+        sectors = self._prepared_pooled_sectors()
+
+        results, primary, supporters, ephemeris, supported, gate = (
+            tess_blind_transit_search._candidate_evidence(sectors, 0.2)
+        )
+
+        self.assertTrue(primary)
+        self.assertTrue(supported)
+        self.assertTrue(ephemeris["coherent"])
+        self.assertEqual("POOLED_SPLIT_RECURRENCE", gate["mode"])
+        self.assertGreaterEqual(
+            gate["pooledIndependentSnr"], gate["minimumPooledIndependentSnr"]
+        )
+        self.assertGreaterEqual(
+            gate["minimumObservedLeaveOneOutSnr"],
+            gate["minimumLeaveOneOutSnr"],
+        )
+        self.assertGreaterEqual(len(supporters), 4)
+        self.assertTrue(all(
+            not item["usable"] for item in results
+            if item["role"] == "INDEPENDENT"
+        ))
+        self.assertFalse(gate["catalogAnswerKeyUsed"])
+
+    def test_pooled_gate_rejects_events_missing_from_late_sectors(self):
+        sectors = self._prepared_pooled_sectors(late_transits=False)
+
+        _, _, supporters, ephemeris, supported, gate = (
+            tess_blind_transit_search._candidate_evidence(sectors, 0.2)
+        )
+
+        self.assertFalse(supported)
+        self.assertEqual([], supporters)
+        self.assertFalse(ephemeris["coherent"])
+        pooled = gate["pooledRecurrence"]
+        self.assertEqual("NOT_SATISFIED", pooled["mode"])
+        self.assertLess(pooled["lateIndependentSnr"], pooled["minimumSplitSnr"])
+
+    def test_pooled_search_grid_selects_shared_weak_clock(self):
+        sectors = self._prepared_pooled_sectors(period=5.0)
+
+        frequency, _, _, _, _, _ = tess_blind_transit_search._search_grid(
+            sectors, 0.15, 0.3
+        )
+
+        self.assertAlmostEqual(0.2, frequency, delta=0.001)
+
+    def test_short_long_period_transit_is_not_diluted_by_one_percent_floor(self):
+        import numpy as np
+
+        period = 10.0
+        frequency = 1.0 / period
+        times = np.arange(0.0, 30.0, 0.005)
+        residual = np.zeros_like(times)
+        distance = np.abs(
+            np.remainder(times - 0.37 + period / 2.0, period)
+            - period / 2.0
+        )
+        residual[distance <= 0.025] -= 1.0
+
+        measurement = tess_blind_transit_search._box_score(
+            times, residual, 1.0, frequency
+        )
+        with mock.patch.object(
+            tess_blind_transit_search,
+            "DUTY_CYCLES",
+            (0.01, 0.015, 0.02, 0.03, 0.04, 0.05, 0.07, 0.10),
+        ):
+            old_floor = tess_blind_transit_search._box_score(
+                times, residual, 1.0, frequency
+            )
+
+        self.assertLessEqual(measurement["dutyCycle"], 0.005)
+        self.assertLessEqual(measurement["durationDays"], 0.05)
+        self.assertGreater(measurement["snr"], 1.25 * old_floor["snr"])
+
     def test_handler_id_is_stable(self):
         self.assertEqual("openstar.tess.blind-transit-search.analyze", HANDLER_ID)
+
+    def test_unresolved_blind_search_freezes_additional_sectors_and_retries(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = InvestigationStore(root / "investigations")
+            investigation = store.create("adaptive-blind-search", WORKFLOW_ID,
+                                         WORKFLOW_VERSION)
+            source_project = root / "source-project.json"
+            source_project.write_text(json.dumps({
+                "id": "source", "name": "source", "workloadID": "ls",
+                "datasets": [],
+            }), encoding="utf-8")
+            primary = root / "primary.json"
+            primary.write_text("{}", encoding="utf-8")
+            existing = []
+            for sector in (2, 3):
+                path = root / f"sector-{sector}.json"
+                path.write_text("{}", encoding="utf-8")
+                existing.append({"sector": sector, "datasetPath": str(path)})
+            added_path = root / "sector-4.json"
+            added_path.write_text("{}", encoding="utf-8")
+            extension_project = root / "extension-project.json"
+            extension_project.write_text("{}", encoding="utf-8")
+
+            for stage in (
+                ("001-prepare-target", "openstar.tess.prepare-target", {
+                    "datasetPath": str(primary),
+                    "sourceProjectPath": str(source_project),
+                    "sourceDatasetEntry": {"id": "target", "targetName": "Blind"},
+                    "ticID": 1,
+                    "sector": 1,
+                }),
+                ("002-independent", "openstar.tess.independent.prepare", {
+                    "investigationGoal": "FULL_CHARACTERIZATION",
+                    "targetPeriodDays": 5.5,
+                    "candidateSectors": [2, 3, 4, 5, 6],
+                    "preparedSectors": existing,
+                }),
+                ("003-interpret", "openstar.tess.independent.interpret", {
+                    "claimDecision": {"claim": "HUMAN_REVIEW_REQUIRED"},
+                    "primaryReliable": False,
+                }),
+            ):
+                investigation = self._complete(store, investigation, *stage)
+
+            unresolved = {
+                "classification": "BLIND_TRANSIT_PERIOD_UNRESOLVED",
+                "coarseCandidatePeriodDays": 4.2,
+                "candidatePeriodDays": None,
+                "supportingIndependentSectors": [],
+                "linearEphemeris": {"coherent": False},
+                "recommendedNextTest": "HUMAN_SCIENTIFIC_REVIEW",
+            }
+            recovered = {
+                "classification": "REPLICATED_BLIND_TRANSIT_LIKE_CANDIDATE",
+                "candidatePeriodDays": 9.9,
+                "supportingIndependentSectors": [2, 4],
+                "linearEphemeris": {"coherent": True},
+                "recommendedNextTest": (
+                    "ADDITIONAL_INDEPENDENT_SECTOR_TRANSIT_CONFIRMATION"
+                ),
+            }
+            extension = {
+                "preparedSectors": [
+                    {"sector": 4, "datasetPath": str(added_path)}
+                ],
+                "projectPath": str(extension_project),
+            }
+            engine = build_engine(store, types.SimpleNamespace(), poll_interval=0,
+                                  timeout=None)
+            engine.chain_stages = False
+            with mock.patch(
+                "workflows.tess.tess_investigation.analyze_blind_transit_search",
+                side_effect=[unresolved, recovered],
+            ) as analyze_search, mock.patch(
+                "workflows.tess.tess_investigation.build_independent_sector_project",
+                return_value=extension,
+            ) as build_extension:
+                completed, next_request = engine.run_stage(
+                    investigation,
+                    StageRequest("004-blind", HANDLER_ID, {}, "003-interpret"),
+                    software_id="test", software_version="adaptive-extension",
+                )
+
+        result = completed.stages[-1].result
+        self.assertEqual("REPLICATED_BLIND_TRANSIT_LIKE_CANDIDATE",
+                         result["classification"])
+        self.assertEqual([4], result["adaptiveSectorExtension"][
+            "additionalPreparedSectors"])
+        self.assertFalse(result["adaptiveSectorExtension"]["catalogAnswerKeyUsed"])
+        self.assertEqual(2, analyze_search.call_count)
+        second_spec = analyze_search.call_args_list[1].kwargs["independent_spec"]
+        self.assertEqual([2, 3, 4], [
+            item["sector"] for item in second_spec["preparedSectors"]
+        ])
+        self.assertEqual(8, build_extension.call_args.kwargs["maximum_sectors"])
+        self.assertEqual([2, 3], sorted(
+            build_extension.call_args.kwargs["excluded_sectors"]
+        ))
+        self.assertEqual("openstar.tess.finalize", next_request.handler_id)
 
     def test_unresolved_full_characterization_morphology_routes_to_blind_search(self):
         with tempfile.TemporaryDirectory() as temporary:

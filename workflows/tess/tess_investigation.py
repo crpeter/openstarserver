@@ -299,6 +299,7 @@ WORKFLOW_ID = "openstar.workflow.tess-investigation.v1"
 WORKFLOW_VERSION = "20.2"
 SOFTWARE_ID = "openstar.tess-investigation-plugin"
 SOFTWARE_VERSION = "20.36"
+ADAPTIVE_BLIND_TRANSIT_ADDITIONAL_SECTORS = 8
 
 
 def _stage(investigation: Investigation, stage_id: str):
@@ -2916,15 +2917,118 @@ def build_engine(
         )
         print("🕳 Searching frozen sectors for a software-blind transit period")
         print("   removing smooth local variability; no catalog period and no MAST download")
-        result = analyze_blind_transit_search(
+        first_pass = analyze_blind_transit_search(
             primary_dataset_path=prepared["datasetPath"],
             independent_spec=independent_prepare,
             morphology=morphology,
             broad_interpretation=broad,
             targeted_interpretation=targeted,
         )
+        result = first_pass
+        analysis_spec = independent_prepare
+        extension_spec = None
+        if first_pass.get("classification") == "BLIND_TRANSIT_PERIOD_UNRESOLVED":
+            consumed = {
+                int(item["sector"])
+                for item in independent_prepare.get("preparedSectors") or []
+                if item.get("sector") is not None
+            }
+            remaining = [
+                int(sector)
+                for sector in independent_prepare.get("candidateSectors") or []
+                if int(sector) not in consumed
+            ]
+            if remaining:
+                print("🔭 Extending unresolved blind transit evidence")
+                print(
+                    "   freezing up to "
+                    f"{ADAPTIVE_BLIND_TRANSIT_ADDITIONAL_SECTORS} additional "
+                    "balanced sectors"
+                )
+                artifact_root = store.directory_for(investigation.id) / "artifacts"
+                try:
+                    extension_spec = build_independent_sector_project(
+                        source_project_path=prepared["sourceProjectPath"],
+                        source_dataset_entry=prepared["sourceDatasetEntry"],
+                        tic_id=int(prepared["ticID"]),
+                        primary_sector=prepared.get("sector"),
+                        target_period_days=float(independent_prepare["targetPeriodDays"]),
+                        candidate_sectors=remaining,
+                        output_dir=artifact_root,
+                        investigation_id=investigation.id,
+                        maximum_sectors=ADAPTIVE_BLIND_TRANSIT_ADDITIONAL_SECTORS,
+                        excluded_sectors=list(consumed),
+                        artifact_subdirectory="blind-transit-extension-sectors",
+                        project_suffix="blind-transit-extension-v1",
+                    )
+                except TessArchiveInfrastructureError as error:
+                    raise RetryableExecutionError(
+                        str(error), result=error.diagnostics,
+                        input_hashes={
+                            "initialBlindTransitSearch": sha256_json(first_pass),
+                            "independentPreparation": sha256_json(independent_prepare),
+                        },
+                    ) from error
+                added = extension_spec.get("preparedSectors") or []
+                print(
+                    "   additional frozen sectors: "
+                    f"{[item.get('sector') for item in added]}"
+                )
+                if added:
+                    analysis_spec = dict(independent_prepare)
+                    analysis_spec["preparedSectors"] = [
+                        *(independent_prepare.get("preparedSectors") or []),
+                        *added,
+                    ]
+                    result = analyze_blind_transit_search(
+                        primary_dataset_path=prepared["datasetPath"],
+                        independent_spec=analysis_spec,
+                        morphology=morphology,
+                        broad_interpretation=broad,
+                        targeted_interpretation=targeted,
+                    )
+                    result = dict(result)
+                    result["adaptiveSectorExtension"] = {
+                        "attempted": True,
+                        "reason": "INITIAL_BLIND_TRANSIT_PERIOD_UNRESOLVED",
+                        "initialClassification": first_pass.get("classification"),
+                        "initialCoarseCandidatePeriodDays": first_pass.get(
+                            "coarseCandidatePeriodDays"
+                        ),
+                        "initialPreparedSectors": [
+                            item.get("sector")
+                            for item in independent_prepare.get("preparedSectors") or []
+                        ],
+                        "additionalPreparedSectors": [
+                            item.get("sector") for item in added
+                        ],
+                        "catalogAnswerKeyUsed": False,
+                    }
         print(f"   classification: {result.get('classification')}")
         print(f"   candidate period: {result.get('candidatePeriodDays')} days")
+        recurrence_gate = result.get("recurrenceSupportGate") or {}
+        pooled_gate = (
+            recurrence_gate
+            if recurrence_gate.get("mode") == "POOLED_SPLIT_RECURRENCE"
+            else recurrence_gate.get("pooledRecurrence") or {}
+        )
+        if pooled_gate.get("independentSectorCount", 0) >= 6:
+            print(f"   pooled recurrence mode: {pooled_gate.get('mode')}")
+            print(
+                "   pooled / early / late SNR: "
+                f"{pooled_gate.get('pooledIndependentSnr')} / "
+                f"{pooled_gate.get('earlyIndependentSnr')} / "
+                f"{pooled_gate.get('lateIndependentSnr')}"
+            )
+            print(
+                "   minimum leave-one-sector-out SNR: "
+                f"{pooled_gate.get('minimumObservedLeaveOneOutSnr')}"
+            )
+            print(
+                "   maximum phase offset / tolerance: "
+                f"{pooled_gate.get('maximumPhaseOffset')} / "
+                f"{pooled_gate.get('phaseCoherenceTolerance')}"
+            )
         print(
             "   supporting independent sectors: "
             f"{result.get('supportingIndependentSectors') or []}"
@@ -2946,10 +3050,18 @@ def build_engine(
             input_hashes["morphology"] = sha256_json(morphology)
         if targeted is not None:
             input_hashes["targetedIndependentInterpretation"] = sha256_json(targeted)
-        for item in independent_prepare.get("preparedSectors") or []:
+        for item in analysis_spec.get("preparedSectors") or []:
             if item.get("datasetPath"):
                 input_hashes[f"independentSector{item.get('sector')}"] = sha256_file(
                     Path(item["datasetPath"])
+                )
+        artifacts = [_artifact(artifact_path, "application/json")]
+        if extension_spec is not None:
+            for item in extension_spec.get("preparedSectors") or []:
+                artifacts.append(_artifact(Path(item["datasetPath"]), "application/json"))
+            if extension_spec.get("projectPath"):
+                artifacts.append(
+                    _artifact(Path(extension_spec["projectPath"]), "application/json")
                 )
         return StageOutcome(
             result=result,
@@ -2960,7 +3072,7 @@ def build_engine(
                 triggered_by_stage_id=request.id,
             ),
             input_hashes=input_hashes,
-            artifacts=(_artifact(artifact_path, "application/json"),),
+            artifacts=tuple(artifacts),
         )
 
     def physical_interpretation_stage(investigation, request):
