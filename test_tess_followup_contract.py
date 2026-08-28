@@ -29,6 +29,38 @@ def _primary(preferred_period):
 
 
 class LowFrequencyFollowupContractTests(unittest.TestCase):
+    def test_primary_grid_boundary_is_not_reliable_or_catalog_promotable(self):
+        identity = _identity() | {
+            "vsx": {"matches": [{"name": "generic-variable", "periodDays": 10.0}]},
+        }
+        analysis = analyze(
+            {
+                "periodStatus": "RELIABLE",
+                "periodConfidence": "high",
+                "candidatePeriodDays": 10.0,
+                "candidateFrequency": 0.1,
+                "preferredPhysicalPeriodDays": 10.0,
+                "preferredPhysicalPeriodRelation": "1x",
+            },
+            identity,
+            observation_baseline_days=27.0,
+            primary_minimum_frequency=0.1,
+            primary_maximum_frequency=5.0,
+            primary_frequency_step=0.000001,
+        )
+
+        self.assertTrue(analysis["primaryBoundaryHit"])
+        self.assertEqual("minimum", analysis["primaryBoundary"])
+        self.assertFalse(analysis["primaryReliable"])
+        ordinary = plan(analysis, identity)
+        full = plan(analysis, identity, "FULL_CHARACTERIZATION")
+        self.assertEqual(("STOP", "primary-period-search-boundary"),
+                         (ordinary["action"], ordinary["reason"]))
+        self.assertEqual("HUMAN_REVIEW_REQUIRED",
+                         ordinary["claimDecision"]["claim"])
+        self.assertEqual("INDEPENDENT_SECTOR_FOLLOWUP", full["action"])
+        self.assertEqual("primary-period-search-boundary", full["reason"])
+
     def test_catalog_match_is_terminal_only_without_full_characterization_goal(self):
         analysis = {
             "observedPeriodDays": 2.0,
