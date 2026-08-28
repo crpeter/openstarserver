@@ -2859,7 +2859,19 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
         for sector in range(4):
             path = self._write_light_curve(root, f"sector-{sector}", sector, 0.1 * sector)
             paths.append(str(path))
-        prepared = {"datasetPath": paths[0], "sourceProjectPath": str(root / "project.json")}
+        source_entry = {"id": "primary", "path": paths[0], "targetName": "Synthetic"}
+        source_project = root / "project.json"
+        source_project.write_text(json.dumps({
+            "id": "direct-dynamic-source",
+            "workloadID": "openstar.lomb-scargle.v1",
+            "datasets": [source_entry],
+        }))
+        prepared = {
+            "datasetPath": paths[0],
+            "sector": 0,
+            "sourceProjectPath": str(source_project),
+            "sourceDatasetEntry": source_entry,
+        }
         independent = {"preparedSectors": [
             {"sector": sector, "datasetPath": paths[sector]} for sector in range(1, 4)
         ]}
@@ -2907,11 +2919,27 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
             "independentPreparation": sha256_json(independent),
         }, stage.provenance.input_hashes)
         self.assertEqual("openstar.tess.time-frequency.prepare", next_request.handler_id)
+        self.assertEqual("RESOLVED_DYNAMIC_HARMONIC_RESIDUAL",
+                         next_request.parameters["entryReason"])
 
         restarted = store.load(completed.id)
         target = InvestigationTarget("synthetic:direct-dynamic", restarted.id,
                                      WORKFLOW_ID, WORKFLOW_VERSION)
         self.assertEqual(next_request, plan_tess_branches(restarted, target)[0].experiment)
+
+        prepared_investigation, run_request = engine.run_stage(
+            completed, next_request,
+            software_id="integration", software_version="20.30",
+        )
+        time_frequency_preparation = prepared_investigation.stages[-1].result
+        self.assertEqual({
+            "periodDays": period,
+            "kind": "MORPHOLOGY_RESOLVED_PHYSICAL_PERIOD",
+            "physicalCycleResolved": True,
+        }, time_frequency_preparation["periodReference"])
+        self.assertEqual("PERSISTED_DYNAMIC_HARMONIC_MODEL",
+                         time_frequency_preparation["familySubtraction"]["source"])
+        self.assertEqual("openstar.tess.time-frequency.run", run_request.handler_id)
 
     def test_direct_dynamic_harmonic_handler_rejects_inconsistent_period(self):
         temporary = tempfile.TemporaryDirectory()

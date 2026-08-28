@@ -646,7 +646,12 @@ def dynamic_harmonic_continuation(summary: dict[str, Any], *, request_id: str) -
         handler_id=("openstar.tess.dynamic-harmonic.frequency-refinement" if refine else
                     ("openstar.tess.time-frequency.prepare" if residual else "openstar.tess.finalize")),
         parameters=({} if refine else
-                    ({"entryReason": "DYNAMIC_HARMONIC_RESIDUAL"} if residual else
+                    ({"entryReason": (
+                        "RESOLVED_DYNAMIC_HARMONIC_RESIDUAL"
+                        if summary.get("evidenceLineage") ==
+                        "MORPHOLOGY_RESOLVED_TIME_FREQUENCY_RECOMMENDATION"
+                        else "DYNAMIC_HARMONIC_RESIDUAL")}
+                     if residual else
                      {"outputSuffix": "v20.10-dynamic-harmonic"})),
         triggered_by_stage_id=request_id,
     )
@@ -3599,7 +3604,11 @@ def build_engine(
             "RESOLVED_NONSTATIONARY_MORPHOLOGY",  # persisted v2 compatibility
         }
         continuation = morphology.get("continuationEvidence") or {}
-        if entry_reason == "DYNAMIC_HARMONIC_RESIDUAL":
+        dynamic_residual_entry = entry_reason in {
+            "DYNAMIC_HARMONIC_RESIDUAL",
+            "RESOLVED_DYNAMIC_HARMONIC_RESIDUAL",
+        }
+        if dynamic_residual_entry:
             if (dynamic_harmonic is None
                     or dynamic_harmonic.get("recommendedNextTest") != "RESIDUAL_MULTIMODE_LOCALIZATION"):
                 raise RuntimeError("Dynamic residual time-frequency analysis was not recommended.")
@@ -3619,7 +3628,7 @@ def build_engine(
                 raise RuntimeError("v20.8 requires v20.7 to recommend TIME_FREQUENCY_EVOLUTION_ANALYSIS.")
             physical_period = float(morphology["resolvedPhysicalPeriodDays"])
             harmonic_orders = (1, 2)
-        if entry_reason != "DYNAMIC_HARMONIC_RESIDUAL":
+        if not dynamic_residual_entry:
             harmonic_orders = (1, 2)
         artifact_root = store.directory_for(investigation.id) / "artifacts"
         print("🪟 Preparing sliding-window residual time-frequency search")
@@ -3640,7 +3649,7 @@ def build_engine(
             investigation_id=investigation.id,
             harmonic_orders=harmonic_orders,
             workload_id=("openstar.lomb-scargle.v1"
-                         if entry_reason == "DYNAMIC_HARMONIC_RESIDUAL" else None),
+                         if dynamic_residual_entry else None),
         )
         spec["periodReference"] = {
             "periodDays": physical_period,
@@ -3651,7 +3660,7 @@ def build_engine(
             "physicalCycleResolved": not unresolved_reference,
         }
         spec["familySubtraction"] = {
-            "source": ("PERSISTED_DYNAMIC_HARMONIC_MODEL" if entry_reason == "DYNAMIC_HARMONIC_RESIDUAL"
+            "source": ("PERSISTED_DYNAMIC_HARMONIC_MODEL" if dynamic_residual_entry
                        else "ESTABLISHED_FUNDAMENTAL_AND_FIRST_HARMONIC"),
             "harmonicOrders": list(harmonic_orders),
             "frozenDatasetsReused": True,
@@ -3934,7 +3943,6 @@ def build_engine(
                 raise RuntimeError("Dynamic harmonic modeling requires frozen datasets and a family period.")
             result = model_dynamic_harmonics(dataset_paths=paths, reference_period_days=float(period),
                                              harmonic_orders=(1, 2, 3, 4))
-            result["evidenceLineage"] = "PERSISTED_MODE_IDENTIFICATION_RECOMMENDATION"
             input_hashes = {"modeIdentification": sha256_json(mode)}
         artifact_path = (store.directory_for(investigation.id) / "artifacts" /
                          "dynamic-harmonic" / "dynamic-harmonic-v20.10.json")
