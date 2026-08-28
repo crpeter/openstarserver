@@ -1220,11 +1220,28 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
             ]
             if include_binary:
                 stages.append(("022-binary", "openstar.tess.binary-confirmation.analyze", {
-                    "independentEvidence": {"classification": "REPLICATED_ECLIPSE_LIKE_EVENT_SUPPORTED"},
-                    "linearEphemeris": {"coherent": True},
+                    "resultVersion": "2.0",
+                    "independentEvidence": {
+                        "classification": "REPLICATED_ECLIPSE_LIKE_EVENT_SUPPORTED",
+                        "supportingIndependentSectorCount": 3,
+                    },
+                    "linearEphemeris": {
+                        "coherent": True,
+                        "primaryTimingConsistent": True,
+                        "primarySectorIncluded": True,
+                        "refinedPeriodDays": 2.000125,
+                        "referenceEpoch": 1000.25,
+                        "rmsOMinusCDays": 0.0002,
+                        "maximumAbsoluteOMinusCDays": 0.0003,
+                        "timingSectors": [1, 2, 3, 4],
+                    },
                     "oppositeConjunctionEvidence": {
                         "classification": "OPPOSITE_CONJUNCTION_EVENT_UNRESOLVED"},
-                    "recommendedNextTest": "ECLIPSE_EVENT_SOURCE_LOCALIZATION"}))
+                    "recommendedNextTest": "ECLIPSE_EVENT_SOURCE_LOCALIZATION",
+                    "catalogAnswerKeyUsed": False,
+                    "physicalMechanismResolved": False,
+                    "companionNatureResolved": False,
+                }))
             if joint_model is not None:
                 stages.append(("023-joint", "openstar.tess.joint-event-phase-model.fit",
                                joint_model))
@@ -1259,6 +1276,15 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
                          physical_console)
         binary, binary_console = run(True)
         self.assertEqual("ECLIPSE_EVENT_SOURCE_LOCALIZATION", binary["recommendedNextTest"])
+        self.assertAlmostEqual(2.000125, binary["periodEvidence"]["physicalPeriodDays"])
+        self.assertAlmostEqual(
+            2.0,
+            binary["periodEvidence"]["morphologyResolvedPhysicalPeriodDays"],
+        )
+        self.assertEqual(
+            "multi-sector-replicated-event-timing-refinement",
+            binary["periodEvidence"]["candidateSource"],
+        )
         report = Path(binary["reportPath"]).read_text(encoding="utf-8")
         self.assertIn("ECLIPSE_EVENT_SOURCE_LOCALIZATION", report)
         self.assertIn("REPLICATED_ECLIPSE_LIKE_EVENT_SUPPORTED", report)
