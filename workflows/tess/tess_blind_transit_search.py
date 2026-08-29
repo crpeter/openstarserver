@@ -15,7 +15,7 @@ from typing import Any
 
 
 HANDLER_ID = "openstar.tess.blind-transit-search.analyze"
-RESULT_VERSION = "1.6"
+RESULT_VERSION = "1.7"
 ENTRY_BOUNDARY = "FULL_CHARACTERIZATION_UNRESOLVED_BROAD_VARIABILITY"
 TARGETED_BOUNDARY_ENTRY = "FULL_CHARACTERIZATION_NONRECURRENT_BOUNDARY_PERIOD"
 UNRELIABLE_PRIMARY_ENTRY = "FULL_CHARACTERIZATION_NONRECURRENT_UNRELIABLE_PRIMARY"
@@ -39,6 +39,7 @@ OVERSAMPLING = 8.0
 COARSE_FAMILY_COUNT = 12
 JOINT_REFINEMENT_FAMILY_COUNT = 4
 JOINT_REFINEMENT_HALF_WIDTH_STEPS = 12
+MAXIMUM_VALIDATED_FREQUENCY_FAMILIES = COARSE_FAMILY_COUNT
 MAXIMUM_ITERATIVE_CANDIDATES = 4
 TRANSIT_MASK_DURATION_MULTIPLIER = 1.5
 DISTINCT_FREQUENCY_TOLERANCE_STEPS = 4.0
@@ -929,7 +930,11 @@ def _resolve_alternating_cycle_alias(
     return selected_frequency, result
 
 
-def _search_grid(sectors: list[dict[str, Any]], minimum: float, maximum: float):
+def _ranked_search_grid_candidates(
+    sectors: list[dict[str, Any]], minimum: float, maximum: float,
+    maximum_candidates: int = MAXIMUM_VALIDATED_FREQUENCY_FAMILIES,
+):
+    """Return objective-ranked representatives of distinct frequency families."""
     import numpy as np
 
     longest_baseline = max(float(item["times"][-1] - item["times"][0]) for item in sectors)
@@ -1042,14 +1047,67 @@ def _search_grid(sectors: list[dict[str, Any]], minimum: float, maximum: float):
                 refined.append((score, frequency, measurements))
     if not refined:
         refined = ranked_joint
-    score, frequency, measurements = max(
-        refined, key=lambda item: (item[0], -item[1])
+
+    ranked_candidates = []
+
+    def add_distinct(candidate):
+        score, frequency, measurements = candidate
+        if any(
+            abs(float(frequency) - item[0]) <= coarse_step
+            for item in ranked_candidates
+        ):
+            return
+        ranked_candidates.append(
+            (float(frequency), float(score), measurements)
+        )
+
+    for candidate in sorted(
+        refined, key=lambda item: (item[0], -item[1]), reverse=True
+    ):
+        add_distinct(candidate)
+        if len(ranked_candidates) >= maximum_candidates:
+            break
+
+    # The original search refined only the four loudest hypotheses.  Preserve
+    # that winner, then refine the best hypothesis from every remaining coarse
+    # family so a loud but incoherent residual cannot hide a quieter recurring
+    # clock that satisfies the unchanged evidence gates.
+    for candidate in ranked_joint:
+        if len(ranked_candidates) >= maximum_candidates:
+            break
+        _, center, _ = candidate
+        if any(
+            abs(float(center) - item[0]) <= coarse_step
+            for item in ranked_candidates
+        ):
+            continue
+        local = []
+        for offset in range(
+            -JOINT_REFINEMENT_HALF_WIDTH_STEPS,
+            JOINT_REFINEMENT_HALF_WIDTH_STEPS + 1,
+        ):
+            frequency = center + offset * requested_fine_step
+            if minimum <= frequency <= maximum:
+                score, measurements, _ = _joint_box_score(sectors, frequency)
+                local.append((score, frequency, measurements))
+        add_distinct(max(
+            local or [candidate], key=lambda item: (item[0], -item[1])
+        ))
+
+    ranked_candidates.sort(
+        key=lambda item: (item[1], -item[0]), reverse=True
     )
-    actual_fine_step = requested_fine_step
-    return (
-        float(frequency), float(score), measurements,
-        coarse_step, actual_fine_step, full_span,
+    return ranked_candidates, coarse_step, requested_fine_step, full_span
+
+
+def _search_grid(sectors: list[dict[str, Any]], minimum: float, maximum: float):
+    candidates, coarse_step, fine_step, full_span = (
+        _ranked_search_grid_candidates(
+            sectors, minimum, maximum, maximum_candidates=1
+        )
     )
+    frequency, score, measurements = candidates[0]
+    return frequency, score, measurements, coarse_step, fine_step, full_span
 
 
 def _linear_ephemeris(sector_results: list[dict[str, Any]], input_period: float) -> dict[str, Any]:
@@ -1135,38 +1193,174 @@ def _frequency_bounds(primary_dataset: dict[str, Any]) -> tuple[float, float]:
     return minimum, maximum
 
 
-def _analyze_prepared_sectors(
-    sectors: list[dict[str, Any]], minimum: float, maximum: float,
-    entry_boundary: str,
+def _evaluate_frequency_hypothesis(
+    sectors: list[dict[str, Any]], minimum: float,
+    hypothesis: tuple[float, float, list[dict[str, Any]]],
 ) -> dict[str, Any]:
-    """Run one authoritative shared-clock search over prepared sectors."""
-
-    (
-        frequency, combined_score, measurements, coarse_step,
-        fine_step, full_span,
-    ) = _search_grid(sectors, minimum, maximum)
-    raw_period = 1.0 / frequency
+    """Resolve aliases and apply the authoritative evidence gates once."""
+    raw_frequency, objective_score, measurements = hypothesis
     frequency, alias_resolution = _resolve_alternating_cycle_alias(
-        sectors, measurements, frequency, minimum
+        sectors, measurements, raw_frequency, minimum
     )
     _, _, joint_search = _joint_box_score(sectors, frequency)
     (
         sector_results, primary_supported, independent_supporters,
         ephemeris, supported, support_gate,
     ) = _candidate_evidence(sectors, frequency)
-    refined = ephemeris.get("refinedPeriodDays") if supported else None
+    return {
+        "rawFrequencyPerDay": raw_frequency,
+        "rawPeriodDays": 1.0 / raw_frequency,
+        "objectiveScore": objective_score,
+        "frequencyPerDay": frequency,
+        "periodDays": 1.0 / frequency,
+        "alternatingCycleAliasResolution": alias_resolution,
+        "jointTransitSearch": joint_search,
+        "sectorResults": sector_results,
+        "primarySectorSupported": primary_supported,
+        "independentSupporters": independent_supporters,
+        "linearEphemeris": ephemeris,
+        "supported": supported,
+        "recurrenceSupportGate": support_gate,
+    }
+
+
+def _frequency_hypothesis_rejection_reasons(
+    evaluated: dict[str, Any], distinct_audit: dict[str, Any],
+) -> list[str]:
+    reasons = []
+    if evaluated["primarySectorSupported"] is not True:
+        reasons.append("PRIMARY_SECTOR_BELOW_SUPPORT_GATE")
+    if len(evaluated["independentSupporters"]) < MINIMUM_INDEPENDENT_SECTORS:
+        reasons.append("INSUFFICIENT_INDEPENDENT_SECTOR_SUPPORT")
+    ephemeris = evaluated["linearEphemeris"]
+    if ephemeris.get("coherent") is not True:
+        reasons.append(ephemeris.get("reason") or "LINEAR_EPHEMERIS_INCOHERENT")
+    if evaluated["supported"] is not True and not reasons:
+        reasons.append("RECURRENCE_SUPPORT_GATE_NOT_SATISFIED")
+    if distinct_audit.get("distinct") is not True:
+        reasons.append(distinct_audit.get("reason") or "FREQUENCY_FAMILY_NOT_DISTINCT")
+    return reasons
+
+
+def _ranked_fallback_eligible(
+    evaluated: dict[str, Any], distinct_audit: dict[str, Any],
+) -> tuple[bool, str]:
+    """Limit family trials to a pre-specified near-support boundary."""
+    if distinct_audit.get("distinct") is not True:
+        return True, "TOP_FAMILY_REPEATS_A_PREVIOUSLY_ACCEPTED_CLOCK"
+    if (
+        evaluated["primarySectorSupported"] is True
+        and len(evaluated["independentSupporters"]) >= 1
+    ):
+        return True, "TOP_FAMILY_HAS_PRIMARY_AND_PARTIAL_INDEPENDENT_SUPPORT"
+    return False, "TOP_FAMILY_HAS_NO_NEAR_RECURRENCE_SUPPORT"
+
+
+def _analyze_prepared_sectors(
+    sectors: list[dict[str, Any]], minimum: float, maximum: float,
+    entry_boundary: str,
+    excluded_frequency_families: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Select the highest-ranked frequency family that passes every gate."""
+
+    (
+        frequency, combined_score, measurements, coarse_step,
+        fine_step, full_span,
+    ) = _search_grid(sectors, minimum, maximum)
+    first_hypothesis = (frequency, combined_score, measurements)
+    excluded = excluded_frequency_families or []
+    trials = []
+
+    def evaluate_trial(
+        hypothesis: tuple[float, float, list[dict[str, Any]]], rank: int,
+    ) -> tuple[dict[str, Any], bool]:
+        evaluated = _evaluate_frequency_hypothesis(
+            sectors, minimum, hypothesis
+        )
+        candidate = {
+            "candidateIndex": rank,
+            "jointTransitSearch": evaluated["jointTransitSearch"],
+            "candidateFrequencyPerDay": evaluated["frequencyPerDay"],
+            "searchGrid": {"fineFrequencyStepPerDay": fine_step},
+        }
+        if excluded:
+            _, distinct_audit = _distinct_frequency_family(candidate, excluded)
+        else:
+            distinct_audit = {
+                "distinct": True,
+                "reason": "NO_PREVIOUSLY_ACCEPTED_FREQUENCY_FAMILIES",
+            }
+        accepted = bool(evaluated["supported"] and distinct_audit["distinct"])
+        trials.append({
+            "objectiveRank": rank,
+            "objectiveScore": evaluated["objectiveScore"],
+            "coarseFrequencyPerDay": evaluated["rawFrequencyPerDay"],
+            "coarsePeriodDays": evaluated["rawPeriodDays"],
+            "resolvedFrequencyPerDay": evaluated["frequencyPerDay"],
+            "resolvedPeriodDays": evaluated["periodDays"],
+            "accepted": accepted,
+            "rejectionReasons": (
+                [] if accepted else _frequency_hypothesis_rejection_reasons(
+                    evaluated, distinct_audit
+                )
+            ),
+            "frequencyFamilySeparation": distinct_audit,
+            "alternatingCycleAliasResolution": evaluated[
+                "alternatingCycleAliasResolution"
+            ],
+            "primarySectorSupported": evaluated["primarySectorSupported"],
+            "supportingIndependentSectors": [
+                item.get("sector")
+                for item in evaluated["independentSupporters"]
+            ],
+            "sectorResults": evaluated["sectorResults"],
+            "linearEphemeris": evaluated["linearEphemeris"],
+            "recurrenceSupportGate": evaluated["recurrenceSupportGate"],
+            "catalogAnswerKeyUsed": False,
+        })
+        return evaluated, accepted
+
+    selected, accepted = evaluate_trial(first_hypothesis, 1)
+    fallback_eligible = False
+    fallback_reason = "TOP_FAMILY_ACCEPTED"
+    if not accepted:
+        fallback_eligible, fallback_reason = _ranked_fallback_eligible(
+            selected, trials[0]["frequencyFamilySeparation"]
+        )
+    if not accepted and fallback_eligible:
+        ranked, _, _, _ = _ranked_search_grid_candidates(
+            sectors, minimum, maximum
+        )
+        for rank, hypothesis in enumerate(ranked, start=1):
+            if abs(hypothesis[0] - first_hypothesis[0]) <= coarse_step:
+                continue
+            alternative, alternative_accepted = evaluate_trial(hypothesis, rank)
+            if alternative_accepted:
+                selected, accepted = alternative, True
+                break
+
+    raw_period = selected["rawPeriodDays"]
+    frequency = selected["frequencyPerDay"]
+    alias_resolution = selected["alternatingCycleAliasResolution"]
+    joint_search = selected["jointTransitSearch"]
+    sector_results = selected["sectorResults"]
+    primary_supported = selected["primarySectorSupported"]
+    independent_supporters = selected["independentSupporters"]
+    ephemeris = selected["linearEphemeris"]
+    support_gate = selected["recurrenceSupportGate"]
+    refined = ephemeris.get("refinedPeriodDays") if accepted else None
     return {
         "resultVersion": RESULT_VERSION,
         "experiment": "SOFTWARE_BLIND_MULTI_SECTOR_BOX_PERIOD_SEARCH",
         "entryBoundary": entry_boundary,
         "classification": (
-            "REPLICATED_BLIND_TRANSIT_LIKE_CANDIDATE" if supported
+            "REPLICATED_BLIND_TRANSIT_LIKE_CANDIDATE" if accepted
             else "BLIND_TRANSIT_PERIOD_UNRESOLVED"
         ),
         "candidatePeriodDays": refined,
         "coarseCandidatePeriodDays": raw_period,
         "candidateFrequencyPerDay": (1.0 / refined if refined else None),
-        "combinedRecurrenceScore": combined_score,
+        "combinedRecurrenceScore": selected["objectiveScore"],
         "jointTransitSearch": joint_search,
         "alternatingCycleAliasResolution": alias_resolution,
         "sectorResults": sector_results,
@@ -1176,6 +1370,20 @@ def _analyze_prepared_sectors(
         "minimumSupportingIndependentSectors": MINIMUM_INDEPENDENT_SECTORS,
         "linearEphemeris": ephemeris,
         "recurrenceSupportGate": support_gate,
+        "rankedFrequencyFamilySelection": {
+            "method": "OBJECTIVE_RANKED_FAMILIES_WITH_UNCHANGED_RECURRENCE_GATES",
+            "maximumValidatedFrequencyFamilies": (
+                MAXIMUM_VALIDATED_FREQUENCY_FAMILIES
+            ),
+            "testedFamilyCount": len(trials),
+            "rankedFallbackEligible": fallback_eligible,
+            "rankedFallbackReason": fallback_reason,
+            "selectedObjectiveRank": next((
+                item["objectiveRank"] for item in trials if item["accepted"]
+            ), None),
+            "trials": trials,
+            "catalogAnswerKeyUsed": False,
+        },
         "searchGrid": {
             "minimumFrequencyPerDay": minimum,
             "maximumFrequencyPerDay": maximum,
@@ -1192,21 +1400,24 @@ def _analyze_prepared_sectors(
             ),
             "phaseBinCount": PHASE_BIN_COUNT,
             "dutyCycles": list(DUTY_CYCLES),
+            "maximumValidatedFrequencyFamilies": (
+                MAXIMUM_VALIDATED_FREQUENCY_FAMILIES
+            ),
         },
         "physicalCycleResolved": False,
         "companionNatureResolved": False,
         "catalogAnswerKeyUsed": False,
         "claimDecision": {
-            "claim": "CANDIDATE_PERIOD" if supported else "HUMAN_REVIEW_REQUIRED",
+            "claim": "CANDIDATE_PERIOD" if accepted else "HUMAN_REVIEW_REQUIRED",
             "rationale": ([
                 "A software-blind box search recovered the same narrow dimming clock in the primary and at least two frozen independent TESS sectors.",
                 "The event period is a transit-like candidate; source attribution and companion nature remain unresolved.",
-            ] if supported else [
+            ] if accepted else [
                 "The full-characterization variability path did not yield a coherently repeated blind narrow-event period.",
             ]),
         },
         "recommendedNextTest": (
-            "ADDITIONAL_INDEPENDENT_SECTOR_TRANSIT_CONFIRMATION" if supported
+            "ADDITIONAL_INDEPENDENT_SECTOR_TRANSIT_CONFIRMATION" if accepted
             else "HUMAN_SCIENTIFIC_REVIEW"
         ),
     }
@@ -1258,6 +1469,9 @@ def _candidate_signal(result: dict[str, Any], candidate_index: int) -> dict[str,
         ),
         "linearEphemeris": result.get("linearEphemeris"),
         "recurrenceSupportGate": result.get("recurrenceSupportGate"),
+        "rankedFrequencyFamilySelection": result.get(
+            "rankedFrequencyFamilySelection"
+        ),
         "searchGrid": result.get("searchGrid"),
         "physicalCycleResolved": False,
         "companionNatureResolved": False,
@@ -1453,7 +1667,11 @@ def analyze_iterative_blind_transit_search(
                 break
             accepted_signals[-1]["residualSearchMask"] = mask_audit
             residual_result = _analyze_prepared_sectors(
-                working, minimum, maximum, entry_boundary
+                working,
+                minimum,
+                maximum,
+                entry_boundary,
+                excluded_frequency_families=accepted_signals,
             )
             iteration = {
                 "iteration": len(accepted_results) + 1,
@@ -1481,6 +1699,9 @@ def analyze_iterative_blind_transit_search(
                     "linearEphemeris": residual_result.get("linearEphemeris"),
                     "recurrenceSupportGate": residual_result.get(
                         "recurrenceSupportGate"
+                    ),
+                    "rankedFrequencyFamilySelection": residual_result.get(
+                        "rankedFrequencyFamilySelection"
                     ),
                     "catalogAnswerKeyUsed": False,
                 },
