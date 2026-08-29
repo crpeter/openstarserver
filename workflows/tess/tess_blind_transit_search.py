@@ -15,7 +15,7 @@ from typing import Any
 
 
 HANDLER_ID = "openstar.tess.blind-transit-search.analyze"
-RESULT_VERSION = "1.9"
+RESULT_VERSION = "1.10"
 ENTRY_BOUNDARY = "FULL_CHARACTERIZATION_UNRESOLVED_BROAD_VARIABILITY"
 TARGETED_BOUNDARY_ENTRY = "FULL_CHARACTERIZATION_NONRECURRENT_BOUNDARY_PERIOD"
 UNRELIABLE_PRIMARY_ENTRY = "FULL_CHARACTERIZATION_NONRECURRENT_UNRELIABLE_PRIMARY"
@@ -1880,6 +1880,34 @@ def analyze_iterative_blind_transit_search(
                     "subtractionSearchClassification": (
                         subtraction_result.get("classification")
                     ),
+                    "subtractionCandidateEvidence": {
+                        "coarseCandidatePeriodDays": subtraction_result.get(
+                            "coarseCandidatePeriodDays"
+                        ),
+                        "jointTransitSearch": subtraction_result.get(
+                            "jointTransitSearch"
+                        ),
+                        "alternatingCycleAliasResolution": (
+                            subtraction_result.get(
+                                "alternatingCycleAliasResolution"
+                            )
+                        ),
+                        "sectorResults": subtraction_result.get(
+                            "sectorResults"
+                        ),
+                        "linearEphemeris": subtraction_result.get(
+                            "linearEphemeris"
+                        ),
+                        "recurrenceSupportGate": subtraction_result.get(
+                            "recurrenceSupportGate"
+                        ),
+                        "rankedFrequencyFamilySelection": (
+                            subtraction_result.get(
+                                "rankedFrequencyFamilySelection"
+                            )
+                        ),
+                        "catalogAnswerKeyUsed": False,
+                    },
                     "selected": residual_search_method
                     == "ACCEPTED_BOX_MODEL_SUBTRACTION_FALLBACK",
                 } if subtraction_audit is not None else None),

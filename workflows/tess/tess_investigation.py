@@ -303,6 +303,18 @@ SOFTWARE_VERSION = "20.36"
 ADAPTIVE_BLIND_TRANSIT_ADDITIONAL_SECTORS = 8
 
 
+def _iterative_blind_sector_extension_warranted(result: dict[str, Any]) -> bool:
+    """Broaden a replicated multi-clock search once when its residual stalls."""
+    iterative = result.get("iterativeSearch") or {}
+    return bool(
+        result.get("classification")
+        == "REPLICATED_BLIND_TRANSIT_LIKE_CANDIDATE"
+        and len(result.get("candidateSignals") or []) >= 2
+        and iterative.get("terminationReason")
+        == "NEXT_RESIDUAL_SIGNAL_UNRESOLVED"
+    )
+
+
 def _stage(investigation: Investigation, stage_id: str):
     for stage in investigation.stages:
         if stage.id == stage_id:
@@ -3031,6 +3043,132 @@ def build_engine(
                 targeted_interpretation=targeted,
                 initial_result=result,
             )
+        if (
+            extension_spec is None
+            and _iterative_blind_sector_extension_warranted(result)
+        ):
+            consumed = {
+                int(item["sector"])
+                for item in analysis_spec.get("preparedSectors") or []
+                if item.get("sector") is not None
+            }
+            remaining = [
+                int(sector)
+                for sector in independent_prepare.get("candidateSectors") or []
+                if int(sector) not in consumed
+            ]
+            if remaining:
+                print("🔭 Extending replicated multi-clock transit evidence")
+                print(
+                    "   residual signal unresolved after multiple accepted clocks; "
+                    "freezing up to "
+                    f"{ADAPTIVE_BLIND_TRANSIT_ADDITIONAL_SECTORS} additional "
+                    "balanced sectors"
+                )
+                initial_iterative_result = result
+                artifact_root = store.directory_for(investigation.id) / "artifacts"
+                try:
+                    extension_spec = build_independent_sector_project(
+                        source_project_path=prepared["sourceProjectPath"],
+                        source_dataset_entry=prepared["sourceDatasetEntry"],
+                        tic_id=int(prepared["ticID"]),
+                        primary_sector=prepared.get("sector"),
+                        target_period_days=float(
+                            independent_prepare["targetPeriodDays"]
+                        ),
+                        candidate_sectors=remaining,
+                        output_dir=artifact_root,
+                        investigation_id=investigation.id,
+                        maximum_sectors=(
+                            ADAPTIVE_BLIND_TRANSIT_ADDITIONAL_SECTORS
+                        ),
+                        excluded_sectors=list(consumed),
+                        artifact_subdirectory=(
+                            "blind-transit-extension-sectors"
+                        ),
+                        project_suffix="blind-transit-extension-v1",
+                    )
+                except TessArchiveInfrastructureError as error:
+                    raise RetryableExecutionError(
+                        str(error), result=error.diagnostics,
+                        input_hashes={
+                            "initialIterativeBlindTransitSearch": sha256_json(
+                                initial_iterative_result
+                            ),
+                            "independentPreparation": sha256_json(
+                                independent_prepare
+                            ),
+                        },
+                    ) from error
+                added = extension_spec.get("preparedSectors") or []
+                print(
+                    "   additional frozen sectors: "
+                    f"{[item.get('sector') for item in added]}"
+                )
+                if added:
+                    analysis_spec = dict(independent_prepare)
+                    analysis_spec["preparedSectors"] = [
+                        *(independent_prepare.get("preparedSectors") or []),
+                        *added,
+                    ]
+                    expanded_first = analyze_blind_transit_search(
+                        primary_dataset_path=prepared["datasetPath"],
+                        independent_spec=analysis_spec,
+                        morphology=morphology,
+                        broad_interpretation=broad,
+                        targeted_interpretation=targeted,
+                    )
+                    expanded_result = expanded_first
+                    if expanded_first.get("classification") == (
+                        "REPLICATED_BLIND_TRANSIT_LIKE_CANDIDATE"
+                    ):
+                        expanded_result = analyze_iterative_blind_transit_search(
+                            primary_dataset_path=prepared["datasetPath"],
+                            independent_spec=analysis_spec,
+                            morphology=morphology,
+                            broad_interpretation=broad,
+                            targeted_interpretation=targeted,
+                            initial_result=expanded_first,
+                        )
+                    initial_count = len(
+                        initial_iterative_result.get("candidateSignals") or []
+                    )
+                    expanded_count = len(
+                        expanded_result.get("candidateSignals") or []
+                    )
+                    expanded_selected = expanded_count >= initial_count
+                    if expanded_selected:
+                        result = expanded_result
+                    result = dict(result)
+                    result["adaptiveSectorExtension"] = {
+                        "attempted": True,
+                        "reason": (
+                            "MULTI_CLOCK_ITERATIVE_RESIDUAL_SIGNAL_UNRESOLVED"
+                        ),
+                        "initialClassification": (
+                            initial_iterative_result.get("classification")
+                        ),
+                        "initialAcceptedCandidateCount": initial_count,
+                        "initialAcceptedCandidatePeriodsDays": [
+                            item.get("candidatePeriodDays")
+                            for item in initial_iterative_result.get(
+                                "candidateSignals"
+                            ) or []
+                        ],
+                        "initialIterativeTerminationReason": (
+                            (
+                                initial_iterative_result.get("iterativeSearch")
+                                or {}
+                            ).get("terminationReason")
+                        ),
+                        "initialPreparedSectors": sorted(consumed),
+                        "additionalPreparedSectors": [
+                            item.get("sector") for item in added
+                        ],
+                        "expandedAcceptedCandidateCount": expanded_count,
+                        "expandedResultSelected": expanded_selected,
+                        "catalogAnswerKeyUsed": False,
+                    }
         print(f"   classification: {result.get('classification')}")
         print(f"   candidate period: {result.get('candidatePeriodDays')} days")
         candidate_signals = result.get("candidateSignals") or []

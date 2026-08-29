@@ -1601,6 +1601,133 @@ class BlindTransitSearchTests(unittest.TestCase):
         ])
         self.assertEqual("openstar.tess.finalize", next_request.handler_id)
 
+    def test_multiclock_residual_stall_extends_sectors_and_reanalyzes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = InvestigationStore(root / "investigations")
+            investigation = store.create(
+                "adaptive-multiclock-search", WORKFLOW_ID, WORKFLOW_VERSION
+            )
+            source_project = root / "source-project.json"
+            source_project.write_text("{}", encoding="utf-8")
+            primary = root / "primary.json"
+            primary.write_text("{}", encoding="utf-8")
+            existing = []
+            for sector in (2, 3):
+                path = root / f"sector-{sector}.json"
+                path.write_text("{}", encoding="utf-8")
+                existing.append({"sector": sector, "datasetPath": str(path)})
+            added_path = root / "sector-4.json"
+            added_path.write_text("{}", encoding="utf-8")
+            extension_project = root / "extension-project.json"
+            extension_project.write_text("{}", encoding="utf-8")
+            for stage in (
+                ("001-prepare-target", "openstar.tess.prepare-target", {
+                    "datasetPath": str(primary),
+                    "sourceProjectPath": str(source_project),
+                    "sourceDatasetEntry": {"id": "target"},
+                    "ticID": 1,
+                    "sector": 1,
+                }),
+                ("002-independent", "openstar.tess.independent.prepare", {
+                    "investigationGoal": "FULL_CHARACTERIZATION",
+                    "targetPeriodDays": 5.5,
+                    "candidateSectors": [2, 3, 4, 5],
+                    "preparedSectors": existing,
+                }),
+                ("003-interpret", "openstar.tess.independent.interpret", {
+                    "claimDecision": {"claim": "HUMAN_REVIEW_REQUIRED"},
+                    "primaryReliable": False,
+                }),
+            ):
+                investigation = self._complete(store, investigation, *stage)
+
+            def first(period):
+                return {
+                    "classification": "REPLICATED_BLIND_TRANSIT_LIKE_CANDIDATE",
+                    "candidatePeriodDays": period,
+                    "supportingIndependentSectors": [2, 3],
+                    "linearEphemeris": {"coherent": True},
+                    "recommendedNextTest": (
+                        "ADDITIONAL_INDEPENDENT_SECTOR_TRANSIT_CONFIRMATION"
+                    ),
+                }
+
+            initial_first = first(2.0)
+            stalled = {
+                **initial_first,
+                "candidateSignals": [
+                    {"candidateIndex": 1, "candidatePeriodDays": 2.0},
+                    {"candidateIndex": 2, "candidatePeriodDays": 3.0},
+                ],
+                "iterativeSearch": {
+                    "acceptedCandidateCount": 2,
+                    "terminationReason": "NEXT_RESIDUAL_SIGNAL_UNRESOLVED",
+                },
+            }
+            expanded_first = first(2.0)
+            expanded = {
+                **expanded_first,
+                "candidateSignals": [
+                    {"candidateIndex": 1, "candidatePeriodDays": 2.0},
+                    {"candidateIndex": 2, "candidatePeriodDays": 3.0},
+                    {"candidateIndex": 3, "candidatePeriodDays": 5.0},
+                ],
+                "iterativeSearch": {
+                    "acceptedCandidateCount": 3,
+                    "terminationReason": "NEXT_RESIDUAL_SIGNAL_UNRESOLVED",
+                },
+            }
+            extension = {
+                "preparedSectors": [
+                    {"sector": 4, "datasetPath": str(added_path)}
+                ],
+                "projectPath": str(extension_project),
+            }
+            engine = build_engine(
+                store, types.SimpleNamespace(), poll_interval=0, timeout=None
+            )
+            engine.chain_stages = False
+            with mock.patch(
+                "workflows.tess.tess_investigation.analyze_blind_transit_search",
+                side_effect=[initial_first, expanded_first],
+            ) as analyze_search, mock.patch(
+                "workflows.tess.tess_investigation."
+                "analyze_iterative_blind_transit_search",
+                side_effect=[stalled, expanded],
+            ) as iterative_search, mock.patch(
+                "workflows.tess.tess_investigation.build_independent_sector_project",
+                return_value=extension,
+            ) as build_extension:
+                completed, next_request = engine.run_stage(
+                    investigation,
+                    StageRequest("004-blind", HANDLER_ID, {}, "003-interpret"),
+                    software_id="test",
+                    software_version="adaptive-multiclock-extension",
+                )
+
+        result = completed.stages[-1].result
+        self.assertEqual(3, len(result["candidateSignals"]))
+        self.assertEqual(2, analyze_search.call_count)
+        self.assertEqual(2, iterative_search.call_count)
+        self.assertEqual(8, build_extension.call_args.kwargs["maximum_sectors"])
+        expanded_spec = iterative_search.call_args_list[1].kwargs[
+            "independent_spec"
+        ]
+        self.assertEqual([2, 3, 4], [
+            item["sector"] for item in expanded_spec["preparedSectors"]
+        ])
+        audit = result["adaptiveSectorExtension"]
+        self.assertEqual(
+            "MULTI_CLOCK_ITERATIVE_RESIDUAL_SIGNAL_UNRESOLVED",
+            audit["reason"],
+        )
+        self.assertEqual(2, audit["initialAcceptedCandidateCount"])
+        self.assertEqual(3, audit["expandedAcceptedCandidateCount"])
+        self.assertTrue(audit["expandedResultSelected"])
+        self.assertFalse(audit["catalogAnswerKeyUsed"])
+        self.assertEqual("openstar.tess.finalize", next_request.handler_id)
+
     def test_unresolved_full_characterization_morphology_routes_to_blind_search(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
