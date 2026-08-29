@@ -15,7 +15,7 @@ from typing import Any
 
 
 HANDLER_ID = "openstar.tess.blind-transit-search.analyze"
-RESULT_VERSION = "1.8"
+RESULT_VERSION = "1.9"
 ENTRY_BOUNDARY = "FULL_CHARACTERIZATION_UNRESOLVED_BROAD_VARIABILITY"
 TARGETED_BOUNDARY_ENTRY = "FULL_CHARACTERIZATION_NONRECURRENT_BOUNDARY_PERIOD"
 UNRELIABLE_PRIMARY_ENTRY = "FULL_CHARACTERIZATION_NONRECURRENT_UNRELIABLE_PRIMARY"
@@ -43,6 +43,7 @@ MAXIMUM_VALIDATED_FREQUENCY_FAMILIES = COARSE_FAMILY_COUNT
 MAXIMUM_ITERATIVE_CANDIDATES = 4
 TRANSIT_MASK_DURATION_MULTIPLIER = 1.5
 DISTINCT_FREQUENCY_TOLERANCE_STEPS = 4.0
+DISTINCT_FREQUENCY_COARSE_STEPS = 1.0
 MAXIMUM_CYCLE_ALIAS_MULTIPLIER = 4
 MINIMUM_PARITY_CYCLES = 2
 MINIMUM_PARITY_SNR_SEPARATION = 4.0
@@ -1265,8 +1266,8 @@ def _ranked_fallback_eligible(
     if distinct_audit.get("distinct") is not True:
         return (
             True,
-            "TOP_FAMILY_REPEATS_A_PREVIOUSLY_ACCEPTED_CLOCK",
-            False,
+            "TOP_FAMILY_REPEATS_ACCEPTED_CLOCK_TRY_INTEGER_CYCLE_ALIASES_ONLY",
+            True,
         )
     if (
         evaluated["primarySectorSupported"] is True
@@ -1310,7 +1311,10 @@ def _analyze_prepared_sectors(
             "candidateIndex": rank,
             "jointTransitSearch": evaluated["jointTransitSearch"],
             "candidateFrequencyPerDay": evaluated["frequencyPerDay"],
-            "searchGrid": {"fineFrequencyStepPerDay": fine_step},
+            "searchGrid": {
+                "coarseFrequencyStepPerDay": coarse_step,
+                "fineFrequencyStepPerDay": fine_step,
+            },
         }
         if excluded:
             _, distinct_audit = _distinct_frequency_family(candidate, excluded)
@@ -1608,6 +1612,102 @@ def _mask_candidate_clock(
     }
 
 
+def _subtract_candidate_clocks(
+    sectors: list[dict[str, Any]], results: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Subtract accepted sector-specific box models without deleting samples."""
+    import numpy as np
+
+    residualized = []
+    sector_audit = []
+    for sector in sectors:
+        residual = np.array(sector["residual"], dtype=float, copy=True)
+        clock_audit = []
+        for candidate_index, result in enumerate(results, start=1):
+            ephemeris = result.get("linearEphemeris") or {}
+            joint = result.get("jointTransitSearch") or {}
+            period = float(
+                ephemeris.get("refinedPeriodDays")
+                or result["candidatePeriodDays"]
+            )
+            reference_epoch = ephemeris.get("referenceEpoch")
+            if reference_epoch is None:
+                frequency = float(joint.get("frequencyPerDay") or 1.0 / period)
+                reference_epoch = float(joint["eventPhase"]) / frequency
+            reference_epoch = float(reference_epoch)
+            measurement = next((
+                item for item in result.get("sectorResults") or []
+                if item.get("datasetID") == sector.get("datasetID")
+            ), None)
+            if measurement is None:
+                measurement = next((
+                    item for item in result.get("sectorResults") or []
+                    if item.get("role") == sector.get("role")
+                    and item.get("sector") == sector.get("sector")
+                ), None)
+            duration = float(
+                (measurement or {}).get("durationDays")
+                or joint.get("durationDays")
+                or 0.0
+            )
+            depth = float((measurement or {}).get("depthStandardized") or 0.0)
+            valid = bool(
+                math.isfinite(period)
+                and period > 0.0
+                and math.isfinite(reference_epoch)
+                and math.isfinite(duration)
+                and duration > 0.0
+                and math.isfinite(depth)
+                and depth > 0.0
+            )
+            adjusted = 0
+            if valid:
+                distance = np.abs(
+                    np.remainder(
+                        sector["times"] - reference_epoch + period / 2.0,
+                        period,
+                    ) - period / 2.0
+                )
+                inside = distance <= duration / 2.0
+                adjusted = int(np.count_nonzero(inside))
+                residual[inside] += depth
+            clock_audit.append({
+                "candidateIndex": candidate_index,
+                "periodDays": period,
+                "referenceEpoch": reference_epoch,
+                "durationDays": duration,
+                "depthStandardized": depth,
+                "modelApplied": valid,
+                "adjustedSampleCount": adjusted,
+            })
+        residual -= np.median(residual)
+        updated = dict(sector)
+        updated["residual"] = residual
+        updated["sigma"] = _robust_scatter(residual)
+        residualized.append(updated)
+        sector_audit.append({
+            "role": sector["role"],
+            "sector": sector["sector"],
+            "datasetID": sector["datasetID"],
+            "sampleCount": len(residual),
+            "clocks": clock_audit,
+        })
+    return residualized, {
+        "method": "SUBTRACT_ACCEPTED_SECTOR_BOX_MODELS_WITHOUT_DELETING_SAMPLES",
+        "acceptedClockCount": len(results),
+        "perSector": sector_audit,
+        "totalAdjustedSampleCount": sum(
+            clock["adjustedSampleCount"]
+            for item in sector_audit
+            for clock in item["clocks"]
+        ),
+        "allOriginalSamplesRetained": True,
+        "detrendingRecomputed": False,
+        "robustScatterRecomputedAfterSubtraction": True,
+        "catalogAnswerKeyUsed": False,
+    }
+
+
 def _search_frequency(result: dict[str, Any]) -> float | None:
     joint = result.get("jointTransitSearch") or {}
     value = joint.get("frequencyPerDay") or result.get("candidateFrequencyPerDay")
@@ -1627,6 +1727,9 @@ def _distinct_frequency_family(
     fine_step = float((candidate.get("searchGrid") or {}).get(
         "fineFrequencyStepPerDay", 0.0
     ))
+    coarse_step = float((candidate.get("searchGrid") or {}).get(
+        "coarseFrequencyStepPerDay", 0.0
+    ))
     comparisons = []
     harmonic_multipliers = (0.25, 1.0 / 3.0, 0.5, 1.0, 2.0, 3.0, 4.0)
     for prior in accepted:
@@ -1636,8 +1739,16 @@ def _distinct_frequency_family(
         prior_step = float((prior.get("searchGrid") or {}).get(
             "fineFrequencyStepPerDay", 0.0
         ))
-        tolerance = DISTINCT_FREQUENCY_TOLERANCE_STEPS * max(
-            fine_step, prior_step, 1e-12
+        prior_coarse_step = float((prior.get("searchGrid") or {}).get(
+            "coarseFrequencyStepPerDay", 0.0
+        ))
+        tolerance = max(
+            DISTINCT_FREQUENCY_TOLERANCE_STEPS * max(
+                fine_step, prior_step, 1e-12
+            ),
+            DISTINCT_FREQUENCY_COARSE_STEPS * max(
+                coarse_step, prior_coarse_step, 0.0
+            ),
         )
         for multiplier in harmonic_multipliers:
             distance = abs(frequency - multiplier * prior_frequency)
@@ -1725,6 +1836,32 @@ def analyze_iterative_blind_transit_search(
                 entry_boundary,
                 excluded_frequency_families=accepted_signals,
             )
+            residual_search_method = "CUMULATIVE_TRANSIT_WINDOW_MASKING"
+            subtraction_audit = None
+            masked_result = residual_result
+            if (
+                len(accepted_results) >= 2
+                and residual_result.get("classification")
+                != "REPLICATED_BLIND_TRANSIT_LIKE_CANDIDATE"
+            ):
+                subtracted, subtraction_audit = _subtract_candidate_clocks(
+                    sectors, accepted_results
+                )
+                subtraction_result = _analyze_prepared_sectors(
+                    subtracted,
+                    minimum,
+                    maximum,
+                    entry_boundary,
+                    excluded_frequency_families=accepted_signals,
+                )
+                if subtraction_result.get("classification") == (
+                    "REPLICATED_BLIND_TRANSIT_LIKE_CANDIDATE"
+                ):
+                    residual_result = subtraction_result
+                    working = subtracted
+                    residual_search_method = (
+                        "ACCEPTED_BOX_MODEL_SUBTRACTION_FALLBACK"
+                    )
             iteration = {
                 "iteration": len(accepted_results) + 1,
                 "accepted": False,
@@ -1734,6 +1871,18 @@ def analyze_iterative_blind_transit_search(
                     "coarseCandidatePeriodDays"
                 ),
                 "maskingAppliedBeforeSearch": mask_audit,
+                "residualSearchMethod": residual_search_method,
+                "boxModelSubtractionFallback": ({
+                    **subtraction_audit,
+                    "maskedSearchClassification": masked_result.get(
+                        "classification"
+                    ),
+                    "subtractionSearchClassification": (
+                        subtraction_result.get("classification")
+                    ),
+                    "selected": residual_search_method
+                    == "ACCEPTED_BOX_MODEL_SUBTRACTION_FALLBACK",
+                } if subtraction_audit is not None else None),
                 "candidateEvidence": {
                     "jointTransitSearch": residual_result.get(
                         "jointTransitSearch"
@@ -1786,12 +1935,16 @@ def analyze_iterative_blind_transit_search(
     enriched = dict(first)
     enriched["candidateSignals"] = accepted_signals
     enriched["iterativeSearch"] = {
-        "method": "REPEATED_SHARED_CLOCK_SEARCH_AFTER_TRANSIT_WINDOW_MASKING",
+        "method": (
+            "REPEATED_SHARED_CLOCK_SEARCH_WITH_MASKING_AND_BOX_MODEL_"
+            "SUBTRACTION_RECOVERY"
+        ),
         "maximumCandidateCount": maximum_candidates,
         "acceptedCandidateCount": len(accepted_signals),
         "terminationReason": termination_reason,
         "maskDurationMultiplier": TRANSIT_MASK_DURATION_MULTIPLIER,
         "exactHarmonicToleranceFineSteps": DISTINCT_FREQUENCY_TOLERANCE_STEPS,
+        "exactHarmonicToleranceCoarseSteps": DISTINCT_FREQUENCY_COARSE_STEPS,
         "iterations": iterations,
         "catalogAnswerKeyUsed": False,
     }

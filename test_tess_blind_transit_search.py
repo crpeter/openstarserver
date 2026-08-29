@@ -312,7 +312,7 @@ class BlindTransitSearchTests(unittest.TestCase):
                 broad_interpretation={
                     "claimDecision": {"claim": "CANDIDATE_PERIOD"}
                 },
-                maximum_candidates=2,
+                maximum_candidates=4,
             )
 
         candidates = result["candidateSignals"]
@@ -333,8 +333,18 @@ class BlindTransitSearchTests(unittest.TestCase):
             "frequencyFamilySeparation"
         ]["distinct"])
         self.assertEqual(
-            "MAXIMUM_CANDIDATE_COUNT_REACHED",
+            "NEXT_RESIDUAL_SIGNAL_UNRESOLVED",
             result["iterativeSearch"]["terminationReason"],
+        )
+        stopping_iteration = result["iterativeSearch"]["iterations"][-1]
+        self.assertEqual(
+            "BLIND_TRANSIT_PERIOD_UNRESOLVED",
+            stopping_iteration["boxModelSubtractionFallback"][
+                "subtractionSearchClassification"
+            ],
+        )
+        self.assertFalse(
+            stopping_iteration["boxModelSubtractionFallback"]["selected"]
         )
         self.assertTrue(all(
             item["linearEphemeris"]["coherent"] for item in candidates
@@ -613,6 +623,194 @@ class BlindTransitSearchTests(unittest.TestCase):
         self.assertTrue(distinct)
         self.assertEqual("SEPARATE_FREQUENCY_FAMILY", audit["reason"])
 
+        shifted_refit = {
+            "jointTransitSearch": {"frequencyPerDay": 0.50004},
+            "searchGrid": {
+                "coarseFrequencyStepPerDay": 0.001,
+                "fineFrequencyStepPerDay": 0.000001,
+            },
+        }
+        prior_with_coarse_resolution = {
+            **prior,
+            "searchGrid": {
+                "coarseFrequencyStepPerDay": 0.001,
+                "fineFrequencyStepPerDay": 0.000001,
+            },
+        }
+        distinct, audit = tess_blind_transit_search._distinct_frequency_family(
+            shifted_refit, [prior_with_coarse_resolution]
+        )
+        self.assertFalse(distinct)
+        self.assertEqual(
+            "DUPLICATE_OR_EXACT_HARMONIC_FREQUENCY_FAMILY", audit["reason"]
+        )
+
+    def test_box_model_subtraction_preserves_overlapping_event_samples(self):
+        import numpy as np
+
+        times = np.arange(0.0, 10.0, 0.01)
+        residual = 0.01 * np.sin(2.0 * np.pi * times / 0.37)
+        period = 2.0
+        epoch = 0.5
+        duration = 0.1
+        inside = np.abs(
+            np.remainder(times - epoch + period / 2.0, period)
+            - period / 2.0
+        ) <= duration / 2.0
+        residual[inside] -= 1.0
+        overlap_index = int(np.argmin(np.abs(times - 4.5)))
+        residual[overlap_index] -= 0.5
+        sectors = [{
+            "role": "PRIMARY",
+            "sector": 1,
+            "datasetID": "sector-1",
+            "times": times,
+            "residual": residual,
+            "sigma": 0.01,
+            "origin": 0.0,
+            "cadence": 0.01,
+            "detrendWindowSamples": 75,
+        }]
+        result = {
+            "candidatePeriodDays": period,
+            "linearEphemeris": {
+                "refinedPeriodDays": period,
+                "referenceEpoch": epoch,
+            },
+            "jointTransitSearch": {
+                "frequencyPerDay": 1.0 / period,
+                "eventPhase": epoch / period,
+                "durationDays": duration,
+            },
+            "sectorResults": [{
+                "role": "PRIMARY",
+                "sector": 1,
+                "datasetID": "sector-1",
+                "durationDays": duration,
+                "depthStandardized": 1.0,
+            }],
+        }
+
+        subtracted, audit = tess_blind_transit_search._subtract_candidate_clocks(
+            sectors, [result]
+        )
+        masked, _ = tess_blind_transit_search._mask_candidate_clock(
+            sectors, result
+        )
+
+        self.assertEqual(len(times), len(subtracted[0]["times"]))
+        self.assertLess(subtracted[0]["residual"][overlap_index], -0.4)
+        self.assertFalse(np.any(np.isclose(masked[0]["times"], 4.5)))
+        self.assertTrue(audit["allOriginalSamplesRetained"])
+        self.assertGreater(audit["totalAdjustedSampleCount"], 0)
+
+    def test_iterative_search_can_select_box_model_subtraction_recovery(self):
+        def candidate(period):
+            return {
+                "classification": "REPLICATED_BLIND_TRANSIT_LIKE_CANDIDATE",
+                "candidatePeriodDays": period,
+                "coarseCandidatePeriodDays": period,
+                "candidateFrequencyPerDay": 1.0 / period,
+                "jointTransitSearch": {
+                    "frequencyPerDay": 1.0 / period,
+                    "eventPhase": 0.1,
+                    "durationDays": 0.05,
+                },
+                "sectorResults": [],
+                "primarySectorSupported": True,
+                "supportingIndependentSectorCount": 2,
+                "supportingIndependentSectors": [2, 3],
+                "linearEphemeris": {
+                    "coherent": True,
+                    "refinedPeriodDays": period,
+                    "referenceEpoch": 0.2,
+                },
+                "recurrenceSupportGate": {
+                    "mode": "STRICT_INDIVIDUAL_SECTORS",
+                },
+                "searchGrid": {
+                    "coarseFrequencyStepPerDay": 0.001,
+                    "fineFrequencyStepPerDay": 0.000001,
+                },
+            }
+
+        first = candidate(2.0)
+        second = candidate(3.0)
+        unresolved = {
+            "classification": "BLIND_TRANSIT_PERIOD_UNRESOLVED",
+            "rankedFrequencyFamilySelection": {"trials": []},
+        }
+        third = candidate(5.0)
+        mask_audit = {"method": "test-mask", "catalogAnswerKeyUsed": False}
+        subtraction_audit = {
+            "method": "test-subtraction",
+            "catalogAnswerKeyUsed": False,
+        }
+        independent = {
+            "investigationGoal": "FULL_CHARACTERIZATION",
+            "preparedSectors": [
+                {"datasetPath": "/two"},
+                {"datasetPath": "/three"},
+            ],
+        }
+        with (
+            mock.patch.object(
+                tess_blind_transit_search,
+                "_prepare_analysis_sectors",
+                return_value=([{"role": "PRIMARY"}], {}),
+            ),
+            mock.patch.object(
+                tess_blind_transit_search,
+                "_frequency_bounds",
+                return_value=(0.1, 5.0),
+            ),
+            mock.patch.object(
+                tess_blind_transit_search,
+                "_mask_candidate_clock",
+                return_value=([{"role": "PRIMARY"}], mask_audit),
+            ),
+            mock.patch.object(
+                tess_blind_transit_search,
+                "_subtract_candidate_clocks",
+                return_value=([{"role": "PRIMARY"}], subtraction_audit),
+            ),
+            mock.patch.object(
+                tess_blind_transit_search,
+                "_analyze_prepared_sectors",
+                side_effect=(second, unresolved, third),
+            ),
+            mock.patch.object(
+                tess_blind_transit_search,
+                "_distinct_frequency_family",
+                return_value=(True, {"distinct": True}),
+            ),
+        ):
+            result = analyze_iterative_blind_transit_search(
+                primary_dataset_path="/one",
+                independent_spec=independent,
+                morphology={"physicalCycleResolved": False},
+                broad_interpretation={
+                    "claimDecision": {"claim": "CANDIDATE_PERIOD"}
+                },
+                initial_result=first,
+                maximum_candidates=3,
+            )
+
+        self.assertEqual(3, len(result["candidateSignals"]))
+        recovered = result["iterativeSearch"]["iterations"][-1]
+        self.assertTrue(recovered["accepted"])
+        self.assertEqual(
+            "ACCEPTED_BOX_MODEL_SUBTRACTION_FALLBACK",
+            recovered["residualSearchMethod"],
+        )
+        self.assertTrue(recovered["boxModelSubtractionFallback"]["selected"])
+        self.assertEqual(
+            "REPLICATED_BLIND_TRANSIT_LIKE_CANDIDATE",
+            recovered["boxModelSubtractionFallback"][
+                "subtractionSearchClassification"
+            ],
+        )
+
     def test_iterative_search_stops_after_masking_a_single_real_clock(self):
         with tempfile.TemporaryDirectory() as temporary:
             primary, independent, morphology, broad = self._inputs(
@@ -649,7 +847,7 @@ class BlindTransitSearchTests(unittest.TestCase):
         ]
         self.assertTrue(selection["rankedFallbackEligible"])
         self.assertEqual(
-            "TOP_FAMILY_HAS_NO_NEAR_SUPPORT_TRY_INTEGER_CYCLE_ALIASES_ONLY",
+            "TOP_FAMILY_REPEATS_ACCEPTED_CLOCK_TRY_INTEGER_CYCLE_ALIASES_ONLY",
             selection["rankedFallbackReason"],
         )
         self.assertTrue(
