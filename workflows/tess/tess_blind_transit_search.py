@@ -15,7 +15,7 @@ from typing import Any
 
 
 HANDLER_ID = "openstar.tess.blind-transit-search.analyze"
-RESULT_VERSION = "1.10"
+RESULT_VERSION = "1.11"
 ENTRY_BOUNDARY = "FULL_CHARACTERIZATION_UNRESOLVED_BROAD_VARIABILITY"
 TARGETED_BOUNDARY_ENTRY = "FULL_CHARACTERIZATION_NONRECURRENT_BOUNDARY_PERIOD"
 UNRELIABLE_PRIMARY_ENTRY = "FULL_CHARACTERIZATION_NONRECURRENT_UNRELIABLE_PRIMARY"
@@ -41,6 +41,8 @@ JOINT_REFINEMENT_FAMILY_COUNT = 4
 JOINT_REFINEMENT_HALF_WIDTH_STEPS = 12
 MAXIMUM_VALIDATED_FREQUENCY_FAMILIES = COARSE_FAMILY_COUNT
 MAXIMUM_ITERATIVE_CANDIDATES = 4
+MINIMUM_SINGLE_CLOCK_SUBTRACTION_SECTORS = 6
+MINIMUM_SINGLE_CLOCK_SUBTRACTION_SUPPORT = 3
 TRANSIT_MASK_DURATION_MULTIPLIER = 1.5
 DISTINCT_FREQUENCY_TOLERANCE_STEPS = 4.0
 DISTINCT_FREQUENCY_COARSE_STEPS = 1.0
@@ -1839,10 +1841,16 @@ def analyze_iterative_blind_transit_search(
             residual_search_method = "CUMULATIVE_TRANSIT_WINDOW_MASKING"
             subtraction_audit = None
             masked_result = residual_result
-            if (
+            independent_sector_count = len(sectors) - 1
+            subtraction_permitted = bool(
                 len(accepted_results) >= 2
-                and residual_result.get("classification")
+                or independent_sector_count
+                >= MINIMUM_SINGLE_CLOCK_SUBTRACTION_SECTORS
+            )
+            if (
+                residual_result.get("classification")
                 != "REPLICATED_BLIND_TRANSIT_LIKE_CANDIDATE"
+                and subtraction_permitted
             ):
                 subtracted, subtraction_audit = _subtract_candidate_clocks(
                     sectors, accepted_results
@@ -1854,8 +1862,41 @@ def analyze_iterative_blind_transit_search(
                     entry_boundary,
                     excluded_frequency_families=accepted_signals,
                 )
-                if subtraction_result.get("classification") == (
-                    "REPLICATED_BLIND_TRANSIT_LIKE_CANDIDATE"
+                single_clock_expanded_gate = {
+                    "applied": len(accepted_results) == 1,
+                    "availableIndependentSectorCount": independent_sector_count,
+                    "minimumAvailableIndependentSectorCount": (
+                        MINIMUM_SINGLE_CLOCK_SUBTRACTION_SECTORS
+                    ),
+                    "supportingIndependentSectorCount": subtraction_result.get(
+                        "supportingIndependentSectorCount", 0
+                    ),
+                    "minimumSupportingIndependentSectorCount": (
+                        MINIMUM_SINGLE_CLOCK_SUBTRACTION_SUPPORT
+                    ),
+                    "linearEphemerisCoherent": (
+                        (subtraction_result.get("linearEphemeris") or {}).get(
+                            "coherent"
+                        ) is True
+                    ),
+                }
+                single_clock_expanded_gate["satisfied"] = bool(
+                    not single_clock_expanded_gate["applied"]
+                    or (
+                        independent_sector_count
+                        >= MINIMUM_SINGLE_CLOCK_SUBTRACTION_SECTORS
+                        and single_clock_expanded_gate[
+                            "supportingIndependentSectorCount"
+                        ] >= MINIMUM_SINGLE_CLOCK_SUBTRACTION_SUPPORT
+                        and single_clock_expanded_gate[
+                            "linearEphemerisCoherent"
+                        ]
+                    )
+                )
+                if (
+                    subtraction_result.get("classification")
+                    == "REPLICATED_BLIND_TRANSIT_LIKE_CANDIDATE"
+                    and single_clock_expanded_gate["satisfied"]
                 ):
                     residual_result = subtraction_result
                     working = subtracted
@@ -1874,6 +1915,9 @@ def analyze_iterative_blind_transit_search(
                 "residualSearchMethod": residual_search_method,
                 "boxModelSubtractionFallback": ({
                     **subtraction_audit,
+                    "expandedEvidenceSelectionGate": (
+                        single_clock_expanded_gate
+                    ),
                     "maskedSearchClassification": masked_result.get(
                         "classification"
                     ),
