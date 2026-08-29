@@ -55,6 +55,7 @@ from .tess_binary_confirmation import (
 from .tess_blind_transit_search import (
     HANDLER_ID as BLIND_TRANSIT_SEARCH_HANDLER_ID,
     analyze_blind_transit_search,
+    analyze_iterative_blind_transit_search,
     blind_transit_search_continuation,
 )
 from .tess_eclipse_event_localization import (
@@ -1062,6 +1063,7 @@ def _render_report(conclusion: dict[str, Any]) -> str:
     blind_transit = conclusion.get("blindTransitSearch")
     if blind_transit is not None:
         ephemeris = blind_transit.get("linearEphemeris") or {}
+        candidate_signals = blind_transit.get("candidateSignals") or []
         lines.extend([
             "",
             "## Software-blind transit-period search",
@@ -1075,6 +1077,20 @@ def _render_report(conclusion: dict[str, Any]) -> str:
             f"- Catalog answer key used: {blind_transit.get('catalogAnswerKeyUsed')}",
             f"- Recommended next test: {blind_transit.get('recommendedNextTest')}",
         ])
+        if candidate_signals:
+            lines.append(
+                f"- Accepted distinct transit-like clocks: {len(candidate_signals)}"
+            )
+            for candidate in candidate_signals:
+                lines.append(
+                    "- Candidate "
+                    f"{candidate.get('candidateIndex')}: "
+                    f"period={candidate.get('candidatePeriodDays')} d, "
+                    "supportingIndependentSectors="
+                    f"{candidate.get('supportingIndependentSectors')}, "
+                    "ephemerisCoherent="
+                    f"{(candidate.get('linearEphemeris') or {}).get('coherent')}"
+                )
         for item in blind_transit.get("sectorResults") or []:
             lines.append(
                 "- Sector "
@@ -3004,8 +3020,36 @@ def build_engine(
                         ],
                         "catalogAnswerKeyUsed": False,
                     }
+        if result.get("classification") == (
+            "REPLICATED_BLIND_TRANSIT_LIKE_CANDIDATE"
+        ):
+            result = analyze_iterative_blind_transit_search(
+                primary_dataset_path=prepared["datasetPath"],
+                independent_spec=analysis_spec,
+                morphology=morphology,
+                broad_interpretation=broad,
+                targeted_interpretation=targeted,
+                initial_result=result,
+            )
         print(f"   classification: {result.get('classification')}")
         print(f"   candidate period: {result.get('candidatePeriodDays')} days")
+        candidate_signals = result.get("candidateSignals") or []
+        if candidate_signals:
+            print(
+                "   accepted distinct transit-like clocks: "
+                f"{len(candidate_signals)}"
+            )
+            for candidate in candidate_signals:
+                print(
+                    "      candidate "
+                    f"{candidate.get('candidateIndex')}: "
+                    f"{candidate.get('candidatePeriodDays')} days | sectors "
+                    f"{candidate.get('supportingIndependentSectors') or []}"
+                )
+            print(
+                "   iterative search termination: "
+                f"{(result.get('iterativeSearch') or {}).get('terminationReason')}"
+            )
         recurrence_gate = result.get("recurrenceSupportGate") or {}
         pooled_gate = (
             recurrence_gate
