@@ -55,8 +55,14 @@ from .tess_binary_confirmation import (
 from .tess_blind_transit_search import (
     HANDLER_ID as BLIND_TRANSIT_SEARCH_HANDLER_ID,
     analyze_blind_transit_search,
+    analyze_exhausted_distributed_residual_candidates,
     analyze_iterative_blind_transit_search,
     blind_transit_search_continuation,
+)
+from .tess_exhausted_residual_candidates import (
+    build_exhausted_residual_candidate_project,
+    distributed_candidate_generation_warranted,
+    interpret_exhausted_residual_candidate_project,
 )
 from .tess_eclipse_event_localization import (
     HANDLER_ID as ECLIPSE_LOCALIZATION_HANDLER_ID,
@@ -299,8 +305,14 @@ from .tess_multisector import (
 WORKFLOW_ID = "openstar.workflow.tess-investigation.v1"
 WORKFLOW_VERSION = "20.2"
 SOFTWARE_ID = "openstar.tess-investigation-plugin"
-SOFTWARE_VERSION = "20.38"
+SOFTWARE_VERSION = "20.39"
 ADAPTIVE_BLIND_TRANSIT_ADDITIONAL_SECTORS = 8
+EXHAUSTED_RESIDUAL_RUN_HANDLER_ID = (
+    "openstar.tess.blind-transit-distributed.run"
+)
+EXHAUSTED_RESIDUAL_INTERPRET_HANDLER_ID = (
+    "openstar.tess.blind-transit-distributed.interpret"
+)
 EXHAUSTED_RESIDUAL_TRANSIT_NEXT_TEST = (
     "GENERIC_DISTRIBUTED_RESIDUAL_TRANSIT_CANDIDATE_GENERATION"
 )
@@ -506,6 +518,19 @@ def _latest_result_for_handler(
         if stage.handler_id == handler_id and stage.status == "COMPLETE":
             return stage.result
     return None
+
+
+def _latest_blind_transit_result(
+    investigation: Investigation,
+) -> dict[str, Any] | None:
+    distributed = _latest_result_for_handler(
+        investigation, EXHAUSTED_RESIDUAL_INTERPRET_HANDLER_ID
+    )
+    if distributed is not None:
+        return distributed
+    return _latest_result_for_handler(
+        investigation, BLIND_TRANSIT_SEARCH_HANDLER_ID
+    )
 
 
 def _required_latest_result_for_handler(
@@ -1275,10 +1300,17 @@ def _render_report(conclusion: dict[str, Any]) -> str:
             f"- Recommended next test: {blind_transit.get('recommendedNextTest')}",
         ])
         if residual_census:
-            lines.append(
-                "- Expanded residual-family census: audit only; candidate "
-                "selection and claim decision unchanged"
-            )
+            if blind_transit.get("distributedResidualCandidateGeneration"):
+                lines.append(
+                    "- Expanded residual-family census: frozen candidate "
+                    "inventory only; no family score directly satisfied a "
+                    "transit or claim gate"
+                )
+            else:
+                lines.append(
+                    "- Expanded residual-family census: audit only; candidate "
+                    "selection and claim decision unchanged"
+                )
             for method in residual_census.get("methods") or []:
                 audit = method.get("candidateGenerationAudit") or {}
                 lines.append(
@@ -1286,6 +1318,27 @@ def _render_report(conclusion: dict[str, Any]) -> str:
                     f"{method.get('residualSearchMethod')}: "
                     f"{audit.get('recordedFamilyCount')} coarse families"
                 )
+        distributed_residual = blind_transit.get(
+            "distributedResidualCandidateGeneration"
+        ) or {}
+        if distributed_residual:
+            generic = distributed_residual.get(
+                "genericCandidateInterpretation"
+            ) or {}
+            validation = distributed_residual.get(
+                "serverTransitValidation"
+            ) or {}
+            lines.extend([
+                "- Distributed residual worker semantics: "
+                f"{generic.get('workerSemantics')}",
+                "- Worker candidate selection authority: false",
+                "- Worker claim-decision authority: false",
+                "- Server transit thresholds changed: false",
+                "- Dual-residual family groups corroborated: "
+                f"{validation.get('corroboratedFamilyGroupCount')}",
+                "- Additional server-validated candidate accepted: "
+                f"{validation.get('accepted')}",
+            ])
         if candidate_signals:
             lines.append(
                 f"- Accepted distinct transit-like clocks: {len(candidate_signals)}"
@@ -3379,6 +3432,33 @@ def build_engine(
         result = _apply_blind_transit_sector_exhaustion(
             result, independent_prepare, analysis_spec
         )
+        distributed_preparation = None
+        if distributed_candidate_generation_warranted(result):
+            print("🧮 Preparing generic distributed residual candidates")
+            print(
+                "   workers generate numerical Lomb-Scargle candidates; "
+                "all transit gates remain server-side"
+            )
+            distributed_preparation = build_exhausted_residual_candidate_project(
+                source_project_path=prepared["sourceProjectPath"],
+                primary_dataset_path=prepared["datasetPath"],
+                independent_spec=analysis_spec,
+                blind_transit_result=result,
+                output_dir=store.directory_for(investigation.id) / "artifacts",
+                investigation_id=investigation.id,
+            )
+            result = dict(result)
+            result["distributedResidualCandidateGenerationPreparation"] = (
+                distributed_preparation
+            )
+            print(
+                "   generic residual datasets: "
+                f"{len(distributed_preparation.get('preparedDatasets') or [])}"
+            )
+            print(
+                "   distributed work units: "
+                f"{distributed_preparation.get('totalWorkUnits')}"
+            )
         print(f"   classification: {result.get('classification')}")
         print(f"   candidate period: {result.get('candidatePeriodDays')} days")
         candidate_signals = result.get("candidateSignals") or []
@@ -3468,16 +3548,170 @@ def build_engine(
                 artifacts.append(
                     _artifact(Path(extension_spec["projectPath"]), "application/json")
                 )
+        if distributed_preparation is not None:
+            for item in distributed_preparation.get("preparedDatasets") or []:
+                artifacts.append(
+                    _artifact(Path(item["datasetPath"]), "application/json")
+                )
+            artifacts.append(
+                _artifact(
+                    Path(distributed_preparation["projectPath"]),
+                    "application/json",
+                )
+            )
+        if distributed_preparation is None:
+            next_stage = StageRequest(
+                id=_next_stage_id(request.id, "finalize"),
+                handler_id="openstar.tess.finalize",
+                parameters={"outputSuffix": "blind-transit-search-v1"},
+                triggered_by_stage_id=request.id,
+            )
+        else:
+            next_stage = StageRequest(
+                id=_next_stage_id(
+                    request.id, "run-distributed-residual-candidates"
+                ),
+                handler_id=EXHAUSTED_RESIDUAL_RUN_HANDLER_ID,
+                parameters={
+                    "projectPath": distributed_preparation["projectPath"]
+                },
+                triggered_by_stage_id=request.id,
+            )
         return StageOutcome(
             result=result,
+            next_stage=next_stage,
+            input_hashes=input_hashes,
+            artifacts=tuple(artifacts),
+        )
+
+    def exhausted_residual_candidate_run_stage(investigation, request):
+        print("⚙️ Activating generic distributed residual-candidate search")
+        run = coordinator.run_project(
+            request.parameters["projectPath"],
+            poll_interval=poll_interval,
+            timeout=timeout,
+        )
+        print("✅ Generic distributed residual-candidate search complete")
+        print(f"   datasets: {len(run.status.get('datasets') or [])}")
+        return StageOutcome(
+            result=run.status,
+            next_stage=StageRequest(
+                id=_next_stage_id(
+                    request.id, "interpret-distributed-residual-candidates"
+                ),
+                handler_id=EXHAUSTED_RESIDUAL_INTERPRET_HANDLER_ID,
+                parameters={},
+                triggered_by_stage_id=request.id,
+            ),
+            node_contributions=run.node_contributions,
+            project_ids=(run.project_id,),
+        )
+
+    def exhausted_residual_candidate_interpret_stage(investigation, request):
+        blind_result = _required_latest_result_for_handler(
+            investigation, BLIND_TRANSIT_SEARCH_HANDLER_ID
+        )
+        preparation = blind_result.get(
+            "distributedResidualCandidateGenerationPreparation"
+        )
+        if not isinstance(preparation, dict):
+            raise RuntimeError(
+                "Distributed residual interpretation is missing its frozen "
+                "preparation."
+            )
+        run = _required_latest_result_for_handler(
+            investigation, EXHAUSTED_RESIDUAL_RUN_HANDLER_ID
+        )
+        generic = interpret_exhausted_residual_candidate_project(
+            preparation=preparation,
+            project_status=run,
+        )
+        validation = analyze_exhausted_distributed_residual_candidates(
+            primary_dataset_path=preparation["primaryDatasetPath"],
+            independent_spec=preparation["independentSpec"],
+            blind_transit_result=blind_result,
+            distributed_candidates=generic["candidateMap"],
+        )
+
+        updated = copy.deepcopy(blind_result)
+        updated["distributedResidualCandidateGeneration"] = {
+            "version": "1.0",
+            "genericCandidateInterpretation": generic,
+            "serverTransitValidation": validation,
+            "candidateSelectionAuthority": "SERVER",
+            "normalTopTwelveSelectionPathChanged": False,
+            "scienceThresholdsChanged": False,
+            "catalogAnswerKeyUsed": False,
+        }
+        previous_recommendation = updated.get("recommendedNextTest")
+        candidate = validation.get("candidateSignal")
+        if validation.get("accepted") is True and isinstance(candidate, dict):
+            signals = list(updated.get("candidateSignals") or [])
+            signals.append(candidate)
+            updated["candidateSignals"] = signals
+            claim = dict(updated.get("claimDecision") or {})
+            rationale = list(claim.get("rationale") or [])
+            rationale.append(
+                "A lower-ranked residual family was independently generated "
+                "by generic distributed searches in both frozen residual "
+                "representations, then passed the unchanged server-side "
+                "recurrence, ephemeris, alias, and distinct-family gates."
+            )
+            claim["rationale"] = rationale
+            updated["claimDecision"] = claim
+            recommendation_reason = (
+                "DISTRIBUTED_CANDIDATE_PASSED_UNCHANGED_SERVER_TRANSIT_GATES_"
+                "WITH_OFFICIAL_SECTOR_INVENTORY_EXHAUSTED"
+            )
+        else:
+            recommendation_reason = (
+                "GENERIC_DISTRIBUTED_CANDIDATES_DID_NOT_PASS_UNCHANGED_"
+                "SERVER_TRANSIT_GATES"
+            )
+        updated["recommendedNextTest"] = "HUMAN_SCIENTIFIC_REVIEW"
+        updated["recommendedNextTestRevision"] = {
+            "previousRecommendedNextTest": previous_recommendation,
+            "recommendedNextTest": "HUMAN_SCIENTIFIC_REVIEW",
+            "reason": recommendation_reason,
+            "candidateSelectionAffected": validation.get("accepted") is True,
+            "claimDecisionAffected": False,
+            "catalogAnswerKeyUsed": False,
+        }
+
+        print("🔬 Server-side residual transit interpretation")
+        print(
+            "   distributed family groups corroborated: "
+            f"{validation.get('corroboratedFamilyGroupCount')}"
+        )
+        print(f"   additional candidate accepted: {validation.get('accepted')}")
+        if candidate:
+            print(
+                "   additional candidate period: "
+                f"{candidate.get('candidatePeriodDays')} days"
+            )
+        print("   science thresholds changed: False")
+        print("   recommended next test: HUMAN_SCIENTIFIC_REVIEW")
+
+        artifact_path = (
+            store.directory_for(investigation.id)
+            / "artifacts"
+            / "blind-transit-search"
+            / "distributed-residual-candidate-generation-v1.json"
+        )
+        _write_json(artifact_path, updated)
+        return StageOutcome(
+            result=updated,
             next_stage=StageRequest(
                 id=_next_stage_id(request.id, "finalize"),
                 handler_id="openstar.tess.finalize",
                 parameters={"outputSuffix": "blind-transit-search-v1"},
                 triggered_by_stage_id=request.id,
             ),
-            input_hashes=input_hashes,
-            artifacts=tuple(artifacts),
+            input_hashes={
+                "blindTransitSearch": sha256_json(blind_result),
+                "distributedProjectStatus": sha256_json(run),
+            },
+            artifacts=(_artifact(artifact_path, "application/json"),),
         )
 
     def physical_interpretation_stage(investigation, request):
@@ -9810,9 +10044,7 @@ def build_engine(
             investigation,
             "openstar.tess.morphology.analyze",
         )
-        blind_transit_search = _latest_result_for_handler(
-            investigation, BLIND_TRANSIT_SEARCH_HANDLER_ID,
-        )
+        blind_transit_search = _latest_blind_transit_result(investigation)
         physical_interpretation = _latest_result_for_handler(
             investigation,
             "openstar.tess.physical.interpret",
@@ -11680,6 +11912,14 @@ def build_engine(
         morphology_stage,
     )
     engine.register_handler(BLIND_TRANSIT_SEARCH_HANDLER_ID, blind_transit_search_stage)
+    engine.register_handler(
+        EXHAUSTED_RESIDUAL_RUN_HANDLER_ID,
+        exhausted_residual_candidate_run_stage,
+    )
+    engine.register_handler(
+        EXHAUSTED_RESIDUAL_INTERPRET_HANDLER_ID,
+        exhausted_residual_candidate_interpret_stage,
+    )
     engine.register_handler(
         "openstar.tess.physical.interpret",
         physical_interpretation_stage,
