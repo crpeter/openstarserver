@@ -1,7 +1,24 @@
 # OpenStar Server
 
+## Development setup and tests
+
+OpenStar supports Python 3.11 and newer. From the repository root, create a clean
+virtual environment and install the runtime dependencies plus the development test
+tools:
+
 ```bash
+python3 -m venv .venv
 source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+python -m pip install -r requirements-dev.txt
+```
+
+Run a focused test module or the complete buffered `unittest` suite:
+
+```bash
+python -m unittest test_tess_additional_sector_source_localization
+python -m unittest discover -b
 ```
 
 ## Fleet dashboard sidecar

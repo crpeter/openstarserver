@@ -1,0 +1,2 @@
+# Test runner used by contributors; the canonical suite also runs with unittest.
+pytest
