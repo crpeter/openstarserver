@@ -15,7 +15,7 @@ from typing import Any
 
 
 HANDLER_ID = "openstar.tess.blind-transit-search.analyze"
-RESULT_VERSION = "1.12"
+RESULT_VERSION = "1.13"
 ENTRY_BOUNDARY = "FULL_CHARACTERIZATION_UNRESOLVED_BROAD_VARIABILITY"
 TARGETED_BOUNDARY_ENTRY = "FULL_CHARACTERIZATION_NONRECURRENT_BOUNDARY_PERIOD"
 UNRELIABLE_PRIMARY_ENTRY = "FULL_CHARACTERIZATION_NONRECURRENT_UNRELIABLE_PRIMARY"
@@ -54,7 +54,6 @@ MAXIMUM_ALTERNATE_PARITY_SNR_FRACTION = 0.5
 DUTY_CYCLES = (
     0.0025, 0.005, 0.0075, 0.01, 0.015, 0.02, 0.03, 0.04, 0.05, 0.07, 0.10,
 )
-
 
 class _SearchGridResult(tuple):
     """Six-value legacy result carrying a non-selection audit sidecar."""
@@ -2105,3 +2104,458 @@ def analyze_iterative_blind_transit_search(
         claim["rationale"] = rationale
         enriched["claimDecision"] = claim
     return enriched
+
+
+def prepare_exhausted_residual_sectors(
+    *, primary_dataset_path: str | Path,
+    independent_spec: dict[str, Any],
+    accepted_signals: list[dict[str, Any]],
+    residual_search_method: str,
+) -> list[dict[str, Any]]:
+    """Recreate one frozen residual representation for generic computation."""
+    sectors, _ = _prepare_analysis_sectors(
+        primary_dataset_path, independent_spec
+    )
+    if not accepted_signals:
+        raise ValueError("distributed residual generation requires an accepted clock")
+    if residual_search_method == "CUMULATIVE_TRANSIT_WINDOW_MASKING":
+        working = sectors
+        for signal in accepted_signals:
+            working, _ = _mask_candidate_clock(working, signal)
+        return working
+    if residual_search_method == "BOX_MODEL_SUBTRACTION":
+        working, _ = _subtract_candidate_clocks(sectors, accepted_signals)
+        return working
+    raise ValueError(
+        "unsupported exhausted residual search method: "
+        f"{residual_search_method}"
+    )
+
+
+def _explicit_family_hypothesis(
+    sectors: list[dict[str, Any]], minimum: float, maximum: float,
+    seeds: list[float],
+) -> tuple[tuple[float, float, list[dict[str, Any]]], dict[str, Any]]:
+    """Jointly refine preregistered seeds without widening any claim gate."""
+    import numpy as np
+
+    longest_baseline = max(
+        float(item["times"][-1] - item["times"][0]) for item in sectors
+    )
+    full_span = max(float(item["times"][-1]) for item in sectors) - min(
+        float(item["times"][0]) for item in sectors
+    )
+    coarse_step = 1.0 / (longest_baseline * OVERSAMPLING)
+    fine_step = min(DUTY_CYCLES) / (full_span * OVERSAMPLING)
+    centers = []
+    for raw_seed in seeds:
+        seed = float(raw_seed)
+        if not math.isfinite(seed) or not minimum <= seed <= maximum:
+            continue
+        centers.append(seed)
+        measurements = [
+            _box_score(
+                item["times"], item["residual"], item["sigma"], seed
+            )
+            for item in sectors
+        ]
+        event_epochs = []
+        for sector, measurement in zip(sectors, measurements):
+            median_time = float(statistics.median(sector["times"]))
+            phase = float(measurement["eventPhase"])
+            event_epochs.append(
+                (round(median_time * seed - phase) + phase) / seed
+            )
+        for first in range(len(event_epochs)):
+            for second in range(first + 1, len(event_epochs)):
+                separation = event_epochs[second] - event_epochs[first]
+                cycles = round(separation * seed)
+                if cycles == 0:
+                    continue
+                frequency = cycles / separation
+                if (
+                    minimum <= frequency <= maximum
+                    and abs(frequency - seed) <= coarse_step
+                ):
+                    centers.append(float(frequency))
+
+    resolution = max(fine_step, np.finfo(float).eps)
+    unique_centers = {}
+    for center in centers:
+        unique_centers.setdefault(round(center / resolution), center)
+    if not unique_centers:
+        raise ValueError("distributed residual family contains no valid seed")
+
+    refined = []
+    for center in unique_centers.values():
+        for offset in range(
+            -JOINT_REFINEMENT_HALF_WIDTH_STEPS,
+            JOINT_REFINEMENT_HALF_WIDTH_STEPS + 1,
+        ):
+            frequency = center + offset * fine_step
+            if minimum <= frequency <= maximum:
+                score, measurements, _ = _joint_box_score(sectors, frequency)
+                refined.append((float(score), float(frequency), measurements))
+    score, frequency, measurements = max(
+        refined, key=lambda item: (item[0], -item[1])
+    )
+    return (frequency, score, measurements), {
+        "coarseFrequencyStepPerDay": coarse_step,
+        "fineFrequencyStepPerDay": fine_step,
+        "fullObservationSpanDays": full_span,
+        "inputSeedFrequenciesPerDay": sorted(set(float(item) for item in seeds)),
+        "derivedCenterCount": len(unique_centers),
+        "catalogAnswerKeyUsed": False,
+    }
+
+
+def _distributed_family_match(
+    family: dict[str, Any], candidates: list[dict[str, Any]],
+    coarse_step: float, minimum: float, maximum: float,
+) -> dict[str, Any] | None:
+    family_frequency = float(family["coarseFrequencyPerDay"])
+    family_rank = int(family["objectiveRank"])
+    matches = []
+    for candidate in candidates:
+        try:
+            worker_frequency = float(candidate["frequency"])
+            worker_score = float(candidate["score"])
+            worker_family_rank = int(candidate["familyRank"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not (
+            math.isfinite(worker_frequency)
+            and worker_frequency > 0.0
+            and math.isfinite(worker_score)
+            and worker_family_rank == family_rank
+        ):
+            continue
+        if not minimum <= worker_frequency <= maximum:
+            continue
+        distance = abs(worker_frequency - family_frequency)
+        if distance <= coarse_step * (1.0 + 1.0e-9):
+            matches.append({
+                "workerFrequencyPerDay": worker_frequency,
+                "workerBoxScore": worker_score,
+                "workerFamilyRank": worker_family_rank,
+                "projectedBoxFrequencyPerDay": worker_frequency,
+                "absoluteFrequencyDistancePerDay": distance,
+            })
+    if not matches:
+        return None
+    return min(
+        matches,
+        key=lambda item: (
+            item["absoluteFrequencyDistancePerDay"],
+            -item["workerBoxScore"],
+            item["workerFrequencyPerDay"],
+        ),
+    )
+
+
+def analyze_exhausted_distributed_residual_candidates(
+    *, primary_dataset_path: str | Path,
+    independent_spec: dict[str, Any],
+    blind_transit_result: dict[str, Any],
+    distributed_candidates: dict[str, list[dict[str, Any]]],
+) -> dict[str, Any]:
+    """Corroborate lower-ranked residual families with generic worker scans.
+
+    Generic periodic-box results only refine the matching already-frozen audit
+    family. They never satisfy a transit gate themselves.
+    """
+    availability = blind_transit_result.get(
+        "independentSectorAvailability"
+    ) or {}
+    iterative = blind_transit_result.get("iterativeSearch") or {}
+    if not (
+        blind_transit_result.get("classification")
+        == "REPLICATED_BLIND_TRANSIT_LIKE_CANDIDATE"
+        and availability.get("allCandidateSectorsPrepared") is True
+        and iterative.get("terminationReason")
+        == "NEXT_RESIDUAL_SIGNAL_UNRESOLVED"
+    ):
+        raise ValueError(
+            "distributed residual candidate generation boundary is not satisfied"
+        )
+    accepted_signals = list(blind_transit_result.get("candidateSignals") or [])
+    if not accepted_signals:
+        raise ValueError("distributed residual generation has no accepted clock")
+    if len(accepted_signals) >= MAXIMUM_ITERATIVE_CANDIDATES:
+        return {
+            "resultVersion": "1.0",
+            "classification": "DISTRIBUTED_RESIDUAL_CANDIDATE_LIMIT_REACHED",
+            "accepted": False,
+            "reason": "MAXIMUM_CANDIDATE_COUNT_ALREADY_REACHED",
+            "trials": [],
+            "catalogAnswerKeyUsed": False,
+        }
+
+    primary_dataset = _load(primary_dataset_path)
+    minimum, maximum = _frequency_bounds(primary_dataset)
+    census = blind_transit_result.get(
+        "exhaustedSectorResidualFamilyCensus"
+    ) or {}
+    methods = {
+        item.get("residualSearchMethod"): item
+        for item in census.get("methods") or []
+    }
+    required_methods = (
+        "CUMULATIVE_TRANSIT_WINDOW_MASKING",
+        "BOX_MODEL_SUBTRACTION",
+    )
+    if any(method not in methods for method in required_methods):
+        raise ValueError("both frozen residual-family censuses are required")
+
+    sectors_by_method = {
+        method: prepare_exhausted_residual_sectors(
+            primary_dataset_path=primary_dataset_path,
+            independent_spec=independent_spec,
+            accepted_signals=accepted_signals,
+            residual_search_method=method,
+        )
+        for method in required_methods
+    }
+    longest_baseline = max(
+        float(item["times"][-1] - item["times"][0])
+        for item in sectors_by_method[required_methods[0]]
+    )
+    coarse_step = 1.0 / (longest_baseline * OVERSAMPLING)
+
+    corroborated_by_method: dict[str, list[dict[str, Any]]] = {}
+    for method in required_methods:
+        families = (
+            (methods[method].get("candidateGenerationAudit") or {}).get(
+                "families"
+            )
+            or []
+        )
+        candidates = distributed_candidates.get(method) or []
+        corroborated = []
+        for family in families:
+            rank = int(family.get("objectiveRank") or 0)
+            if not COARSE_FAMILY_COUNT < rank <= AUDIT_COARSE_FAMILY_COUNT:
+                continue
+            match = _distributed_family_match(
+                family, candidates, coarse_step, minimum, maximum
+            )
+            if match is not None:
+                corroborated.append({
+                    "family": family,
+                    "distributedMatch": match,
+                })
+        corroborated_by_method[method] = corroborated
+
+    groups = []
+    masking_method, subtraction_method = required_methods
+    for masked in corroborated_by_method[masking_method]:
+        masked_frequency = float(masked["family"]["coarseFrequencyPerDay"])
+        compatible = [
+            item for item in corroborated_by_method[subtraction_method]
+            if abs(
+                float(item["family"]["coarseFrequencyPerDay"])
+                - masked_frequency
+            ) <= coarse_step
+        ]
+        if not compatible:
+            continue
+        subtracted = min(
+            compatible,
+            key=lambda item: (
+                abs(
+                    float(item["family"]["coarseFrequencyPerDay"])
+                    - masked_frequency
+                ),
+                int(item["family"]["objectiveRank"]),
+            ),
+        )
+        groups.append({
+            masking_method: masked,
+            subtraction_method: subtracted,
+        })
+    groups.sort(key=lambda group: (
+        max(
+            int(group[method]["family"]["objectiveRank"])
+            for method in required_methods
+        ),
+        sum(
+            int(group[method]["family"]["objectiveRank"])
+            for method in required_methods
+        ),
+        float(group[masking_method]["family"]["coarseFrequencyPerDay"]),
+    ))
+
+    trials = []
+    selected_result = None
+    selected_group = None
+    independent_sector_count = len(independent_spec.get("preparedSectors") or [])
+    for group_index, group in enumerate(groups, start=1):
+        method_results = {}
+        method_accepted = []
+        for method in required_methods:
+            family = group[method]["family"]
+            match = group[method]["distributedMatch"]
+            seeds = [
+                float(family["coarseFrequencyPerDay"]),
+                float(match["projectedBoxFrequencyPerDay"]),
+            ]
+            hypothesis, grid = _explicit_family_hypothesis(
+                sectors_by_method[method], minimum, maximum, seeds
+            )
+            evaluated = _evaluate_frequency_hypothesis(
+                sectors_by_method[method], minimum, hypothesis
+            )
+            candidate = {
+                "candidateIndex": len(accepted_signals) + 1,
+                "candidateFrequencyPerDay": evaluated["frequencyPerDay"],
+                "jointTransitSearch": evaluated["jointTransitSearch"],
+                "searchGrid": grid,
+            }
+            _, distinct = _distinct_frequency_family(
+                candidate, accepted_signals
+            )
+            expanded_support_satisfied = bool(
+                len(accepted_signals) != 1
+                or independent_sector_count
+                < MINIMUM_SINGLE_CLOCK_SUBTRACTION_SECTORS
+                or len(evaluated["independentSupporters"])
+                >= MINIMUM_SINGLE_CLOCK_SUBTRACTION_SUPPORT
+            )
+            accepted = bool(
+                evaluated["supported"]
+                and distinct.get("distinct") is True
+                and expanded_support_satisfied
+            )
+            method_accepted.append(accepted)
+            method_results[method] = {
+                "auditObjectiveRank": int(family["objectiveRank"]),
+                "auditCoarseFrequencyPerDay": float(
+                    family["coarseFrequencyPerDay"]
+                ),
+                "distributedMatch": match,
+                "refinementGrid": grid,
+                "resolvedFrequencyPerDay": evaluated["frequencyPerDay"],
+                "resolvedPeriodDays": evaluated["periodDays"],
+                "objectiveScore": evaluated["objectiveScore"],
+                "primarySectorSupported": evaluated["primarySectorSupported"],
+                "supportingIndependentSectors": [
+                    item.get("sector")
+                    for item in evaluated["independentSupporters"]
+                ],
+                "linearEphemeris": evaluated["linearEphemeris"],
+                "recurrenceSupportGate": evaluated["recurrenceSupportGate"],
+                "alternatingCycleAliasResolution": evaluated[
+                    "alternatingCycleAliasResolution"
+                ],
+                "frequencyFamilySeparation": distinct,
+                "expandedSingleClockSupportSatisfied": (
+                    expanded_support_satisfied
+                ),
+                "accepted": accepted,
+                "sectorResults": evaluated["sectorResults"],
+                "catalogAnswerKeyUsed": False,
+            }
+            if selected_result is None and accepted:
+                selected_result = evaluated
+
+        resolved = [
+            float(method_results[method]["resolvedFrequencyPerDay"])
+            for method in required_methods
+        ]
+        method_agreement = abs(resolved[0] - resolved[1]) <= coarse_step
+        accepted = bool(all(method_accepted) and method_agreement)
+        trial = {
+            "groupIndex": group_index,
+            "accepted": accepted,
+            "requiredResidualMethods": list(required_methods),
+            "bothMethodsPassUnchangedScienceGates": all(method_accepted),
+            "resolvedMethodFrequencyAgreement": method_agreement,
+            "frequencyAgreementTolerancePerDay": coarse_step,
+            "methods": method_results,
+            "catalogAnswerKeyUsed": False,
+        }
+        trials.append(trial)
+        if accepted:
+            selected_group = trial
+            # Prefer masking deterministically after both methods pass.
+            selected_result = _evaluate_frequency_hypothesis(
+                sectors_by_method[masking_method],
+                minimum,
+                _explicit_family_hypothesis(
+                    sectors_by_method[masking_method],
+                    minimum,
+                    maximum,
+                    [
+                        float(
+                            group[masking_method]["family"][
+                                "coarseFrequencyPerDay"
+                            ]
+                        ),
+                        float(
+                            group[masking_method]["distributedMatch"][
+                                "projectedBoxFrequencyPerDay"
+                            ]
+                        ),
+                    ],
+                )[0],
+            )
+            break
+        selected_result = None
+
+    result = {
+        "resultVersion": "1.0",
+        "experiment": "DISTRIBUTED_GENERIC_RESIDUAL_CANDIDATE_CORROBORATION",
+        "classification": (
+            "DISTRIBUTED_RESIDUAL_TRANSIT_LIKE_CANDIDATE"
+            if selected_group is not None
+            else "DISTRIBUTED_RESIDUAL_CANDIDATE_UNRESOLVED"
+        ),
+        "accepted": selected_group is not None,
+        "normalTopTwelveSelectionPathChanged": False,
+        "scienceThresholdsChanged": False,
+        "requiredResidualMethodAgreement": True,
+        "workerSemantics": "GENERIC_PERIODIC_BOX_SEARCH",
+        "specializedTessWorkerLogic": False,
+        "corroboratedFamilyGroupCount": len(groups),
+        "trials": trials,
+        "catalogAnswerKeyUsed": False,
+    }
+    if selected_result is not None and selected_group is not None:
+        refined_period = selected_result["linearEphemeris"].get(
+            "refinedPeriodDays"
+        ) or selected_result["periodDays"]
+        result["candidateSignal"] = {
+            "candidateIndex": len(accepted_signals) + 1,
+            "classification": "REPLICATED_BLIND_TRANSIT_LIKE_CANDIDATE",
+            "candidatePeriodDays": refined_period,
+            "coarseCandidatePeriodDays": selected_result["rawPeriodDays"],
+            "candidateFrequencyPerDay": 1.0 / refined_period,
+            "combinedRecurrenceScore": selected_result["objectiveScore"],
+            "jointTransitSearch": selected_result["jointTransitSearch"],
+            "alternatingCycleAliasResolution": selected_result[
+                "alternatingCycleAliasResolution"
+            ],
+            "sectorResults": selected_result["sectorResults"],
+            "primarySectorSupported": selected_result[
+                "primarySectorSupported"
+            ],
+            "supportingIndependentSectorCount": len(
+                selected_result["independentSupporters"]
+            ),
+            "supportingIndependentSectors": [
+                item.get("sector")
+                for item in selected_result["independentSupporters"]
+            ],
+            "linearEphemeris": selected_result["linearEphemeris"],
+            "recurrenceSupportGate": selected_result[
+                "recurrenceSupportGate"
+            ],
+            "searchGrid": selected_group["methods"][masking_method][
+                "refinementGrid"
+            ],
+            "distributedCandidateGeneration": selected_group,
+            "physicalCycleResolved": False,
+            "companionNatureResolved": False,
+            "catalogAnswerKeyUsed": False,
+        }
+    return result

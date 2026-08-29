@@ -88,6 +88,31 @@ DEFAULT_ACCOUNTING = WorkloadAccountingRegistry()
 DEFAULT_ACCOUNTING.register("openstar.lomb-scargle.v1", _lomb_scargle_metrics)
 
 
+def _box_period_search_metrics(
+    work_unit: dict[str, Any], dataset: dict[str, Any]
+) -> dict[str, Any]:
+    samples = dataset.get("coordinates")
+    if not isinstance(samples, list):
+        samples = dataset.get("times")
+    sample_count = len(samples) if isinstance(samples, list) else 0
+    payload = work_unit.get("payload")
+    if not isinstance(payload, dict):
+        payload = {}
+    frequency_count = int(payload.get("frequencyCount", 0))
+    return {
+        "sampleCount": sample_count,
+        "frequencyCount": frequency_count,
+        "durationCount": len(payload.get("durationFractions") or []),
+        "phaseBinCount": int(payload.get("phaseBinCount", 0)),
+        "sampleFrequencyEvaluations": sample_count * frequency_count,
+    }
+
+
+DEFAULT_ACCOUNTING.register(
+    "openstar.box-period-search.v1", _box_period_search_metrics
+)
+
+
 class ContributionStore:
     """SQLite implementation of the contribution repository boundary."""
 

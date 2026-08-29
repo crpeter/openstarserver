@@ -282,6 +282,24 @@ class ContributionRuntimeTests(unittest.TestCase):
             1, self.runtime.contribution_summary()["allTime"]["totalAcceptedWorkUnits"]
         )
 
+    def test_generic_box_work_uses_server_owned_accounting_dimensions(self):
+        metrics = DEFAULT_ACCOUNTING.metrics({
+            "workloadID": "openstar.box-period-search.v1",
+            "payload": {
+                "frequencyCount": 65,
+                "phaseBinCount": 400,
+                "durationFractions": [0.01, 0.02, 0.04],
+            },
+        }, {"coordinates": [0.0, 1.0, 2.0, 3.0]})
+        self.assertEqual({
+            "workloadID": "openstar.box-period-search.v1",
+            "sampleCount": 4,
+            "frequencyCount": 65,
+            "durationCount": 3,
+            "phaseBinCount": 400,
+            "sampleFrequencyEvaluations": 260,
+        }, metrics)
+
     def test_network_wall_throughput_is_not_summed_metal_time(self):
         second = {"nodeID": "second", "capabilities": {"platform": "iOS"}}
         self.runtime.register_node(second)
