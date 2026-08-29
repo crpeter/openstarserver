@@ -312,7 +312,7 @@ class BlindTransitSearchTests(unittest.TestCase):
                 broad_interpretation={
                     "claimDecision": {"claim": "CANDIDATE_PERIOD"}
                 },
-                maximum_candidates=2,
+                maximum_candidates=4,
             )
 
         candidates = result["candidateSignals"]
@@ -333,8 +333,18 @@ class BlindTransitSearchTests(unittest.TestCase):
             "frequencyFamilySeparation"
         ]["distinct"])
         self.assertEqual(
-            "MAXIMUM_CANDIDATE_COUNT_REACHED",
+            "NEXT_RESIDUAL_SIGNAL_UNRESOLVED",
             result["iterativeSearch"]["terminationReason"],
+        )
+        stopping_iteration = result["iterativeSearch"]["iterations"][-1]
+        self.assertEqual(
+            "BLIND_TRANSIT_PERIOD_UNRESOLVED",
+            stopping_iteration["boxModelSubtractionFallback"][
+                "subtractionSearchClassification"
+            ],
+        )
+        self.assertFalse(
+            stopping_iteration["boxModelSubtractionFallback"]["selected"]
         )
         self.assertTrue(all(
             item["linearEphemeris"]["coherent"] for item in candidates
@@ -343,6 +353,247 @@ class BlindTransitSearchTests(unittest.TestCase):
             item["catalogAnswerKeyUsed"] is False for item in candidates
         ))
         self.assertFalse(result["iterativeSearch"]["catalogAnswerKeyUsed"])
+
+    def test_iterative_search_recovers_three_distinct_shared_clocks(self):
+        periods = (2.21857567, 3.133, 7.17)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = [
+                self._dataset(
+                    root,
+                    sector=sector,
+                    origin=origin,
+                    period=periods[0],
+                    additional_transits=(
+                        (periods[1], 1001.11, 0.06, 0.05),
+                        (periods[2], 1002.03, 0.10, 0.045),
+                    ),
+                )
+                for sector, origin in ((41, 1000.0), (54, 1700.0), (81, 2400.0))
+            ]
+            independent = {
+                "investigationGoal": "FULL_CHARACTERIZATION",
+                "preparedSectors": [
+                    {"sector": sector, "datasetPath": str(path)}
+                    for sector, path in zip((54, 81), paths[1:])
+                ],
+            }
+            result = analyze_iterative_blind_transit_search(
+                primary_dataset_path=paths[0],
+                independent_spec=independent,
+                morphology={"physicalCycleResolved": False},
+                broad_interpretation={
+                    "claimDecision": {"claim": "CANDIDATE_PERIOD"}
+                },
+                maximum_candidates=4,
+            )
+
+        candidates = result["candidateSignals"]
+        self.assertEqual(3, len(candidates))
+        recovered = sorted(item["candidatePeriodDays"] for item in candidates)
+        for measured, target in zip(recovered, sorted(periods)):
+            self.assertAlmostEqual(target, measured, delta=0.004)
+        longest = max(candidates, key=lambda item: item["candidatePeriodDays"])
+        alias = longest["alternatingCycleAliasResolution"]
+        self.assertEqual("PROMOTE_INTEGER_MULTIPLE_PERIOD", alias["decision"])
+        self.assertEqual(4, alias["selectedCycleMultiplier"])
+        self.assertEqual(
+            "NEXT_RESIDUAL_SIGNAL_UNRESOLVED",
+            result["iterativeSearch"]["terminationReason"],
+        )
+        self.assertTrue(all(
+            item["linearEphemeris"]["coherent"] for item in candidates
+        ))
+        self.assertFalse(result["iterativeSearch"]["catalogAnswerKeyUsed"])
+
+    def test_ranked_family_fallback_accepts_lower_near_support_clock(self):
+        def evaluated(
+            raw_frequency, objective_score, *, primary_supported,
+            independent_count, coherent, supported,
+            resolved_frequency=None, alias_decision="RETAIN_BASE_PERIOD",
+            alias_multiplier=None,
+        ):
+            resolved_frequency = resolved_frequency or raw_frequency
+            period = 1.0 / resolved_frequency
+            supporters = [
+                {"sector": index + 2} for index in range(independent_count)
+            ]
+            return {
+                "rawFrequencyPerDay": raw_frequency,
+                "rawPeriodDays": 1.0 / raw_frequency,
+                "objectiveScore": objective_score,
+                "frequencyPerDay": resolved_frequency,
+                "periodDays": period,
+                "alternatingCycleAliasResolution": {
+                    "decision": alias_decision,
+                    "selectedCycleMultiplier": alias_multiplier,
+                    "catalogAnswerKeyUsed": False,
+                },
+                "jointTransitSearch": {
+                    "frequencyPerDay": resolved_frequency,
+                    "periodDays": period,
+                },
+                "sectorResults": [],
+                "primarySectorSupported": primary_supported,
+                "independentSupporters": supporters,
+                "linearEphemeris": ({
+                    "coherent": True,
+                    "refinedPeriodDays": period,
+                } if coherent else {
+                    "coherent": False,
+                    "reason": "CROSS_SECTOR_EVENT_TIMES_INCOHERENT",
+                }),
+                "supported": supported,
+                "recurrenceSupportGate": {
+                    "mode": (
+                        "STRICT_INDIVIDUAL_SECTORS"
+                        if supported else "NOT_SATISFIED"
+                    ),
+                },
+            }
+
+        first = evaluated(
+            1.0,
+            30.0,
+            primary_supported=True,
+            independent_count=1,
+            coherent=False,
+            supported=False,
+        )
+        second = evaluated(
+            0.4,
+            20.0,
+            primary_supported=True,
+            independent_count=2,
+            coherent=True,
+            supported=True,
+        )
+        with (
+            mock.patch.object(
+                tess_blind_transit_search,
+                "_search_grid",
+                return_value=(1.0, 30.0, [], 0.01, 0.0001, 100.0),
+            ),
+            mock.patch.object(
+                tess_blind_transit_search,
+                "_ranked_search_grid_candidates",
+                return_value=(
+                    [(1.0, 30.0, []), (0.4, 20.0, [])],
+                    0.01,
+                    0.0001,
+                    100.0,
+                ),
+            ),
+            mock.patch.object(
+                tess_blind_transit_search,
+                "_evaluate_frequency_hypothesis",
+                side_effect=(first, second),
+            ),
+        ):
+            result = tess_blind_transit_search._analyze_prepared_sectors(
+                [], 0.1, 5.0, UNRELIABLE_PRIMARY_ENTRY
+            )
+
+        self.assertEqual(
+            "REPLICATED_BLIND_TRANSIT_LIKE_CANDIDATE",
+            result["classification"],
+        )
+        self.assertAlmostEqual(2.5, result["candidatePeriodDays"])
+        selection = result["rankedFrequencyFamilySelection"]
+        self.assertTrue(selection["rankedFallbackEligible"])
+        self.assertEqual(
+            "TOP_FAMILY_HAS_PRIMARY_AND_PARTIAL_INDEPENDENT_SUPPORT",
+            selection["rankedFallbackReason"],
+        )
+        self.assertEqual(2, selection["selectedObjectiveRank"])
+        self.assertEqual(2, selection["testedFamilyCount"])
+        self.assertEqual(
+            [
+                "INSUFFICIENT_INDEPENDENT_SECTOR_SUPPORT",
+                "CROSS_SECTOR_EVENT_TIMES_INCOHERENT",
+            ],
+            selection["trials"][0]["rejectionReasons"],
+        )
+        self.assertFalse(selection["catalogAnswerKeyUsed"])
+
+        no_support = evaluated(
+            1.0,
+            30.0,
+            primary_supported=False,
+            independent_count=0,
+            coherent=False,
+            supported=False,
+        )
+        lower_base_clock = evaluated(
+            0.5,
+            20.0,
+            primary_supported=True,
+            independent_count=2,
+            coherent=True,
+            supported=True,
+        )
+        promoted_alias = evaluated(
+            1.6,
+            15.0,
+            primary_supported=True,
+            independent_count=2,
+            coherent=True,
+            supported=True,
+            resolved_frequency=0.4,
+            alias_decision="PROMOTE_INTEGER_MULTIPLE_PERIOD",
+            alias_multiplier=4,
+        )
+        with (
+            mock.patch.object(
+                tess_blind_transit_search,
+                "_search_grid",
+                return_value=(1.0, 30.0, [], 0.01, 0.0001, 100.0),
+            ),
+            mock.patch.object(
+                tess_blind_transit_search,
+                "_ranked_search_grid_candidates",
+                return_value=(
+                    [
+                        (1.0, 30.0, []),
+                        (0.5, 20.0, []),
+                        (1.6, 15.0, []),
+                    ],
+                    0.01,
+                    0.0001,
+                    100.0,
+                ),
+            ),
+            mock.patch.object(
+                tess_blind_transit_search,
+                "_evaluate_frequency_hypothesis",
+                side_effect=(no_support, lower_base_clock, promoted_alias),
+            ),
+        ):
+            result = tess_blind_transit_search._analyze_prepared_sectors(
+                [], 0.1, 5.0, UNRELIABLE_PRIMARY_ENTRY
+            )
+
+        selection = result["rankedFrequencyFamilySelection"]
+        self.assertEqual(
+            "REPLICATED_BLIND_TRANSIT_LIKE_CANDIDATE",
+            result["classification"],
+        )
+        self.assertAlmostEqual(2.5, result["candidatePeriodDays"])
+        self.assertEqual(
+            "TOP_FAMILY_HAS_NO_NEAR_SUPPORT_TRY_INTEGER_CYCLE_ALIASES_ONLY",
+            selection["rankedFallbackReason"],
+        )
+        self.assertTrue(
+            selection["rankedFallbackRequiresIntegerCycleAliasPromotion"]
+        )
+        self.assertEqual(3, selection["selectedObjectiveRank"])
+        self.assertIn(
+            "RANKED_FALLBACK_REQUIRES_INTEGER_CYCLE_ALIAS_PROMOTION",
+            selection["trials"][1]["rejectionReasons"],
+        )
+        self.assertTrue(
+            selection["trials"][2]["integerCycleAliasPromotionSatisfied"]
+        )
 
     def test_distinct_frequency_gate_rejects_exact_alias_but_allows_near_resonance(self):
         prior = {
@@ -372,6 +623,194 @@ class BlindTransitSearchTests(unittest.TestCase):
         self.assertTrue(distinct)
         self.assertEqual("SEPARATE_FREQUENCY_FAMILY", audit["reason"])
 
+        shifted_refit = {
+            "jointTransitSearch": {"frequencyPerDay": 0.50004},
+            "searchGrid": {
+                "coarseFrequencyStepPerDay": 0.001,
+                "fineFrequencyStepPerDay": 0.000001,
+            },
+        }
+        prior_with_coarse_resolution = {
+            **prior,
+            "searchGrid": {
+                "coarseFrequencyStepPerDay": 0.001,
+                "fineFrequencyStepPerDay": 0.000001,
+            },
+        }
+        distinct, audit = tess_blind_transit_search._distinct_frequency_family(
+            shifted_refit, [prior_with_coarse_resolution]
+        )
+        self.assertFalse(distinct)
+        self.assertEqual(
+            "DUPLICATE_OR_EXACT_HARMONIC_FREQUENCY_FAMILY", audit["reason"]
+        )
+
+    def test_box_model_subtraction_preserves_overlapping_event_samples(self):
+        import numpy as np
+
+        times = np.arange(0.0, 10.0, 0.01)
+        residual = 0.01 * np.sin(2.0 * np.pi * times / 0.37)
+        period = 2.0
+        epoch = 0.5
+        duration = 0.1
+        inside = np.abs(
+            np.remainder(times - epoch + period / 2.0, period)
+            - period / 2.0
+        ) <= duration / 2.0
+        residual[inside] -= 1.0
+        overlap_index = int(np.argmin(np.abs(times - 4.5)))
+        residual[overlap_index] -= 0.5
+        sectors = [{
+            "role": "PRIMARY",
+            "sector": 1,
+            "datasetID": "sector-1",
+            "times": times,
+            "residual": residual,
+            "sigma": 0.01,
+            "origin": 0.0,
+            "cadence": 0.01,
+            "detrendWindowSamples": 75,
+        }]
+        result = {
+            "candidatePeriodDays": period,
+            "linearEphemeris": {
+                "refinedPeriodDays": period,
+                "referenceEpoch": epoch,
+            },
+            "jointTransitSearch": {
+                "frequencyPerDay": 1.0 / period,
+                "eventPhase": epoch / period,
+                "durationDays": duration,
+            },
+            "sectorResults": [{
+                "role": "PRIMARY",
+                "sector": 1,
+                "datasetID": "sector-1",
+                "durationDays": duration,
+                "depthStandardized": 1.0,
+            }],
+        }
+
+        subtracted, audit = tess_blind_transit_search._subtract_candidate_clocks(
+            sectors, [result]
+        )
+        masked, _ = tess_blind_transit_search._mask_candidate_clock(
+            sectors, result
+        )
+
+        self.assertEqual(len(times), len(subtracted[0]["times"]))
+        self.assertLess(subtracted[0]["residual"][overlap_index], -0.4)
+        self.assertFalse(np.any(np.isclose(masked[0]["times"], 4.5)))
+        self.assertTrue(audit["allOriginalSamplesRetained"])
+        self.assertGreater(audit["totalAdjustedSampleCount"], 0)
+
+    def test_iterative_search_can_select_box_model_subtraction_recovery(self):
+        def candidate(period):
+            return {
+                "classification": "REPLICATED_BLIND_TRANSIT_LIKE_CANDIDATE",
+                "candidatePeriodDays": period,
+                "coarseCandidatePeriodDays": period,
+                "candidateFrequencyPerDay": 1.0 / period,
+                "jointTransitSearch": {
+                    "frequencyPerDay": 1.0 / period,
+                    "eventPhase": 0.1,
+                    "durationDays": 0.05,
+                },
+                "sectorResults": [],
+                "primarySectorSupported": True,
+                "supportingIndependentSectorCount": 2,
+                "supportingIndependentSectors": [2, 3],
+                "linearEphemeris": {
+                    "coherent": True,
+                    "refinedPeriodDays": period,
+                    "referenceEpoch": 0.2,
+                },
+                "recurrenceSupportGate": {
+                    "mode": "STRICT_INDIVIDUAL_SECTORS",
+                },
+                "searchGrid": {
+                    "coarseFrequencyStepPerDay": 0.001,
+                    "fineFrequencyStepPerDay": 0.000001,
+                },
+            }
+
+        first = candidate(2.0)
+        second = candidate(3.0)
+        unresolved = {
+            "classification": "BLIND_TRANSIT_PERIOD_UNRESOLVED",
+            "rankedFrequencyFamilySelection": {"trials": []},
+        }
+        third = candidate(5.0)
+        mask_audit = {"method": "test-mask", "catalogAnswerKeyUsed": False}
+        subtraction_audit = {
+            "method": "test-subtraction",
+            "catalogAnswerKeyUsed": False,
+        }
+        independent = {
+            "investigationGoal": "FULL_CHARACTERIZATION",
+            "preparedSectors": [
+                {"datasetPath": "/two"},
+                {"datasetPath": "/three"},
+            ],
+        }
+        with (
+            mock.patch.object(
+                tess_blind_transit_search,
+                "_prepare_analysis_sectors",
+                return_value=([{"role": "PRIMARY"}], {}),
+            ),
+            mock.patch.object(
+                tess_blind_transit_search,
+                "_frequency_bounds",
+                return_value=(0.1, 5.0),
+            ),
+            mock.patch.object(
+                tess_blind_transit_search,
+                "_mask_candidate_clock",
+                return_value=([{"role": "PRIMARY"}], mask_audit),
+            ),
+            mock.patch.object(
+                tess_blind_transit_search,
+                "_subtract_candidate_clocks",
+                return_value=([{"role": "PRIMARY"}], subtraction_audit),
+            ),
+            mock.patch.object(
+                tess_blind_transit_search,
+                "_analyze_prepared_sectors",
+                side_effect=(second, unresolved, third),
+            ),
+            mock.patch.object(
+                tess_blind_transit_search,
+                "_distinct_frequency_family",
+                return_value=(True, {"distinct": True}),
+            ),
+        ):
+            result = analyze_iterative_blind_transit_search(
+                primary_dataset_path="/one",
+                independent_spec=independent,
+                morphology={"physicalCycleResolved": False},
+                broad_interpretation={
+                    "claimDecision": {"claim": "CANDIDATE_PERIOD"}
+                },
+                initial_result=first,
+                maximum_candidates=3,
+            )
+
+        self.assertEqual(3, len(result["candidateSignals"]))
+        recovered = result["iterativeSearch"]["iterations"][-1]
+        self.assertTrue(recovered["accepted"])
+        self.assertEqual(
+            "ACCEPTED_BOX_MODEL_SUBTRACTION_FALLBACK",
+            recovered["residualSearchMethod"],
+        )
+        self.assertTrue(recovered["boxModelSubtractionFallback"]["selected"])
+        self.assertEqual(
+            "REPLICATED_BLIND_TRANSIT_LIKE_CANDIDATE",
+            recovered["boxModelSubtractionFallback"][
+                "subtractionSearchClassification"
+            ],
+        )
+
     def test_iterative_search_stops_after_masking_a_single_real_clock(self):
         with tempfile.TemporaryDirectory() as temporary:
             primary, independent, morphology, broad = self._inputs(
@@ -396,6 +835,28 @@ class BlindTransitSearchTests(unittest.TestCase):
             "BLIND_TRANSIT_PERIOD_UNRESOLVED",
             stopping_iteration["classification"],
         )
+        self.assertIn("sectorResults", stopping_iteration["candidateEvidence"])
+        self.assertIn(
+            "recurrenceSupportGate", stopping_iteration["candidateEvidence"]
+        )
+        self.assertFalse(
+            stopping_iteration["candidateEvidence"]["catalogAnswerKeyUsed"]
+        )
+        selection = stopping_iteration["candidateEvidence"][
+            "rankedFrequencyFamilySelection"
+        ]
+        self.assertTrue(selection["rankedFallbackEligible"])
+        self.assertEqual(
+            "TOP_FAMILY_REPEATS_ACCEPTED_CLOCK_TRY_INTEGER_CYCLE_ALIASES_ONLY",
+            selection["rankedFallbackReason"],
+        )
+        self.assertTrue(
+            selection["rankedFallbackRequiresIntegerCycleAliasPromotion"]
+        )
+        self.assertGreater(selection["testedFamilyCount"], 1)
+        self.assertFalse(any(
+            item["accepted"] for item in selection["trials"]
+        ))
         self.assertGreater(
             result["candidateSignals"][0]["residualSearchMask"][
                 "totalRemovedSampleCount"
@@ -467,6 +928,82 @@ class BlindTransitSearchTests(unittest.TestCase):
         self.assertTrue(alias["doublePeriodValidation"]["supported"])
         self.assertTrue(all(
             item["decisiveAlternatingEvents"] for item in alias["sectorEvidence"]
+        ))
+        self.assertFalse(result["catalogAnswerKeyUsed"])
+
+    def test_promotes_quarter_period_alias_when_one_cycle_residue_transits(self):
+        true_period = 7.17
+        quarter_frequency = 4.0 / true_period
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = [
+                self._dataset(
+                    root, sector=sector, origin=origin, period=true_period
+                )
+                for sector, origin in ((8, 1000.0), (35, 1700.0), (62, 2400.0))
+            ]
+            independent = {
+                "investigationGoal": "FULL_CHARACTERIZATION",
+                "preparedSectors": [
+                    {"sector": sector, "datasetPath": str(path)}
+                    for sector, path in zip((35, 62), paths[1:])
+                ],
+            }
+
+            def forced_quarter_period(sectors, minimum, maximum):
+                measurements = [
+                    tess_blind_transit_search._box_score(
+                        item["times"], item["residual"], item["sigma"],
+                        quarter_frequency,
+                    )
+                    for item in sectors
+                ]
+                full_span = max(item["times"][-1] for item in sectors) - min(
+                    item["times"][0] for item in sectors
+                )
+                return (
+                    quarter_frequency, 10.0, measurements, 0.001, 0.000001,
+                    float(full_span),
+                )
+
+            with mock.patch.object(
+                tess_blind_transit_search, "_search_grid",
+                side_effect=forced_quarter_period,
+            ):
+                result = analyze_blind_transit_search(
+                    primary_dataset_path=paths[0],
+                    independent_spec=independent,
+                    morphology=None,
+                    broad_interpretation=None,
+                    targeted_interpretation={
+                        "claimDecision": {"claim": "HUMAN_REVIEW_REQUIRED"},
+                        "primaryReliable": False,
+                    },
+                )
+
+        self.assertEqual(
+            "REPLICATED_BLIND_TRANSIT_LIKE_CANDIDATE",
+            result["classification"],
+        )
+        self.assertAlmostEqual(
+            true_period, result["candidatePeriodDays"], delta=0.003
+        )
+        self.assertAlmostEqual(
+            true_period / 4.0,
+            result["coarseCandidatePeriodDays"],
+            delta=1e-9,
+        )
+        alias = result["alternatingCycleAliasResolution"]
+        self.assertEqual("PROMOTE_INTEGER_MULTIPLE_PERIOD", alias["decision"])
+        self.assertEqual(4, alias["selectedCycleMultiplier"])
+        selected = next(
+            item for item in alias["integerMultipleTests"]
+            if item["multiplier"] == 4
+        )
+        self.assertTrue(selected["recurrenceValidation"]["supported"])
+        self.assertTrue(all(
+            item["decisiveSingleResidueEvents"]
+            for item in selected["sectorEvidence"]
         ))
         self.assertFalse(result["catalogAnswerKeyUsed"])
 
@@ -1062,6 +1599,133 @@ class BlindTransitSearchTests(unittest.TestCase):
             item["sector"] for item in
             iterative_search.call_args.kwargs["independent_spec"]["preparedSectors"]
         ])
+        self.assertEqual("openstar.tess.finalize", next_request.handler_id)
+
+    def test_multiclock_residual_stall_extends_sectors_and_reanalyzes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = InvestigationStore(root / "investigations")
+            investigation = store.create(
+                "adaptive-multiclock-search", WORKFLOW_ID, WORKFLOW_VERSION
+            )
+            source_project = root / "source-project.json"
+            source_project.write_text("{}", encoding="utf-8")
+            primary = root / "primary.json"
+            primary.write_text("{}", encoding="utf-8")
+            existing = []
+            for sector in (2, 3):
+                path = root / f"sector-{sector}.json"
+                path.write_text("{}", encoding="utf-8")
+                existing.append({"sector": sector, "datasetPath": str(path)})
+            added_path = root / "sector-4.json"
+            added_path.write_text("{}", encoding="utf-8")
+            extension_project = root / "extension-project.json"
+            extension_project.write_text("{}", encoding="utf-8")
+            for stage in (
+                ("001-prepare-target", "openstar.tess.prepare-target", {
+                    "datasetPath": str(primary),
+                    "sourceProjectPath": str(source_project),
+                    "sourceDatasetEntry": {"id": "target"},
+                    "ticID": 1,
+                    "sector": 1,
+                }),
+                ("002-independent", "openstar.tess.independent.prepare", {
+                    "investigationGoal": "FULL_CHARACTERIZATION",
+                    "targetPeriodDays": 5.5,
+                    "candidateSectors": [2, 3, 4, 5],
+                    "preparedSectors": existing,
+                }),
+                ("003-interpret", "openstar.tess.independent.interpret", {
+                    "claimDecision": {"claim": "HUMAN_REVIEW_REQUIRED"},
+                    "primaryReliable": False,
+                }),
+            ):
+                investigation = self._complete(store, investigation, *stage)
+
+            def first(period):
+                return {
+                    "classification": "REPLICATED_BLIND_TRANSIT_LIKE_CANDIDATE",
+                    "candidatePeriodDays": period,
+                    "supportingIndependentSectors": [2, 3],
+                    "linearEphemeris": {"coherent": True},
+                    "recommendedNextTest": (
+                        "ADDITIONAL_INDEPENDENT_SECTOR_TRANSIT_CONFIRMATION"
+                    ),
+                }
+
+            initial_first = first(2.0)
+            stalled = {
+                **initial_first,
+                "candidateSignals": [
+                    {"candidateIndex": 1, "candidatePeriodDays": 2.0},
+                    {"candidateIndex": 2, "candidatePeriodDays": 3.0},
+                ],
+                "iterativeSearch": {
+                    "acceptedCandidateCount": 2,
+                    "terminationReason": "NEXT_RESIDUAL_SIGNAL_UNRESOLVED",
+                },
+            }
+            expanded_first = first(2.0)
+            expanded = {
+                **expanded_first,
+                "candidateSignals": [
+                    {"candidateIndex": 1, "candidatePeriodDays": 2.0},
+                    {"candidateIndex": 2, "candidatePeriodDays": 3.0},
+                    {"candidateIndex": 3, "candidatePeriodDays": 5.0},
+                ],
+                "iterativeSearch": {
+                    "acceptedCandidateCount": 3,
+                    "terminationReason": "NEXT_RESIDUAL_SIGNAL_UNRESOLVED",
+                },
+            }
+            extension = {
+                "preparedSectors": [
+                    {"sector": 4, "datasetPath": str(added_path)}
+                ],
+                "projectPath": str(extension_project),
+            }
+            engine = build_engine(
+                store, types.SimpleNamespace(), poll_interval=0, timeout=None
+            )
+            engine.chain_stages = False
+            with mock.patch(
+                "workflows.tess.tess_investigation.analyze_blind_transit_search",
+                side_effect=[initial_first, expanded_first],
+            ) as analyze_search, mock.patch(
+                "workflows.tess.tess_investigation."
+                "analyze_iterative_blind_transit_search",
+                side_effect=[stalled, expanded],
+            ) as iterative_search, mock.patch(
+                "workflows.tess.tess_investigation.build_independent_sector_project",
+                return_value=extension,
+            ) as build_extension:
+                completed, next_request = engine.run_stage(
+                    investigation,
+                    StageRequest("004-blind", HANDLER_ID, {}, "003-interpret"),
+                    software_id="test",
+                    software_version="adaptive-multiclock-extension",
+                )
+
+        result = completed.stages[-1].result
+        self.assertEqual(3, len(result["candidateSignals"]))
+        self.assertEqual(2, analyze_search.call_count)
+        self.assertEqual(2, iterative_search.call_count)
+        self.assertEqual(8, build_extension.call_args.kwargs["maximum_sectors"])
+        expanded_spec = iterative_search.call_args_list[1].kwargs[
+            "independent_spec"
+        ]
+        self.assertEqual([2, 3, 4], [
+            item["sector"] for item in expanded_spec["preparedSectors"]
+        ])
+        audit = result["adaptiveSectorExtension"]
+        self.assertEqual(
+            "MULTI_CLOCK_ITERATIVE_RESIDUAL_SIGNAL_UNRESOLVED",
+            audit["reason"],
+        )
+        self.assertEqual(2, audit["initialAcceptedCandidateCount"])
+        self.assertEqual(3, audit["expandedAcceptedCandidateCount"])
+        self.assertTrue(audit["expandedResultSelected"])
+        self.assertFalse(audit["catalogAnswerKeyUsed"])
         self.assertEqual("openstar.tess.finalize", next_request.handler_id)
 
     def test_unresolved_full_characterization_morphology_routes_to_blind_search(self):
