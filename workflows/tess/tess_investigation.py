@@ -3436,7 +3436,7 @@ def build_engine(
         if distributed_candidate_generation_warranted(result):
             print("🧮 Preparing generic distributed residual candidates")
             print(
-                "   workers generate numerical Lomb-Scargle candidates; "
+                "   workers generate numerical periodic-box candidates; "
                 "all transit gates remain server-side"
             )
             distributed_preparation = build_exhausted_residual_candidate_project(
