@@ -1,8 +1,8 @@
 """Generic distributed candidate generation for exhausted transit residuals.
 
 All astronomy-specific preparation and interpretation remains on the server.
-Workers receive two ordinary ``openstar.lomb-scargle.v1`` datasets and return
-generic numerical period candidates only.
+Workers receive ordinary ``openstar.box-period-search.v1`` numerical series
+and return bounded periodic-box window scores only.
 """
 from __future__ import annotations
 
@@ -13,21 +13,25 @@ from pathlib import Path
 from typing import Any
 
 from .tess_blind_transit_search import (
+    AUDIT_COARSE_FAMILY_COUNT,
+    COARSE_FAMILY_COUNT,
+    DUTY_CYCLES,
+    OVERSAMPLING,
+    PHASE_BIN_COUNT,
     _frequency_bounds,
     _load,
     prepare_exhausted_residual_sectors,
 )
 
 
-WORKLOAD_ID = "openstar.lomb-scargle.v1"
+WORKLOAD_ID = "openstar.box-period-search.v1"
 PREPARATION_VERSION = (
     "openstar.tess-exhausted-residual-candidate-generation-preparation.v1"
 )
 INTERPRETATION_VERSION = (
     "openstar.tess-exhausted-residual-candidate-generation.v1"
 )
-TOTAL_FREQUENCIES = 262_144
-FREQUENCIES_PER_WORK_UNIT = 4_096
+FREQUENCIES_PER_FAMILY_WINDOW = 65
 RESIDUAL_METHODS = (
     "CUMULATIVE_TRANSIT_WINDOW_MASKING",
     "BOX_MODEL_SUBTRACTION",
@@ -77,6 +81,7 @@ def _pooled_residual_dataset(
     *, dataset_id: str, target_name: str,
     sectors: list[dict[str, Any]], residual_method: str,
     minimum_frequency: float, maximum_frequency: float,
+    families: list[dict[str, Any]],
 ) -> dict[str, Any]:
     import numpy as np
 
@@ -97,33 +102,54 @@ def _pooled_residual_dataset(
     origin = float(absolute_times[0])
     relative = (absolute_times - origin).astype(np.float32)
     standardized = (values - np.median(values)).astype(np.float32)
-    frequency_step = (
-        maximum_frequency - minimum_frequency
-    ) / (TOTAL_FREQUENCIES - 1)
+    longest_baseline = max(
+        float(item["times"][-1] - item["times"][0]) for item in sectors
+    )
+    coarse_step = 1.0 / (longest_baseline * OVERSAMPLING)
+    windows = []
+    for window_index, family in enumerate(families):
+        rank = int(family.get("objectiveRank") or 0)
+        if not COARSE_FAMILY_COUNT < rank <= AUDIT_COARSE_FAMILY_COUNT:
+            continue
+        center = float(family["coarseFrequencyPerDay"])
+        lower = max(minimum_frequency, center - coarse_step)
+        upper = min(maximum_frequency, center + coarse_step)
+        if not upper > lower:
+            continue
+        step = (upper - lower) / (FREQUENCIES_PER_FAMILY_WINDOW - 1)
+        windows.append({
+            "familyRank": rank,
+            "familyID": f"objective-rank-{rank}",
+            "centerFrequency": center,
+            "startFrequency": lower,
+            "frequencyStep": step,
+            "frequencyCount": FREQUENCIES_PER_FAMILY_WINDOW,
+            "frequencyStartIndex": window_index * FREQUENCIES_PER_FAMILY_WINDOW,
+        })
+    if not windows:
+        raise ValueError("distributed residual dataset has no lower-ranked families")
     return {
         "id": dataset_id,
         "targetName": target_name,
         "mission": "generic-distributed-time-series",
         "times": relative.astype(float).tolist(),
         "flux": standardized.astype(float).tolist(),
-        "frequencySearch": {
-            "minimumFrequency": minimum_frequency,
-            "maximumFrequency": maximum_frequency,
-            "frequencyStep": frequency_step,
-            "totalFrequencies": TOTAL_FREQUENCIES,
-            "frequenciesPerWorkUnit": FREQUENCIES_PER_WORK_UNIT,
+        "boxPeriodSearch": {
+            "phaseBinCount": PHASE_BIN_COUNT,
+            "durationFractions": list(DUTY_CYCLES),
+            "minimumInBoxSamples": 4,
+            "minimumOutOfBoxSamples": 20,
+            "frequencyWindows": windows,
         },
         "reference": {},
         "source": {
             "timeOriginDays": origin,
             "samplePrecision": "Float32",
-            "residualSearchMethod": residual_method,
+            "seriesVariantID": RESIDUAL_METHODS.index(residual_method),
             "sectorCount": len(sectors),
         },
         "science": {
-            "role": "generic-candidate-generation",
-            "selectionAuthority": "SERVER_SIDE_UNCHANGED_TRANSIT_GATES_ONLY",
-            "catalogAnswerKeyUsed": False,
+            "role": "discovery",
         },
     }
 
@@ -154,6 +180,12 @@ def build_exhausted_residual_candidate_project(
 
     prepared = []
     entries = []
+    census_methods = {
+        item.get("residualSearchMethod"): item
+        for item in (
+            blind_transit_result.get("exhaustedSectorResidualFamilyCensus") or {}
+        ).get("methods") or []
+    }
     for method in RESIDUAL_METHODS:
         method_slug = method.lower().replace("_", "-")
         dataset_id = (
@@ -172,6 +204,10 @@ def build_exhausted_residual_candidate_project(
             residual_method=method,
             minimum_frequency=minimum,
             maximum_frequency=maximum,
+            families=(
+                (census_methods[method].get("candidateGenerationAudit") or {}).get("families")
+                or []
+            ),
         )
         dataset_path = artifact_dir / f"{_safe(dataset_id)}.json"
         _write_json(dataset_path, dataset)
@@ -179,7 +215,7 @@ def build_exhausted_residual_candidate_project(
             "id": dataset_id,
             "path": str(dataset_path.resolve()),
             "targetName": dataset["targetName"],
-            "role": "generic-candidate-generation",
+            "role": "discovery",
             "residualSearchMethod": method,
         }
         entries.append(entry)
@@ -189,7 +225,7 @@ def build_exhausted_residual_candidate_project(
             "residualSearchMethod": method,
             "sampleCount": len(dataset["times"]),
             "timeOriginDays": dataset["source"]["timeOriginDays"],
-            "frequencySearch": dataset["frequencySearch"],
+            "boxPeriodSearch": dataset["boxPeriodSearch"],
         })
 
     project_id = (
@@ -215,15 +251,16 @@ def build_exhausted_residual_candidate_project(
         "projectID": project_id,
         "projectPath": str(project_path.resolve()),
         "workloadID": WORKLOAD_ID,
-        "workerSemantics": "GENERIC_LOMB_SCARGLE",
+        "workerSemantics": "GENERIC_PERIODIC_BOX_SEARCH",
         "specializedTessWorkerLogic": False,
         "normalTopTwelveSelectionPathChanged": False,
         "scienceThresholdsChanged": False,
         "primaryDatasetPath": str(primary_dataset_path),
         "independentSpec": independent_spec,
         "preparedDatasets": prepared,
-        "totalWorkUnits": len(prepared) * math.ceil(
-            TOTAL_FREQUENCIES / FREQUENCIES_PER_WORK_UNIT
+        "totalWorkUnits": sum(
+            len(item["boxPeriodSearch"]["frequencyWindows"])
+            for item in prepared
         ),
         "catalogAnswerKeyUsed": False,
     }
@@ -235,7 +272,7 @@ def interpret_exhausted_residual_candidate_project(
     if preparation.get("version") != PREPARATION_VERSION:
         raise ValueError("unexpected distributed residual preparation version")
     if preparation.get("workloadID") != WORKLOAD_ID:
-        raise ValueError("distributed residual preparation is not generic Lomb-Scargle")
+        raise ValueError("distributed residual preparation is not generic periodic-box work")
     if str(project_status.get("projectID")) != str(preparation.get("projectID")):
         raise ValueError("distributed residual project identity changed")
     if project_status.get("workloadID") != WORKLOAD_ID:
@@ -263,21 +300,29 @@ def interpret_exhausted_residual_candidate_project(
                 f"distributed residual dataset did not complete: {dataset_id}"
             )
         candidates = []
-        for item in status.get("independentCandidates") or []:
+        for item in status.get("boxCandidates") or []:
             try:
                 frequency = float(item["frequency"])
-                power = float(item["power"])
+                score = float(item["score"])
+                phase = float(item["phase"])
+                duration = float(item["durationFraction"])
+                family_rank = int(item["familyRank"])
             except (KeyError, TypeError, ValueError):
                 continue
             if (
                 math.isfinite(frequency)
                 and frequency > 0.0
-                and math.isfinite(power)
+                and math.isfinite(score)
+                and math.isfinite(phase)
+                and math.isfinite(duration)
             ):
                 candidates.append({
                     "frequency": frequency,
                     "periodDays": 1.0 / frequency,
-                    "power": power,
+                    "score": score,
+                    "phase": phase,
+                    "durationFraction": duration,
+                    "familyRank": family_rank,
                 })
         method = prepared["residualSearchMethod"]
         candidate_map[method] = candidates
@@ -293,7 +338,7 @@ def interpret_exhausted_residual_candidate_project(
         "version": INTERPRETATION_VERSION,
         "classification": "GENERIC_DISTRIBUTED_RESIDUAL_CANDIDATES_COMPLETE",
         "workloadID": WORKLOAD_ID,
-        "workerSemantics": "GENERIC_LOMB_SCARGLE",
+        "workerSemantics": "GENERIC_PERIODIC_BOX_SEARCH",
         "specializedTessWorkerLogic": False,
         "methods": methods,
         "candidateMap": candidate_map,

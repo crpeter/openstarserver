@@ -55,18 +55,6 @@ DUTY_CYCLES = (
     0.0025, 0.005, 0.0075, 0.01, 0.015, 0.02, 0.03, 0.04, 0.05, 0.07, 0.10,
 )
 
-# A narrow box has appreciable Fourier power across many integer harmonics.
-# This fixed family is candidate-generation bookkeeping only: a match still
-# has to pass both residual methods and every authoritative transit gate.
-DISTRIBUTED_CANDIDATE_HARMONIC_MULTIPLIERS = tuple(
-    sorted({
-        1.0,
-        *(float(value) for value in range(2, 17)),
-        *(1.0 / value for value in range(2, 17)),
-    })
-)
-
-
 class _SearchGridResult(tuple):
     """Six-value legacy result carrying a non-selection audit sidecar."""
 
@@ -2226,39 +2214,40 @@ def _distributed_family_match(
     coarse_step: float, minimum: float, maximum: float,
 ) -> dict[str, Any] | None:
     family_frequency = float(family["coarseFrequencyPerDay"])
+    family_rank = int(family["objectiveRank"])
     matches = []
     for candidate in candidates:
         try:
             worker_frequency = float(candidate["frequency"])
-            power = float(candidate.get("power") or 0.0)
+            worker_score = float(candidate["score"])
+            worker_family_rank = int(candidate["familyRank"])
         except (KeyError, TypeError, ValueError):
             continue
         if not (
             math.isfinite(worker_frequency)
             and worker_frequency > 0.0
-            and math.isfinite(power)
+            and math.isfinite(worker_score)
+            and worker_family_rank == family_rank
         ):
             continue
-        for multiplier in DISTRIBUTED_CANDIDATE_HARMONIC_MULTIPLIERS:
-            projected = worker_frequency * multiplier
-            if not minimum <= projected <= maximum:
-                continue
-            distance = abs(projected - family_frequency)
-            if distance <= coarse_step:
-                matches.append({
-                    "workerFrequencyPerDay": worker_frequency,
-                    "workerPower": power,
-                    "harmonicMultiplier": multiplier,
-                    "projectedBoxFrequencyPerDay": projected,
-                    "absoluteFrequencyDistancePerDay": distance,
-                })
+        if not minimum <= worker_frequency <= maximum:
+            continue
+        distance = abs(worker_frequency - family_frequency)
+        if distance <= coarse_step * (1.0 + 1.0e-9):
+            matches.append({
+                "workerFrequencyPerDay": worker_frequency,
+                "workerBoxScore": worker_score,
+                "workerFamilyRank": worker_family_rank,
+                "projectedBoxFrequencyPerDay": worker_frequency,
+                "absoluteFrequencyDistancePerDay": distance,
+            })
     if not matches:
         return None
     return min(
         matches,
         key=lambda item: (
             item["absoluteFrequencyDistancePerDay"],
-            -item["workerPower"],
+            -item["workerBoxScore"],
             item["workerFrequencyPerDay"],
         ),
     )
@@ -2272,9 +2261,8 @@ def analyze_exhausted_distributed_residual_candidates(
 ) -> dict[str, Any]:
     """Corroborate lower-ranked residual families with generic worker scans.
 
-    The generic Lomb--Scargle results only decide which already-frozen audit
-    families receive bounded server-side box refinement.  They never satisfy a
-    transit gate themselves.
+    Generic periodic-box results only refine the matching already-frozen audit
+    family. They never satisfy a transit gate themselves.
     """
     availability = blind_transit_result.get(
         "independentSectorAvailability"
@@ -2526,7 +2514,7 @@ def analyze_exhausted_distributed_residual_candidates(
         "normalTopTwelveSelectionPathChanged": False,
         "scienceThresholdsChanged": False,
         "requiredResidualMethodAgreement": True,
-        "workerSemantics": "GENERIC_LOMB_SCARGLE_CANDIDATE_GENERATION",
+        "workerSemantics": "GENERIC_PERIODIC_BOX_SEARCH",
         "specializedTessWorkerLogic": False,
         "corroboratedFamilyGroupCount": len(groups),
         "trials": trials,

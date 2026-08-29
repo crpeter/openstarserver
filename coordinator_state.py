@@ -56,6 +56,7 @@ HARMONIC_PREFERENCE_MIN_COHERENCE_GAIN = 0.15
 PERIOD_FOLD_BINS = 100
 PERIOD_MIN_POINTS_PER_BIN = 3
 PERIOD_INDEPENDENT_CANDIDATE_COUNT = 5
+BOX_PERIOD_SEARCH_V1 = "openstar.box-period-search.v1"
 
 
 def normalize_id(value):
@@ -292,6 +293,9 @@ class CoordinatorState:
 
     def _build_work_units(self):
         for dataset_id, dataset in self.datasets.items():
+            if self.workload_id == BOX_PERIOD_SEARCH_V1:
+                self._build_box_period_work_units(dataset_id, dataset)
+                continue
             search = self._frequency_search(dataset)
 
             minimum_frequency = search["minimumFrequency"]
@@ -348,6 +352,67 @@ class CoordinatorState:
                 self.verification_failure_counts[normalized_work_id] = 0
                 self.reference_mismatch_counts[normalized_work_id] = 0
 
+    def _build_box_period_work_units(self, dataset_id, dataset):
+        search = dataset.get("boxPeriodSearch")
+        if not isinstance(search, dict):
+            raise RuntimeError(f"{dataset_id}: missing boxPeriodSearch object")
+        windows = search.get("frequencyWindows")
+        if not isinstance(windows, list) or not windows:
+            raise RuntimeError(f"{dataset_id}: frequencyWindows must be nonempty")
+        phase_bin_count = int(search.get("phaseBinCount", 0))
+        durations = search.get("durationFractions")
+        minimum_in = int(search.get("minimumInBoxSamples", 0))
+        minimum_out = int(search.get("minimumOutOfBoxSamples", 0))
+        if phase_bin_count < 2:
+            raise RuntimeError(f"{dataset_id}: phaseBinCount must be >= 2")
+        if not isinstance(durations, list) or not durations:
+            raise RuntimeError(f"{dataset_id}: durationFractions must be nonempty")
+        durations = [float(value) for value in durations]
+        if any(not math.isfinite(value) or value <= 0 or value >= 1 for value in durations):
+            raise RuntimeError(f"{dataset_id}: durationFractions must be finite and between 0 and 1")
+        if minimum_in <= 0 or minimum_out <= 0:
+            raise RuntimeError(f"{dataset_id}: sample-count gates must be positive")
+
+        self.work_ids_by_dataset[dataset_id] = []
+        for window_index, window in enumerate(windows):
+            start_frequency = float(window["startFrequency"])
+            frequency_step = float(window["frequencyStep"])
+            frequency_count = int(window["frequencyCount"])
+            frequency_start_index = int(window.get("frequencyStartIndex", 0))
+            if (not math.isfinite(start_frequency) or start_frequency <= 0
+                    or not math.isfinite(frequency_step) or frequency_step <= 0
+                    or frequency_count <= 0):
+                raise RuntimeError(f"{dataset_id}: invalid frequency window {window_index}")
+            payload = {
+                "startFrequency": start_frequency,
+                "frequencyStep": frequency_step,
+                "frequencyCount": frequency_count,
+                "frequencyStartIndex": frequency_start_index,
+                "phaseBinCount": phase_bin_count,
+                "durationFractions": durations,
+                "minimumInBoxSamples": minimum_in,
+                "minimumOutOfBoxSamples": minimum_out,
+                "windowIndex": window_index,
+            }
+            for key in ("familyRank", "familyID", "centerFrequency"):
+                if window.get(key) is not None:
+                    payload[key] = window[key]
+            work_id = str(uuid.uuid4())
+            normalized_work_id = normalize_id(work_id)
+            work_unit = {
+                "id": work_id,
+                "projectID": self.project_id,
+                "workloadID": self.workload_id,
+                "datasetID": dataset_id,
+                "payload": payload,
+            }
+            self.work_units[normalized_work_id] = work_unit
+            self.work_ids_by_dataset[dataset_id].append(normalized_work_id)
+            self.pending.append(normalized_work_id)
+            self.retry_counts[normalized_work_id] = 0
+            self.verification_failure_counts[normalized_work_id] = 0
+            self.reference_mismatch_counts[normalized_work_id] = 0
+
     @staticmethod
     def _global_reference(dataset):
         reference = dataset.get("reference", {})
@@ -374,6 +439,8 @@ class CoordinatorState:
         errors = []
 
         for dataset_id, dataset in self.datasets.items():
+            if self.workload_id == BOX_PERIOD_SEARCH_V1:
+                continue
             search = self._frequency_search(dataset)
 
             global_frequency, global_period, global_power = self._global_reference(
@@ -945,6 +1012,9 @@ class CoordinatorState:
         numeric finite values, and a winning frequency inside the assigned
         frequency range.
         """
+        if work_unit.get("workloadID") == BOX_PERIOD_SEARCH_V1:
+            return self._validate_box_period_result(work_unit, result)
+
         details = {
             "deviceFrequency": None,
             "devicePower": None,
@@ -992,6 +1062,80 @@ class CoordinatorState:
             return False, "Best frequency is outside work-unit range.", details
 
         return True, "Metal result is structurally valid.", details
+
+    def _validate_box_period_result(self, work_unit, result):
+        payload = work_unit["payload"]
+        details = {"deviceFrequency": None, "deviceScore": None}
+        required = (
+            "bestFrequency", "bestScore", "bestPhase",
+            "bestDurationFraction", "bestFrequencyIndex",
+            "bestDurationIndex", "bestPhaseBin",
+            "inBoxSamples", "outOfBoxSamples",
+        )
+        if result.get("status") != "completed":
+            return False, "Work unit did not complete.", details
+        if any(result.get(key) is None for key in required):
+            return False, "Missing periodic-box result field.", details
+        def exact_integer(key):
+            value = result[key]
+            if isinstance(value, bool):
+                raise ValueError(key)
+            numeric = float(value)
+            if not math.isfinite(numeric) or not numeric.is_integer():
+                raise ValueError(key)
+            return int(numeric)
+
+        try:
+            frequency = float(result["bestFrequency"])
+            score = float(result["bestScore"])
+            phase = float(result["bestPhase"])
+            duration = float(result["bestDurationFraction"])
+            frequency_index = exact_integer("bestFrequencyIndex")
+            duration_index = exact_integer("bestDurationIndex")
+            phase_bin = exact_integer("bestPhaseBin")
+            in_count = exact_integer("inBoxSamples")
+            out_count = exact_integer("outOfBoxSamples")
+        except (TypeError, ValueError):
+            return False, "Periodic-box result fields must be numeric.", details
+        details.update({"deviceFrequency": frequency, "deviceScore": score})
+        if not all(math.isfinite(value) for value in (frequency, score, phase, duration)):
+            return False, "Periodic-box result contains a non-finite value.", details
+        start = float(payload["startFrequency"])
+        step = float(payload["frequencyStep"])
+        count = int(payload["frequencyCount"])
+        start_index = int(payload.get("frequencyStartIndex", 0))
+        relative_index = frequency_index - start_index
+        if relative_index < 0 or relative_index >= count:
+            return False, "Best frequency index is outside work-unit range.", details
+        expected_frequency = start + relative_index * step
+        frequency_tolerance = max(
+            abs(expected_frequency) * 2.0e-6,
+            abs(step) * 2.0e-5,
+            1.0e-7,
+        )
+        if abs(frequency - expected_frequency) > frequency_tolerance:
+            return False, "Best frequency does not match its grid index.", details
+        bins = int(payload["phaseBinCount"])
+        durations = [float(value) for value in payload["durationFractions"]]
+        if duration_index < 0 or duration_index >= len(durations):
+            return False, "Best duration index is outside configured durations.", details
+        expected_bins = max(1, min(bins - 1, int(math.floor(durations[duration_index] * bins + 0.5))))
+        expected_duration = expected_bins / bins
+        if phase_bin < 0 or phase_bin >= bins or abs(phase - phase_bin / bins) > 1.0e-6:
+            return False, "Best phase does not match its phase-bin index.", details
+        if abs(duration - expected_duration) > 1.0e-6:
+            return False, "Best duration does not match its configured index.", details
+        if in_count < int(payload["minimumInBoxSamples"]):
+            return False, "In-box sample gate was not satisfied.", details
+        if out_count < int(payload["minimumOutOfBoxSamples"]):
+            return False, "Out-of-box sample gate was not satisfied.", details
+        dataset = self.datasets[work_unit["datasetID"]]
+        series = dataset.get("coordinates")
+        if not isinstance(series, list):
+            series = dataset.get("times")
+        if not isinstance(series, list) or in_count + out_count != len(series):
+            return False, "Periodic-box sample counts do not partition the dataset.", details
+        return True, "Periodic-box result is structurally valid.", details
 
     def _reference_comparison(self, work_unit, result):
         """
@@ -1375,10 +1519,13 @@ class CoordinatorState:
         print(f"   work: {work_unit['id']}")
         print(f"   node: {assignment.get('nodeID', 'unknown')}")
         print(f"   dataset: {work_unit['datasetID']}")
-        print(
-            "   frequency start index: "
-            f"{work_unit['frequencyStartIndex']}"
+        frequency_start_index = first_value(
+            work_unit,
+            "frequencyStartIndex",
+            default=(work_unit.get("payload") or {}).get("frequencyStartIndex"),
         )
+        if frequency_start_index is not None:
+            print(f"   frequency start index: {frequency_start_index}")
         self._print_optional_float(
             "device frequency",
             details.get("deviceFrequency"),
@@ -1572,6 +1719,14 @@ class CoordinatorState:
                 "bestFrequency",
                 "bestPeriodDays",
                 "bestPower",
+                "bestScore",
+                "bestPhase",
+                "bestDurationFraction",
+                "bestFrequencyIndex",
+                "bestDurationIndex",
+                "bestPhaseBin",
+                "inBoxSamples",
+                "outOfBoxSamples",
             ):
                 if result.get(key) is None and result_payload.get(key) is not None:
                     result[key] = result_payload[key]
@@ -1797,7 +1952,21 @@ class CoordinatorState:
 
                 reference_comparison = None
 
-                if accepted:
+                if accepted and work_unit.get("workloadID") == BOX_PERIOD_SEARCH_V1:
+                    reference_comparison = {
+                        "status": "not-applicable",
+                        "matched": None,
+                        "method": None,
+                        "message": "No external reference is used for generic periodic-box work.",
+                        "details": {},
+                    }
+                    verification = {
+                        **validation_details,
+                        "method": "periodic-box-result",
+                        "referenceComparisonStatus": "not-applicable",
+                    }
+                    message = "Periodic-box result accepted."
+                elif accepted:
                     reference_comparison = self._reference_comparison(
                         work_unit,
                         result,
@@ -1932,7 +2101,8 @@ class CoordinatorState:
                 stored_result["nodeID"] = assignment["nodeID"]
                 stored_result["verification"] = dict(verification)
 
-                if stored_result.get("bestPeriodDays") is None:
+                if (work_unit.get("workloadID") != BOX_PERIOD_SEARCH_V1
+                        and stored_result.get("bestPeriodDays") is None):
                     best_frequency = float(stored_result["bestFrequency"])
                     stored_result["bestPeriodDays"] = (
                         1.0 / best_frequency
@@ -2030,6 +2200,36 @@ class CoordinatorState:
                 best = result
 
         return best
+
+    def _box_period_candidates_locked(self, dataset_id):
+        candidates = []
+        for work_id in self.work_ids_by_dataset.get(dataset_id, []):
+            result = self.completed.get(work_id)
+            if result is None or result.get("bestScore") is None:
+                continue
+            work_unit = self.work_units[work_id]
+            payload = work_unit["payload"]
+            candidates.append({
+                "workID": work_id,
+                "windowIndex": payload.get("windowIndex"),
+                "familyRank": payload.get("familyRank"),
+                "familyID": payload.get("familyID"),
+                "centerFrequency": payload.get("centerFrequency"),
+                "frequency": float(result["bestFrequency"]),
+                "score": float(result["bestScore"]),
+                "phase": float(result["bestPhase"]),
+                "durationFraction": float(result["bestDurationFraction"]),
+                "frequencyIndex": int(result["bestFrequencyIndex"]),
+                "durationIndex": int(result["bestDurationIndex"]),
+                "phaseBin": int(result["bestPhaseBin"]),
+                "inBoxSamples": int(result["inBoxSamples"]),
+                "outOfBoxSamples": int(result["outOfBoxSamples"]),
+            })
+        candidates.sort(key=lambda item: (
+            item["windowIndex"] if item["windowIndex"] is not None else math.inf,
+            item["frequencyIndex"],
+        ))
+        return candidates
 
     @staticmethod
     def _finite_float_list(values):
@@ -2280,6 +2480,25 @@ class CoordinatorState:
             total > 0
             and completed + failed == total
         )
+
+        if self.workload_id == BOX_PERIOD_SEARCH_V1:
+            candidates = self._box_period_candidates_locked(dataset_id)
+            return {
+                "periodStatus": (
+                    "BOX_SEARCH_COMPLETE" if terminal and failed == 0
+                    else "INCOMPLETE_COVERAGE" if terminal
+                    else "SEARCHING"
+                ),
+                "periodConfidence": None,
+                "coverageComplete": terminal and failed == 0,
+                "candidate": None,
+                "authoritative": None,
+                "harmonicCandidates": [],
+                "preferredPhysicalPeriodDays": None,
+                "preferredPhysicalPeriodRelation": None,
+                "independentCandidates": [],
+                "boxCandidates": candidates,
+            }
 
         best = self._dataset_best_locked(dataset_id)
 
@@ -2755,6 +2974,7 @@ class CoordinatorState:
                     "independentCandidates",
                     [],
                 ),
+                "boxCandidates": diagnostics.get("boxCandidates", []),
                 "iPhoneContribution": contributions["iPhone"],
                 "macContribution": contributions["Mac"],
                 "otherContribution": contributions["other"],

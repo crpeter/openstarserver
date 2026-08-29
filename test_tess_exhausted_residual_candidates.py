@@ -131,7 +131,7 @@ class ExhaustedResidualCandidateTests(unittest.TestCase):
             distributed.distributed_candidate_generation_warranted(changed)
         )
 
-    def test_builder_emits_only_generic_lomb_scargle_work(self):
+    def test_builder_emits_only_generic_periodic_box_work(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             source_project = root / "source-project.json"
@@ -170,20 +170,24 @@ class ExhaustedResidualCandidateTests(unittest.TestCase):
                 preparation["projectPath"]
             ).project_status()
 
-        self.assertEqual("openstar.lomb-scargle.v1", manifest["workloadID"])
+        self.assertEqual("openstar.box-period-search.v1", manifest["workloadID"])
         self.assertEqual(2, len(manifest["datasets"]))
-        self.assertEqual(128, preparation["totalWorkUnits"])
-        self.assertEqual(128, coordinator_status["projectTotalWorkUnits"])
+        self.assertEqual(2, preparation["totalWorkUnits"])
+        self.assertEqual(2, coordinator_status["projectTotalWorkUnits"])
         self.assertEqual(2, len(coordinator_status["datasets"]))
         self.assertFalse(preparation["specializedTessWorkerLogic"])
         self.assertFalse(preparation["normalTopTwelveSelectionPathChanged"])
         self.assertFalse(preparation["scienceThresholdsChanged"])
         self.assertEqual(
-            set(distributed.RESIDUAL_METHODS),
-            {item["source"]["residualSearchMethod"] for item in datasets},
+            {0, 1},
+            {item["source"]["seriesVariantID"] for item in datasets},
         )
         self.assertTrue(all(item["times"] for item in datasets))
         self.assertTrue(all(item["flux"] for item in datasets))
+        self.assertTrue(all(
+            item["boxPeriodSearch"]["frequencyWindows"][0]["familyRank"] == 29
+            for item in datasets
+        ))
 
     def test_interpreter_is_fail_closed_and_returns_numerical_candidates_only(self):
         preparation = {
@@ -204,9 +208,11 @@ class ExhaustedResidualCandidateTests(unittest.TestCase):
                     "id": f"dataset-{index}",
                     "coverageComplete": True,
                     "failedWorkUnits": 0,
-                    "periodStatus": "RELIABLE",
-                    "independentCandidates": [
-                        {"frequency": 0.3 + index * 0.01, "power": 0.2},
+                    "periodStatus": "BOX_SEARCH_COMPLETE",
+                    "boxCandidates": [
+                        {"frequency": 0.3 + index * 0.01, "score": 8.0,
+                         "phase": 0.1, "durationFraction": 0.02,
+                         "familyRank": 29},
                     ],
                 }
                 for index in range(2)
@@ -272,7 +278,7 @@ class ExhaustedResidualCandidateTests(unittest.TestCase):
                 "recurrenceSupportGate": {"mode": "UNCHANGED_TEST_GATE"},
             }
             candidates = {
-                method: [{"frequency": 0.3, "power": 0.2}]
+                method: [{"frequency": 0.3, "score": 8.0, "familyRank": 29}]
                 for method in distributed.RESIDUAL_METHODS
             }
             with mock.patch.object(
@@ -326,17 +332,22 @@ class ExhaustedResidualCandidateTests(unittest.TestCase):
         self.assertFalse(top_twelve["accepted"])
         self.assertEqual(0, top_twelve["corroboratedFamilyGroupCount"])
 
-    def test_fixed_fourier_family_can_map_a_narrow_transit_harmonic(self):
+    def test_worker_candidate_must_belong_to_the_exact_frozen_family(self):
         match = blind._distributed_family_match(
-            {"coarseFrequencyPerDay": 0.3},
-            [{"frequency": 1.5, "power": 0.25}],
+            {"coarseFrequencyPerDay": 0.3, "objectiveRank": 29},
+            [{"frequency": 0.3, "score": 8.0, "familyRank": 29}],
             coarse_step=0.001,
             minimum=0.1,
             maximum=5.0,
         )
         self.assertIsNotNone(match)
-        self.assertAlmostEqual(0.2, match["harmonicMultiplier"])
+        self.assertEqual(29, match["workerFamilyRank"])
         self.assertAlmostEqual(0.3, match["projectedBoxFrequencyPerDay"])
+        self.assertIsNone(blind._distributed_family_match(
+            {"coarseFrequencyPerDay": 0.3, "objectiveRank": 30},
+            [{"frequency": 0.3, "score": 8.0, "familyRank": 29}],
+            coarse_step=0.001, minimum=0.1, maximum=5.0,
+        ))
 
     def test_lifecycle_runs_generic_project_then_returns_to_server_authority(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -373,7 +384,7 @@ class ExhaustedResidualCandidateTests(unittest.TestCase):
             coordinator = types.SimpleNamespace(
                 run_project=mock.Mock(return_value=types.SimpleNamespace(
                     status=status,
-                    node_contributions={"generic-node": 128},
+                    node_contributions={"generic-node": 2},
                     project_id="generic-project",
                 ))
             )
@@ -403,7 +414,7 @@ class ExhaustedResidualCandidateTests(unittest.TestCase):
                 "linearEphemeris": {"coherent": True},
             }
             generic = {
-                "workerSemantics": "GENERIC_LOMB_SCARGLE",
+                "workerSemantics": "GENERIC_PERIODIC_BOX_SEARCH",
                 "candidateMap": {method: [] for method in distributed.RESIDUAL_METHODS},
             }
             validation = {
