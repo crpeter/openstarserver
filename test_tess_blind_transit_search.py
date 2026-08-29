@@ -282,6 +282,18 @@ class BlindTransitSearchTests(unittest.TestCase):
             "RETAIN_BASE_PERIOD",
             result["alternatingCycleAliasResolution"]["decision"],
         )
+        generation_audit = result["candidateGenerationAudit"]
+        self.assertEqual(64, generation_audit["recordedFamilyCount"])
+        self.assertEqual(12, generation_audit["selectionFamilyCount"])
+        self.assertFalse(generation_audit["selectionEligible"])
+        self.assertFalse(generation_audit["claimDecisionAffected"])
+        self.assertEqual(
+            list(range(1, 65)),
+            [
+                family["objectiveRank"]
+                for family in generation_audit["families"]
+            ],
+        )
 
     def test_iterative_search_masks_first_clock_and_recovers_second(self):
         first_period = 2.21857567
@@ -1773,6 +1785,102 @@ class BlindTransitSearchTests(unittest.TestCase):
                 weakened
             )
         )
+
+    def test_exhausted_sector_census_is_audit_only_and_revises_next_test(self):
+        family_audit = {
+            "method": "OBJECTIVE_RANKED_COARSE_FREQUENCY_FAMILY_CENSUS",
+            "recordedFamilyCount": 64,
+            "selectionEligible": False,
+            "claimDecisionAffected": False,
+            "families": [
+                {
+                    "objectiveRank": rank,
+                    "coarsePeriodDays": 2.0 + rank / 100.0,
+                }
+                for rank in range(1, 65)
+            ],
+            "catalogAnswerKeyUsed": False,
+        }
+        claim = {
+            "claim": "CANDIDATE_PERIOD",
+            "rationale": ["unchanged candidate evidence"],
+        }
+        result = {
+            "classification": "REPLICATED_BLIND_TRANSIT_LIKE_CANDIDATE",
+            "claimDecision": claim,
+            "recommendedNextTest": (
+                "ADDITIONAL_INDEPENDENT_SECTOR_TRANSIT_CONFIRMATION"
+            ),
+            "candidateSignals": [{"candidateIndex": 1}],
+            "iterativeSearch": {
+                "terminationReason": "NEXT_RESIDUAL_SIGNAL_UNRESOLVED",
+                "iterations": [
+                    {"iteration": 1, "accepted": True},
+                    {
+                        "iteration": 2,
+                        "accepted": False,
+                        "candidateEvidence": {
+                            "candidateGenerationAudit": family_audit,
+                        },
+                        "boxModelSubtractionFallback": {
+                            "subtractionCandidateEvidence": {
+                                "candidateGenerationAudit": family_audit,
+                            },
+                        },
+                    },
+                ],
+            },
+        }
+        independent = {
+            "candidateSectors": [4, 5, 30, 32, 97, 98],
+        }
+        exhausted = {
+            "preparedSectors": [
+                {"sector": sector}
+                for sector in (98, 4, 97, 5, 32, 30)
+            ],
+        }
+
+        updated = tess_investigation._apply_blind_transit_sector_exhaustion(
+            result, independent, exhausted
+        )
+
+        self.assertEqual(claim, updated["claimDecision"])
+        self.assertEqual(
+            "GENERIC_DISTRIBUTED_RESIDUAL_TRANSIT_CANDIDATE_GENERATION",
+            updated["recommendedNextTest"],
+        )
+        self.assertTrue(
+            updated["independentSectorAvailability"][
+                "allCandidateSectorsPrepared"
+            ]
+        )
+        census = updated["exhaustedSectorResidualFamilyCensus"]
+        self.assertEqual(2, len(census["methods"]))
+        self.assertFalse(census["selectionEligible"])
+        self.assertFalse(census["candidateSelectionAffected"])
+        self.assertFalse(census["claimDecisionAffected"])
+        self.assertFalse(
+            census["recommendedNextTestAffectedByFamilyScores"]
+        )
+        self.assertEqual(
+            "ALL_OFFICIAL_INDEPENDENT_SECTORS_ALREADY_CONSUMED",
+            updated["recommendedNextTestRevision"]["reason"],
+        )
+
+        not_exhausted = {
+            "preparedSectors": [
+                {"sector": sector} for sector in (98, 4, 97, 5)
+            ],
+        }
+        unchanged = tess_investigation._apply_blind_transit_sector_exhaustion(
+            result, independent, not_exhausted
+        )
+        self.assertEqual(
+            "ADDITIONAL_INDEPENDENT_SECTOR_TRANSIT_CONFIRMATION",
+            unchanged["recommendedNextTest"],
+        )
+        self.assertNotIn("exhaustedSectorResidualFamilyCensus", unchanged)
 
     def test_single_clock_blocked_residual_extends_and_reanalyzes(self):
         with tempfile.TemporaryDirectory() as temporary:
