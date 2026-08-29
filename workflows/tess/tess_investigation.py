@@ -299,8 +299,122 @@ from .tess_multisector import (
 WORKFLOW_ID = "openstar.workflow.tess-investigation.v1"
 WORKFLOW_VERSION = "20.2"
 SOFTWARE_ID = "openstar.tess-investigation-plugin"
-SOFTWARE_VERSION = "20.37"
+SOFTWARE_VERSION = "20.38"
 ADAPTIVE_BLIND_TRANSIT_ADDITIONAL_SECTORS = 8
+EXHAUSTED_RESIDUAL_TRANSIT_NEXT_TEST = (
+    "GENERIC_DISTRIBUTED_RESIDUAL_TRANSIT_CANDIDATE_GENERATION"
+)
+
+
+def _blind_transit_sector_availability(
+    independent_prepare: dict[str, Any], analysis_spec: dict[str, Any],
+) -> dict[str, Any]:
+    candidate_sectors = sorted({
+        int(sector)
+        for sector in independent_prepare.get("candidateSectors") or []
+    })
+    prepared_sectors = sorted({
+        int(item["sector"])
+        for item in analysis_spec.get("preparedSectors") or []
+        if item.get("sector") is not None
+    })
+    prepared = set(prepared_sectors)
+    remaining_sectors = [
+        sector for sector in candidate_sectors if sector not in prepared
+    ]
+    return {
+        "candidateSectors": candidate_sectors,
+        "preparedSectors": prepared_sectors,
+        "remainingSectors": remaining_sectors,
+        "allCandidateSectorsPrepared": bool(
+            candidate_sectors and not remaining_sectors
+        ),
+        "catalogAnswerKeyUsed": False,
+    }
+
+
+def _exhausted_residual_family_census(
+    result: dict[str, Any], sector_availability: dict[str, Any],
+) -> dict[str, Any] | None:
+    iterative = result.get("iterativeSearch") or {}
+    if not (
+        result.get("classification")
+        == "REPLICATED_BLIND_TRANSIT_LIKE_CANDIDATE"
+        and iterative.get("terminationReason")
+        == "NEXT_RESIDUAL_SIGNAL_UNRESOLVED"
+        and sector_availability.get("allCandidateSectorsPrepared") is True
+    ):
+        return None
+    iterations = iterative.get("iterations") or []
+    if not iterations:
+        return None
+    stopping = iterations[-1]
+    fallback = stopping.get("boxModelSubtractionFallback") or {}
+    evidence_sources = [
+        (
+            "CUMULATIVE_TRANSIT_WINDOW_MASKING",
+            stopping.get("candidateEvidence") or {},
+        ),
+        (
+            "BOX_MODEL_SUBTRACTION",
+            fallback.get("subtractionCandidateEvidence") or {},
+        ),
+    ]
+    methods = []
+    for residual_method, evidence in evidence_sources:
+        audit = evidence.get("candidateGenerationAudit") or {}
+        if not audit.get("families"):
+            continue
+        methods.append({
+            "residualSearchMethod": residual_method,
+            "candidateGenerationAudit": copy.deepcopy(audit),
+        })
+    if not methods:
+        return None
+    return {
+        "version": "1.0",
+        "trigger": "ALL_OFFICIAL_INDEPENDENT_SECTORS_CONSUMED_WITH_UNRESOLVED_RESIDUAL",
+        "sectorAvailability": copy.deepcopy(sector_availability),
+        "methods": methods,
+        "selectionEligible": False,
+        "candidateSelectionAffected": False,
+        "claimDecisionAffected": False,
+        "recommendedNextTestAffectedByFamilyScores": False,
+        "catalogAnswerKeyUsed": False,
+    }
+
+
+def _apply_blind_transit_sector_exhaustion(
+    result: dict[str, Any], independent_prepare: dict[str, Any],
+    analysis_spec: dict[str, Any],
+) -> dict[str, Any]:
+    sector_availability = _blind_transit_sector_availability(
+        independent_prepare, analysis_spec
+    )
+    updated = dict(result)
+    updated["independentSectorAvailability"] = sector_availability
+    census = _exhausted_residual_family_census(updated, sector_availability)
+    if census is not None:
+        updated["exhaustedSectorResidualFamilyCensus"] = census
+    iterative = updated.get("iterativeSearch") or {}
+    previous = updated.get("recommendedNextTest")
+    if (
+        sector_availability.get("allCandidateSectorsPrepared") is True
+        and iterative.get("terminationReason")
+        == "NEXT_RESIDUAL_SIGNAL_UNRESOLVED"
+        and previous
+        == "ADDITIONAL_INDEPENDENT_SECTOR_TRANSIT_CONFIRMATION"
+    ):
+        updated["recommendedNextTest"] = EXHAUSTED_RESIDUAL_TRANSIT_NEXT_TEST
+        updated["recommendedNextTestRevision"] = {
+            "previousRecommendedNextTest": previous,
+            "recommendedNextTest": EXHAUSTED_RESIDUAL_TRANSIT_NEXT_TEST,
+            "reason": "ALL_OFFICIAL_INDEPENDENT_SECTORS_ALREADY_CONSUMED",
+            "candidateSelectionAffected": False,
+            "claimDecisionAffected": False,
+            "catalogAnswerKeyUsed": False,
+        }
+    return updated
 
 
 def _residual_trial_passes_gates_but_remains_conservatively_blocked(
@@ -1139,6 +1253,12 @@ def _render_report(conclusion: dict[str, Any]) -> str:
     if blind_transit is not None:
         ephemeris = blind_transit.get("linearEphemeris") or {}
         candidate_signals = blind_transit.get("candidateSignals") or []
+        sector_availability = (
+            blind_transit.get("independentSectorAvailability") or {}
+        )
+        residual_census = (
+            blind_transit.get("exhaustedSectorResidualFamilyCensus") or {}
+        )
         lines.extend([
             "",
             "## Software-blind transit-period search",
@@ -1150,8 +1270,22 @@ def _render_report(conclusion: dict[str, Any]) -> str:
             f"- Linear ephemeris coherent: {ephemeris.get('coherent')}",
             f"- Companion nature resolved: {blind_transit.get('companionNatureResolved')}",
             f"- Catalog answer key used: {blind_transit.get('catalogAnswerKeyUsed')}",
+            "- Official independent-sector inventory exhausted: "
+            f"{sector_availability.get('allCandidateSectorsPrepared')}",
             f"- Recommended next test: {blind_transit.get('recommendedNextTest')}",
         ])
+        if residual_census:
+            lines.append(
+                "- Expanded residual-family census: audit only; candidate "
+                "selection and claim decision unchanged"
+            )
+            for method in residual_census.get("methods") or []:
+                audit = method.get("candidateGenerationAudit") or {}
+                lines.append(
+                    "- Residual census "
+                    f"{method.get('residualSearchMethod')}: "
+                    f"{audit.get('recordedFamilyCount')} coarse families"
+                )
         if candidate_signals:
             lines.append(
                 f"- Accepted distinct transit-like clocks: {len(candidate_signals)}"
@@ -3242,6 +3376,9 @@ def build_engine(
                         "expandedResultSelected": expanded_selected,
                         "catalogAnswerKeyUsed": False,
                     }
+        result = _apply_blind_transit_sector_exhaustion(
+            result, independent_prepare, analysis_spec
+        )
         print(f"   classification: {result.get('classification')}")
         print(f"   candidate period: {result.get('candidatePeriodDays')} days")
         candidate_signals = result.get("candidateSignals") or []
@@ -3289,6 +3426,19 @@ def build_engine(
             f"{result.get('supportingIndependentSectors') or []}"
         )
         print(f"   ephemeris coherent: {(result.get('linearEphemeris') or {}).get('coherent')}")
+        sector_availability = result.get("independentSectorAvailability") or {}
+        if sector_availability.get("allCandidateSectorsPrepared") is True:
+            print("   official independent-sector inventory exhausted: True")
+        residual_census = result.get("exhaustedSectorResidualFamilyCensus") or {}
+        if residual_census:
+            print("   expanded residual-family census: audit only")
+            for method in residual_census.get("methods") or []:
+                audit = method.get("candidateGenerationAudit") or {}
+                print(
+                    "      "
+                    f"{method.get('residualSearchMethod')}: "
+                    f"{audit.get('recordedFamilyCount')} coarse families"
+                )
         print(f"   recommended next test: {result.get('recommendedNextTest')}")
 
         artifact_path = (

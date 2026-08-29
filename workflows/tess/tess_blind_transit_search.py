@@ -15,7 +15,7 @@ from typing import Any
 
 
 HANDLER_ID = "openstar.tess.blind-transit-search.analyze"
-RESULT_VERSION = "1.11"
+RESULT_VERSION = "1.12"
 ENTRY_BOUNDARY = "FULL_CHARACTERIZATION_UNRESOLVED_BROAD_VARIABILITY"
 TARGETED_BOUNDARY_ENTRY = "FULL_CHARACTERIZATION_NONRECURRENT_BOUNDARY_PERIOD"
 UNRELIABLE_PRIMARY_ENTRY = "FULL_CHARACTERIZATION_NONRECURRENT_UNRELIABLE_PRIMARY"
@@ -37,6 +37,7 @@ MAXIMUM_PERIOD_DAYS = 10.0
 PHASE_BIN_COUNT = 400
 OVERSAMPLING = 8.0
 COARSE_FAMILY_COUNT = 12
+AUDIT_COARSE_FAMILY_COUNT = 64
 JOINT_REFINEMENT_FAMILY_COUNT = 4
 JOINT_REFINEMENT_HALF_WIDTH_STEPS = 12
 MAXIMUM_VALIDATED_FREQUENCY_FAMILIES = COARSE_FAMILY_COUNT
@@ -53,6 +54,15 @@ MAXIMUM_ALTERNATE_PARITY_SNR_FRACTION = 0.5
 DUTY_CYCLES = (
     0.0025, 0.005, 0.0075, 0.01, 0.015, 0.02, 0.03, 0.04, 0.05, 0.07, 0.10,
 )
+
+
+class _SearchGridResult(tuple):
+    """Six-value legacy result carrying a non-selection audit sidecar."""
+
+    def __new__(cls, values, candidate_generation_audit):
+        result = super().__new__(cls, values)
+        result.candidate_generation_audit = candidate_generation_audit
+        return result
 
 
 def blind_transit_search_continuation(
@@ -936,6 +946,7 @@ def _resolve_alternating_cycle_alias(
 def _ranked_search_grid_candidates(
     sectors: list[dict[str, Any]], minimum: float, maximum: float,
     maximum_candidates: int = MAXIMUM_VALIDATED_FREQUENCY_FAMILIES,
+    *, include_candidate_generation_audit: bool = False,
 ):
     """Return objective-ranked representatives of distinct frequency families."""
     import numpy as np
@@ -1000,11 +1011,35 @@ def _ranked_search_grid_candidates(
         if any(abs(index - selected) <= 1 for selected in family_indices):
             continue
         family_indices.append(index)
-        if len(family_indices) >= COARSE_FAMILY_COUNT:
+        if len(family_indices) >= AUDIT_COARSE_FAMILY_COUNT:
             break
 
+    coarse_family_census = []
+    for rank, index in enumerate(family_indices, start=1):
+        frequency = float(coarse[index])
+        coarse_family_census.append({
+            "objectiveRank": rank,
+            "coarseFrequencyPerDay": frequency,
+            "coarsePeriodDays": 1.0 / frequency,
+            "objectiveScore": float(coarse_scores[index]),
+            "perSector": [
+                {
+                    "role": sector.get("role"),
+                    "sector": sector.get("sector"),
+                    "datasetID": sector.get("datasetID"),
+                    "snr": float(measurement.get("snr") or 0.0),
+                    "eventPhase": measurement.get("eventPhase"),
+                    "dutyCycle": measurement.get("dutyCycle"),
+                    "durationDays": measurement.get("durationDays"),
+                }
+                for sector, measurement in zip(
+                    sectors, coarse_details[index]
+                )
+            ],
+        })
+
     hypotheses = []
-    for index in family_indices:
+    for index in family_indices[:COARSE_FAMILY_COUNT]:
         center = float(coarse[index])
         hypotheses.append(center)
         measurements = coarse_details[index]
@@ -1100,17 +1135,36 @@ def _ranked_search_grid_candidates(
     ranked_candidates.sort(
         key=lambda item: (item[1], -item[0]), reverse=True
     )
-    return ranked_candidates, coarse_step, requested_fine_step, full_span
+    result = (
+        ranked_candidates,
+        coarse_step,
+        requested_fine_step,
+        full_span,
+    )
+    if include_candidate_generation_audit:
+        return (*result, coarse_family_census)
+    return result
 
 
 def _search_grid(sectors: list[dict[str, Any]], minimum: float, maximum: float):
-    candidates, coarse_step, fine_step, full_span = (
+    candidates, coarse_step, fine_step, full_span, coarse_family_census = (
         _ranked_search_grid_candidates(
-            sectors, minimum, maximum, maximum_candidates=1
+            sectors,
+            minimum,
+            maximum,
+            maximum_candidates=1,
+            include_candidate_generation_audit=True,
         )
     )
     frequency, score, measurements = candidates[0]
-    return frequency, score, measurements, coarse_step, fine_step, full_span
+    return _SearchGridResult((
+        frequency,
+        score,
+        measurements,
+        coarse_step,
+        fine_step,
+        full_span,
+    ), coarse_family_census)
 
 
 def _linear_ephemeris(sector_results: list[dict[str, Any]], input_period: float) -> dict[str, Any]:
@@ -1294,10 +1348,14 @@ def _analyze_prepared_sectors(
 ) -> dict[str, Any]:
     """Select the highest-ranked frequency family that passes every gate."""
 
+    search_result = _search_grid(sectors, minimum, maximum)
     (
         frequency, combined_score, measurements, coarse_step,
         fine_step, full_span,
-    ) = _search_grid(sectors, minimum, maximum)
+    ) = search_result
+    coarse_family_census = getattr(
+        search_result, "candidate_generation_audit", []
+    )
     first_hypothesis = (frequency, combined_score, measurements)
     excluded = excluded_frequency_families or []
     trials = []
@@ -1440,6 +1498,17 @@ def _analyze_prepared_sectors(
                 item["objectiveRank"] for item in trials if item["accepted"]
             ), None),
             "trials": trials,
+            "catalogAnswerKeyUsed": False,
+        },
+        "candidateGenerationAudit": {
+            "method": "OBJECTIVE_RANKED_COARSE_FREQUENCY_FAMILY_CENSUS",
+            "purpose": "AUDIT_ONLY_CANDIDATE_GENERATION_DIAGNOSTIC",
+            "maximumRecordedFamilyCount": AUDIT_COARSE_FAMILY_COUNT,
+            "recordedFamilyCount": len(coarse_family_census),
+            "selectionFamilyCount": COARSE_FAMILY_COUNT,
+            "selectionEligible": False,
+            "claimDecisionAffected": False,
+            "families": coarse_family_census,
             "catalogAnswerKeyUsed": False,
         },
         "searchGrid": {
@@ -1950,6 +2019,9 @@ def analyze_iterative_blind_transit_search(
                                 "rankedFrequencyFamilySelection"
                             )
                         ),
+                        "candidateGenerationAudit": subtraction_result.get(
+                            "candidateGenerationAudit"
+                        ),
                         "catalogAnswerKeyUsed": False,
                     },
                     "selected": residual_search_method
@@ -1975,6 +2047,9 @@ def analyze_iterative_blind_transit_search(
                     ),
                     "rankedFrequencyFamilySelection": residual_result.get(
                         "rankedFrequencyFamilySelection"
+                    ),
+                    "candidateGenerationAudit": residual_result.get(
+                        "candidateGenerationAudit"
                     ),
                     "catalogAnswerKeyUsed": False,
                 },
