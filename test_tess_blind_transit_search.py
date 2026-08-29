@@ -16,6 +16,7 @@ from workflows.tess.tess_blind_transit_search import (
     HANDLER_ID,
     UNRELIABLE_PRIMARY_ENTRY,
     analyze_blind_transit_search,
+    analyze_iterative_blind_transit_search,
     blind_transit_search_continuation,
 )
 
@@ -32,7 +33,8 @@ class BlindTransitSearchTests(unittest.TestCase):
         return store.complete_current_stage(investigation, terminal)
 
     def _dataset(self, root: Path, *, sector: int, origin: float,
-                 transit: bool = True, period: float = 2.21857567) -> Path:
+                 transit: bool = True, period: float = 2.21857567,
+                 additional_transits=()) -> Path:
         epoch = 1000.37
         duration = 0.08
         relative_times = [0.01 * index for index in range(2601)]
@@ -47,6 +49,15 @@ class BlindTransitSearchTests(unittest.TestCase):
             phase_days = abs((absolute - epoch + period / 2.0) % period - period / 2.0)
             if transit and phase_days <= duration / 2.0:
                 value -= 0.04
+            for extra_period, extra_epoch, extra_duration, extra_depth in (
+                additional_transits
+            ):
+                extra_phase_days = abs(
+                    (absolute - extra_epoch + extra_period / 2.0)
+                    % extra_period - extra_period / 2.0
+                )
+                if extra_phase_days <= extra_duration / 2.0:
+                    value -= extra_depth
             flux.append(value)
         path = root / f"sector-{sector}.json"
         path.write_text(json.dumps({
@@ -270,6 +281,126 @@ class BlindTransitSearchTests(unittest.TestCase):
         self.assertEqual(
             "RETAIN_BASE_PERIOD",
             result["alternatingCycleAliasResolution"]["decision"],
+        )
+
+    def test_iterative_search_masks_first_clock_and_recovers_second(self):
+        first_period = 2.21857567
+        second_period = 3.133
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = [
+                self._dataset(
+                    root,
+                    sector=sector,
+                    origin=origin,
+                    period=first_period,
+                    additional_transits=((second_period, 1001.11, 0.06, 0.05),),
+                )
+                for sector, origin in ((41, 1000.0), (54, 1700.0), (81, 2400.0))
+            ]
+            independent = {
+                "investigationGoal": "FULL_CHARACTERIZATION",
+                "preparedSectors": [
+                    {"sector": sector, "datasetPath": str(path)}
+                    for sector, path in zip((54, 81), paths[1:])
+                ],
+            }
+            result = analyze_iterative_blind_transit_search(
+                primary_dataset_path=paths[0],
+                independent_spec=independent,
+                morphology={"physicalCycleResolved": False},
+                broad_interpretation={
+                    "claimDecision": {"claim": "CANDIDATE_PERIOD"}
+                },
+                maximum_candidates=2,
+            )
+
+        candidates = result["candidateSignals"]
+        self.assertEqual(2, len(candidates))
+        recovered = sorted(item["candidatePeriodDays"] for item in candidates)
+        expected = sorted((first_period, second_period))
+        for measured, target in zip(recovered, expected):
+            self.assertAlmostEqual(target, measured, delta=0.004)
+        self.assertAlmostEqual(
+            candidates[0]["candidatePeriodDays"],
+            result["candidatePeriodDays"],
+            delta=1e-12,
+        )
+        self.assertGreater(
+            candidates[0]["residualSearchMask"]["totalRemovedSampleCount"], 0
+        )
+        self.assertTrue(result["iterativeSearch"]["iterations"][1][
+            "frequencyFamilySeparation"
+        ]["distinct"])
+        self.assertEqual(
+            "MAXIMUM_CANDIDATE_COUNT_REACHED",
+            result["iterativeSearch"]["terminationReason"],
+        )
+        self.assertTrue(all(
+            item["linearEphemeris"]["coherent"] for item in candidates
+        ))
+        self.assertTrue(all(
+            item["catalogAnswerKeyUsed"] is False for item in candidates
+        ))
+        self.assertFalse(result["iterativeSearch"]["catalogAnswerKeyUsed"])
+
+    def test_distinct_frequency_gate_rejects_exact_alias_but_allows_near_resonance(self):
+        prior = {
+            "candidateIndex": 1,
+            "jointTransitSearch": {"frequencyPerDay": 0.5},
+            "searchGrid": {"fineFrequencyStepPerDay": 0.00001},
+        }
+        exact_harmonic = {
+            "jointTransitSearch": {"frequencyPerDay": 1.0},
+            "searchGrid": {"fineFrequencyStepPerDay": 0.00001},
+        }
+        near_resonance = {
+            "jointTransitSearch": {"frequencyPerDay": 0.99},
+            "searchGrid": {"fineFrequencyStepPerDay": 0.00001},
+        }
+
+        distinct, audit = tess_blind_transit_search._distinct_frequency_family(
+            exact_harmonic, [prior]
+        )
+        self.assertFalse(distinct)
+        self.assertEqual(
+            "DUPLICATE_OR_EXACT_HARMONIC_FREQUENCY_FAMILY", audit["reason"]
+        )
+        distinct, audit = tess_blind_transit_search._distinct_frequency_family(
+            near_resonance, [prior]
+        )
+        self.assertTrue(distinct)
+        self.assertEqual("SEPARATE_FREQUENCY_FAMILY", audit["reason"])
+
+    def test_iterative_search_stops_after_masking_a_single_real_clock(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            primary, independent, morphology, broad = self._inputs(
+                Path(temporary)
+            )
+            result = analyze_iterative_blind_transit_search(
+                primary_dataset_path=primary,
+                independent_spec=independent,
+                morphology=morphology,
+                broad_interpretation=broad,
+                maximum_candidates=2,
+            )
+
+        self.assertEqual(1, len(result["candidateSignals"]))
+        self.assertEqual(
+            "NEXT_RESIDUAL_SIGNAL_UNRESOLVED",
+            result["iterativeSearch"]["terminationReason"],
+        )
+        stopping_iteration = result["iterativeSearch"]["iterations"][-1]
+        self.assertFalse(stopping_iteration["accepted"])
+        self.assertEqual(
+            "BLIND_TRANSIT_PERIOD_UNRESOLVED",
+            stopping_iteration["classification"],
+        )
+        self.assertGreater(
+            result["candidateSignals"][0]["residualSearchMask"][
+                "totalRemovedSampleCount"
+            ],
+            0,
         )
 
     def test_promotes_half_period_alias_when_only_alternating_cycles_transit(self):
@@ -887,7 +1018,24 @@ class BlindTransitSearchTests(unittest.TestCase):
             ) as analyze_search, mock.patch(
                 "workflows.tess.tess_investigation.build_independent_sector_project",
                 return_value=extension,
-            ) as build_extension:
+            ) as build_extension, mock.patch(
+                "workflows.tess.tess_investigation."
+                "analyze_iterative_blind_transit_search",
+                side_effect=lambda **kwargs: {
+                    **kwargs["initial_result"],
+                    "candidateSignals": [{
+                        "candidateIndex": 1,
+                        "candidatePeriodDays": 9.9,
+                        "supportingIndependentSectors": [2, 4],
+                        "linearEphemeris": {"coherent": True},
+                    }],
+                    "iterativeSearch": {
+                        "acceptedCandidateCount": 1,
+                        "terminationReason": "NEXT_RESIDUAL_SIGNAL_UNRESOLVED",
+                        "catalogAnswerKeyUsed": False,
+                    },
+                },
+            ) as iterative_search:
                 completed, next_request = engine.run_stage(
                     investigation,
                     StageRequest("004-blind", HANDLER_ID, {}, "003-interpret"),
@@ -901,6 +1049,7 @@ class BlindTransitSearchTests(unittest.TestCase):
             "additionalPreparedSectors"])
         self.assertFalse(result["adaptiveSectorExtension"]["catalogAnswerKeyUsed"])
         self.assertEqual(2, analyze_search.call_count)
+        self.assertEqual(1, iterative_search.call_count)
         second_spec = analyze_search.call_args_list[1].kwargs["independent_spec"]
         self.assertEqual([2, 3, 4], [
             item["sector"] for item in second_spec["preparedSectors"]
@@ -909,6 +1058,10 @@ class BlindTransitSearchTests(unittest.TestCase):
         self.assertEqual([2, 3], sorted(
             build_extension.call_args.kwargs["excluded_sectors"]
         ))
+        self.assertEqual([2, 3, 4], [
+            item["sector"] for item in
+            iterative_search.call_args.kwargs["independent_spec"]["preparedSectors"]
+        ])
         self.assertEqual("openstar.tess.finalize", next_request.handler_id)
 
     def test_unresolved_full_characterization_morphology_routes_to_blind_search(self):

@@ -15,7 +15,7 @@ from typing import Any
 
 
 HANDLER_ID = "openstar.tess.blind-transit-search.analyze"
-RESULT_VERSION = "1.4"
+RESULT_VERSION = "1.5"
 ENTRY_BOUNDARY = "FULL_CHARACTERIZATION_UNRESOLVED_BROAD_VARIABILITY"
 TARGETED_BOUNDARY_ENTRY = "FULL_CHARACTERIZATION_NONRECURRENT_BOUNDARY_PERIOD"
 UNRELIABLE_PRIMARY_ENTRY = "FULL_CHARACTERIZATION_NONRECURRENT_UNRELIABLE_PRIMARY"
@@ -39,6 +39,9 @@ OVERSAMPLING = 8.0
 COARSE_FAMILY_COUNT = 12
 JOINT_REFINEMENT_FAMILY_COUNT = 4
 JOINT_REFINEMENT_HALF_WIDTH_STEPS = 12
+MAXIMUM_ITERATIVE_CANDIDATES = 4
+TRANSIT_MASK_DURATION_MULTIPLIER = 1.5
+DISTINCT_FREQUENCY_TOLERANCE_STEPS = 4.0
 MINIMUM_PARITY_CYCLES = 2
 MINIMUM_PARITY_SNR_SEPARATION = 4.0
 MAXIMUM_ALTERNATE_PARITY_SNR_FRACTION = 0.5
@@ -145,6 +148,16 @@ def _detrend(times, flux):
     if not math.isfinite(sigma) or sigma <= 1e-12:
         raise ValueError("detrended frozen dataset has no finite robust scatter")
     return residual, sigma, cadence, window
+
+
+def _robust_scatter(values) -> float:
+    import numpy as np
+
+    median = float(np.median(values))
+    sigma = 1.4826 * float(np.median(np.abs(values - median)))
+    if not math.isfinite(sigma) or sigma <= 1e-12:
+        raise ValueError("masked frozen dataset has no finite robust scatter")
+    return sigma
 
 
 def _box_score(times, residual, sigma: float, frequency: float) -> dict[str, Any]:
@@ -930,26 +943,29 @@ def _linear_ephemeris(sector_results: list[dict[str, Any]], input_period: float)
     }
 
 
-def analyze_blind_transit_search(
-    *, primary_dataset_path: str | Path, independent_spec: dict[str, Any],
-    morphology: dict[str, Any] | None,
+def _entry_boundary(
     broad_interpretation: dict[str, Any] | None,
-    targeted_interpretation: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Search a shared blind box period across primary plus frozen sectors."""
-    if not blind_transit_search_continuation(
-        morphology, independent_spec, broad_interpretation, targeted_interpretation
-    ):
-        raise ValueError("authoritative blind-transit-search input gate is not satisfied")
+    targeted_interpretation: dict[str, Any] | None,
+) -> str:
+    if broad_interpretation is not None:
+        return ENTRY_BOUNDARY
+    if (targeted_interpretation or {}).get("primaryReliable") is False:
+        return UNRELIABLE_PRIMARY_ENTRY
+    return TARGETED_BOUNDARY_ENTRY
 
-    entries = [("PRIMARY", None, primary_dataset_path)] + [
-        ("INDEPENDENT", item.get("sector"), item["datasetPath"])
+
+def _prepare_analysis_sectors(
+    primary_dataset_path: str | Path,
+    independent_spec: dict[str, Any],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    primary_dataset = _load(primary_dataset_path)
+    entries = [("PRIMARY", None, primary_dataset)] + [
+        ("INDEPENDENT", item.get("sector"), _load(item["datasetPath"]))
         for item in independent_spec.get("preparedSectors") or []
         if item.get("datasetPath")
     ]
     sectors = []
-    for role, frozen_sector, path in entries:
-        dataset = _load(path)
+    for role, frozen_sector, dataset in entries:
         times, flux, origin = _finite_light_curve(dataset)
         residual, sigma, cadence, window = _detrend(times, flux)
         source = dataset.get("source") or {}
@@ -964,8 +980,10 @@ def analyze_blind_transit_search(
             "cadence": cadence,
             "detrendWindowSamples": window,
         })
+    return sectors, primary_dataset
 
-    primary_dataset = _load(primary_dataset_path)
+
+def _frequency_bounds(primary_dataset: dict[str, Any]) -> tuple[float, float]:
     search = primary_dataset.get("frequencySearch") or {}
     try:
         source_minimum = float(search.get("minimumFrequency", 1.0 / MAXIMUM_PERIOD_DAYS))
@@ -976,6 +994,14 @@ def analyze_blind_transit_search(
     maximum = min(1.0 / MINIMUM_PERIOD_DAYS, source_maximum)
     if not (math.isfinite(minimum) and math.isfinite(maximum) and 0 < minimum < maximum):
         raise ValueError("primary frozen frequency search does not overlap the transit search")
+    return minimum, maximum
+
+
+def _analyze_prepared_sectors(
+    sectors: list[dict[str, Any]], minimum: float, maximum: float,
+    entry_boundary: str,
+) -> dict[str, Any]:
+    """Run one authoritative shared-clock search over prepared sectors."""
 
     (
         frequency, combined_score, measurements, coarse_step,
@@ -994,14 +1020,7 @@ def analyze_blind_transit_search(
     return {
         "resultVersion": RESULT_VERSION,
         "experiment": "SOFTWARE_BLIND_MULTI_SECTOR_BOX_PERIOD_SEARCH",
-        "entryBoundary": (
-            ENTRY_BOUNDARY if broad_interpretation is not None
-            else (
-                UNRELIABLE_PRIMARY_ENTRY
-                if (targeted_interpretation or {}).get("primaryReliable") is False
-                else TARGETED_BOUNDARY_ENTRY
-            )
-        ),
+        "entryBoundary": entry_boundary,
         "classification": (
             "REPLICATED_BLIND_TRANSIT_LIKE_CANDIDATE" if supported
             else "BLIND_TRANSIT_PERIOD_UNRESOLVED"
@@ -1053,3 +1072,305 @@ def analyze_blind_transit_search(
             else "HUMAN_SCIENTIFIC_REVIEW"
         ),
     }
+
+
+def analyze_blind_transit_search(
+    *, primary_dataset_path: str | Path, independent_spec: dict[str, Any],
+    morphology: dict[str, Any] | None,
+    broad_interpretation: dict[str, Any] | None,
+    targeted_interpretation: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Search one shared blind box period across frozen sectors."""
+    if not blind_transit_search_continuation(
+        morphology, independent_spec, broad_interpretation, targeted_interpretation
+    ):
+        raise ValueError("authoritative blind-transit-search input gate is not satisfied")
+    sectors, primary_dataset = _prepare_analysis_sectors(
+        primary_dataset_path, independent_spec
+    )
+    minimum, maximum = _frequency_bounds(primary_dataset)
+    return _analyze_prepared_sectors(
+        sectors,
+        minimum,
+        maximum,
+        _entry_boundary(broad_interpretation, targeted_interpretation),
+    )
+
+
+def _candidate_signal(result: dict[str, Any], candidate_index: int) -> dict[str, Any]:
+    """Persist the complete evidence needed to audit one accepted clock."""
+    return {
+        "candidateIndex": candidate_index,
+        "classification": result.get("classification"),
+        "candidatePeriodDays": result.get("candidatePeriodDays"),
+        "coarseCandidatePeriodDays": result.get("coarseCandidatePeriodDays"),
+        "candidateFrequencyPerDay": result.get("candidateFrequencyPerDay"),
+        "combinedRecurrenceScore": result.get("combinedRecurrenceScore"),
+        "jointTransitSearch": result.get("jointTransitSearch"),
+        "alternatingCycleAliasResolution": result.get(
+            "alternatingCycleAliasResolution"
+        ),
+        "sectorResults": result.get("sectorResults"),
+        "primarySectorSupported": result.get("primarySectorSupported"),
+        "supportingIndependentSectorCount": result.get(
+            "supportingIndependentSectorCount"
+        ),
+        "supportingIndependentSectors": result.get(
+            "supportingIndependentSectors"
+        ),
+        "linearEphemeris": result.get("linearEphemeris"),
+        "recurrenceSupportGate": result.get("recurrenceSupportGate"),
+        "searchGrid": result.get("searchGrid"),
+        "physicalCycleResolved": False,
+        "companionNatureResolved": False,
+        "catalogAnswerKeyUsed": False,
+    }
+
+
+def _mask_candidate_clock(
+    sectors: list[dict[str, Any]], result: dict[str, Any]
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Remove one accepted clock's predicted windows from every sector."""
+    import numpy as np
+
+    ephemeris = result.get("linearEphemeris") or {}
+    joint = result.get("jointTransitSearch") or {}
+    period = float(
+        ephemeris.get("refinedPeriodDays") or result["candidatePeriodDays"]
+    )
+    frequency = float(joint.get("frequencyPerDay") or 1.0 / period)
+    reference_epoch = ephemeris.get("referenceEpoch")
+    if reference_epoch is None:
+        reference_epoch = float(joint["eventPhase"]) / frequency
+    reference_epoch = float(reference_epoch)
+    duration = float(joint.get("durationDays") or 0.0)
+    if duration <= 0.0:
+        durations = [
+            float(item.get("durationDays") or 0.0)
+            for item in result.get("sectorResults") or []
+            if float(item.get("durationDays") or 0.0) > 0.0
+        ]
+        duration = statistics.median(durations) if durations else 0.0
+    if not all(math.isfinite(value) and value > 0.0 for value in (period, duration)):
+        raise ValueError("accepted blind transit candidate has no finite masking clock")
+    if not math.isfinite(reference_epoch):
+        raise ValueError("accepted blind transit candidate has no finite masking epoch")
+
+    mask_duration = TRANSIT_MASK_DURATION_MULTIPLIER * duration
+    masked = []
+    sector_audit = []
+    for sector in sectors:
+        distance = np.abs(
+            np.remainder(
+                sector["times"] - reference_epoch + period / 2.0, period
+            ) - period / 2.0
+        )
+        keep = distance > mask_duration / 2.0
+        remaining = int(np.count_nonzero(keep))
+        removed = int(len(keep) - remaining)
+        if remaining < 200:
+            raise ValueError(
+                "iterative transit masking leaves fewer than 200 samples"
+            )
+        residual = sector["residual"][keep]
+        residual = residual - np.median(residual)
+        updated = dict(sector)
+        updated["times"] = sector["times"][keep]
+        updated["residual"] = residual
+        updated["sigma"] = _robust_scatter(residual)
+        masked.append(updated)
+        sector_audit.append({
+            "role": sector["role"],
+            "sector": sector["sector"],
+            "datasetID": sector["datasetID"],
+            "inputSampleCount": len(keep),
+            "removedSampleCount": removed,
+            "remainingSampleCount": remaining,
+        })
+    return masked, {
+        "method": "REMOVE_PREDICTED_SHARED_CLOCK_TRANSIT_WINDOWS",
+        "periodDays": period,
+        "referenceEpoch": reference_epoch,
+        "detectedDurationDays": duration,
+        "maskDurationMultiplier": TRANSIT_MASK_DURATION_MULTIPLIER,
+        "maskDurationDays": mask_duration,
+        "perSector": sector_audit,
+        "totalRemovedSampleCount": sum(
+            item["removedSampleCount"] for item in sector_audit
+        ),
+        "detrendingRecomputed": False,
+        "robustScatterRecomputedAfterMasking": True,
+        "catalogAnswerKeyUsed": False,
+    }
+
+
+def _search_frequency(result: dict[str, Any]) -> float | None:
+    joint = result.get("jointTransitSearch") or {}
+    value = joint.get("frequencyPerDay") or result.get("candidateFrequencyPerDay")
+    try:
+        frequency = float(value)
+    except (TypeError, ValueError):
+        return None
+    return frequency if math.isfinite(frequency) and frequency > 0.0 else None
+
+
+def _distinct_frequency_family(
+    candidate: dict[str, Any], accepted: list[dict[str, Any]]
+) -> tuple[bool, dict[str, Any]]:
+    frequency = _search_frequency(candidate)
+    if frequency is None:
+        return False, {"distinct": False, "reason": "MALFORMED_CANDIDATE_FREQUENCY"}
+    fine_step = float((candidate.get("searchGrid") or {}).get(
+        "fineFrequencyStepPerDay", 0.0
+    ))
+    comparisons = []
+    harmonic_multipliers = (0.25, 1.0 / 3.0, 0.5, 1.0, 2.0, 3.0, 4.0)
+    for prior in accepted:
+        prior_frequency = _search_frequency(prior)
+        if prior_frequency is None:
+            continue
+        prior_step = float((prior.get("searchGrid") or {}).get(
+            "fineFrequencyStepPerDay", 0.0
+        ))
+        tolerance = DISTINCT_FREQUENCY_TOLERANCE_STEPS * max(
+            fine_step, prior_step, 1e-12
+        )
+        for multiplier in harmonic_multipliers:
+            distance = abs(frequency - multiplier * prior_frequency)
+            comparison = {
+                "priorCandidateIndex": prior.get("candidateIndex"),
+                "harmonicMultiplier": multiplier,
+                "absoluteFrequencyDistancePerDay": distance,
+                "tolerancePerDay": tolerance,
+            }
+            comparisons.append(comparison)
+            if distance <= tolerance:
+                return False, {
+                    "distinct": False,
+                    "reason": "DUPLICATE_OR_EXACT_HARMONIC_FREQUENCY_FAMILY",
+                    "matchingComparison": comparison,
+                }
+    return True, {
+        "distinct": True,
+        "reason": "SEPARATE_FREQUENCY_FAMILY",
+        "comparisons": comparisons,
+    }
+
+
+def analyze_iterative_blind_transit_search(
+    *, primary_dataset_path: str | Path, independent_spec: dict[str, Any],
+    morphology: dict[str, Any] | None,
+    broad_interpretation: dict[str, Any] | None,
+    targeted_interpretation: dict[str, Any] | None = None,
+    initial_result: dict[str, Any] | None = None,
+    maximum_candidates: int = MAXIMUM_ITERATIVE_CANDIDATES,
+) -> dict[str, Any]:
+    """Repeatedly mask accepted shared clocks and search the residuals."""
+    if not isinstance(maximum_candidates, int) or not (
+        1 <= maximum_candidates <= MAXIMUM_ITERATIVE_CANDIDATES
+    ):
+        raise ValueError("maximum_candidates is outside the iterative search contract")
+    if not blind_transit_search_continuation(
+        morphology, independent_spec, broad_interpretation, targeted_interpretation
+    ):
+        raise ValueError("authoritative blind-transit-search input gate is not satisfied")
+
+    sectors, primary_dataset = _prepare_analysis_sectors(
+        primary_dataset_path, independent_spec
+    )
+    minimum, maximum = _frequency_bounds(primary_dataset)
+    entry_boundary = _entry_boundary(broad_interpretation, targeted_interpretation)
+    first = dict(initial_result) if initial_result is not None else (
+        _analyze_prepared_sectors(sectors, minimum, maximum, entry_boundary)
+    )
+    iterations = [{
+        "iteration": 1,
+        "accepted": first.get("classification")
+        == "REPLICATED_BLIND_TRANSIT_LIKE_CANDIDATE",
+        "classification": first.get("classification"),
+        "candidatePeriodDays": first.get("candidatePeriodDays"),
+        "input": "ORIGINAL_DETRENDED_FROZEN_SECTORS",
+        "catalogAnswerKeyUsed": False,
+    }]
+    accepted_results = []
+    accepted_signals = []
+    termination_reason = "INITIAL_SIGNAL_UNRESOLVED"
+    if first.get("classification") == "REPLICATED_BLIND_TRANSIT_LIKE_CANDIDATE":
+        accepted_results.append(first)
+        accepted_signals.append(_candidate_signal(first, 1))
+        working = sectors
+        current = first
+        while len(accepted_results) < maximum_candidates:
+            try:
+                working, mask_audit = _mask_candidate_clock(working, current)
+            except ValueError as error:
+                termination_reason = "MASKED_DATA_INSUFFICIENT"
+                iterations.append({
+                    "iteration": len(accepted_results) + 1,
+                    "accepted": False,
+                    "classification": "BLIND_TRANSIT_PERIOD_UNRESOLVED",
+                    "reason": str(error),
+                    "catalogAnswerKeyUsed": False,
+                })
+                break
+            accepted_signals[-1]["residualSearchMask"] = mask_audit
+            residual_result = _analyze_prepared_sectors(
+                working, minimum, maximum, entry_boundary
+            )
+            iteration = {
+                "iteration": len(accepted_results) + 1,
+                "accepted": False,
+                "classification": residual_result.get("classification"),
+                "candidatePeriodDays": residual_result.get("candidatePeriodDays"),
+                "coarseCandidatePeriodDays": residual_result.get(
+                    "coarseCandidatePeriodDays"
+                ),
+                "maskingAppliedBeforeSearch": mask_audit,
+                "catalogAnswerKeyUsed": False,
+            }
+            if residual_result.get("classification") != (
+                "REPLICATED_BLIND_TRANSIT_LIKE_CANDIDATE"
+            ):
+                termination_reason = "NEXT_RESIDUAL_SIGNAL_UNRESOLVED"
+                iterations.append(iteration)
+                break
+            distinct, distinct_audit = _distinct_frequency_family(
+                residual_result, accepted_signals
+            )
+            iteration["frequencyFamilySeparation"] = distinct_audit
+            if not distinct:
+                termination_reason = "NEXT_SIGNAL_NOT_DISTINCT"
+                iterations.append(iteration)
+                break
+            iteration["accepted"] = True
+            iterations.append(iteration)
+            accepted_results.append(residual_result)
+            accepted_signals.append(
+                _candidate_signal(residual_result, len(accepted_results))
+            )
+            current = residual_result
+        else:
+            termination_reason = "MAXIMUM_CANDIDATE_COUNT_REACHED"
+
+    enriched = dict(first)
+    enriched["candidateSignals"] = accepted_signals
+    enriched["iterativeSearch"] = {
+        "method": "REPEATED_SHARED_CLOCK_SEARCH_AFTER_TRANSIT_WINDOW_MASKING",
+        "maximumCandidateCount": maximum_candidates,
+        "acceptedCandidateCount": len(accepted_signals),
+        "terminationReason": termination_reason,
+        "maskDurationMultiplier": TRANSIT_MASK_DURATION_MULTIPLIER,
+        "exactHarmonicToleranceFineSteps": DISTINCT_FREQUENCY_TOLERANCE_STEPS,
+        "iterations": iterations,
+        "catalogAnswerKeyUsed": False,
+    }
+    if len(accepted_signals) > 1:
+        claim = dict(enriched.get("claimDecision") or {})
+        rationale = list(claim.get("rationale") or [])
+        rationale.append(
+            "Additional distinct transit-like clocks remained independently "
+            "replicated after masking every previously accepted event window."
+        )
+        claim["rationale"] = rationale
+        enriched["claimDecision"] = claim
+    return enriched
