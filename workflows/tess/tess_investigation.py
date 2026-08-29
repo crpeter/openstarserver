@@ -937,6 +937,14 @@ def _render_report(conclusion: dict[str, Any]) -> str:
         lines.append(
             f"- Recurrent photometric periodicity: {period_evidence.get('recurrentPhotometricPeriodDays')} days"
         )
+    transit_candidate_periods = (
+        period_evidence.get("transitLikeCandidatePeriodsDays") or []
+    )
+    if len(transit_candidate_periods) > 1:
+        lines.append(
+            "- Accepted distinct transit-like periods: "
+            f"{transit_candidate_periods} days"
+        )
     if period_evidence.get("possiblePhysicalCycleDays") is not None:
         lines.append(
             f"- Possible double-wave / physical cycle: {period_evidence.get('possiblePhysicalCycleDays')} days"
@@ -10743,6 +10751,16 @@ def build_engine(
         ):
             transit_period = blind_transit_search.get("candidatePeriodDays")
             ephemeris = blind_transit_search.get("linearEphemeris") or {}
+            candidate_periods = []
+            for candidate in blind_transit_search.get("candidateSignals") or []:
+                try:
+                    candidate_period = float(candidate.get("candidatePeriodDays"))
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(candidate_period) and candidate_period > 0.0:
+                    candidate_periods.append(candidate_period)
+            if not candidate_periods and transit_period is not None:
+                candidate_periods.append(float(transit_period))
             period_evidence.update({
                 "candidatePeriodDays": transit_period,
                 "candidateSource": "software-blind-multi-sector-box-period-search",
@@ -10753,6 +10771,8 @@ def build_engine(
                 "transitLikeEventPeriodDays": transit_period,
                 "transitLikeEventReferenceEpoch": ephemeris.get("referenceEpoch"),
                 "transitLikeEventTimingRmsOMinusCDays": ephemeris.get("rmsOMinusCDays"),
+                "transitLikeCandidateCount": len(candidate_periods),
+                "transitLikeCandidatePeriodsDays": candidate_periods,
                 "interpretation": "replicated-transit-like-event-period-candidate",
             })
         if binary_confirmation is not None and authoritative_binary_gate(binary_confirmation):
@@ -11021,6 +11041,14 @@ def build_engine(
             print(
                 "   recurrent photometric periodicity: "
                 f"{period_evidence.get('recurrentPhotometricPeriodDays')} days"
+            )
+        transit_candidate_periods = (
+            period_evidence.get("transitLikeCandidatePeriodsDays") or []
+        )
+        if len(transit_candidate_periods) > 1:
+            print(
+                "   accepted distinct transit-like periods: "
+                f"{transit_candidate_periods} days"
             )
         if period_evidence.get("possiblePhysicalCycleDays") is not None:
             print(

@@ -1789,6 +1789,11 @@ class BlindTransitSearchTests(unittest.TestCase):
                     "coherent": True, "referenceEpoch": 1000.37,
                     "rmsOMinusCDays": 0.001,
                 },
+                "candidateSignals": [
+                    {"candidateIndex": 1, "candidatePeriodDays": 2.21858},
+                    {"candidateIndex": 2, "candidatePeriodDays": 3.133},
+                    {"candidateIndex": 3, "candidatePeriodDays": 7.17},
+                ],
                 "sectorResults": [],
                 "claimDecision": {"claim": "CANDIDATE_PERIOD", "rationale": ["blind box recurrence"]},
                 "physicalCycleResolved": False,
@@ -1831,11 +1836,22 @@ class BlindTransitSearchTests(unittest.TestCase):
         self.assertIsNone(next_request)
         self.assertEqual("CANDIDATE_PERIOD", result["claim"]["claim"])
         self.assertAlmostEqual(2.21858, result["periodEvidence"]["recurrentPhotometricPeriodDays"])
+        self.assertEqual(
+            [2.21858, 3.133, 7.17],
+            result["periodEvidence"]["transitLikeCandidatePeriodsDays"],
+        )
+        self.assertEqual(
+            3, result["periodEvidence"]["transitLikeCandidateCount"]
+        )
         self.assertFalse(result["periodEvidence"]["physicalCycleResolved"])
         self.assertIsNone(result["selectedPeriodDays"])
         self.assertEqual("ADDITIONAL_INDEPENDENT_SECTOR_TRANSIT_CONFIRMATION",
                          result["recommendedNextTest"])
         self.assertEqual(transit, result["blindTransitSearch"])
+        self.assertIn(
+            "Accepted distinct transit-like periods: [2.21858, 3.133, 7.17] days",
+            report,
+        )
         self.assertIn("Software-blind transit-period search", report)
 
 
