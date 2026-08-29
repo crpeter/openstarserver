@@ -1,0 +1,7 @@
+# OpenStar server and astronomy workflow runtime dependencies.
+astropy
+astroquery
+lightkurve
+matplotlib
+numpy
+scipy
