@@ -400,23 +400,27 @@ class BlindTransitSearchTests(unittest.TestCase):
         def evaluated(
             raw_frequency, objective_score, *, primary_supported,
             independent_count, coherent, supported,
+            resolved_frequency=None, alias_decision="RETAIN_BASE_PERIOD",
+            alias_multiplier=None,
         ):
-            period = 1.0 / raw_frequency
+            resolved_frequency = resolved_frequency or raw_frequency
+            period = 1.0 / resolved_frequency
             supporters = [
                 {"sector": index + 2} for index in range(independent_count)
             ]
             return {
                 "rawFrequencyPerDay": raw_frequency,
-                "rawPeriodDays": period,
+                "rawPeriodDays": 1.0 / raw_frequency,
                 "objectiveScore": objective_score,
-                "frequencyPerDay": raw_frequency,
+                "frequencyPerDay": resolved_frequency,
                 "periodDays": period,
                 "alternatingCycleAliasResolution": {
-                    "decision": "RETAIN_BASE_PERIOD",
+                    "decision": alias_decision,
+                    "selectedCycleMultiplier": alias_multiplier,
                     "catalogAnswerKeyUsed": False,
                 },
                 "jointTransitSearch": {
-                    "frequencyPerDay": raw_frequency,
+                    "frequencyPerDay": resolved_frequency,
                     "periodDays": period,
                 },
                 "sectorResults": [],
@@ -502,6 +506,85 @@ class BlindTransitSearchTests(unittest.TestCase):
         )
         self.assertFalse(selection["catalogAnswerKeyUsed"])
 
+        no_support = evaluated(
+            1.0,
+            30.0,
+            primary_supported=False,
+            independent_count=0,
+            coherent=False,
+            supported=False,
+        )
+        lower_base_clock = evaluated(
+            0.5,
+            20.0,
+            primary_supported=True,
+            independent_count=2,
+            coherent=True,
+            supported=True,
+        )
+        promoted_alias = evaluated(
+            1.6,
+            15.0,
+            primary_supported=True,
+            independent_count=2,
+            coherent=True,
+            supported=True,
+            resolved_frequency=0.4,
+            alias_decision="PROMOTE_INTEGER_MULTIPLE_PERIOD",
+            alias_multiplier=4,
+        )
+        with (
+            mock.patch.object(
+                tess_blind_transit_search,
+                "_search_grid",
+                return_value=(1.0, 30.0, [], 0.01, 0.0001, 100.0),
+            ),
+            mock.patch.object(
+                tess_blind_transit_search,
+                "_ranked_search_grid_candidates",
+                return_value=(
+                    [
+                        (1.0, 30.0, []),
+                        (0.5, 20.0, []),
+                        (1.6, 15.0, []),
+                    ],
+                    0.01,
+                    0.0001,
+                    100.0,
+                ),
+            ),
+            mock.patch.object(
+                tess_blind_transit_search,
+                "_evaluate_frequency_hypothesis",
+                side_effect=(no_support, lower_base_clock, promoted_alias),
+            ),
+        ):
+            result = tess_blind_transit_search._analyze_prepared_sectors(
+                [], 0.1, 5.0, UNRELIABLE_PRIMARY_ENTRY
+            )
+
+        selection = result["rankedFrequencyFamilySelection"]
+        self.assertEqual(
+            "REPLICATED_BLIND_TRANSIT_LIKE_CANDIDATE",
+            result["classification"],
+        )
+        self.assertAlmostEqual(2.5, result["candidatePeriodDays"])
+        self.assertEqual(
+            "TOP_FAMILY_HAS_NO_NEAR_SUPPORT_TRY_INTEGER_CYCLE_ALIASES_ONLY",
+            selection["rankedFallbackReason"],
+        )
+        self.assertTrue(
+            selection["rankedFallbackRequiresIntegerCycleAliasPromotion"]
+        )
+        self.assertEqual(3, selection["selectedObjectiveRank"])
+        self.assertIn(
+            "RANKED_FALLBACK_REQUIRES_INTEGER_CYCLE_ALIAS_PROMOTION",
+            selection["trials"][1]["rejectionReasons"],
+        )
+        self.assertTrue(
+            selection["trials"][2]["integerCycleAliasPromotionSatisfied"]
+        )
+
     def test_distinct_frequency_gate_rejects_exact_alias_but_allows_near_resonance(self):
         prior = {
             "candidateIndex": 1,
@@ -564,11 +647,18 @@ class BlindTransitSearchTests(unittest.TestCase):
         selection = stopping_iteration["candidateEvidence"][
             "rankedFrequencyFamilySelection"
         ]
-        self.assertFalse(selection["rankedFallbackEligible"])
+        self.assertTrue(selection["rankedFallbackEligible"])
         self.assertEqual(
-            "TOP_FAMILY_HAS_NO_NEAR_RECURRENCE_SUPPORT",
+            "TOP_FAMILY_HAS_NO_NEAR_SUPPORT_TRY_INTEGER_CYCLE_ALIASES_ONLY",
             selection["rankedFallbackReason"],
         )
+        self.assertTrue(
+            selection["rankedFallbackRequiresIntegerCycleAliasPromotion"]
+        )
+        self.assertGreater(selection["testedFamilyCount"], 1)
+        self.assertFalse(any(
+            item["accepted"] for item in selection["trials"]
+        ))
         self.assertGreater(
             result["candidateSignals"][0]["residualSearchMask"][
                 "totalRemovedSampleCount"

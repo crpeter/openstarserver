@@ -15,7 +15,7 @@ from typing import Any
 
 
 HANDLER_ID = "openstar.tess.blind-transit-search.analyze"
-RESULT_VERSION = "1.7"
+RESULT_VERSION = "1.8"
 ENTRY_BOUNDARY = "FULL_CHARACTERIZATION_UNRESOLVED_BROAD_VARIABILITY"
 TARGETED_BOUNDARY_ENTRY = "FULL_CHARACTERIZATION_NONRECURRENT_BOUNDARY_PERIOD"
 UNRELIABLE_PRIMARY_ENTRY = "FULL_CHARACTERIZATION_NONRECURRENT_UNRELIABLE_PRIMARY"
@@ -1226,6 +1226,7 @@ def _evaluate_frequency_hypothesis(
 
 def _frequency_hypothesis_rejection_reasons(
     evaluated: dict[str, Any], distinct_audit: dict[str, Any],
+    requires_alias_promotion: bool,
 ) -> list[str]:
     reasons = []
     if evaluated["primarySectorSupported"] is not True:
@@ -1239,21 +1240,48 @@ def _frequency_hypothesis_rejection_reasons(
         reasons.append("RECURRENCE_SUPPORT_GATE_NOT_SATISFIED")
     if distinct_audit.get("distinct") is not True:
         reasons.append(distinct_audit.get("reason") or "FREQUENCY_FAMILY_NOT_DISTINCT")
+    if requires_alias_promotion and not _has_integer_cycle_alias_promotion(
+        evaluated
+    ):
+        reasons.append("RANKED_FALLBACK_REQUIRES_INTEGER_CYCLE_ALIAS_PROMOTION")
     return reasons
+
+
+def _has_integer_cycle_alias_promotion(evaluated: dict[str, Any]) -> bool:
+    alias = evaluated.get("alternatingCycleAliasResolution") or {}
+    return bool(
+        alias.get("decision") in {
+            "PROMOTE_DOUBLE_PERIOD",
+            "PROMOTE_INTEGER_MULTIPLE_PERIOD",
+        }
+        and int(alias.get("selectedCycleMultiplier") or 0) >= 2
+    )
 
 
 def _ranked_fallback_eligible(
     evaluated: dict[str, Any], distinct_audit: dict[str, Any],
-) -> tuple[bool, str]:
+) -> tuple[bool, str, bool]:
     """Limit family trials to a pre-specified near-support boundary."""
     if distinct_audit.get("distinct") is not True:
-        return True, "TOP_FAMILY_REPEATS_A_PREVIOUSLY_ACCEPTED_CLOCK"
+        return (
+            True,
+            "TOP_FAMILY_REPEATS_A_PREVIOUSLY_ACCEPTED_CLOCK",
+            False,
+        )
     if (
         evaluated["primarySectorSupported"] is True
         and len(evaluated["independentSupporters"]) >= 1
     ):
-        return True, "TOP_FAMILY_HAS_PRIMARY_AND_PARTIAL_INDEPENDENT_SUPPORT"
-    return False, "TOP_FAMILY_HAS_NO_NEAR_RECURRENCE_SUPPORT"
+        return (
+            True,
+            "TOP_FAMILY_HAS_PRIMARY_AND_PARTIAL_INDEPENDENT_SUPPORT",
+            False,
+        )
+    return (
+        True,
+        "TOP_FAMILY_HAS_NO_NEAR_SUPPORT_TRY_INTEGER_CYCLE_ALIASES_ONLY",
+        True,
+    )
 
 
 def _analyze_prepared_sectors(
@@ -1273,6 +1301,7 @@ def _analyze_prepared_sectors(
 
     def evaluate_trial(
         hypothesis: tuple[float, float, list[dict[str, Any]]], rank: int,
+        *, requires_alias_promotion: bool = False,
     ) -> tuple[dict[str, Any], bool]:
         evaluated = _evaluate_frequency_hypothesis(
             sectors, minimum, hypothesis
@@ -1290,7 +1319,16 @@ def _analyze_prepared_sectors(
                 "distinct": True,
                 "reason": "NO_PREVIOUSLY_ACCEPTED_FREQUENCY_FAMILIES",
             }
-        accepted = bool(evaluated["supported"] and distinct_audit["distinct"])
+        alias_promotion_satisfied = _has_integer_cycle_alias_promotion(
+            evaluated
+        )
+        accepted = bool(
+            evaluated["supported"]
+            and distinct_audit["distinct"]
+            and (
+                not requires_alias_promotion or alias_promotion_satisfied
+            )
+        )
         trials.append({
             "objectiveRank": rank,
             "objectiveScore": evaluated["objectiveScore"],
@@ -1299,9 +1337,11 @@ def _analyze_prepared_sectors(
             "resolvedFrequencyPerDay": evaluated["frequencyPerDay"],
             "resolvedPeriodDays": evaluated["periodDays"],
             "accepted": accepted,
+            "requiresIntegerCycleAliasPromotion": requires_alias_promotion,
+            "integerCycleAliasPromotionSatisfied": alias_promotion_satisfied,
             "rejectionReasons": (
                 [] if accepted else _frequency_hypothesis_rejection_reasons(
-                    evaluated, distinct_audit
+                    evaluated, distinct_audit, requires_alias_promotion
                 )
             ),
             "frequencyFamilySeparation": distinct_audit,
@@ -1323,8 +1363,13 @@ def _analyze_prepared_sectors(
     selected, accepted = evaluate_trial(first_hypothesis, 1)
     fallback_eligible = False
     fallback_reason = "TOP_FAMILY_ACCEPTED"
+    fallback_requires_alias_promotion = False
     if not accepted:
-        fallback_eligible, fallback_reason = _ranked_fallback_eligible(
+        (
+            fallback_eligible,
+            fallback_reason,
+            fallback_requires_alias_promotion,
+        ) = _ranked_fallback_eligible(
             selected, trials[0]["frequencyFamilySeparation"]
         )
     if not accepted and fallback_eligible:
@@ -1334,7 +1379,11 @@ def _analyze_prepared_sectors(
         for rank, hypothesis in enumerate(ranked, start=1):
             if abs(hypothesis[0] - first_hypothesis[0]) <= coarse_step:
                 continue
-            alternative, alternative_accepted = evaluate_trial(hypothesis, rank)
+            alternative, alternative_accepted = evaluate_trial(
+                hypothesis,
+                rank,
+                requires_alias_promotion=fallback_requires_alias_promotion,
+            )
             if alternative_accepted:
                 selected, accepted = alternative, True
                 break
@@ -1378,6 +1427,9 @@ def _analyze_prepared_sectors(
             "testedFamilyCount": len(trials),
             "rankedFallbackEligible": fallback_eligible,
             "rankedFallbackReason": fallback_reason,
+            "rankedFallbackRequiresIntegerCycleAliasPromotion": (
+                fallback_requires_alias_promotion
+            ),
             "selectedObjectiveRank": next((
                 item["objectiveRank"] for item in trials if item["accepted"]
             ), None),
