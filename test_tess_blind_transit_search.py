@@ -118,6 +118,49 @@ class BlindTransitSearchTests(unittest.TestCase):
             })
         return sectors
 
+    def _prepared_joint_outlier_sectors(self):
+        import numpy as np
+
+        period = 6.2713
+        epoch = 0.41
+        specifications = (
+            ("PRIMARY", 1, 0.0),
+            ("INDEPENDENT", 4, 100.0),
+            ("INDEPENDENT", 8, 700.0),
+            ("INDEPENDENT", 11, 1400.0),
+            ("INDEPENDENT", 12, 2100.0),
+        )
+        sectors = []
+        for role, sector, origin in specifications:
+            times = np.arange(origin, origin + 25.0, 0.02)
+            residual = np.zeros_like(times)
+            distance = np.abs(
+                np.remainder(times - epoch + period / 2.0, period)
+                - period / 2.0
+            )
+            residual[distance <= 0.05] -= 2.0
+            if sector in {4, 8}:
+                wrong_phase = 0.25 if sector == 4 else 0.40
+                wrong_epoch = epoch + wrong_phase * period
+                wrong_distance = np.abs(
+                    np.remainder(
+                        times - wrong_epoch + period / 2.0, period
+                    ) - period / 2.0
+                )
+                residual[wrong_distance <= 0.05] -= 6.0 if sector == 4 else 5.0
+            sectors.append({
+                "role": role,
+                "sector": sector,
+                "datasetID": f"sector-{sector}",
+                "times": times,
+                "residual": residual,
+                "sigma": 1.0,
+                "origin": origin,
+                "cadence": 0.02,
+                "detrendWindowSamples": 37,
+            })
+        return sectors, period
+
     def test_entry_gate_is_exact_and_requires_two_independent_sectors(self):
         morphology = {"physicalCycleResolved": False}
         independent = {
@@ -213,6 +256,17 @@ class BlindTransitSearchTests(unittest.TestCase):
         self.assertFalse(result["catalogAnswerKeyUsed"])
         self.assertFalse(result["physicalCycleResolved"])
         self.assertFalse(result["companionNatureResolved"])
+        self.assertEqual(
+            "SHARED_PERIOD_EPOCH_DURATION_BOX_SEARCH",
+            result["jointTransitSearch"]["method"],
+        )
+        self.assertEqual(
+            "MINIMUM_TRANSIT_DUTY_CYCLE_OVER_FULL_OBSERVATION_SPAN",
+            result["searchGrid"]["frequencyResolutionBasis"],
+        )
+        self.assertEqual(1, len({
+            item["eventPhase"] for item in result["sectorResults"]
+        }))
         self.assertEqual(
             "RETAIN_BASE_PERIOD",
             result["alternatingCycleAliasResolution"]["decision"],
@@ -384,7 +438,7 @@ class BlindTransitSearchTests(unittest.TestCase):
             result["searchGrid"]["coarseFrequencyStepPerDay"],
         )
         self.assertEqual(
-            "PRIMARY_PLUS_TWO_INDEPENDENT_SECTORS",
+            "SHARED_PERIOD_EPOCH_DURATION_PRIMARY_PLUS_TWO_INDEPENDENT",
             result["searchGrid"]["selectionSupportRule"],
         )
         self.assertFalse(result["catalogAnswerKeyUsed"])
@@ -683,6 +737,47 @@ class BlindTransitSearchTests(unittest.TestCase):
         )
 
         self.assertAlmostEqual(0.2, frequency, delta=0.001)
+
+    def test_joint_search_ignores_louder_wrong_phase_sector_events(self):
+        sectors, true_period = self._prepared_joint_outlier_sectors()
+        true_frequency = 1.0 / true_period
+        local = [
+            tess_blind_transit_search._box_score(
+                item["times"], item["residual"], item["sigma"], true_frequency
+            )
+            for item in sectors
+        ]
+        self.assertGreater(
+            tess_blind_transit_search._phase_distance(
+                local[0]["eventPhase"], local[1]["eventPhase"]
+            ),
+            0.20,
+        )
+        self.assertGreater(
+            tess_blind_transit_search._phase_distance(
+                local[0]["eventPhase"], local[2]["eventPhase"]
+            ),
+            0.35,
+        )
+
+        frequency, _, _, _, fine_step, full_span = (
+            tess_blind_transit_search._search_grid(sectors, 0.14, 0.18)
+        )
+        results, primary, supporters, ephemeris, supported, _ = (
+            tess_blind_transit_search._candidate_evidence(sectors, frequency)
+        )
+
+        self.assertAlmostEqual(true_period, 1.0 / frequency, delta=0.001)
+        self.assertTrue(primary)
+        self.assertTrue(supported)
+        self.assertTrue(ephemeris["coherent"])
+        self.assertGreaterEqual(len(supporters), 2)
+        self.assertEqual(1, len({item["eventPhase"] for item in results}))
+        self.assertAlmostEqual(
+            min(tess_blind_transit_search.DUTY_CYCLES)
+            / (full_span * tess_blind_transit_search.OVERSAMPLING),
+            fine_step,
+        )
 
     def test_short_long_period_transit_is_not_diluted_by_one_percent_floor(self):
         import numpy as np
