@@ -344,6 +344,58 @@ class BlindTransitSearchTests(unittest.TestCase):
         ))
         self.assertFalse(result["iterativeSearch"]["catalogAnswerKeyUsed"])
 
+    def test_iterative_search_recovers_three_distinct_shared_clocks(self):
+        periods = (2.21857567, 3.133, 7.17)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = [
+                self._dataset(
+                    root,
+                    sector=sector,
+                    origin=origin,
+                    period=periods[0],
+                    additional_transits=(
+                        (periods[1], 1001.11, 0.06, 0.05),
+                        (periods[2], 1002.03, 0.10, 0.045),
+                    ),
+                )
+                for sector, origin in ((41, 1000.0), (54, 1700.0), (81, 2400.0))
+            ]
+            independent = {
+                "investigationGoal": "FULL_CHARACTERIZATION",
+                "preparedSectors": [
+                    {"sector": sector, "datasetPath": str(path)}
+                    for sector, path in zip((54, 81), paths[1:])
+                ],
+            }
+            result = analyze_iterative_blind_transit_search(
+                primary_dataset_path=paths[0],
+                independent_spec=independent,
+                morphology={"physicalCycleResolved": False},
+                broad_interpretation={
+                    "claimDecision": {"claim": "CANDIDATE_PERIOD"}
+                },
+                maximum_candidates=4,
+            )
+
+        candidates = result["candidateSignals"]
+        self.assertEqual(3, len(candidates))
+        recovered = sorted(item["candidatePeriodDays"] for item in candidates)
+        for measured, target in zip(recovered, sorted(periods)):
+            self.assertAlmostEqual(target, measured, delta=0.004)
+        longest = max(candidates, key=lambda item: item["candidatePeriodDays"])
+        alias = longest["alternatingCycleAliasResolution"]
+        self.assertEqual("PROMOTE_INTEGER_MULTIPLE_PERIOD", alias["decision"])
+        self.assertEqual(4, alias["selectedCycleMultiplier"])
+        self.assertEqual(
+            "NEXT_RESIDUAL_SIGNAL_UNRESOLVED",
+            result["iterativeSearch"]["terminationReason"],
+        )
+        self.assertTrue(all(
+            item["linearEphemeris"]["coherent"] for item in candidates
+        ))
+        self.assertFalse(result["iterativeSearch"]["catalogAnswerKeyUsed"])
+
     def test_distinct_frequency_gate_rejects_exact_alias_but_allows_near_resonance(self):
         prior = {
             "candidateIndex": 1,
@@ -395,6 +447,13 @@ class BlindTransitSearchTests(unittest.TestCase):
         self.assertEqual(
             "BLIND_TRANSIT_PERIOD_UNRESOLVED",
             stopping_iteration["classification"],
+        )
+        self.assertIn("sectorResults", stopping_iteration["candidateEvidence"])
+        self.assertIn(
+            "recurrenceSupportGate", stopping_iteration["candidateEvidence"]
+        )
+        self.assertFalse(
+            stopping_iteration["candidateEvidence"]["catalogAnswerKeyUsed"]
         )
         self.assertGreater(
             result["candidateSignals"][0]["residualSearchMask"][
@@ -467,6 +526,82 @@ class BlindTransitSearchTests(unittest.TestCase):
         self.assertTrue(alias["doublePeriodValidation"]["supported"])
         self.assertTrue(all(
             item["decisiveAlternatingEvents"] for item in alias["sectorEvidence"]
+        ))
+        self.assertFalse(result["catalogAnswerKeyUsed"])
+
+    def test_promotes_quarter_period_alias_when_one_cycle_residue_transits(self):
+        true_period = 7.17
+        quarter_frequency = 4.0 / true_period
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = [
+                self._dataset(
+                    root, sector=sector, origin=origin, period=true_period
+                )
+                for sector, origin in ((8, 1000.0), (35, 1700.0), (62, 2400.0))
+            ]
+            independent = {
+                "investigationGoal": "FULL_CHARACTERIZATION",
+                "preparedSectors": [
+                    {"sector": sector, "datasetPath": str(path)}
+                    for sector, path in zip((35, 62), paths[1:])
+                ],
+            }
+
+            def forced_quarter_period(sectors, minimum, maximum):
+                measurements = [
+                    tess_blind_transit_search._box_score(
+                        item["times"], item["residual"], item["sigma"],
+                        quarter_frequency,
+                    )
+                    for item in sectors
+                ]
+                full_span = max(item["times"][-1] for item in sectors) - min(
+                    item["times"][0] for item in sectors
+                )
+                return (
+                    quarter_frequency, 10.0, measurements, 0.001, 0.000001,
+                    float(full_span),
+                )
+
+            with mock.patch.object(
+                tess_blind_transit_search, "_search_grid",
+                side_effect=forced_quarter_period,
+            ):
+                result = analyze_blind_transit_search(
+                    primary_dataset_path=paths[0],
+                    independent_spec=independent,
+                    morphology=None,
+                    broad_interpretation=None,
+                    targeted_interpretation={
+                        "claimDecision": {"claim": "HUMAN_REVIEW_REQUIRED"},
+                        "primaryReliable": False,
+                    },
+                )
+
+        self.assertEqual(
+            "REPLICATED_BLIND_TRANSIT_LIKE_CANDIDATE",
+            result["classification"],
+        )
+        self.assertAlmostEqual(
+            true_period, result["candidatePeriodDays"], delta=0.003
+        )
+        self.assertAlmostEqual(
+            true_period / 4.0,
+            result["coarseCandidatePeriodDays"],
+            delta=1e-9,
+        )
+        alias = result["alternatingCycleAliasResolution"]
+        self.assertEqual("PROMOTE_INTEGER_MULTIPLE_PERIOD", alias["decision"])
+        self.assertEqual(4, alias["selectedCycleMultiplier"])
+        selected = next(
+            item for item in alias["integerMultipleTests"]
+            if item["multiplier"] == 4
+        )
+        self.assertTrue(selected["recurrenceValidation"]["supported"])
+        self.assertTrue(all(
+            item["decisiveSingleResidueEvents"]
+            for item in selected["sectorEvidence"]
         ))
         self.assertFalse(result["catalogAnswerKeyUsed"])
 

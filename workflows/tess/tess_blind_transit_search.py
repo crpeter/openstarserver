@@ -15,7 +15,7 @@ from typing import Any
 
 
 HANDLER_ID = "openstar.tess.blind-transit-search.analyze"
-RESULT_VERSION = "1.5"
+RESULT_VERSION = "1.6"
 ENTRY_BOUNDARY = "FULL_CHARACTERIZATION_UNRESOLVED_BROAD_VARIABILITY"
 TARGETED_BOUNDARY_ENTRY = "FULL_CHARACTERIZATION_NONRECURRENT_BOUNDARY_PERIOD"
 UNRELIABLE_PRIMARY_ENTRY = "FULL_CHARACTERIZATION_NONRECURRENT_UNRELIABLE_PRIMARY"
@@ -42,6 +42,7 @@ JOINT_REFINEMENT_HALF_WIDTH_STEPS = 12
 MAXIMUM_ITERATIVE_CANDIDATES = 4
 TRANSIT_MASK_DURATION_MULTIPLIER = 1.5
 DISTINCT_FREQUENCY_TOLERANCE_STEPS = 4.0
+MAXIMUM_CYCLE_ALIAS_MULTIPLIER = 4
 MINIMUM_PARITY_CYCLES = 2
 MINIMUM_PARITY_SNR_SEPARATION = 4.0
 MAXIMUM_ALTERNATE_PARITY_SNR_FRACTION = 0.5
@@ -574,6 +575,25 @@ def _alternating_cycle_evidence(
     sector: dict[str, Any], measurement: dict[str, Any], period: float
 ) -> dict[str, Any]:
     """Measure whether a candidate clock contains events on only one parity."""
+    result = _cycle_residue_evidence(sector, measurement, period, 2)
+    residues = result["residues"]
+    return {
+        **result,
+        "decisiveAlternatingEvents": result["decisiveSingleResidueEvents"],
+        "dominantParity": result["dominantResidue"],
+        "dominantParitySnr": result["dominantResidueSnr"],
+        "alternateParitySnr": result["maximumAlternateResidueSnr"],
+        "parities": [
+            {**item, "parity": item["residue"]} for item in residues
+        ],
+    }
+
+
+def _cycle_residue_evidence(
+    sector: dict[str, Any], measurement: dict[str, Any], period: float,
+    multiplier: int,
+) -> dict[str, Any]:
+    """Measure whether events occupy one residue of an integer-multiple clock."""
     import numpy as np
 
     event_phase = float(measurement["eventPhase"])
@@ -582,24 +602,25 @@ def _alternating_cycle_evidence(
     cycle_numbers = np.rint(cycle_coordinates).astype(np.int64)
     distance = np.abs(cycle_coordinates - cycle_numbers)
     inside = distance <= duty_cycle / 2.0
-    parities = []
-    for parity in (0, 1):
-        selected = inside & (np.remainder(cycle_numbers, 2) == parity)
+    residues = []
+    for residue in range(multiplier):
+        selected = inside & (np.remainder(cycle_numbers, multiplier) == residue)
         count = int(np.count_nonzero(selected))
         observed_cycles = int(np.unique(cycle_numbers[selected]).size)
         depth = -float(np.mean(sector["residual"][selected])) if count else 0.0
         snr = depth * math.sqrt(count) / sector["sigma"] if depth > 0 else 0.0
-        parities.append({
-            "parity": parity,
+        residues.append({
+            "residue": residue,
             "snr": snr,
             "depthStandardized": depth,
             "eventSampleCount": count,
             "observedCycleCount": observed_cycles,
         })
 
-    dominant, alternate = sorted(parities, key=lambda item: item["snr"], reverse=True)
+    ranked = sorted(residues, key=lambda item: item["snr"], reverse=True)
+    dominant, alternate = ranked[0], ranked[1]
     sufficiently_observed = all(
-        item["observedCycleCount"] >= MINIMUM_PARITY_CYCLES for item in parities
+        item["observedCycleCount"] >= MINIMUM_PARITY_CYCLES for item in residues
     )
     decisive = bool(
         sufficiently_observed
@@ -612,11 +633,12 @@ def _alternating_cycle_evidence(
         "role": sector["role"],
         "sector": sector["sector"],
         "datasetID": sector["datasetID"],
-        "decisiveAlternatingEvents": decisive,
-        "dominantParity": dominant["parity"],
-        "dominantParitySnr": dominant["snr"],
-        "alternateParitySnr": alternate["snr"],
-        "parities": parities,
+        "cycleMultiplier": multiplier,
+        "decisiveSingleResidueEvents": decisive,
+        "dominantResidue": dominant["residue"],
+        "dominantResidueSnr": dominant["snr"],
+        "maximumAlternateResidueSnr": alternate["snr"],
+        "residues": residues,
     }
 
 
@@ -647,6 +669,86 @@ def _candidate_evidence(
         results, primary_supported, independent_supporters, ephemeris, supported,
         support_gate,
     )
+
+
+def _refine_integer_multiple_frequency(
+    sectors: list[dict[str, Any]], measurements: list[dict[str, Any]],
+    base_frequency: float, multiplier: int,
+    residue_audit: list[dict[str, Any]], minimum_frequency: float,
+) -> tuple[float, dict[str, Any]]:
+    """Refine a promoted clock from cross-sector epochs before validating it."""
+    base_period = 1.0 / base_frequency
+    promoted_period = multiplier * base_period
+    event_epochs = []
+    for sector, measurement, evidence in zip(
+        sectors, measurements, residue_audit
+    ):
+        phase = float(measurement["eventPhase"])
+        residue = int(evidence["dominantResidue"])
+        coordinate = float(statistics.median(sector["times"])) / base_period - phase
+        quotient = math.floor((coordinate - residue) / multiplier)
+        candidate_cycles = [
+            residue + multiplier * (quotient + offset) for offset in (0, 1)
+        ]
+        cycle = min(candidate_cycles, key=lambda value: abs(value - coordinate))
+        event_epochs.append((cycle + phase) * base_period)
+
+    seeds = [base_frequency / multiplier]
+    for first in range(len(event_epochs)):
+        for second in range(first + 1, len(event_epochs)):
+            separation = event_epochs[second] - event_epochs[first]
+            cycles = round(separation / promoted_period)
+            if cycles == 0:
+                continue
+            candidate = cycles / separation
+            if minimum_frequency <= candidate <= base_frequency:
+                seeds.append(candidate)
+
+    full_span = max(float(item["times"][-1]) for item in sectors) - min(
+        float(item["times"][0]) for item in sectors
+    )
+    fine_step = min(DUTY_CYCLES) / (full_span * OVERSAMPLING)
+    frequencies = {}
+    for seed in seeds:
+        for offset in range(
+            -JOINT_REFINEMENT_HALF_WIDTH_STEPS,
+            JOINT_REFINEMENT_HALF_WIDTH_STEPS + 1,
+        ):
+            candidate = seed + offset * fine_step
+            if minimum_frequency <= candidate <= base_frequency:
+                frequencies.setdefault(round(candidate / fine_step), candidate)
+
+    ranked = []
+    for candidate in frequencies.values():
+        score, _, _ = _joint_box_score(sectors, candidate)
+        ranked.append((score, candidate))
+    ranked.sort(key=lambda item: (item[0], -item[1]), reverse=True)
+
+    best_validation = None
+    for score, candidate in ranked:
+        (
+            _, _, independent, ephemeris, supported, support_gate,
+        ) = _candidate_evidence(sectors, candidate)
+        validation = {
+            "supported": supported,
+            "frequencyPerDay": candidate,
+            "periodDays": 1.0 / candidate,
+            "objectiveScore": score,
+            "supportingIndependentSectorCount": len(independent),
+            "linearEphemeris": ephemeris,
+            "recurrenceSupportGate": support_gate,
+        }
+        if best_validation is None:
+            best_validation = validation
+        if supported:
+            return candidate, validation
+
+    return base_frequency / multiplier, best_validation or {
+        "supported": False,
+        "frequencyPerDay": base_frequency / multiplier,
+        "periodDays": promoted_period,
+        "reason": "NO_INTEGER_MULTIPLE_FREQUENCY_HYPOTHESIS",
+    }
 
 
 def _evaluate_recurrence_support(
@@ -737,27 +839,13 @@ def _resolve_alternating_cycle_alias(
     sectors: list[dict[str, Any]], measurements: list[dict[str, Any]],
     frequency: float, minimum_frequency: float,
 ) -> tuple[float, dict[str, Any]]:
-    """Promote P to 2P only when alternating-cycle and recurrence gates agree."""
+    """Promote an integer subharmonic only when residue and recurrence gates agree."""
     period = 1.0 / frequency
     doubled_period = 2.0 * period
-    audit = [
+    parity_audit = [
         _alternating_cycle_evidence(sector, measurement, period)
         for sector, measurement in zip(sectors, measurements)
     ]
-    primary_decisive = any(
-        item["role"] == "PRIMARY" and item["decisiveAlternatingEvents"]
-        for item in audit
-    )
-    independent_decisive = [
-        item for item in audit
-        if item["role"] == "INDEPENDENT" and item["decisiveAlternatingEvents"]
-    ]
-    eligible = bool(
-        doubled_period <= MAXIMUM_PERIOD_DAYS
-        and frequency / 2.0 >= minimum_frequency
-        and primary_decisive
-        and len(independent_decisive) >= MINIMUM_INDEPENDENT_SECTORS
-    )
     result = {
         "testedBasePeriodDays": period,
         "testedDoublePeriodDays": doubled_period,
@@ -766,29 +854,79 @@ def _resolve_alternating_cycle_alias(
         "minimumParityCycles": MINIMUM_PARITY_CYCLES,
         "minimumParitySnrSeparation": MINIMUM_PARITY_SNR_SEPARATION,
         "maximumAlternateParitySnrFraction": MAXIMUM_ALTERNATE_PARITY_SNR_FRACTION,
-        "sectorEvidence": audit,
+        "sectorEvidence": parity_audit,
+        "maximumTestedCycleMultiplier": MAXIMUM_CYCLE_ALIAS_MULTIPLIER,
     }
-    if not eligible:
-        if doubled_period > MAXIMUM_PERIOD_DAYS or frequency / 2.0 < minimum_frequency:
+    multiplier_audits = []
+    validated = []
+    for multiplier in range(2, MAXIMUM_CYCLE_ALIAS_MULTIPLIER + 1):
+        audit = (
+            parity_audit if multiplier == 2 else [
+                _cycle_residue_evidence(
+                    sector, measurement, period, multiplier
+                )
+                for sector, measurement in zip(sectors, measurements)
+            ]
+        )
+        promoted_period = multiplier * period
+        primary_decisive = any(
+            item["role"] == "PRIMARY"
+            and item["decisiveSingleResidueEvents"]
+            for item in audit
+        )
+        independent_decisive = [
+            item for item in audit
+            if item["role"] == "INDEPENDENT"
+            and item["decisiveSingleResidueEvents"]
+        ]
+        in_range = bool(
+            promoted_period <= MAXIMUM_PERIOD_DAYS
+            and frequency / multiplier >= minimum_frequency
+        )
+        eligible = bool(
+            in_range
+            and primary_decisive
+            and len(independent_decisive) >= MINIMUM_INDEPENDENT_SECTORS
+        )
+        multiplier_audit = {
+            "multiplier": multiplier,
+            "testedPeriodDays": promoted_period,
+            "inSearchRange": in_range,
+            "primaryDecisive": primary_decisive,
+            "decisiveIndependentSectorCount": len(independent_decisive),
+            "eligibleForRecurrenceValidation": eligible,
+            "sectorEvidence": audit,
+        }
+        if eligible:
+            refined_frequency, validation = _refine_integer_multiple_frequency(
+                sectors, measurements, frequency, multiplier, audit,
+                minimum_frequency,
+            )
+            multiplier_audit["recurrenceValidation"] = validation
+            if multiplier == 2:
+                result["doublePeriodValidation"] = validation
+            if validation["supported"]:
+                validated.append((multiplier, refined_frequency))
+        multiplier_audits.append(multiplier_audit)
+    result["integerMultipleTests"] = multiplier_audits
+
+    if not validated:
+        double_audit = multiplier_audits[0]
+        if not double_audit["inSearchRange"]:
             result["reason"] = "DOUBLE_PERIOD_OUTSIDE_SEARCH_RANGE"
+        elif double_audit["eligibleForRecurrenceValidation"]:
+            result["reason"] = "DOUBLE_PERIOD_FAILED_RECURRENCE_OR_EPHEMERIS_GATE"
         return frequency, result
 
-    _, _, doubled_independent, doubled_ephemeris, doubled_supported, doubled_gate = (
-        _candidate_evidence(sectors, frequency / 2.0)
-    )
-    result["doublePeriodValidation"] = {
-        "supported": doubled_supported,
-        "supportingIndependentSectorCount": len(doubled_independent),
-        "linearEphemeris": doubled_ephemeris,
-        "recurrenceSupportGate": doubled_gate,
-    }
-    if not doubled_supported:
-        result["reason"] = "DOUBLE_PERIOD_FAILED_RECURRENCE_OR_EPHEMERIS_GATE"
-        return frequency, result
-
-    result["decision"] = "PROMOTE_DOUBLE_PERIOD"
-    result["reason"] = "TRANSITS_OCCUR_ON_ONLY_ONE_ALTERNATING_CYCLE_PARITY"
-    return frequency / 2.0, result
+    selected, selected_frequency = max(validated, key=lambda item: item[0])
+    result["selectedCycleMultiplier"] = selected
+    if selected == 2:
+        result["decision"] = "PROMOTE_DOUBLE_PERIOD"
+        result["reason"] = "TRANSITS_OCCUR_ON_ONLY_ONE_ALTERNATING_CYCLE_PARITY"
+    else:
+        result["decision"] = "PROMOTE_INTEGER_MULTIPLE_PERIOD"
+        result["reason"] = "TRANSITS_OCCUR_ON_ONLY_ONE_INTEGER_CYCLE_RESIDUE"
+    return selected_frequency, result
 
 
 def _search_grid(sectors: list[dict[str, Any]], minimum: float, maximum: float):
@@ -1326,6 +1464,26 @@ def analyze_iterative_blind_transit_search(
                     "coarseCandidatePeriodDays"
                 ),
                 "maskingAppliedBeforeSearch": mask_audit,
+                "candidateEvidence": {
+                    "jointTransitSearch": residual_result.get(
+                        "jointTransitSearch"
+                    ),
+                    "alternatingCycleAliasResolution": residual_result.get(
+                        "alternatingCycleAliasResolution"
+                    ),
+                    "sectorResults": residual_result.get("sectorResults"),
+                    "primarySectorSupported": residual_result.get(
+                        "primarySectorSupported"
+                    ),
+                    "supportingIndependentSectors": residual_result.get(
+                        "supportingIndependentSectors"
+                    ),
+                    "linearEphemeris": residual_result.get("linearEphemeris"),
+                    "recurrenceSupportGate": residual_result.get(
+                        "recurrenceSupportGate"
+                    ),
+                    "catalogAnswerKeyUsed": False,
+                },
                 "catalogAnswerKeyUsed": False,
             }
             if residual_result.get("classification") != (
