@@ -299,20 +299,75 @@ from .tess_multisector import (
 WORKFLOW_ID = "openstar.workflow.tess-investigation.v1"
 WORKFLOW_VERSION = "20.2"
 SOFTWARE_ID = "openstar.tess-investigation-plugin"
-SOFTWARE_VERSION = "20.36"
+SOFTWARE_VERSION = "20.37"
 ADAPTIVE_BLIND_TRANSIT_ADDITIONAL_SECTORS = 8
 
 
-def _iterative_blind_sector_extension_warranted(result: dict[str, Any]) -> bool:
-    """Broaden a replicated multi-clock search once when its residual stalls."""
-    iterative = result.get("iterativeSearch") or {}
+def _residual_trial_passes_gates_but_remains_conservatively_blocked(
+    trial: dict[str, Any],
+) -> bool:
+    """Recognize evidence that permits more data, never candidate promotion."""
     return bool(
+        trial.get("accepted") is False
+        and trial.get("rejectionReasons")
+        == ["RANKED_FALLBACK_REQUIRES_INTEGER_CYCLE_ALIAS_PROMOTION"]
+        and trial.get("primarySectorSupported") is True
+        and len(trial.get("supportingIndependentSectors") or []) >= 2
+        and (trial.get("linearEphemeris") or {}).get("coherent") is True
+        and (trial.get("frequencyFamilySeparation") or {}).get("distinct") is True
+        and (trial.get("recurrenceSupportGate") or {}).get("mode")
+        != "NOT_SATISFIED"
+    )
+
+
+def _iterative_blind_sector_extension_reason(
+    result: dict[str, Any],
+) -> str | None:
+    """Return the exact evidence boundary that permits one sector extension."""
+    iterative = result.get("iterativeSearch") or {}
+    if not (
         result.get("classification")
         == "REPLICATED_BLIND_TRANSIT_LIKE_CANDIDATE"
-        and len(result.get("candidateSignals") or []) >= 2
         and iterative.get("terminationReason")
         == "NEXT_RESIDUAL_SIGNAL_UNRESOLVED"
+    ):
+        return None
+    accepted_count = len(result.get("candidateSignals") or [])
+    if accepted_count >= 2:
+        return "MULTI_CLOCK_ITERATIVE_RESIDUAL_SIGNAL_UNRESOLVED"
+    if accepted_count != 1:
+        return None
+    iterations = iterative.get("iterations") or []
+    if not iterations:
+        return None
+    stopping = iterations[-1]
+    masked_selection = (
+        (stopping.get("candidateEvidence") or {}).get(
+            "rankedFrequencyFamilySelection"
+        )
+        or {}
     )
+    subtraction_evidence = (
+        stopping.get("boxModelSubtractionFallback") or {}
+    ).get("subtractionCandidateEvidence") or {}
+    subtraction_selection = (
+        subtraction_evidence.get("rankedFrequencyFamilySelection") or {}
+    )
+    selections = [
+        masked_selection,
+        subtraction_selection,
+    ]
+    if any(
+        _residual_trial_passes_gates_but_remains_conservatively_blocked(trial)
+        for selection in selections
+        for trial in selection.get("trials") or []
+    ):
+        return "SINGLE_CLOCK_DISTINCT_RESIDUAL_REQUIRES_MORE_SECTORS"
+    return None
+
+
+def _iterative_blind_sector_extension_warranted(result: dict[str, Any]) -> bool:
+    return _iterative_blind_sector_extension_reason(result) is not None
 
 
 def _stage(investigation: Investigation, stage_id: str):
@@ -3051,10 +3106,10 @@ def build_engine(
                 targeted_interpretation=targeted,
                 initial_result=result,
             )
-        if (
-            extension_spec is None
-            and _iterative_blind_sector_extension_warranted(result)
-        ):
+        iterative_extension_reason = _iterative_blind_sector_extension_reason(
+            result
+        )
+        if extension_spec is None and iterative_extension_reason is not None:
             consumed = {
                 int(item["sector"])
                 for item in analysis_spec.get("preparedSectors") or []
@@ -3066,13 +3121,25 @@ def build_engine(
                 if int(sector) not in consumed
             ]
             if remaining:
-                print("🔭 Extending replicated multi-clock transit evidence")
-                print(
-                    "   residual signal unresolved after multiple accepted clocks; "
-                    "freezing up to "
-                    f"{ADAPTIVE_BLIND_TRANSIT_ADDITIONAL_SECTORS} additional "
-                    "balanced sectors"
-                )
+                if iterative_extension_reason == (
+                    "MULTI_CLOCK_ITERATIVE_RESIDUAL_SIGNAL_UNRESOLVED"
+                ):
+                    print("🔭 Extending replicated multi-clock transit evidence")
+                    print(
+                        "   residual signal unresolved after multiple accepted "
+                        "clocks; freezing up to "
+                        f"{ADAPTIVE_BLIND_TRANSIT_ADDITIONAL_SECTORS} additional "
+                        "balanced sectors"
+                    )
+                else:
+                    print("🔭 Extending conservatively blocked residual evidence")
+                    print(
+                        "   one clock accepted and a distinct residual family "
+                        "passes recurrence gates but remains unpromoted; freezing "
+                        "up to "
+                        f"{ADAPTIVE_BLIND_TRANSIT_ADDITIONAL_SECTORS} additional "
+                        "balanced sectors"
+                    )
                 initial_iterative_result = result
                 artifact_root = store.directory_for(investigation.id) / "artifacts"
                 try:
@@ -3150,9 +3217,7 @@ def build_engine(
                     result = dict(result)
                     result["adaptiveSectorExtension"] = {
                         "attempted": True,
-                        "reason": (
-                            "MULTI_CLOCK_ITERATIVE_RESIDUAL_SIGNAL_UNRESOLVED"
-                        ),
+                        "reason": iterative_extension_reason,
                         "initialClassification": (
                             initial_iterative_result.get("classification")
                         ),

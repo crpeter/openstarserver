@@ -10,7 +10,7 @@ from openstar_investigation import InvestigationStage, InvestigationStore
 from openstar_workflow import StageRequest
 from workflows.tess.tess_autonomy import WORKFLOW_ID, WORKFLOW_VERSION
 from workflows.tess.tess_investigation import build_engine
-from workflows.tess import tess_blind_transit_search
+from workflows.tess import tess_blind_transit_search, tess_investigation
 
 from workflows.tess.tess_blind_transit_search import (
     HANDLER_ID,
@@ -811,6 +811,116 @@ class BlindTransitSearchTests(unittest.TestCase):
             ],
         )
 
+    def test_iterative_search_can_subtract_after_first_accepted_clock(self):
+        def candidate(period, supporters=(2, 3)):
+            return {
+                "classification": "REPLICATED_BLIND_TRANSIT_LIKE_CANDIDATE",
+                "candidatePeriodDays": period,
+                "coarseCandidatePeriodDays": period,
+                "candidateFrequencyPerDay": 1.0 / period,
+                "jointTransitSearch": {
+                    "frequencyPerDay": 1.0 / period,
+                    "eventPhase": 0.1,
+                    "durationDays": 0.05,
+                },
+                "sectorResults": [],
+                "primarySectorSupported": True,
+                "supportingIndependentSectorCount": len(supporters),
+                "supportingIndependentSectors": list(supporters),
+                "linearEphemeris": {
+                    "coherent": True,
+                    "refinedPeriodDays": period,
+                    "referenceEpoch": 0.2,
+                },
+                "recurrenceSupportGate": {
+                    "mode": "STRICT_INDIVIDUAL_SECTORS",
+                },
+                "searchGrid": {
+                    "coarseFrequencyStepPerDay": 0.001,
+                    "fineFrequencyStepPerDay": 0.000001,
+                },
+            }
+
+        first = candidate(2.0)
+        second = candidate(3.0, supporters=(2, 3, 4))
+        unresolved = {
+            "classification": "BLIND_TRANSIT_PERIOD_UNRESOLVED",
+            "rankedFrequencyFamilySelection": {"trials": []},
+        }
+        mask_audit = {"method": "test-mask", "catalogAnswerKeyUsed": False}
+        subtraction_audit = {
+            "method": "test-subtraction", "catalogAnswerKeyUsed": False,
+        }
+        independent = {
+            "investigationGoal": "FULL_CHARACTERIZATION",
+            "preparedSectors": [
+                {"datasetPath": f"/{index}"} for index in range(2, 8)
+            ],
+        }
+        analysis_sectors = [
+            {"role": "PRIMARY"},
+            *({"role": "INDEPENDENT"} for _ in range(6)),
+        ]
+        with (
+            mock.patch.object(
+                tess_blind_transit_search,
+                "_prepare_analysis_sectors",
+                return_value=(analysis_sectors, {}),
+            ),
+            mock.patch.object(
+                tess_blind_transit_search,
+                "_frequency_bounds",
+                return_value=(0.1, 5.0),
+            ),
+            mock.patch.object(
+                tess_blind_transit_search,
+                "_mask_candidate_clock",
+                return_value=([{"role": "PRIMARY"}], mask_audit),
+            ),
+            mock.patch.object(
+                tess_blind_transit_search,
+                "_subtract_candidate_clocks",
+                return_value=([{"role": "PRIMARY"}], subtraction_audit),
+            ) as subtract,
+            mock.patch.object(
+                tess_blind_transit_search,
+                "_analyze_prepared_sectors",
+                side_effect=(unresolved, second),
+            ),
+            mock.patch.object(
+                tess_blind_transit_search,
+                "_distinct_frequency_family",
+                return_value=(True, {"distinct": True}),
+            ),
+        ):
+            result = analyze_iterative_blind_transit_search(
+                primary_dataset_path="/one",
+                independent_spec=independent,
+                morphology={"physicalCycleResolved": False},
+                broad_interpretation={
+                    "claimDecision": {"claim": "CANDIDATE_PERIOD"}
+                },
+                initial_result=first,
+                maximum_candidates=2,
+            )
+
+        self.assertEqual(1, subtract.call_count)
+        self.assertEqual(2, len(result["candidateSignals"]))
+        recovered = result["iterativeSearch"]["iterations"][-1]
+        self.assertTrue(recovered["accepted"])
+        self.assertEqual(
+            "ACCEPTED_BOX_MODEL_SUBTRACTION_FALLBACK",
+            recovered["residualSearchMethod"],
+        )
+        self.assertTrue(recovered["boxModelSubtractionFallback"]["selected"])
+        gate = recovered["boxModelSubtractionFallback"][
+            "expandedEvidenceSelectionGate"
+        ]
+        self.assertTrue(gate["applied"])
+        self.assertTrue(gate["satisfied"])
+        self.assertEqual(6, gate["availableIndependentSectorCount"])
+        self.assertEqual(3, gate["supportingIndependentSectorCount"])
+
     def test_iterative_search_stops_after_masking_a_single_real_clock(self):
         with tempfile.TemporaryDirectory() as temporary:
             primary, independent, morphology, broad = self._inputs(
@@ -834,6 +944,9 @@ class BlindTransitSearchTests(unittest.TestCase):
         self.assertEqual(
             "BLIND_TRANSIT_PERIOD_UNRESOLVED",
             stopping_iteration["classification"],
+        )
+        self.assertIsNone(
+            stopping_iteration["boxModelSubtractionFallback"]
         )
         self.assertIn("sectorResults", stopping_iteration["candidateEvidence"])
         self.assertIn(
@@ -1599,6 +1712,214 @@ class BlindTransitSearchTests(unittest.TestCase):
             item["sector"] for item in
             iterative_search.call_args.kwargs["independent_spec"]["preparedSectors"]
         ])
+        self.assertEqual("openstar.tess.finalize", next_request.handler_id)
+
+    def test_single_clock_extension_requires_fully_supported_blocked_family(self):
+        trial = {
+            "accepted": False,
+            "rejectionReasons": [
+                "RANKED_FALLBACK_REQUIRES_INTEGER_CYCLE_ALIAS_PROMOTION"
+            ],
+            "primarySectorSupported": True,
+            "supportingIndependentSectors": [4, 5],
+            "linearEphemeris": {"coherent": True},
+            "frequencyFamilySeparation": {
+                "distinct": True,
+                "reason": "SEPARATE_FREQUENCY_FAMILY",
+            },
+            "recurrenceSupportGate": {
+                "mode": "STRICT_INDIVIDUAL_SECTORS",
+            },
+        }
+        result = {
+            "classification": "REPLICATED_BLIND_TRANSIT_LIKE_CANDIDATE",
+            "candidateSignals": [{"candidateIndex": 1}],
+            "iterativeSearch": {
+                "terminationReason": "NEXT_RESIDUAL_SIGNAL_UNRESOLVED",
+                "iterations": [
+                    {"iteration": 1, "accepted": True},
+                    {
+                        "iteration": 2,
+                        "accepted": False,
+                        "candidateEvidence": {
+                            "rankedFrequencyFamilySelection": {
+                                "trials": [trial],
+                            },
+                        },
+                    },
+                ],
+            },
+        }
+
+        self.assertEqual(
+            "SINGLE_CLOCK_DISTINCT_RESIDUAL_REQUIRES_MORE_SECTORS",
+            tess_investigation._iterative_blind_sector_extension_reason(result),
+        )
+        self.assertTrue(
+            tess_investigation._iterative_blind_sector_extension_warranted(
+                result
+            )
+        )
+
+        weakened = json.loads(json.dumps(result))
+        weakened_trial = weakened["iterativeSearch"]["iterations"][-1][
+            "candidateEvidence"
+        ]["rankedFrequencyFamilySelection"]["trials"][0]
+        weakened_trial["rejectionReasons"].insert(
+            0, "INSUFFICIENT_INDEPENDENT_SECTOR_SUPPORT"
+        )
+        self.assertIsNone(
+            tess_investigation._iterative_blind_sector_extension_reason(
+                weakened
+            )
+        )
+
+    def test_single_clock_blocked_residual_extends_and_reanalyzes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = InvestigationStore(root / "investigations")
+            investigation = store.create(
+                "adaptive-single-clock-search", WORKFLOW_ID, WORKFLOW_VERSION
+            )
+            source_project = root / "source-project.json"
+            source_project.write_text("{}", encoding="utf-8")
+            primary = root / "primary.json"
+            primary.write_text("{}", encoding="utf-8")
+            existing = []
+            for sector in (2, 3, 4, 5):
+                path = root / f"sector-{sector}.json"
+                path.write_text("{}", encoding="utf-8")
+                existing.append({"sector": sector, "datasetPath": str(path)})
+            added = []
+            for sector in (6, 7):
+                path = root / f"sector-{sector}.json"
+                path.write_text("{}", encoding="utf-8")
+                added.append({"sector": sector, "datasetPath": str(path)})
+            extension_project = root / "extension-project.json"
+            extension_project.write_text("{}", encoding="utf-8")
+            for stage in (
+                ("001-prepare-target", "openstar.tess.prepare-target", {
+                    "datasetPath": str(primary),
+                    "sourceProjectPath": str(source_project),
+                    "sourceDatasetEntry": {"id": "target"},
+                    "ticID": 1,
+                    "sector": 1,
+                }),
+                ("002-independent", "openstar.tess.independent.prepare", {
+                    "investigationGoal": "FULL_CHARACTERIZATION",
+                    "targetPeriodDays": 5.5,
+                    "candidateSectors": [2, 3, 4, 5, 6, 7],
+                    "preparedSectors": existing,
+                }),
+                ("003-interpret", "openstar.tess.independent.interpret", {
+                    "claimDecision": {"claim": "HUMAN_REVIEW_REQUIRED"},
+                    "primaryReliable": False,
+                }),
+            ):
+                investigation = self._complete(store, investigation, *stage)
+
+            first = {
+                "classification": "REPLICATED_BLIND_TRANSIT_LIKE_CANDIDATE",
+                "candidatePeriodDays": 5.6,
+                "supportingIndependentSectors": [2, 3, 4, 5],
+                "linearEphemeris": {"coherent": True},
+                "recommendedNextTest": (
+                    "ADDITIONAL_INDEPENDENT_SECTOR_TRANSIT_CONFIRMATION"
+                ),
+            }
+            blocked_trial = {
+                "accepted": False,
+                "rejectionReasons": [
+                    "RANKED_FALLBACK_REQUIRES_INTEGER_CYCLE_ALIAS_PROMOTION"
+                ],
+                "primarySectorSupported": True,
+                "supportingIndependentSectors": [2, 3],
+                "linearEphemeris": {"coherent": True},
+                "frequencyFamilySeparation": {"distinct": True},
+                "recurrenceSupportGate": {
+                    "mode": "STRICT_INDIVIDUAL_SECTORS",
+                },
+            }
+            stalled = {
+                **first,
+                "candidateSignals": [
+                    {"candidateIndex": 1, "candidatePeriodDays": 5.6}
+                ],
+                "iterativeSearch": {
+                    "acceptedCandidateCount": 1,
+                    "terminationReason": "NEXT_RESIDUAL_SIGNAL_UNRESOLVED",
+                    "iterations": [
+                        {"iteration": 1, "accepted": True},
+                        {
+                            "iteration": 2,
+                            "accepted": False,
+                            "candidateEvidence": {
+                                "rankedFrequencyFamilySelection": {
+                                    "trials": [blocked_trial],
+                                },
+                            },
+                        },
+                    ],
+                },
+            }
+            expanded = {
+                **first,
+                "candidateSignals": [
+                    {"candidateIndex": 1, "candidatePeriodDays": 5.6},
+                    {"candidateIndex": 2, "candidatePeriodDays": 3.3},
+                ],
+                "iterativeSearch": {
+                    "acceptedCandidateCount": 2,
+                    "terminationReason": "NEXT_RESIDUAL_SIGNAL_UNRESOLVED",
+                },
+            }
+            extension = {
+                "preparedSectors": added,
+                "projectPath": str(extension_project),
+            }
+            engine = build_engine(
+                store, types.SimpleNamespace(), poll_interval=0, timeout=None
+            )
+            engine.chain_stages = False
+            with mock.patch(
+                "workflows.tess.tess_investigation.analyze_blind_transit_search",
+                side_effect=[first, first],
+            ) as analyze_search, mock.patch(
+                "workflows.tess.tess_investigation."
+                "analyze_iterative_blind_transit_search",
+                side_effect=[stalled, expanded],
+            ) as iterative_search, mock.patch(
+                "workflows.tess.tess_investigation."
+                "build_independent_sector_project",
+                return_value=extension,
+            ) as build_extension:
+                completed, next_request = engine.run_stage(
+                    investigation,
+                    StageRequest("004-blind", HANDLER_ID, {}, "003-interpret"),
+                    software_id="test",
+                    software_version="adaptive-single-clock-extension",
+                )
+
+        result = completed.stages[-1].result
+        self.assertEqual(2, len(result["candidateSignals"]))
+        self.assertEqual(2, analyze_search.call_count)
+        self.assertEqual(2, iterative_search.call_count)
+        self.assertEqual(8, build_extension.call_args.kwargs["maximum_sectors"])
+        expanded_spec = iterative_search.call_args_list[1].kwargs[
+            "independent_spec"
+        ]
+        self.assertEqual([2, 3, 4, 5, 6, 7], [
+            item["sector"] for item in expanded_spec["preparedSectors"]
+        ])
+        audit = result["adaptiveSectorExtension"]
+        self.assertEqual(
+            "SINGLE_CLOCK_DISTINCT_RESIDUAL_REQUIRES_MORE_SECTORS",
+            audit["reason"],
+        )
+        self.assertEqual(1, audit["initialAcceptedCandidateCount"])
+        self.assertEqual(2, audit["expandedAcceptedCandidateCount"])
+        self.assertTrue(audit["expandedResultSelected"])
+        self.assertFalse(audit["catalogAnswerKeyUsed"])
         self.assertEqual("openstar.tess.finalize", next_request.handler_id)
 
     def test_multiclock_residual_stall_extends_sectors_and_reanalyzes(self):
