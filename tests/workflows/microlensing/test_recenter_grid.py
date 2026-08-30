@@ -47,6 +47,8 @@ from workflows.microlensing.recenter_grid import (
     RECENTERED_GRID_CONTRACT_ID,
     TOTAL_CANDIDATE_COUNT,
     RecenterGridBuildError,
+    _REQUIRED_DATASET_STATUS_FIELDS,
+    _REQUIRED_RUN_RESULT_FIELDS,
     _safe_product,
     build_recentered_grid_project,
 )
@@ -124,6 +126,7 @@ def write_refinement_investigation(root, refinement_root, *, best=None):
     best = dict(best or refinement_winning_result(refinement_root))
 
     dataset_status = {
+        "assignedWorkUnits": 0,
         "bestAmplitude": best["bestAmplitude"],
         "bestCenter": best["bestCenter"],
         "bestGridIndex": best["bestGridIndex"],
@@ -135,34 +138,95 @@ def write_refinement_investigation(root, refinement_root, *, best=None):
         ],
         "completedCandidateCount": REFINEMENT_TOTAL_CANDIDATE_COUNT,
         "completedWorkUnits": REFINEMENT_EXPECTED_WORK_UNIT_COUNT,
+        "classification": None,
         "coverageComplete": True,
         "curveGridStatus": "CURVE_GRID_COMPLETE",
         "datasetSchemaID": DATASET_SCHEMA_ID,
+        "environmentUnavailableCount": 0,
+        "executionFailureCount": 0,
+        "executionFailureKinds": {},
         "failedWorkUnits": 0,
         "familyID": FAMILY_ID,
         "id": dataset["id"],
-        "payload": {"best": best},
-        "payloadSchemaID": PAYLOAD_SCHEMA_ID,
-        "resultSchemaID": RESULT_SCHEMA_ID,
-        "totalCandidateCount": REFINEMENT_TOTAL_CANDIDATE_COUNT,
-        "totalWorkUnits": REFINEMENT_EXPECTED_WORK_UNIT_COUNT,
-        "workloadID": WORKLOAD_ID,
-        "workloadStatus": "CURVE_GRID_COMPLETE",
-    }
-    run_result = {
-        "datasets": [dataset_status],
+        "iPhoneContribution": 48,
+        "macContribution": REFINEMENT_EXPECTED_WORK_UNIT_COUNT - 48,
+        "mission": "",
         "nodeContributions": {
             "generic-node-a": 48,
             "generic-node-b": REFINEMENT_EXPECTED_WORK_UNIT_COUNT - 48,
         },
+        "otherContribution": 0,
+        "pendingWorkUnits": 0,
+        "payload": {"best": best},
+        "payloadSchemaID": PAYLOAD_SCHEMA_ID,
+        "progress": 1.0,
+        "publishedPeriodDays": None,
+        "referenceMismatchCount": 0,
+        "resultSchemaID": RESULT_SCHEMA_ID,
+        "retryCount": 0,
+        "role": None,
+        "sector": None,
+        "targetName": dataset["id"],
+        "ticID": None,
+        "totalCandidateCount": REFINEMENT_TOTAL_CANDIDATE_COUNT,
+        "totalWorkUnits": REFINEMENT_EXPECTED_WORK_UNIT_COUNT,
+        "transportUnavailableCount": 0,
+        "verificationFailureCount": 0,
+        "workloadID": WORKLOAD_ID,
+        "workloadStatus": "CURVE_GRID_COMPLETE",
+    }
+    run_result = {
+        "activeNodes": 2,
+        "assigned": 0,
+        "assignedWorkUnits": 0,
+        "bestFrequency": None,
+        "bestPeriodDays": None,
+        "bestPower": None,
+        "candidateFrequency": None,
+        "candidatePeriodDays": None,
+        "candidatePower": None,
+        "completed": REFINEMENT_EXPECTED_WORK_UNIT_COUNT,
+        "completedWorkUnits": REFINEMENT_EXPECTED_WORK_UNIT_COUNT,
+        "coverageComplete": True,
+        "datasetID": dataset["id"],
+        "datasets": [dataset_status],
+        "environmentUnavailableCount": 0,
+        "executionFailureCount": 0,
+        "executionFailureKinds": {},
+        "failedWorkUnits": 0,
+        "harmonicCandidates": [],
+        "mission": "",
+        "nodeContributions": {
+            "generic-node-a": 48,
+            "generic-node-b": REFINEMENT_EXPECTED_WORK_UNIT_COUNT - 48,
+        },
+        "pending": 0,
+        "pendingWorkUnits": 0,
+        "periodConfidence": None,
+        "periodStatus": None,
+        "preferredPhysicalPeriodDays": None,
+        "preferredPhysicalPeriodRelation": None,
+        "progress": 1.0,
         "projectAssignedWorkUnits": 0,
         "projectCompletedWorkUnits": REFINEMENT_EXPECTED_WORK_UNIT_COUNT,
+        "projectEnvironmentUnavailableCount": 0,
+        "projectExecutionFailureCount": 0,
         "projectFailedWorkUnits": 0,
         "projectID": REFINEMENT_PROJECT_ID,
         "projectPath": str(project_path),
         "projectPendingWorkUnits": 0,
+        "projectProgress": 1.0,
         "projectTotalWorkUnits": REFINEMENT_EXPECTED_WORK_UNIT_COUNT,
+        "projectTransportUnavailableCount": 0,
+        "retryCount": 0,
+        "sampleCount": len(dataset["coordinates"]),
+        "samples": len(dataset["coordinates"]),
         "status": "COMPLETE",
+        "targetName": dataset["id"],
+        "total": REFINEMENT_EXPECTED_WORK_UNIT_COUNT,
+        "totalWorkUnits": REFINEMENT_EXPECTED_WORK_UNIT_COUNT,
+        "transportUnavailableCount": 0,
+        "verificationFailureCount": 0,
         "workloadID": WORKLOAD_ID,
     }
     prepare_parameters = {"projectPath": str(project_path)}
@@ -369,6 +433,38 @@ class RecenterGridBuildTests(RecenterGridFixture):
         self.assertEqual(dataset["id"], project["datasets"][0]["id"])
         self.assertEqual(DATASET_RELATIVE_PATH, project["datasets"][0]["path"])
         CURVE_GRID_PLUGIN.validate_dataset(dataset)
+
+    def test_realistic_coordinator_envelope_fields_are_accepted(self):
+        investigation = read_json(self.refinement_investigation)
+        run_result = investigation["stages"][1]["result"]
+        dataset_status = run_result["datasets"][0]
+
+        self.assertEqual(1.0, run_result["projectProgress"])
+        self.assertEqual(0, run_result["projectExecutionFailureCount"])
+        self.assertEqual(2, run_result["activeNodes"])
+        self.assertEqual(1.0, dataset_status["progress"])
+        self.assertEqual(0, dataset_status["retryCount"])
+        self.assertEqual(
+            run_result["nodeContributions"],
+            dataset_status["nodeContributions"],
+        )
+        self.build()
+
+    def test_arbitrary_additional_coordinator_envelope_fields_are_accepted(self):
+        def add_future_fields(stage):
+            stage["result"]["futureProjectDiagnostic"] = {
+                "opaque": "project-value"
+            }
+            stage["result"]["datasets"][0]["futureDatasetDiagnostic"] = {
+                "opaque": "dataset-value"
+            }
+
+        rewrite_investigation_stage(
+            self.refinement_investigation,
+            1,
+            add_future_fields,
+        )
+        self.build()
 
     def test_axes_retain_steps_and_center_the_verified_winner(self):
         output, _ = self.build()
@@ -669,6 +765,117 @@ class RecenterGridRejectionTests(RecenterGridFixture):
         best["bestLogShape"] += 0.001
         replace_winner(self.refinement_investigation, best)
         self.assert_rejected("map exactly")
+
+    def test_removing_any_required_coordinator_field_is_rejected(self):
+        cases = (
+            ("project", _REQUIRED_RUN_RESULT_FIELDS),
+            ("dataset", _REQUIRED_DATASET_STATUS_FIELDS),
+        )
+        for envelope_name, required_fields in cases:
+            for field_name in sorted(required_fields):
+                with self.subTest(envelope=envelope_name, field=field_name):
+                    chain = self.make_chain(
+                        self.root
+                        / f"missing-{envelope_name}-{field_name}"
+                    )
+                    (
+                        self.prepared,
+                        self.coarse,
+                        self.coarse_investigation,
+                        self.refinement,
+                        self.refinement_investigation,
+                    ) = chain
+
+                    def remove_required_field(
+                        stage,
+                        *,
+                        envelope=envelope_name,
+                        field=field_name,
+                    ):
+                        target = stage["result"]
+                        if envelope == "dataset":
+                            target = target["datasets"][0]
+                        target.pop(field)
+
+                    rewrite_investigation_stage(
+                        self.refinement_investigation,
+                        1,
+                        remove_required_field,
+                    )
+                    self.assert_rejected(
+                        "missing required fields",
+                        output_name=(
+                            f"missing-{envelope_name}-{field_name}-output"
+                        ),
+                    )
+
+    def test_altering_any_required_coordinator_field_is_rejected(self):
+        cases = (
+            ("project", _REQUIRED_RUN_RESULT_FIELDS),
+            ("dataset", _REQUIRED_DATASET_STATUS_FIELDS),
+        )
+        for envelope_name, required_fields in cases:
+            for field_name in sorted(required_fields):
+                with self.subTest(envelope=envelope_name, field=field_name):
+                    chain = self.make_chain(
+                        self.root
+                        / f"altered-{envelope_name}-{field_name}"
+                    )
+                    (
+                        self.prepared,
+                        self.coarse,
+                        self.coarse_investigation,
+                        self.refinement,
+                        self.refinement_investigation,
+                    ) = chain
+
+                    def alter_required_field(
+                        stage,
+                        *,
+                        envelope=envelope_name,
+                        field=field_name,
+                    ):
+                        target = stage["result"]
+                        if envelope == "dataset":
+                            target = target["datasets"][0]
+                        target[field] = None
+
+                    rewrite_investigation_stage(
+                        self.refinement_investigation,
+                        1,
+                        alter_required_field,
+                    )
+                    self.assert_rejected(
+                        output_name=(
+                            f"altered-{envelope_name}-{field_name}-output"
+                        )
+                    )
+
+    def test_additional_workload_payload_field_is_rejected(self):
+        def add_payload_field(stage):
+            stage["result"]["datasets"][0]["payload"][
+                "futureWorkloadField"
+            ] = "not-allowed"
+
+        rewrite_investigation_stage(
+            self.refinement_investigation,
+            1,
+            add_payload_field,
+        )
+        self.assert_rejected("result payload is invalid")
+
+    def test_additional_winning_payload_field_is_rejected(self):
+        def add_winner_field(stage):
+            stage["result"]["datasets"][0]["payload"]["best"][
+                "futureWinnerField"
+            ] = "not-allowed"
+
+        rewrite_investigation_stage(
+            self.refinement_investigation,
+            1,
+            add_winner_field,
+        )
+        self.assert_rejected("winning result field set is invalid")
 
     def test_incomplete_coverage_and_failed_work_are_rejected(self):
         cases = (

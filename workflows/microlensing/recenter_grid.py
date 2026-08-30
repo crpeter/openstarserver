@@ -116,7 +116,7 @@ _WINNING_RESULT_FIELDS = frozenset(
         "invalidCandidateCount",
     )
 )
-_DATASET_STATUS_FIELDS = frozenset(
+_REQUIRED_DATASET_STATUS_FIELDS = frozenset(
     (
         "bestAmplitude",
         "bestCenter",
@@ -142,7 +142,7 @@ _DATASET_STATUS_FIELDS = frozenset(
         "workloadStatus",
     )
 )
-_RUN_RESULT_FIELDS = frozenset(
+_REQUIRED_RUN_RESULT_FIELDS = frozenset(
     (
         "datasets",
         "nodeContributions",
@@ -483,8 +483,6 @@ def _verify_winning_result(
     dataset_status: Mapping[str, Any],
     axes: Mapping[str, Mapping[str, Any]],
 ) -> tuple[int, int, int, int, float, float, float, float, float, float, tuple[str, ...]]:
-    if set(dataset_status) != _DATASET_STATUS_FIELDS:
-        raise _fail("first-refinement dataset status field set is invalid")
     payload = dataset_status.get("payload")
     if not isinstance(payload, Mapping) or set(payload) != {"best"}:
         raise _fail("first-refinement dataset result payload is invalid")
@@ -559,16 +557,30 @@ def _verify_winning_result(
     if invalid_count > shard_count:
         raise _fail("first-refinement winning result invalid count is impossible")
 
-    status_matches = {
-        "bestAmplitude": amplitude,
-        "bestCenter": center,
-        "bestGridIndex": grid_index,
-        "bestLogScale": log_scale,
-        "bestLogShape": log_shape,
-        "bestOffset": offset,
-        "bestWeightedResidualSumSquares": objective,
-    }
-    if any(dataset_status.get(key) != value for key, value in status_matches.items()):
+    status_grid_index = _exact_integer(
+        dataset_status.get("bestGridIndex"),
+        "dataset status bestGridIndex",
+    )
+    status_numbers = tuple(
+        _finite_number(dataset_status.get(field_name), f"dataset status {field_name}")
+        for field_name in (
+            "bestAmplitude",
+            "bestCenter",
+            "bestLogScale",
+            "bestLogShape",
+            "bestOffset",
+            "bestWeightedResidualSumSquares",
+        )
+    )
+    if (status_grid_index, *status_numbers) != (
+        grid_index,
+        amplitude,
+        center,
+        log_scale,
+        log_shape,
+        offset,
+        objective,
+    ):
         raise _fail("first-refinement dataset status and winning result disagree")
     return (
         grid_index,
@@ -752,8 +764,12 @@ def _verify_refinement_investigation(
         raise _fail("first-refinement nonterminal stage is marked terminal")
 
     run_result = run_stage["result"]
-    if set(run_result) != _RUN_RESULT_FIELDS:
-        raise _fail("first-refinement run result field set is invalid")
+    missing_run_fields = _REQUIRED_RUN_RESULT_FIELDS.difference(run_result)
+    if missing_run_fields:
+        raise _fail(
+            "first-refinement run result is missing required fields: "
+            f"{', '.join(sorted(missing_run_fields))}"
+        )
     for field_name in (
         "projectAssignedWorkUnits",
         "projectCompletedWorkUnits",
@@ -783,6 +799,14 @@ def _verify_refinement_investigation(
     dataset_status = dataset_statuses[0]
     if not isinstance(dataset_status, Mapping):
         raise _fail("first-refinement dataset status is malformed")
+    missing_status_fields = _REQUIRED_DATASET_STATUS_FIELDS.difference(
+        dataset_status
+    )
+    if missing_status_fields:
+        raise _fail(
+            "first-refinement dataset status is missing required fields: "
+            f"{', '.join(sorted(missing_status_fields))}"
+        )
     for field_name in (
         "completedCandidateCount",
         "completedWorkUnits",
