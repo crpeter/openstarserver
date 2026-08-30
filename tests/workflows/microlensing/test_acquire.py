@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 from workflows.microlensing.acquire import (
     ArchiveIntegrityError,
@@ -61,6 +62,25 @@ def fixture_payloads():
             for entry in entries
         },
     }
+
+
+def read_manifest(root):
+    return json.loads(
+        (root / MANIFEST_RELATIVE_PATH).read_text(encoding="utf-8")
+    )
+
+
+def write_manifest(root, manifest):
+    (root / MANIFEST_RELATIVE_PATH).write_text(
+        json.dumps(
+            manifest,
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
 
 class WgetScriptParsingTests(unittest.TestCase):
@@ -319,6 +339,13 @@ class ArchiveAcquisitionTests(unittest.TestCase):
 
 
 class ArchiveInventoryTests(unittest.TestCase):
+    def acquire_fixture_archive(self, root):
+        acquire_archive(
+            root,
+            fetcher=FakeFetcher(fixture_payloads()),
+            retrieved_at=FIXED_TIME,
+        )
+
     def test_uid_extraction_is_exact(self):
         self.assertEqual("0300030", extract_uid("UID_0300030_PLC_001.tbl"))
         self.assertEqual(
@@ -414,6 +441,112 @@ class ArchiveInventoryTests(unittest.TestCase):
             self.assertEqual(first, second)
             self.assertEqual(first_bytes, second_bytes)
             self.assertTrue(first_bytes.endswith(b"\n"))
+
+    def test_inventory_only_rejects_missing_preserved_source_script(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.acquire_fixture_archive(root)
+            (root / SOURCE_SCRIPT_RELATIVE_PATH).unlink()
+
+            with patch(
+                "workflows.microlensing.acquire.inspect_ipac_table"
+            ) as inspect_table:
+                with self.assertRaisesRegex(
+                    ArchiveIntegrityError,
+                    "preserved source script",
+                ):
+                    inventory_archive(root)
+                inspect_table.assert_not_called()
+
+    def test_inventory_only_rejects_corrupt_preserved_source_script(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.acquire_fixture_archive(root)
+            source_path = root / SOURCE_SCRIPT_RELATIVE_PATH
+            source_bytes = source_path.read_bytes()
+            source_path.write_bytes(b"X" + source_bytes[1:])
+
+            with self.assertRaisesRegex(
+                ArchiveIntegrityError,
+                "size or SHA-256",
+            ):
+                inventory_archive(root)
+
+    def test_inventory_only_rejects_tampered_file_source_url(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.acquire_fixture_archive(root)
+            manifest = read_manifest(root)
+            manifest["files"][0]["canonicalSourceURL"] = (
+                "https://exoplanetarchive.ipac.caltech.edu/"
+                "data/tampered/UID_0300030_PLC_001.tbl"
+            )
+            write_manifest(root, manifest)
+
+            with self.assertRaisesRegex(
+                ArchiveIntegrityError,
+                "does not match preserved script",
+            ):
+                inventory_archive(root)
+
+    def test_inventory_only_rejects_mismatched_source_script_hash(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.acquire_fixture_archive(root)
+            manifest = read_manifest(root)
+            manifest["files"][0]["sourceScriptSHA256"] = "0" * 64
+            write_manifest(root, manifest)
+
+            with self.assertRaisesRegex(
+                ArchiveIntegrityError,
+                "source script SHA-256",
+            ):
+                inventory_archive(root)
+
+    def test_inventory_only_rejects_unexpected_manifest_file_record(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.acquire_fixture_archive(root)
+            manifest = read_manifest(root)
+            unexpected = copy.deepcopy(manifest["files"][0])
+            unexpected["localRelativeFilename"] = (
+                "data/UID_9999999_PLC_999.tbl"
+            )
+            unexpected["canonicalSourceURL"] = (
+                "https://exoplanetarchive.ipac.caltech.edu/"
+                "data/mini/UID_9999999_PLC_999.tbl"
+            )
+            manifest["files"][0] = unexpected
+            write_manifest(root, manifest)
+
+            with self.assertRaisesRegex(
+                ArchiveIntegrityError,
+                "unexpected manifest file record",
+            ):
+                inventory_archive(root)
+
+    def test_inventory_only_accepts_valid_partial_manifest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.acquire_fixture_archive(root)
+            manifest = read_manifest(root)
+            omitted_name = "data/UID_0300030_PLC_003.tbl"
+            manifest["files"] = [
+                record
+                for record in manifest["files"]
+                if record["localRelativeFilename"] != omitted_name
+            ]
+            manifest["archiveComplete"] = False
+            write_manifest(root, manifest)
+            (root / omitted_name).unlink()
+
+            inventory = inventory_archive(root)
+
+            self.assertFalse(inventory["manifestComplete"])
+            self.assertEqual(3, inventory["expectedFileCount"])
+            self.assertEqual(2, inventory["totalFiles"])
+            self.assertEqual(2, inventory["parsedFileCount"])
+            self.assertEqual(0, inventory["parseFailureCount"])
 
 
 if __name__ == "__main__":

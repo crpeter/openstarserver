@@ -876,6 +876,99 @@ def _concise_reason(error: Exception) -> str:
     return text[:200]
 
 
+def _validate_inventory_provenance(
+    root: Path,
+    manifest: Mapping[str, Any],
+) -> dict[str, Mapping[str, Any]]:
+    source_path = _safe_state_path(root, SOURCE_SCRIPT_RELATIVE_PATH)
+    if source_path.is_symlink() or not source_path.is_file():
+        raise ArchiveIntegrityError(
+            "preserved source script is not a regular non-symlink file"
+        )
+    try:
+        source_bytes = source_path.read_bytes()
+    except OSError as error:
+        raise ArchiveIntegrityError(
+            "preserved source script is unreadable"
+        ) from error
+
+    source_record = manifest["sourceScript"]
+    source_sha256 = hashlib.sha256(source_bytes).hexdigest()
+    if (
+        len(source_bytes) != source_record["byteSize"]
+        or source_sha256 != source_record["sha256"]
+    ):
+        raise ArchiveIntegrityError(
+            "preserved source script size or SHA-256 does not match manifest"
+        )
+    try:
+        entries = parse_wget_script(source_bytes)
+    except WgetScriptError as error:
+        raise ArchiveIntegrityError(
+            "preserved source script cannot be parsed safely"
+        ) from error
+
+    if manifest["expectedFileCount"] != len(entries):
+        raise ArchiveIntegrityError(
+            "expectedFileCount does not match preserved source script"
+        )
+    entries_by_name = {
+        entry.local_relative_filename: entry for entry in entries
+    }
+    records_by_name = _existing_file_records(manifest, refresh=False)
+    for relative_name in sorted(records_by_name):
+        record = records_by_name[relative_name]
+        canonical_url = record.get("canonicalSourceURL")
+        try:
+            validated_url = _canonical_nasa_url(
+                canonical_url,
+                normalize_http=False,
+            )
+        except WgetScriptError as error:
+            raise ArchiveIntegrityError(
+                f"invalid NASA HTTPS provenance for {relative_name}"
+            ) from error
+        if validated_url != canonical_url:
+            raise ArchiveIntegrityError(
+                f"noncanonical source URL for {relative_name}"
+            )
+
+        entry = entries_by_name.get(relative_name)
+        if entry is None:
+            raise ArchiveIntegrityError(
+                f"unexpected manifest file record: {relative_name}"
+            )
+        if canonical_url != entry.canonical_source_url:
+            raise ArchiveIntegrityError(
+                f"source URL does not match preserved script for {relative_name}"
+            )
+        if record.get("sourceScriptURL") != SOURCE_SCRIPT_URL:
+            raise ArchiveIntegrityError(
+                f"source script URL does not match for {relative_name}"
+            )
+        if record.get("sourceScriptSHA256") != source_record["sha256"]:
+            raise ArchiveIntegrityError(
+                f"source script SHA-256 does not match for {relative_name}"
+            )
+
+    record_names = set(records_by_name)
+    entry_names = set(entries_by_name)
+    if not record_names.issubset(entry_names):
+        raise ArchiveIntegrityError(
+            "manifest contains records outside the preserved source script"
+        )
+    if manifest["archiveComplete"]:
+        if record_names != entry_names:
+            raise ArchiveIntegrityError(
+                "complete manifest does not contain the exact source entry set"
+            )
+    elif record_names == entry_names:
+        raise ArchiveIntegrityError(
+            "partial manifest incorrectly contains the complete source entry set"
+        )
+    return records_by_name
+
+
 def inventory_archive(output_root: str | Path) -> dict[str, Any]:
     """Write a deterministic structural inventory of manifest-listed tables."""
 
@@ -884,17 +977,13 @@ def inventory_archive(output_root: str | Path) -> dict[str, Any]:
     manifest = _load_existing_manifest(manifest_path, refresh=False)
     if manifest is None:
         raise ArchiveIntegrityError("archive manifest does not exist")
+    records_by_name = _validate_inventory_provenance(root, manifest)
 
     files = []
     failures = []
     grouped_by_uid: dict[str, list[str]] = {}
     schema_counts: dict[str, int] = {}
-    records = sorted(
-        manifest["files"],
-        key=lambda item: item.get("localRelativeFilename", "")
-        if isinstance(item, Mapping)
-        else "",
-    )
+    records = [records_by_name[name] for name in sorted(records_by_name)]
     for record in records:
         relative_name = (
             record.get("localRelativeFilename")

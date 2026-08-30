@@ -55,7 +55,9 @@ This writes `archive-inventory.json`. Inventory is structural: it records
 UIDs, exact column names, IPAC header rows, metadata lines, row counts, schema
 signatures, schema counts, and concise parse failures. It does not assume that
 all contributed tables share one schema and does not assign meanings to
-unknown fields.
+unknown fields. Inventory-only mode first verifies the preserved source
+script's size and SHA-256, reparses its entries, and validates every manifest
+record against that exact script version before reading any table.
 
 Archive files are external state. Do not place the output root inside git or
 commit downloaded data. This phase performs no model fitting, anomaly
