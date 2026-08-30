@@ -10,7 +10,7 @@ from urllib.request import urlopen
 
 import coordinator
 from coordinator_runtime import CoordinatorRuntime
-from openstar_contributions import DEFAULT_ACCOUNTING, ContributionStore, timing_metrics
+from openstar_contributions import ContributionStore, timing_metrics
 from openstar_coordinator_client import OpenStarCoordinatorClient
 
 
@@ -46,7 +46,14 @@ class ContributionStoreTests(unittest.TestCase):
 
     def record(self, **changes):
         work_unit = changes.pop("work_unit", self.work())
-        dataset = changes.pop("dataset", {"times": [1, 2, 3, 4]})
+        changes.pop("dataset", None)
+        work_metrics = {"workloadID": work_unit["workloadID"]}
+        if work_unit["workloadID"] == "openstar.lomb-scargle.v1":
+            work_metrics.update({
+                "sampleCount": 4,
+                "frequencyCount": 7,
+                "sampleFrequencyEvaluations": 28,
+            })
         result = changes.pop(
             "result",
             {
@@ -65,7 +72,7 @@ class ContributionStoreTests(unittest.TestCase):
             "dataset_id": work_unit["datasetID"],
             "work_unit_id": work_unit["id"],
             "node_id": "device-a",
-            "work_metrics": DEFAULT_ACCOUNTING.metrics(work_unit, dataset),
+            "work_metrics": work_metrics,
             "timing_metrics": timing_metrics(result),
         }
         arguments.update(changes)
@@ -261,7 +268,12 @@ class ContributionRuntimeTests(unittest.TestCase):
 
     def test_only_accepted_result_is_recorded_and_duplicate_is_idempotent(self):
         work = self.runtime.claim_work("node")
-        failed = {"status": "failed", "duration": 999}
+        failed = {
+            "status": "failed",
+            "duration": 999,
+            "workUnitID": work["id"],
+            "nodeID": "node",
+        }
         self.assertFalse(self.runtime.submit_result(work["id"], failed)[0])
         self.assertEqual(
             0, self.runtime.contribution_summary()["allTime"]["totalAcceptedWorkUnits"]
@@ -271,6 +283,8 @@ class ContributionRuntimeTests(unittest.TestCase):
         work = self.runtime.claim_work("node-2")
         result = {
             "status": "completed",
+            "workUnitID": work["id"],
+            "nodeID": "node-2",
             "bestFrequency": 1.0,
             "bestPower": 0.5,
             "bestFrequencyIndex": 0,
@@ -282,24 +296,6 @@ class ContributionRuntimeTests(unittest.TestCase):
             1, self.runtime.contribution_summary()["allTime"]["totalAcceptedWorkUnits"]
         )
 
-    def test_generic_box_work_uses_server_owned_accounting_dimensions(self):
-        metrics = DEFAULT_ACCOUNTING.metrics({
-            "workloadID": "openstar.box-period-search.v1",
-            "payload": {
-                "frequencyCount": 65,
-                "phaseBinCount": 400,
-                "durationFractions": [0.01, 0.02, 0.04],
-            },
-        }, {"coordinates": [0.0, 1.0, 2.0, 3.0]})
-        self.assertEqual({
-            "workloadID": "openstar.box-period-search.v1",
-            "sampleCount": 4,
-            "frequencyCount": 65,
-            "durationCount": 3,
-            "phaseBinCount": 400,
-            "sampleFrequencyEvaluations": 260,
-        }, metrics)
-
     def test_network_wall_throughput_is_not_summed_metal_time(self):
         second = {"nodeID": "second", "capabilities": {"platform": "iOS"}}
         self.runtime.register_node(second)
@@ -310,7 +306,12 @@ class ContributionRuntimeTests(unittest.TestCase):
             "datasetID": "d",
             "payload": {"frequencyCount": 7},
         }
-        metrics = DEFAULT_ACCOUNTING.metrics(work, {"times": [1, 2, 3, 4]})
+        metrics = {
+            "workloadID": work["workloadID"],
+            "sampleCount": 4,
+            "frequencyCount": 7,
+            "sampleFrequencyEvaluations": 28,
+        }
         for node, identifier in (("node", "one"), ("second", "two")):
             self.runtime.contribution_store.record(
                 session_id=self.runtime.coordinator_session_id,
@@ -353,6 +354,8 @@ class ContributionRuntimeTests(unittest.TestCase):
         work = self.runtime.claim_work("node")
         result = {
             "status": "completed",
+            "workUnitID": work["id"],
+            "nodeID": "node",
             "bestFrequency": 1.0,
             "bestPower": 0.5,
             "bestFrequencyIndex": 0,
@@ -410,6 +413,8 @@ class ContributionRuntimeTests(unittest.TestCase):
         work = self.runtime.claim_work("node")
         result = {
             "status": "completed",
+            "workUnitID": work["id"],
+            "nodeID": "node",
             "bestFrequency": 1.0,
             "bestPower": 0.5,
             "bestFrequencyIndex": 0,

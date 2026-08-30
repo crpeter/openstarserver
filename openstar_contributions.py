@@ -7,7 +7,7 @@ import json
 import sqlite3
 import threading
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 SCHEMA_VERSION = 1
 DEFAULT_CONTRIBUTION_DB = Path("data/contributions/openstar-contributions.sqlite3")
@@ -39,78 +39,6 @@ def timing_metrics(result: dict[str, Any]) -> dict[str, float]:
         "validationSeconds": _number(validation.get("durationSeconds")),
     }
     return {key: value for key, value in values.items() if value is not None}
-
-
-AccountingAdapter = Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]]
-
-
-class WorkloadAccountingRegistry:
-    """Derives trusted work dimensions from server-owned inputs."""
-
-    def __init__(self) -> None:
-        self._adapters: dict[str, AccountingAdapter] = {}
-
-    def register(self, workload_id: str, adapter: AccountingAdapter) -> None:
-        self._adapters[str(workload_id)] = adapter
-
-    def metrics(
-        self, work_unit: dict[str, Any], dataset: dict[str, Any]
-    ) -> dict[str, Any]:
-        workload_id = str(work_unit.get("workloadID") or "")
-        metrics: dict[str, Any] = {"workloadID": workload_id}
-        adapter = self._adapters.get(workload_id)
-        if adapter is not None:
-            metrics.update(adapter(work_unit, dataset))
-        return metrics
-
-
-def _lomb_scargle_metrics(
-    work_unit: dict[str, Any], dataset: dict[str, Any]
-) -> dict[str, Any]:
-    # Both dimensions come from the coordinator's immutable work and dataset,
-    # never from the submitted result.
-    samples = dataset.get("times")
-    sample_count = len(samples) if isinstance(samples, list) else 0
-    payload = work_unit.get("payload")
-    if not isinstance(payload, dict):
-        payload = {}
-    frequency_count = int(
-        payload.get("frequencyCount", work_unit.get("frequencyCount", 0))
-    )
-    return {
-        "sampleCount": sample_count,
-        "frequencyCount": frequency_count,
-        "sampleFrequencyEvaluations": sample_count * frequency_count,
-    }
-
-
-DEFAULT_ACCOUNTING = WorkloadAccountingRegistry()
-DEFAULT_ACCOUNTING.register("openstar.lomb-scargle.v1", _lomb_scargle_metrics)
-
-
-def _box_period_search_metrics(
-    work_unit: dict[str, Any], dataset: dict[str, Any]
-) -> dict[str, Any]:
-    samples = dataset.get("coordinates")
-    if not isinstance(samples, list):
-        samples = dataset.get("times")
-    sample_count = len(samples) if isinstance(samples, list) else 0
-    payload = work_unit.get("payload")
-    if not isinstance(payload, dict):
-        payload = {}
-    frequency_count = int(payload.get("frequencyCount", 0))
-    return {
-        "sampleCount": sample_count,
-        "frequencyCount": frequency_count,
-        "durationCount": len(payload.get("durationFractions") or []),
-        "phaseBinCount": int(payload.get("phaseBinCount", 0)),
-        "sampleFrequencyEvaluations": sample_count * frequency_count,
-    }
-
-
-DEFAULT_ACCOUNTING.register(
-    "openstar.box-period-search.v1", _box_period_search_metrics
-)
 
 
 class ContributionStore:

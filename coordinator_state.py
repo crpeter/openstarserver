@@ -3,10 +3,13 @@ import math
 import threading
 import time
 import uuid
+from collections.abc import Mapping
 from collections import deque
 from pathlib import Path
 
 from frequency_uncertainty import estimate_frequency_interval
+from openstar_workloads.contract import DatasetReduction, ResultValidation
+from openstar_workloads.discovery import discover_workloads
 
 
 LEASE_SECONDS = 120.0
@@ -56,7 +59,17 @@ HARMONIC_PREFERENCE_MIN_COHERENCE_GAIN = 0.15
 PERIOD_FOLD_BINS = 100
 PERIOD_MIN_POINTS_PER_BIN = 3
 PERIOD_INDEPENDENT_CANDIDATE_COUNT = 5
-BOX_PERIOD_SEARCH_V1 = "openstar.box-period-search.v1"
+
+_CORE_RESULT_ENVELOPE_FIELDS = (
+    "status",
+    "resultSchemaID",
+    "workID",
+    "workUnitID",
+    "projectID",
+    "workloadID",
+    "datasetID",
+    "nodeID",
+)
 
 
 def normalize_id(value):
@@ -71,15 +84,24 @@ def first_value(mapping, *keys, default=None):
 
 
 class CoordinatorState:
-    def __init__(self, project_path):
+    def __init__(self, project_path, workload_registry=None):
         self.lock = threading.RLock()
 
         self.project_path = Path(project_path).resolve()
         self.project = self._load_json(self.project_path)
 
+        self.workload_registry = (
+            workload_registry
+            if workload_registry is not None
+            else discover_workloads()
+        )
+
         self.project_id = self.project["id"]
         self.project_name = self.project.get("name", self.project_id)
         self.workload_id = self.project["workloadID"]
+        self.workload_plugin = self.workload_registry.require(self.workload_id)
+        self.workload_definition = self.workload_plugin.definition
+        self._validate_project_schema_identity()
 
         self.datasets = {}
         self.dataset_manifest_entries = {}
@@ -125,8 +147,33 @@ class CoordinatorState:
         self.dataset_diagnostic_cache = {}
 
         self._load_datasets()
-        self._index_chunk_references()
+        if self.workload_plugin.uses_legacy_coordinator_diagnostics:
+            self._index_chunk_references()
         self._build_work_units()
+
+    def _validate_project_schema_identity(self):
+        definition = self.workload_definition
+        schema_keys = (
+            "datasetSchemaID",
+            "payloadSchemaID",
+            "resultSchemaID",
+        )
+        present = {key for key in schema_keys if key in self.project}
+
+        if not present and definition.allows_legacy_schemaless_workers:
+            return
+
+        expected = (
+            definition.dataset_schema_id,
+            definition.payload_schema_id,
+            definition.result_schema_id,
+        )
+        supplied = tuple(self.project.get(key) for key in schema_keys)
+        if present != set(schema_keys) or supplied != expected:
+            raise RuntimeError(
+                f"Schema tuple mismatch for workload {definition.workload_id}: "
+                f"expected {expected!r}, got {supplied!r}"
+            )
 
     @staticmethod
     def _load_json(path):
@@ -176,6 +223,21 @@ class CoordinatorState:
                 raise RuntimeError(
                     f"Dataset id mismatch: manifest={dataset_id}, file={embedded_id}"
                 )
+
+            definition = self.workload_definition
+            if "datasetSchemaID" not in dataset:
+                if not definition.allows_legacy_schemaless_workers:
+                    raise RuntimeError(
+                        f"Dataset {dataset_id} is missing datasetSchemaID"
+                    )
+            elif dataset.get("datasetSchemaID") != definition.dataset_schema_id:
+                raise RuntimeError(
+                    f"Dataset schema mismatch for {dataset_id}: expected "
+                    f"{definition.dataset_schema_id!r}, got "
+                    f"{dataset.get('datasetSchemaID')!r}"
+                )
+
+            self.workload_plugin.validate_dataset(dataset)
 
             self.datasets[dataset_id] = dataset
             self.dataset_manifest_entries[dataset_id] = entry
@@ -293,56 +355,60 @@ class CoordinatorState:
 
     def _build_work_units(self):
         for dataset_id, dataset in self.datasets.items():
-            if self.workload_id == BOX_PERIOD_SEARCH_V1:
-                self._build_box_period_work_units(dataset_id, dataset)
-                continue
-            search = self._frequency_search(dataset)
-
-            minimum_frequency = search["minimumFrequency"]
-            frequency_step = search["frequencyStep"]
-            total_frequencies = search["totalFrequencies"]
-            frequencies_per_work_unit = search["frequenciesPerWorkUnit"]
-
             self.work_ids_by_dataset[dataset_id] = []
-
-            for start_index in range(
-                0,
-                total_frequencies,
-                frequencies_per_work_unit,
+            payload_count = 0
+            for generated_payload in self.workload_plugin.build_work_payloads(
+                dataset
             ):
-                frequency_count = min(
-                    frequencies_per_work_unit,
-                    total_frequencies - start_index,
+                if not isinstance(generated_payload, Mapping):
+                    raise RuntimeError(
+                        f"Workload {self.workload_id} produced a non-mapping "
+                        f"payload for dataset {dataset_id}"
+                    )
+                payload = dict(generated_payload)
+                legacy_fields = self.workload_plugin.legacy_work_unit_fields(
+                    payload
                 )
-
+                if not isinstance(legacy_fields, Mapping):
+                    raise RuntimeError(
+                        f"Workload {self.workload_id} produced non-mapping "
+                        "legacy work-unit fields"
+                    )
+                legacy_fields = dict(legacy_fields)
+                reserved = {
+                    "id",
+                    "projectID",
+                    "workloadID",
+                    "datasetID",
+                    "datasetSchemaID",
+                    "payloadSchemaID",
+                    "resultSchemaID",
+                    "payload",
+                }
+                collisions = sorted(reserved.intersection(legacy_fields))
+                if collisions:
+                    raise RuntimeError(
+                        f"Workload {self.workload_id} attempted to overwrite "
+                        f"reserved work-unit fields: {', '.join(collisions)}"
+                    )
                 work_id = str(uuid.uuid4())
                 normalized_work_id = normalize_id(work_id)
-
-                start_frequency = (
-                    minimum_frequency + start_index * frequency_step
-                )
-
-                # Generic workload envelope. New worker implementations read
-                # workload-specific parameters from payload. The flattened
-                # frequency fields remain temporarily for v18 client/server
-                # compatibility and can be removed after migration.
-                workload_payload = {
-                    "frequencyStartIndex": start_index,
-                    "startFrequency": start_frequency,
-                    "frequencyStep": frequency_step,
-                    "frequencyCount": frequency_count,
-                }
-
                 work_unit = {
+                    **legacy_fields,
                     "id": work_id,
                     "projectID": self.project_id,
                     "workloadID": self.workload_id,
                     "datasetID": dataset_id,
-                    "payload": workload_payload,
-                    "frequencyStartIndex": start_index,
-                    "startFrequency": start_frequency,
-                    "frequencyStep": frequency_step,
-                    "frequencyCount": frequency_count,
+                    "datasetSchemaID": (
+                        self.workload_definition.dataset_schema_id
+                    ),
+                    "payloadSchemaID": (
+                        self.workload_definition.payload_schema_id
+                    ),
+                    "resultSchemaID": (
+                        self.workload_definition.result_schema_id
+                    ),
+                    "payload": payload,
                 }
 
                 self.work_units[normalized_work_id] = work_unit
@@ -351,67 +417,13 @@ class CoordinatorState:
                 self.retry_counts[normalized_work_id] = 0
                 self.verification_failure_counts[normalized_work_id] = 0
                 self.reference_mismatch_counts[normalized_work_id] = 0
+                payload_count += 1
 
-    def _build_box_period_work_units(self, dataset_id, dataset):
-        search = dataset.get("boxPeriodSearch")
-        if not isinstance(search, dict):
-            raise RuntimeError(f"{dataset_id}: missing boxPeriodSearch object")
-        windows = search.get("frequencyWindows")
-        if not isinstance(windows, list) or not windows:
-            raise RuntimeError(f"{dataset_id}: frequencyWindows must be nonempty")
-        phase_bin_count = int(search.get("phaseBinCount", 0))
-        durations = search.get("durationFractions")
-        minimum_in = int(search.get("minimumInBoxSamples", 0))
-        minimum_out = int(search.get("minimumOutOfBoxSamples", 0))
-        if phase_bin_count < 2:
-            raise RuntimeError(f"{dataset_id}: phaseBinCount must be >= 2")
-        if not isinstance(durations, list) or not durations:
-            raise RuntimeError(f"{dataset_id}: durationFractions must be nonempty")
-        durations = [float(value) for value in durations]
-        if any(not math.isfinite(value) or value <= 0 or value >= 1 for value in durations):
-            raise RuntimeError(f"{dataset_id}: durationFractions must be finite and between 0 and 1")
-        if minimum_in <= 0 or minimum_out <= 0:
-            raise RuntimeError(f"{dataset_id}: sample-count gates must be positive")
-
-        self.work_ids_by_dataset[dataset_id] = []
-        for window_index, window in enumerate(windows):
-            start_frequency = float(window["startFrequency"])
-            frequency_step = float(window["frequencyStep"])
-            frequency_count = int(window["frequencyCount"])
-            frequency_start_index = int(window.get("frequencyStartIndex", 0))
-            if (not math.isfinite(start_frequency) or start_frequency <= 0
-                    or not math.isfinite(frequency_step) or frequency_step <= 0
-                    or frequency_count <= 0):
-                raise RuntimeError(f"{dataset_id}: invalid frequency window {window_index}")
-            payload = {
-                "startFrequency": start_frequency,
-                "frequencyStep": frequency_step,
-                "frequencyCount": frequency_count,
-                "frequencyStartIndex": frequency_start_index,
-                "phaseBinCount": phase_bin_count,
-                "durationFractions": durations,
-                "minimumInBoxSamples": minimum_in,
-                "minimumOutOfBoxSamples": minimum_out,
-                "windowIndex": window_index,
-            }
-            for key in ("familyRank", "familyID", "centerFrequency"):
-                if window.get(key) is not None:
-                    payload[key] = window[key]
-            work_id = str(uuid.uuid4())
-            normalized_work_id = normalize_id(work_id)
-            work_unit = {
-                "id": work_id,
-                "projectID": self.project_id,
-                "workloadID": self.workload_id,
-                "datasetID": dataset_id,
-                "payload": payload,
-            }
-            self.work_units[normalized_work_id] = work_unit
-            self.work_ids_by_dataset[dataset_id].append(normalized_work_id)
-            self.pending.append(normalized_work_id)
-            self.retry_counts[normalized_work_id] = 0
-            self.verification_failure_counts[normalized_work_id] = 0
-            self.reference_mismatch_counts[normalized_work_id] = 0
+            if payload_count == 0:
+                raise RuntimeError(
+                    f"Workload {self.workload_id} produced no work payloads "
+                    f"for dataset {dataset_id}"
+                )
 
     @staticmethod
     def _global_reference(dataset):
@@ -439,8 +451,6 @@ class CoordinatorState:
         errors = []
 
         for dataset_id, dataset in self.datasets.items():
-            if self.workload_id == BOX_PERIOD_SEARCH_V1:
-                continue
             search = self._frequency_search(dataset)
 
             global_frequency, global_period, global_power = self._global_reference(
@@ -606,12 +616,17 @@ class CoordinatorState:
             )
 
     def validate_startup(self):
-        self._validate_reference_data()
-        self._validate_science_metadata()
+        if self.workload_plugin.uses_legacy_coordinator_diagnostics:
+            self._validate_reference_data()
+        if self.workload_plugin.uses_legacy_science_metadata_validation:
+            self._validate_science_metadata()
 
     def register_node(self, payload):
         node_id = str(payload["nodeID"])
         capabilities = payload.get("capabilities", {})
+        if not isinstance(capabilities, Mapping):
+            raise TypeError("Node capabilities must be a mapping.")
+        capabilities = dict(capabilities)
 
         now = time.time()
 
@@ -623,69 +638,89 @@ class CoordinatorState:
                 "lastSeenAt": now,
             }
 
-        print()
-        print("⭐ Node registered")
-        print(f"   id: {node_id}")
-        print(f"   platform: {capabilities.get('platform', 'unknown')}")
-        print(
-            "   hardware: "
-            f"{capabilities.get('hardwareIdentifier', 'unknown')}"
-        )
-        print(f"   gpu: {capabilities.get('gpuName', 'unknown')}")
+        try:
+            print()
+            print("⭐ Node registered")
+            print(f"   id: {node_id}")
+            print(f"   platform: {capabilities.get('platform', 'unknown')}")
+            print(
+                "   hardware: "
+                f"{capabilities.get('hardwareIdentifier', 'unknown')}"
+            )
+            print(f"   gpu: {capabilities.get('gpuName', 'unknown')}")
 
-        advertised = capabilities.get("workloads", [])
-        if isinstance(advertised, list) and advertised:
-            workload_ids = []
-            for item in advertised:
-                if isinstance(item, str):
-                    workload_ids.append(item)
-                elif isinstance(item, dict) and item.get("workloadID"):
-                    workload_ids.append(str(item["workloadID"]))
+            advertised = capabilities.get("workloads", [])
+            if isinstance(advertised, list) and advertised:
+                workload_ids = []
+                for item in advertised:
+                    if isinstance(item, str):
+                        workload_ids.append(item)
+                    elif isinstance(item, dict) and item.get("workloadID"):
+                        workload_ids.append(str(item["workloadID"]))
 
-            if workload_ids:
-                print("   workloads: " + ", ".join(workload_ids))
+                if workload_ids:
+                    print("   workloads: " + ", ".join(workload_ids))
+        except Exception:
+            # Operational output cannot invalidate a completed registration.
+            pass
 
     def _mark_node_seen_locked(self, node_id):
         node_key = normalize_id(node_id)
         if node_key in self.nodes:
             self.nodes[node_key]["lastSeenAt"] = time.time()
 
-    def _node_supported_workload_ids_locked(self, node_id):
-        """Return advertised workload ids, or None for a legacy unrestricted node."""
+    def _node_supports_workload_locked(self, node_id, workload_id):
         node = self.nodes.get(normalize_id(node_id))
         if node is None:
-            return set()
+            return False
 
         capabilities = node.get("capabilities", {})
+        if not isinstance(capabilities, dict):
+            return False
+
+        definition = self.workload_definition
+        if "workloads" not in capabilities:
+            return definition.allows_legacy_schemaless_workers
+
         advertised = capabilities.get("workloads")
+        if not isinstance(advertised, list):
+            return False
+        if not advertised:
+            return definition.allows_legacy_schemaless_workers
 
-        # Backward compatibility: nodes registered before workload capability
-        # advertisement are allowed to claim work exactly as before.
-        if not isinstance(advertised, list) or not advertised:
-            return None
+        expected = {
+            "datasetSchemaID": definition.dataset_schema_id,
+            "payloadSchemaID": definition.payload_schema_id,
+            "resultSchemaID": definition.result_schema_id,
+        }
+        schema_keys = set(expected)
 
-        workload_ids = set()
+        for capability in advertised:
+            if isinstance(capability, str):
+                if (
+                    definition.allows_legacy_schemaless_workers
+                    and capability == workload_id
+                ):
+                    return True
+                continue
 
-        for item in advertised:
-            if isinstance(item, str):
-                workload_id = item
-            elif isinstance(item, dict):
-                workload_id = item.get("workloadID")
-            else:
-                workload_id = None
+            if not isinstance(capability, dict):
+                continue
+            if capability.get("workloadID") != workload_id:
+                continue
 
-            if workload_id is not None:
-                workload_ids.add(str(workload_id))
+            present = schema_keys.intersection(capability)
+            if not present:
+                if definition.allows_legacy_schemaless_workers:
+                    return True
+                continue
+            if present == schema_keys and all(
+                capability[key] == value
+                for key, value in expected.items()
+            ):
+                return True
 
-        return workload_ids
-
-    def _node_supports_workload_locked(self, node_id, workload_id):
-        supported = self._node_supported_workload_ids_locked(node_id)
-
-        if supported is None:
-            return True
-
-        return str(workload_id) in supported
+        return False
 
     def _node_execution_cooldown_remaining_locked(self, node_id, now=None):
         node_key = normalize_id(node_id)
@@ -1003,139 +1038,6 @@ class CoordinatorState:
             abs(frequency_step) * 8.0,
             peak_width * 0.02,
         )
-
-    def _validate_metal_result(self, work_unit, result):
-        """
-        Validate the result itself, independent of any external reference.
-
-        These checks are production execution checks: completed status,
-        numeric finite values, and a winning frequency inside the assigned
-        frequency range.
-        """
-        if work_unit.get("workloadID") == BOX_PERIOD_SEARCH_V1:
-            return self._validate_box_period_result(work_unit, result)
-
-        details = {
-            "deviceFrequency": None,
-            "devicePower": None,
-        }
-
-        if result.get("status") != "completed":
-            return False, "Work unit did not complete.", details
-
-        if result.get("bestFrequency") is None:
-            return False, "Missing best frequency.", details
-
-        if result.get("bestPower") is None:
-            return False, "Missing best power.", details
-
-        try:
-            best_frequency = float(result["bestFrequency"])
-            best_power = float(result["bestPower"])
-        except (TypeError, ValueError):
-            return False, "Best frequency/power must be numeric.", details
-
-        details["deviceFrequency"] = best_frequency
-        details["devicePower"] = best_power
-
-        if not math.isfinite(best_frequency):
-            return False, "Best frequency is not finite.", details
-
-        if not math.isfinite(best_power):
-            return False, "Best power is not finite.", details
-
-        start_frequency = float(work_unit["startFrequency"])
-        frequency_step = float(work_unit["frequencyStep"])
-        frequency_count = int(work_unit["frequencyCount"])
-
-        end_frequency = (
-            start_frequency
-            + max(frequency_count - 1, 0) * frequency_step
-        )
-
-        grid_tolerance = max(abs(frequency_step) * 2.0, 1e-7)
-
-        if (
-            best_frequency < start_frequency - grid_tolerance
-            or best_frequency > end_frequency + grid_tolerance
-        ):
-            return False, "Best frequency is outside work-unit range.", details
-
-        return True, "Metal result is structurally valid.", details
-
-    def _validate_box_period_result(self, work_unit, result):
-        payload = work_unit["payload"]
-        details = {"deviceFrequency": None, "deviceScore": None}
-        required = (
-            "bestFrequency", "bestScore", "bestPhase",
-            "bestDurationFraction", "bestFrequencyIndex",
-            "bestDurationIndex", "bestPhaseBin",
-            "inBoxSamples", "outOfBoxSamples",
-        )
-        if result.get("status") != "completed":
-            return False, "Work unit did not complete.", details
-        if any(result.get(key) is None for key in required):
-            return False, "Missing periodic-box result field.", details
-        def exact_integer(key):
-            value = result[key]
-            if isinstance(value, bool):
-                raise ValueError(key)
-            numeric = float(value)
-            if not math.isfinite(numeric) or not numeric.is_integer():
-                raise ValueError(key)
-            return int(numeric)
-
-        try:
-            frequency = float(result["bestFrequency"])
-            score = float(result["bestScore"])
-            phase = float(result["bestPhase"])
-            duration = float(result["bestDurationFraction"])
-            frequency_index = exact_integer("bestFrequencyIndex")
-            duration_index = exact_integer("bestDurationIndex")
-            phase_bin = exact_integer("bestPhaseBin")
-            in_count = exact_integer("inBoxSamples")
-            out_count = exact_integer("outOfBoxSamples")
-        except (TypeError, ValueError):
-            return False, "Periodic-box result fields must be numeric.", details
-        details.update({"deviceFrequency": frequency, "deviceScore": score})
-        if not all(math.isfinite(value) for value in (frequency, score, phase, duration)):
-            return False, "Periodic-box result contains a non-finite value.", details
-        start = float(payload["startFrequency"])
-        step = float(payload["frequencyStep"])
-        count = int(payload["frequencyCount"])
-        start_index = int(payload.get("frequencyStartIndex", 0))
-        relative_index = frequency_index - start_index
-        if relative_index < 0 or relative_index >= count:
-            return False, "Best frequency index is outside work-unit range.", details
-        expected_frequency = start + relative_index * step
-        frequency_tolerance = max(
-            abs(expected_frequency) * 2.0e-6,
-            abs(step) * 2.0e-5,
-            1.0e-7,
-        )
-        if abs(frequency - expected_frequency) > frequency_tolerance:
-            return False, "Best frequency does not match its grid index.", details
-        bins = int(payload["phaseBinCount"])
-        durations = [float(value) for value in payload["durationFractions"]]
-        if duration_index < 0 or duration_index >= len(durations):
-            return False, "Best duration index is outside configured durations.", details
-        expected_bins = max(1, min(bins - 1, int(math.floor(durations[duration_index] * bins + 0.5))))
-        expected_duration = expected_bins / bins
-        if phase_bin < 0 or phase_bin >= bins or abs(phase - phase_bin / bins) > 1.0e-6:
-            return False, "Best phase does not match its phase-bin index.", details
-        if abs(duration - expected_duration) > 1.0e-6:
-            return False, "Best duration does not match its configured index.", details
-        if in_count < int(payload["minimumInBoxSamples"]):
-            return False, "In-box sample gate was not satisfied.", details
-        if out_count < int(payload["minimumOutOfBoxSamples"]):
-            return False, "Out-of-box sample gate was not satisfied.", details
-        dataset = self.datasets[work_unit["datasetID"]]
-        series = dataset.get("coordinates")
-        if not isinstance(series, list):
-            series = dataset.get("times")
-        if not isinstance(series, list) or in_count + out_count != len(series):
-            return False, "Periodic-box sample counts do not partition the dataset.", details
-        return True, "Periodic-box result is structurally valid.", details
 
     def _reference_comparison(self, work_unit, result):
         """
@@ -1493,10 +1395,44 @@ class CoordinatorState:
                 "nodeID": assignment.get("nodeID"),
                 "bestFrequency": result.get("bestFrequency"),
                 "bestPower": result.get("bestPower"),
+                "result": dict(result),
                 "verification": dict(verification),
                 "recordedAt": time.time(),
             }
         )
+
+    def _canonicalize_completed_result(self, work_unit, result):
+        """Canonicalize workload data without surrendering the core envelope."""
+        protected_envelope = {
+            key: (key in result, result.get(key))
+            for key in _CORE_RESULT_ENVELOPE_FIELDS
+        }
+        canonical = self.workload_plugin.canonicalize_result(
+            work_unit,
+            dict(result),
+        )
+        if not isinstance(canonical, Mapping):
+            raise TypeError("Workload canonicalizer must return a mapping")
+        canonical = dict(canonical)
+
+        for key in _CORE_RESULT_ENVELOPE_FIELDS:
+            submitted_presence, submitted_value = protected_envelope[key]
+            if (
+                (key in canonical) != submitted_presence
+                or canonical.get(key) != submitted_value
+            ):
+                raise ValueError(
+                    f"Workload canonicalizer mutated reserved result field {key}"
+                )
+        return canonical
+
+    @staticmethod
+    def _run_operational(callback, *args, **kwargs):
+        """Run non-authoritative reporting without changing API outcomes."""
+        try:
+            callback(*args, **kwargs)
+        except Exception:
+            pass
 
     @staticmethod
     def _print_optional_float(label, value, digits=8):
@@ -1515,7 +1451,7 @@ class CoordinatorState:
         hard_failed,
     ):
         print()
-        print("❌ Science result rejected")
+        print("❌ Workload result rejected")
         print(f"   work: {work_unit['id']}")
         print(f"   node: {assignment.get('nodeID', 'unknown')}")
         print(f"   dataset: {work_unit['datasetID']}")
@@ -1709,36 +1645,69 @@ class CoordinatorState:
         work_id = normalize_id(route_work_id)
         result = dict(result)
 
-        # Generic result envelope. Current Lomb-Scargle reduction still reads
-        # the historical flattened fields, so mirror them from payload during
-        # the transition. OpenStar Core does not require other workloads to
-        # use these keys.
-        result_payload = result.get("payload")
-        if isinstance(result_payload, dict):
-            for key in (
-                "bestFrequency",
-                "bestPeriodDays",
-                "bestPower",
-                "bestScore",
-                "bestPhase",
-                "bestDurationFraction",
-                "bestFrequencyIndex",
-                "bestDurationIndex",
-                "bestPhaseBin",
-                "inBoxSamples",
-                "outOfBoxSamples",
-            ):
-                if result.get(key) is None and result_payload.get(key) is not None:
-                    result[key] = result_payload[key]
-
         with self.lock:
             work_unit = self.work_units.get(work_id)
 
             if work_unit is None:
                 return False, "Unknown work unit.", 404
 
+            for key in ("workID", "workUnitID"):
+                supplied_work_id = result.get(key)
+                if (
+                    supplied_work_id is not None
+                    and normalize_id(supplied_work_id) != work_id
+                ):
+                    return False, "Result work-unit identity mismatch.", 400
+            for key in ("projectID", "workloadID", "datasetID"):
+                supplied_identity = result.get(key)
+                if (
+                    supplied_identity is not None
+                    and str(supplied_identity) != str(work_unit[key])
+                ):
+                    return False, f"Result {key} identity mismatch.", 400
+
+            result_schema_id = result.get("resultSchemaID")
+            if (
+                result_schema_id is not None
+                and result_schema_id != work_unit["resultSchemaID"]
+            ):
+                return False, "Result schema identity mismatch.", 400
+            if (
+                result_schema_id is None
+                and not self.workload_definition.allows_legacy_schemaless_workers
+            ):
+                return False, "Result is missing resultSchemaID.", 400
+
+            if all(
+                result.get(key) is None
+                for key in ("workID", "workUnitID")
+            ):
+                return False, "Result is missing work-unit identity.", 400
+            if result.get("nodeID") is None:
+                return False, "Result is missing node identity.", 400
+
             if work_id in self.completed:
-                if self.accepted_result_submissions.get(work_id) == result:
+                supplied_node_id = result.get("nodeID")
+                accepted_node_id = self.completed[work_id].get("nodeID")
+                if (
+                    supplied_node_id is not None
+                    and normalize_id(supplied_node_id)
+                    != normalize_id(accepted_node_id)
+                ):
+                    return False, "Result node identity mismatch.", 409
+                comparison_result = result
+                if result.get("status") == "completed":
+                    try:
+                        comparison_result = self._canonicalize_completed_result(
+                            work_unit,
+                            result,
+                        )
+                    except Exception:
+                        return False, "Result canonicalization failed.", 400
+                if (
+                    self.accepted_result_submissions.get(work_id)
+                    == comparison_result
+                ):
                     return True, "Identical result already accepted.", 200
                 return (
                     False,
@@ -1757,6 +1726,23 @@ class CoordinatorState:
 
             if assignment is None:
                 return False, "Work unit is not currently assigned.", 409
+
+            supplied_node_id = result.get("nodeID")
+            if (
+                supplied_node_id is not None
+                and normalize_id(supplied_node_id)
+                != normalize_id(assignment["nodeID"])
+            ):
+                return False, "Result node identity mismatch.", 409
+
+            if result.get("status") == "completed":
+                try:
+                    result = self._canonicalize_completed_result(
+                        work_unit,
+                        result,
+                    )
+                except Exception:
+                    return False, "Result canonicalization failed.", 400
 
             # A client that explicitly reports status != completed did not
             # produce a scientific result. Failure provenance determines
@@ -1943,30 +1929,28 @@ class CoordinatorState:
                 verification = None
                 reference_comparison = None
             else:
-                accepted, message, validation_details = (
-                    self._validate_metal_result(
+                try:
+                    plugin_validation = self.workload_plugin.validate_result(
                         work_unit,
                         result,
+                        self.datasets[work_unit["datasetID"]],
                     )
-                )
+                except Exception:
+                    return False, "Workload result validation failed.", 500
+
+                if not isinstance(plugin_validation, ResultValidation):
+                    return False, "Workload validator returned an invalid response.", 500
+
+                accepted = plugin_validation.accepted
+                message = plugin_validation.message
+                validation_details = dict(plugin_validation.details)
 
                 reference_comparison = None
 
-                if accepted and work_unit.get("workloadID") == BOX_PERIOD_SEARCH_V1:
-                    reference_comparison = {
-                        "status": "not-applicable",
-                        "matched": None,
-                        "method": None,
-                        "message": "No external reference is used for generic periodic-box work.",
-                        "details": {},
-                    }
-                    verification = {
-                        **validation_details,
-                        "method": "periodic-box-result",
-                        "referenceComparisonStatus": "not-applicable",
-                    }
-                    message = "Periodic-box result accepted."
-                elif accepted:
+                if (
+                    accepted
+                    and self.workload_plugin.uses_legacy_coordinator_diagnostics
+                ):
                     reference_comparison = self._reference_comparison(
                         work_unit,
                         result,
@@ -2017,9 +2001,14 @@ class CoordinatorState:
                             "Metal result accepted. No Astropy reference "
                             "was supplied."
                         )
+                elif accepted:
+                    verification = {
+                        "method": "workload-plugin",
+                        **validation_details,
+                    }
                 else:
                     verification = {
-                        "method": "metal-result-invalid",
+                        "method": "workload-plugin-invalid",
                         **validation_details,
                     }
 
@@ -2101,8 +2090,10 @@ class CoordinatorState:
                 stored_result["nodeID"] = assignment["nodeID"]
                 stored_result["verification"] = dict(verification)
 
-                if (work_unit.get("workloadID") != BOX_PERIOD_SEARCH_V1
-                        and stored_result.get("bestPeriodDays") is None):
+                if (
+                    self.workload_plugin.uses_legacy_coordinator_diagnostics
+                    and stored_result.get("bestPeriodDays") is None
+                ):
                     best_frequency = float(stored_result["bestFrequency"])
                     stored_result["bestPeriodDays"] = (
                         1.0 / best_frequency
@@ -2128,15 +2119,20 @@ class CoordinatorState:
 
         if execution_failed:
             if environment_unavailable_args is not None:
-                self._print_environment_unavailable(
+                self._run_operational(
+                    self._print_environment_unavailable,
                     **environment_unavailable_args
                 )
             elif transport_unavailable_args is not None:
-                self._print_transport_unavailable(
+                self._run_operational(
+                    self._print_transport_unavailable,
                     **transport_unavailable_args
                 )
             elif execution_failure_args is not None:
-                self._print_execution_failure(**execution_failure_args)
+                self._run_operational(
+                    self._print_execution_failure,
+                    **execution_failure_args,
+                )
 
             # The client reported that execution itself did not complete.
             # Returning 200 acknowledges the report so the networking layer
@@ -2147,19 +2143,19 @@ class CoordinatorState:
         self._notify_terminal_observer()
 
         if not accepted:
-            self._print_rejection(**rejection_args)
+            self._run_operational(self._print_rejection, **rejection_args)
 
             # Terminal scientific failures must advance scheduling while
             # remaining explicit failures.
             if rejection_args.get("hard_failed"):
-                self._report_completions()
+                self._run_operational(self._report_completions)
 
             # This is an application-level scientific rejection, not a broken
             # HTTP request. Returning 200 prevents networking layers from
             # immediately POSTing the identical deterministic result again.
             return False, message, 200
 
-        self._report_completions()
+        self._run_operational(self._report_completions)
 
         return True, message, 200
 
@@ -2200,36 +2196,6 @@ class CoordinatorState:
                 best = result
 
         return best
-
-    def _box_period_candidates_locked(self, dataset_id):
-        candidates = []
-        for work_id in self.work_ids_by_dataset.get(dataset_id, []):
-            result = self.completed.get(work_id)
-            if result is None or result.get("bestScore") is None:
-                continue
-            work_unit = self.work_units[work_id]
-            payload = work_unit["payload"]
-            candidates.append({
-                "workID": work_id,
-                "windowIndex": payload.get("windowIndex"),
-                "familyRank": payload.get("familyRank"),
-                "familyID": payload.get("familyID"),
-                "centerFrequency": payload.get("centerFrequency"),
-                "frequency": float(result["bestFrequency"]),
-                "score": float(result["bestScore"]),
-                "phase": float(result["bestPhase"]),
-                "durationFraction": float(result["bestDurationFraction"]),
-                "frequencyIndex": int(result["bestFrequencyIndex"]),
-                "durationIndex": int(result["bestDurationIndex"]),
-                "phaseBin": int(result["bestPhaseBin"]),
-                "inBoxSamples": int(result["inBoxSamples"]),
-                "outOfBoxSamples": int(result["outOfBoxSamples"]),
-            })
-        candidates.sort(key=lambda item: (
-            item["windowIndex"] if item["windowIndex"] is not None else math.inf,
-            item["frequencyIndex"],
-        ))
-        return candidates
 
     @staticmethod
     def _finite_float_list(values):
@@ -2480,25 +2446,6 @@ class CoordinatorState:
             total > 0
             and completed + failed == total
         )
-
-        if self.workload_id == BOX_PERIOD_SEARCH_V1:
-            candidates = self._box_period_candidates_locked(dataset_id)
-            return {
-                "periodStatus": (
-                    "BOX_SEARCH_COMPLETE" if terminal and failed == 0
-                    else "INCOMPLETE_COVERAGE" if terminal
-                    else "SEARCHING"
-                ),
-                "periodConfidence": None,
-                "coverageComplete": terminal and failed == 0,
-                "candidate": None,
-                "authoritative": None,
-                "harmonicCandidates": [],
-                "preferredPhysicalPeriodDays": None,
-                "preferredPhysicalPeriodRelation": None,
-                "independentCandidates": [],
-                "boxCandidates": candidates,
-            }
 
         best = self._dataset_best_locked(dataset_id)
 
@@ -2812,8 +2759,114 @@ class CoordinatorState:
             "other": other,
         }
 
+    def _plugin_reduction_locked(self, dataset_id, terminal):
+        if terminal:
+            cached = self.dataset_diagnostic_cache.get(dataset_id)
+            if isinstance(cached, DatasetReduction):
+                return cached
+
+        work_ids = self.work_ids_by_dataset.get(dataset_id, [])
+        reduction = self.workload_plugin.reduce_dataset(
+            self.datasets[dataset_id],
+            [self.work_units[work_id] for work_id in work_ids],
+            [self.completed.get(work_id) for work_id in work_ids],
+            terminal=terminal,
+        )
+        if not isinstance(reduction, DatasetReduction):
+            raise RuntimeError(
+                f"Workload {self.workload_id} returned an invalid dataset reduction"
+            )
+        if terminal:
+            self.dataset_diagnostic_cache[dataset_id] = reduction
+        return reduction
+
+    def _plugin_dataset_status_locked(self, dataset_id):
+        pending, assigned, completed, total = self._dataset_counts_locked(
+            dataset_id
+        )
+        failed = self._dataset_failed_count_locked(dataset_id)
+        terminal = total > 0 and completed + failed == total
+        reduction = self._plugin_reduction_locked(dataset_id, terminal)
+
+        dataset = self.datasets[dataset_id]
+        manifest = self.dataset_manifest_entries.get(dataset_id, {})
+        metadata_value = dataset.get("metadata", {})
+        metadata = (
+            metadata_value if isinstance(metadata_value, Mapping) else {}
+        )
+        science_value = dataset.get("science", {})
+        science = science_value if isinstance(science_value, Mapping) else {}
+        contributions = self._dataset_contributions_locked(dataset_id)
+
+        status = {
+            "id": dataset_id,
+            "workloadID": self.workload_id,
+            "datasetSchemaID": self.workload_definition.dataset_schema_id,
+            "payloadSchemaID": self.workload_definition.payload_schema_id,
+            "resultSchemaID": self.workload_definition.result_schema_id,
+            "targetName": dataset.get("targetName", dataset_id),
+            "mission": dataset.get(
+                "mission",
+                (
+                    "TESS"
+                    if self.workload_plugin.uses_legacy_science_metadata_validation
+                    else ""
+                ),
+            ),
+            "ticID": manifest.get("ticID", metadata.get("ticID")),
+            "sector": manifest.get("sector", metadata.get("sector")),
+            "role": science.get("role"),
+            "classification": science.get("classification"),
+            "publishedPeriodDays": science.get("publishedPeriodDays"),
+            "pendingWorkUnits": pending,
+            "assignedWorkUnits": assigned,
+            "completedWorkUnits": completed,
+            "failedWorkUnits": failed,
+            "totalWorkUnits": total,
+            "progress": (completed + failed) / total if total else 1.0,
+            "retryCount": self._dataset_retry_count_locked(dataset_id),
+            "verificationFailureCount": (
+                self._dataset_verification_failure_count_locked(dataset_id)
+            ),
+            "executionFailureCount": (
+                self._dataset_execution_failure_count_locked(dataset_id)
+            ),
+            "executionFailureKinds": (
+                self._dataset_execution_failure_kinds_locked(dataset_id)
+            ),
+            "environmentUnavailableCount": (
+                self._dataset_environment_unavailable_count_locked(dataset_id)
+            ),
+            "transportUnavailableCount": (
+                self._dataset_transport_unavailable_count_locked(dataset_id)
+            ),
+            "referenceMismatchCount": (
+                self._dataset_reference_mismatch_count_locked(dataset_id)
+            ),
+            "iPhoneContribution": contributions["iPhone"],
+            "macContribution": contributions["Mac"],
+            "otherContribution": contributions["other"],
+            "nodeContributions": (
+                self._dataset_node_contributions_locked(dataset_id)
+            ),
+            "payload": dict(reduction.payload),
+        }
+
+        reserved = set(status)
+        collisions = reserved.intersection(reduction.status_fields)
+        if collisions:
+            raise RuntimeError(
+                f"Workload {self.workload_id} attempted to overwrite reserved "
+                f"dataset status fields: {', '.join(sorted(collisions))}"
+            )
+        status.update(dict(reduction.status_fields))
+        return status
+
     def dataset_status(self, dataset_id):
         with self.lock:
+            if not self.workload_plugin.uses_legacy_coordinator_diagnostics:
+                return self._plugin_dataset_status_locked(dataset_id)
+
             pending, assigned, completed, total = self._dataset_counts_locked(
                 dataset_id
             )
@@ -2974,7 +3027,6 @@ class CoordinatorState:
                     "independentCandidates",
                     [],
                 ),
-                "boxCandidates": diagnostics.get("boxCandidates", []),
                 "iPhoneContribution": contributions["iPhone"],
                 "macContribution": contributions["Mac"],
                 "otherContribution": contributions["other"],
@@ -3056,9 +3108,11 @@ class CoordinatorState:
                     for status in dataset_statuses
                     if status["id"] == current_dataset_id
                 )
-                sample_count = len(
-                    self.datasets[current_dataset_id].get("times", [])
-                )
+                current_dataset = self.datasets[current_dataset_id]
+                samples = current_dataset.get("times")
+                if not isinstance(samples, list):
+                    samples = current_dataset.get("coordinates")
+                sample_count = len(samples) if isinstance(samples, list) else 0
 
             return {
                 "projectID": self.project_id,
@@ -3079,11 +3133,15 @@ class CoordinatorState:
                 "completedWorkUnits": current["completedWorkUnits"],
                 "totalWorkUnits": current["totalWorkUnits"],
                 "progress": current["progress"],
-                "retryCount": current["retryCount"],
-                "verificationFailureCount": current[
-                    "verificationFailureCount"
-                ],
-                "executionFailureCount": current["executionFailureCount"],
+                "retryCount": current.get("retryCount", 0),
+                "verificationFailureCount": current.get(
+                    "verificationFailureCount",
+                    0,
+                ),
+                "executionFailureCount": current.get(
+                    "executionFailureCount",
+                    0,
+                ),
                 "executionFailureKinds": current.get(
                     "executionFailureKinds",
                     {},
@@ -3098,9 +3156,9 @@ class CoordinatorState:
                 ),
                 "failedWorkUnits": current["failedWorkUnits"],
                 "activeNodes": len(self.nodes),
-                "bestFrequency": current["bestFrequency"],
-                "bestPeriodDays": current["bestPeriodDays"],
-                "bestPower": current["bestPower"],
+                "bestFrequency": current.get("bestFrequency"),
+                "bestPeriodDays": current.get("bestPeriodDays"),
+                "bestPower": current.get("bestPower"),
                 "periodStatus": current.get("periodStatus"),
                 "periodConfidence": current.get("periodConfidence"),
                 "coverageComplete": current.get("coverageComplete"),
@@ -3138,6 +3196,49 @@ class CoordinatorState:
             }
 
     def _print_dataset_result_summary(self, dataset_id, indent="   "):
+        if not self.workload_plugin.uses_legacy_coordinator_diagnostics:
+            status = self.dataset_status(dataset_id)
+            payload = status.get("payload")
+            workload_status = (
+                status.get("periodStatus")
+                or (payload.get("status") if isinstance(payload, dict) else None)
+                or (
+                    "COMPLETE"
+                    if status.get("completedWorkUnits", 0)
+                    + status.get("failedWorkUnits", 0)
+                    == status.get("totalWorkUnits", 0)
+                    else "RUNNING"
+                )
+            )
+            print(f"{indent}target: {status.get('targetName', dataset_id)}")
+            print(f"{indent}dataset: {dataset_id}")
+            print(f"{indent}workload: {self.workload_id}")
+            print(f"{indent}workload status: {workload_status}")
+            print(
+                f"{indent}accepted work units: "
+                f"{status.get('completedWorkUnits', 0)}/"
+                f"{status.get('totalWorkUnits', 0)}"
+            )
+            if status.get("failedWorkUnits"):
+                print(
+                    f"{indent}hard-failed work units: "
+                    f"{status['failedWorkUnits']}"
+                )
+            print(
+                f"{indent}iPhone contribution: "
+                f"{status.get('iPhoneContribution', 0)} work units"
+            )
+            print(
+                f"{indent}Mac contribution: "
+                f"{status.get('macContribution', 0)} work units"
+            )
+            if status.get("otherContribution"):
+                print(
+                    f"{indent}other contribution: "
+                    f"{status['otherContribution']} work units"
+                )
+            return
+
         with self.lock:
             dataset = self.datasets[dataset_id]
             science = dataset.get("science", {})
@@ -3479,6 +3580,42 @@ class CoordinatorState:
             "Transport availability: transport-unavailable work is requeued "
             "without retry, execution-failure, or cooldown penalty"
         )
+
+        if not self.workload_plugin.uses_legacy_coordinator_diagnostics:
+            print(
+                "Result authority: completed results are canonicalized and "
+                "validated by the registered workload plugin"
+            )
+            print(
+                "Invalid-result handling: plugin-rejected results retry up "
+                f"to {MAX_VERIFICATION_FAILURES_PER_WORK_UNIT} times"
+            )
+            print(
+                "Schemas: "
+                f"dataset={self.workload_definition.dataset_schema_id} "
+                f"payload={self.workload_definition.payload_schema_id} "
+                f"result={self.workload_definition.result_schema_id}"
+            )
+
+            for dataset_id, dataset in self.datasets.items():
+                samples = dataset.get("times")
+                if not isinstance(samples, list):
+                    samples = dataset.get("coordinates")
+                sample_count = len(samples) if isinstance(samples, list) else None
+
+                print()
+                print(f"Dataset: {dataset_id}")
+                print(f"Target: {dataset.get('targetName', dataset_id)}")
+                if dataset.get("mission") is not None:
+                    print(f"Mission: {dataset['mission']}")
+                if sample_count is not None:
+                    print(f"Samples: {sample_count}")
+                print(
+                    "Work units: "
+                    f"{len(self.work_ids_by_dataset.get(dataset_id, []))}"
+                )
+            return
+
         print(
             "Execution authority: valid Metal chunk results are accepted "
             "without Astropy voting"

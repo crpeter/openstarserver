@@ -47,6 +47,8 @@ class CoordinatorResultSubmissionTests(unittest.TestCase):
         self.work = self.state.claim_work("ios-test")
         self.result = {
             "status": "completed",
+            "workUnitID": self.work["id"],
+            "nodeID": "ios-test",
             "bestFrequency": 1.2,
             "bestPower": 0.75,
             "bestFrequencyIndex": 2,
