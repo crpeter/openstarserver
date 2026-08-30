@@ -94,5 +94,36 @@ normalization constants, and the absolute time origin are written only to
 written under `blind/`; those files contain neither original filenames nor
 archive identity and provenance. Keep the sealed output under server control.
 
-This phase does not create a CurveGrid project, fit a model, inspect expected
-anomaly parameters, classify a result, or make a scientific claim.
+The preparation phase does not create a CurveGrid project, fit a model,
+inspect expected anomaly parameters, classify a result, or make a scientific
+claim.
+
+## Build the bounded blind coarse-grid project
+
+After blind preparation, build the first directly activatable CurveGrid
+project without reading the sealed identity state:
+
+```bash
+python -m workflows.microlensing.coarse_grid \
+  --prepared-root /path/to/microlensing-recovery-a-prepared \
+  --project-id openstar.microlensing-recovery-a.coarse-grid.v1 \
+  --output-root /path/to/microlensing-recovery-a-coarse-grid
+```
+
+The frozen grid contains exactly 4,941 candidates: 61 center values, nine
+log-scale values, and nine log-shape values. With 64 candidates per work unit,
+the project will produce 78 work units when later activated. This builder only
+validates and writes the project; it does not activate the coordinator or
+evaluate any candidate.
+
+The initial project deliberately uses only the generic series with the largest
+sample count, breaking ties by its position in `orderedSeriesIDs`. The current
+CurveGrid result contract retains only each shard winner, so it cannot yet sum
+every candidate objective correctly across multiple independent series.
+
+Identity remains confined to `sealed/`, the server-side microlensing workflow
+owns blind preparation and project construction, and workers receive only the
+generic CurveGrid dataset and workload contract. The bounded stage fits only
+the smooth single-lens-like symmetric radial-amplification curve. Completing
+it is not yet recovery or classification of a planetary anomaly and is not a
+discovery claim.
