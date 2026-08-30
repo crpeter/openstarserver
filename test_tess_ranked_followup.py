@@ -102,7 +102,8 @@ class RankedFollowupTests(IsolatedScienceRunTestCase):
         unchanged = {p.relative_to(shallow): p.read_bytes() for p in shallow.rglob("*") if p.is_file()}
         return investigation, downstream, coordinator.calls, before, unchanged, output.getvalue()
 
-    def _run(self, shallow, deep, top, executions, *, planner=None, execute_hook=None):
+    def _run(self, shallow, deep, top, executions, *, planner=None,
+             execute_hook=None, resume_admitted=False):
         class Coordinator:
             calls = []
             def run_project(self, *args, **kwargs):
@@ -135,6 +136,7 @@ class RankedFollowupTests(IsolatedScienceRunTestCase):
         with patch("run_openstar_tess_ranked_followup.register_tess_workflow_handlers", register), \
              patch("run_openstar_tess_ranked_followup.plan_tess_branches", planner or default_planner):
             code = run_tess_ranked_followup(7, shallow, deep, "unused", top,
+                resume_admitted=resume_admitted,
                 max_concurrent_investigations=2, coordinator=coordinator, allow_temporary_state=True)
         return code, coordinator
 
@@ -489,6 +491,35 @@ class RankedFollowupTests(IsolatedScienceRunTestCase):
             self.assertEqual({k: v for k, v in before.items() if k != ranking_path},
                              {k: v for k, v in after.items() if k != ranking_path})
             self.assertIn(ranking_path, after)
+
+    def test_resume_admitted_does_not_refresh_rank_or_admit_targets(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); shallow = root / "shallow"; deep = root / "deep"
+            self._sweep(shallow)
+            executions = []
+            code, _ = self._run(shallow, deep, 1, executions)
+            self.assertEqual(0, code)
+            self.assertEqual([1], executions)
+            executions.clear()
+            ledger = deep / "tess-sector-7-deep-admissions.json"
+            ledger_before = ledger.read_bytes()
+            shallow_before = self._tree_bytes(shallow)
+
+            with patch(
+                "run_openstar_tess_ranked_followup.aggregate_tess_sector_ranking",
+                side_effect=AssertionError("resume must not refresh ranking"),
+            ), patch(
+                "run_openstar_tess_ranked_followup.collect_identity",
+                side_effect=AssertionError("resume must not screen novelty"),
+            ):
+                code, coordinator = self._run(
+                    shallow, deep, None, executions, resume_admitted=True)
+
+            self.assertEqual(0, code)
+            self.assertEqual([], executions)
+            self.assertEqual([], coordinator.calls)
+            self.assertEqual(ledger_before, ledger.read_bytes())
+            self.assertEqual(shallow_before, self._tree_bytes(shallow))
 
     def test_waiting_and_failed_candidates_do_not_block_runnable_candidate(self):
         with tempfile.TemporaryDirectory() as temporary:

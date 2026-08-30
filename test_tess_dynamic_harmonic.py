@@ -5,7 +5,9 @@ import unittest
 from pathlib import Path
 
 from workflows.tess.tess_dynamic_harmonic import (
+    compare_unresolved_family_dynamic_harmonics,
     model_dynamic_harmonics,
+    read_frozen_light_curve,
     refine_harmonic_family_frequency,
 )
 
@@ -38,10 +40,62 @@ class TessDynamicHarmonicTests(unittest.TestCase):
         return model_dynamic_harmonics(dataset_paths=self._data(root.name, **kwargs),
                                        reference_period_days=kwargs.get("period", 10.0))
 
+    def _alias_data(self, root, components):
+        paths = []
+        for sector in range(4):
+            sector_components = (
+                components(sector) if callable(components) else components
+            )
+            times = [sector * 47 + 18 * index / 599 for index in range(600)]
+            scale = (0.7, 1.0, 0.8, 1.2)[sector]
+            flux = [
+                sum(
+                    scale * amplitude * math.sin(
+                        2 * math.pi * frequency * time + phase
+                    )
+                    for frequency, amplitude, phase in sector_components
+                ) + 0.003 * math.sin(1.731 * index + sector)
+                for index, time in enumerate(times)
+            ]
+            path = Path(root) / f"alias-sector-{sector}.json"
+            path.write_text(json.dumps({
+                "times": times,
+                "flux": flux,
+                "source": {"sector": sector},
+            }))
+            paths.append(path)
+        return paths
+
+    def _compare_alias(self, components):
+        root = tempfile.TemporaryDirectory()
+        self.addCleanup(root.cleanup)
+        return compare_unresolved_family_dynamic_harmonics(
+            dataset_paths=self._alias_data(root.name, components),
+            raw_period_days=5.0,
+            double_cycle_period_days=10.0,
+        )
+
     def test_coherent_static_family(self):
         result = self._run()
         self.assertEqual("COHERENT_STATIC_HARMONIC_FAMILY", result["classification"])
         self.assertFalse(result["dataReuse"]["downloadPerformed"])
+
+    def test_sector_scan_metadata_preserves_absolute_time_and_sector(self):
+        root = tempfile.TemporaryDirectory()
+        self.addCleanup(root.cleanup)
+        path = Path(root.name) / "scan-dataset.json"
+        path.write_text(json.dumps({
+            "times": [0.1 * index for index in range(20)],
+            "flux": [float(index) for index in range(20)],
+            "metadata": {
+                "sector": 1,
+                "originalTimeOriginDays": 1325.25,
+            },
+        }))
+        result = read_frozen_light_curve(path, position=99)
+        self.assertEqual(1, result["sector"])
+        self.assertEqual(1325.25, result["appliedTimeOriginDays"])
+        self.assertAlmostEqual(1325.25, result["times"][0])
 
     def test_amplitude_only_evolution(self):
         amplitudes = [[value] * 4 for value in (0.5, 0.8, 1.1, 0.7)]
@@ -86,6 +140,73 @@ class TessDynamicHarmonicTests(unittest.TestCase):
         self.assertEqual([1, 2, 3, 4], result["harmonicOrdersTested"])
         self.assertTrue(result["modelComparison"]["highestTestedHarmonicSupported"])
         self.assertFalse(result["physicalMechanismResolved"])
+
+    def test_unresolved_alias_comparison_predictively_selects_raw_family(self):
+        result = self._compare_alias((
+            (1 / 5.0, 0.9, 0.2),
+            (3 / 5.0, 0.45, -0.3),
+        ))
+        self.assertEqual("RAW_FAMILY_PREDICTIVELY_PREFERRED",
+                         result["classification"])
+        self.assertTrue(result["physicalCycleResolved"])
+        self.assertEqual(5.0, result["resolvedPhysicalPeriodDays"])
+        resolution = result["periodAliasResolution"]
+        self.assertEqual([0, 1, 2, 3],
+                         resolution["rawSupportingHeldOutSectors"])
+        self.assertEqual([], resolution["doubleCycleSupportingHeldOutSectors"])
+
+    def test_unresolved_alias_comparison_predictively_selects_double_cycle(self):
+        result = self._compare_alias((
+            (1 / 10.0, 0.9, 0.2),
+            (3 / 10.0, 0.45, -0.3),
+        ))
+        self.assertEqual("DOUBLE_CYCLE_PREDICTIVELY_PREFERRED",
+                         result["classification"])
+        self.assertTrue(result["physicalCycleResolved"])
+        self.assertEqual(10.0, result["resolvedPhysicalPeriodDays"])
+        resolution = result["periodAliasResolution"]
+        self.assertEqual([0, 1, 2, 3],
+                         resolution["doubleCycleSupportingHeldOutSectors"])
+        self.assertEqual([], resolution["rawSupportingHeldOutSectors"])
+
+    def test_unresolved_alias_comparison_keeps_shared_harmonic_ambiguous(self):
+        result = self._compare_alias(lambda sector: (
+            (1 / 5.0, 0.9, 0.2),
+            ((3 / 5.0, 0.45, -0.3)
+             if sector < 2 else
+             (1 / 10.0, 0.45, -0.3)),
+        ))
+        self.assertEqual(
+            "UNRESOLVED_FAMILY_DYNAMIC_HARMONIC_ALIAS_AMBIGUOUS",
+            result["classification"],
+        )
+        self.assertFalse(result["physicalCycleResolved"])
+        self.assertIsNone(result["resolvedPhysicalPeriodDays"])
+        self.assertEqual(
+            "ADDITIONAL_INDEPENDENT_SECTOR_CYCLE_ALIAS_CONFIRMATION",
+            result["recommendedNextTest"],
+        )
+        self.assertEqual(
+            "UNRESOLVED_FAMILY_ANALYSIS_REFERENCE",
+            result["referencePeriodRole"],
+        )
+
+    def test_unresolved_alias_comparison_rejects_invalid_lineage(self):
+        root = tempfile.TemporaryDirectory()
+        self.addCleanup(root.cleanup)
+        paths = self._alias_data(root.name, ((1 / 5.0, 0.9, 0.2),))
+        with self.assertRaisesRegex(ValueError, "exact raw/2x"):
+            compare_unresolved_family_dynamic_harmonics(
+                dataset_paths=paths,
+                raw_period_days=5.0,
+                double_cycle_period_days=9.9,
+            )
+        with self.assertRaisesRegex(RuntimeError, "at least three"):
+            compare_unresolved_family_dynamic_harmonics(
+                dataset_paths=paths[:2],
+                raw_period_days=5.0,
+                double_cycle_period_days=10.0,
+            )
 
 
 if __name__ == "__main__":

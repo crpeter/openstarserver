@@ -116,7 +116,11 @@ from .tess_nonstationary import (
     summarize_nonstationary_modeling,
 )
 from .tess_mode_identification import identify_residual_mode
-from .tess_dynamic_harmonic import model_dynamic_harmonics, refine_harmonic_family_frequency
+from .tess_dynamic_harmonic import (
+    compare_unresolved_family_dynamic_harmonics,
+    model_dynamic_harmonics,
+    refine_harmonic_family_frequency,
+)
 from .tess_residual_localization import (
     build_residual_mode_pixel_project,
     interpret_residual_mode_pixel_project,
@@ -713,7 +717,7 @@ def time_frequency_continuation(summary: dict[str, Any], *, request_id: str) -> 
         == "LONG_BASELINE_NONSTATIONARY_MODE_MODELING"
         and summary.get("physicalMechanismResolved") is False
     )
-    run_dynamic_harmonic = (
+    run_resolved_dynamic_harmonic = (
         summary.get("recommendedNextTest") == "DYNAMIC_HARMONIC_MODELING"
         and summary.get("physicalMechanismResolved") is False
         and not post_dynamic_harmonic_residual
@@ -721,6 +725,18 @@ def time_frequency_continuation(summary: dict[str, Any], *, request_id: str) -> 
         and period_reference.get("physicalCycleResolved") is True
         and math.isfinite(physical_period)
         and physical_period > 0
+    )
+    run_unresolved_dynamic_harmonic = (
+        summary.get("recommendedNextTest") == "DYNAMIC_HARMONIC_MODELING"
+        and summary.get("physicalMechanismResolved") is False
+        and not post_dynamic_harmonic_residual
+        and period_reference.get("kind") == "UNRESOLVED_FAMILY_ANALYSIS_REFERENCE"
+        and period_reference.get("physicalCycleResolved") is False
+        and math.isfinite(physical_period)
+        and physical_period > 0
+    )
+    run_dynamic_harmonic = (
+        run_resolved_dynamic_harmonic or run_unresolved_dynamic_harmonic
     )
     return StageRequest(
         id=_next_stage_id(
@@ -740,7 +756,11 @@ def time_frequency_continuation(summary: dict[str, Any], *, request_id: str) -> 
                   else "openstar.tess.finalize")
             ))
         ),
-        parameters=({"evidenceLineage": "MORPHOLOGY_RESOLVED_TIME_FREQUENCY_RECOMMENDATION"}
+        parameters=({"evidenceLineage": (
+                        "MORPHOLOGY_RESOLVED_TIME_FREQUENCY_RECOMMENDATION"
+                        if run_resolved_dynamic_harmonic else
+                        "UNRESOLVED_FAMILY_TIME_FREQUENCY_RECOMMENDATION"
+                    )}
                     if run_dynamic_harmonic else
                     ({} if (run_nonstationary or run_mode_identification
                             or run_physical_interpretation) else {"outputSuffix": "v20.8"})),
@@ -860,6 +880,22 @@ def dynamic_harmonic_continuation(summary: dict[str, Any], *, request_id: str) -
     """Route dynamic-family evidence without assigning a physical mechanism."""
     residual = summary.get("recommendedNextTest") == "RESIDUAL_MULTIMODE_LOCALIZATION"
     refine = summary.get("recommendedNextTest") == "LOMB_SCARGLE_FREQUENCY_REFINEMENT"
+    try:
+        resolved_period = float(summary.get("resolvedPhysicalPeriodDays"))
+        reference_period = float(summary.get("referenceFamilyPeriodDays"))
+    except (TypeError, ValueError):
+        resolved_period = reference_period = math.nan
+    predictively_resolved = (
+        summary.get("evidenceLineage")
+        == "UNRESOLVED_FAMILY_TIME_FREQUENCY_RECOMMENDATION"
+        and summary.get("physicalCycleResolved") is True
+        and summary.get("referencePeriodRole")
+        == "PREDICTIVELY_RESOLVED_PHOTOMETRIC_CYCLE"
+        and math.isfinite(resolved_period) and resolved_period > 0
+        and math.isfinite(reference_period) and reference_period > 0
+        and math.isclose(
+            resolved_period, reference_period, rel_tol=1e-9, abs_tol=1e-12)
+    )
     return StageRequest(
         id=_next_stage_id(request_id, "refine-harmonic-frequency" if refine else
                           ("prepare-time-frequency" if residual else "finalize")),
@@ -868,8 +904,9 @@ def dynamic_harmonic_continuation(summary: dict[str, Any], *, request_id: str) -
         parameters=({} if refine else
                     ({"entryReason": (
                         "RESOLVED_DYNAMIC_HARMONIC_RESIDUAL"
-                        if summary.get("evidenceLineage") ==
-                        "MORPHOLOGY_RESOLVED_TIME_FREQUENCY_RECOMMENDATION"
+                        if (summary.get("evidenceLineage") ==
+                            "MORPHOLOGY_RESOLVED_TIME_FREQUENCY_RECOMMENDATION"
+                            or predictively_resolved)
                         else "DYNAMIC_HARMONIC_RESIDUAL")}
                      if residual else
                      {"outputSuffix": "v20.10-dynamic-harmonic"})),
@@ -4809,6 +4846,91 @@ def build_engine(
 
     def dynamic_harmonic_stage(investigation, request):
         if request.parameters.get("evidenceLineage") == \
+                "UNRESOLVED_FAMILY_TIME_FREQUENCY_RECOMMENDATION":
+            prepared = _result(investigation, "001-prepare-target")
+            independent = _latest_result_for_handler(
+                investigation, "openstar.tess.independent.prepare")
+            morphology = _latest_result_for_handler(
+                investigation, "openstar.tess.morphology.analyze")
+            time_frequency = _latest_result_for_handler(
+                investigation, "openstar.tess.time-frequency.summarize")
+            if not all(isinstance(item, dict) for item in
+                       (prepared, independent, morphology, time_frequency)):
+                raise RuntimeError(
+                    "Unresolved-family dynamic harmonic modeling requires "
+                    "persisted primary, independent, morphology, and "
+                    "time-frequency evidence.")
+            continuation = morphology.get("continuationEvidence") or {}
+            period_reference = time_frequency.get("periodReference") or {}
+            try:
+                raw_period = float(morphology.get("rawPeriodDays"))
+                double_period = float(morphology.get("possibleDoubleCycleDays"))
+                analysis_period = float(
+                    continuation.get("analysisReferencePeriodDays"))
+                time_frequency_period = float(period_reference.get("periodDays"))
+            except (TypeError, ValueError):
+                raise RuntimeError(
+                    "Unresolved-family dynamic harmonic modeling requires a "
+                    "finite persisted raw/2x period pair.")
+            valid_recommendation = (
+                time_frequency.get("recommendedNextTest")
+                == "DYNAMIC_HARMONIC_MODELING"
+                and time_frequency.get("physicalMechanismResolved") is False
+                and period_reference.get("kind")
+                == "UNRESOLVED_FAMILY_ANALYSIS_REFERENCE"
+                and period_reference.get("physicalCycleResolved") is False
+                and morphology.get("physicalCycleResolved") is False
+                and morphology.get("resolvedPhysicalPeriodDays") is None
+                and continuation.get("periodReferenceKind")
+                == "UNRESOLVED_FAMILY_ANALYSIS_REFERENCE"
+                and continuation.get("timeFrequencyEvolutionWarranted") is True
+                and all(math.isfinite(value) and value > 0 for value in (
+                    raw_period, double_period, analysis_period,
+                    time_frequency_period,
+                ))
+                and math.isclose(
+                    double_period, 2.0 * raw_period,
+                    rel_tol=1e-9, abs_tol=1e-12,
+                )
+                and math.isclose(
+                    analysis_period, double_period,
+                    rel_tol=1e-9, abs_tol=1e-12,
+                )
+                and math.isclose(
+                    time_frequency_period, double_period,
+                    rel_tol=1e-9, abs_tol=1e-12,
+                )
+            )
+            independent_paths = [
+                item.get("datasetPath")
+                for item in independent.get("preparedSectors") or []
+            ]
+            paths = [prepared.get("datasetPath"), *independent_paths]
+            if not valid_recommendation:
+                raise RuntimeError(
+                    "Unresolved-family dynamic harmonic modeling requires a "
+                    "consistent unresolved raw/2x time-frequency lineage.")
+            if (len(independent_paths) < 2
+                    or any(not isinstance(path, str) or not Path(path).is_file()
+                           for path in paths)):
+                raise RuntimeError(
+                    "Unresolved-family dynamic harmonic modeling requires at "
+                    "least three available frozen sector datasets.")
+            result = compare_unresolved_family_dynamic_harmonics(
+                dataset_paths=paths,
+                raw_period_days=raw_period,
+                double_cycle_period_days=double_period,
+                harmonic_orders=(1, 2, 3, 4),
+            )
+            result["evidenceLineage"] = \
+                "UNRESOLVED_FAMILY_TIME_FREQUENCY_RECOMMENDATION"
+            input_hashes = {
+                "morphology": sha256_json(morphology),
+                "timeFrequencySummary": sha256_json(time_frequency),
+                "primaryPreparation": sha256_json(prepared),
+                "independentPreparation": sha256_json(independent),
+            }
+        elif request.parameters.get("evidenceLineage") == \
                 "MORPHOLOGY_RESOLVED_TIME_FREQUENCY_RECOMMENDATION":
             prepared = _result(investigation, "001-prepare-target")
             independent = _latest_result_for_handler(
