@@ -339,7 +339,11 @@ class ObservablePreparationTests(unittest.TestCase):
         self.assertEqual("fluxScale", selected.normalization_kind)
         self.assertEqual(3.0, selected.normalization_value)
         self.assertEqual((-2.0 / 3.0, 4.0 / 3.0, 0.0), selected.values)
-        self.assertEqual((0.2 / 3.0, 0.4 / 3.0, 0.1), selected.uncertainties)
+        for actual, expected in zip(
+            selected.uncertainties,
+            (0.2 / 3.0, 0.4 / 3.0, 0.1),
+        ):
+            self.assertAlmostEqual(expected, actual, places=15)
 
     def test_zero_flux_falls_back_to_median_positive_uncertainty(self):
         rows = [
@@ -354,7 +358,11 @@ class ObservablePreparationTests(unittest.TestCase):
 
         self.assertEqual(0.4, selected.normalization_value)
         self.assertEqual((0.0, 0.0, 0.0), selected.values)
-        self.assertEqual((0.5, 1.0, 1.5), selected.uncertainties)
+        for actual, expected in zip(
+            selected.uncertainties,
+            (0.5, 1.0, 1.5),
+        ):
+            self.assertAlmostEqual(expected, actual, places=15)
 
     def test_jd_is_an_explicit_supported_time_column(self):
         columns = ("JD", *COLUMNS[1:])
