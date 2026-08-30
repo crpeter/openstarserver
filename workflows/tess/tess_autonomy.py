@@ -24,6 +24,13 @@ from .tess_mode_identification import (
     MULTIMODE_MODE_EVIDENCE_LINEAGE,
     validated_multimode_mode_evidence,
 )
+from .tess_long_baseline_frequency_confirmation import (
+    HANDLER_ID as LONG_BASELINE_FREQUENCY_CONFIRMATION_HANDLER_ID,
+    build_method_contract as build_long_baseline_frequency_confirmation_contract,
+    validate_ambiguous_mode_identification,
+    validate_frozen_dataset_lineage,
+)
+from .tess_resolved_cycle import validated_cycle_period
 from .tess_source_pair_lineage import frozen_source_pair_evidence
 
 # Kept identical to the public identifiers in tess_investigation.  Importing that
@@ -1272,6 +1279,223 @@ def _repair_mode_identification_terminal(
         control_state={"branchAssessments": [], "selectedExperiment": asdict(continuation),
                        "schedulerAction": "RUN_EXPERIMENT",
                        "recovery": "TESS_MODE_IDENTIFICATION_COMPATIBILITY_CONTINUATION"},
+    )
+
+
+def _repair_long_baseline_frequency_confirmation_terminal(
+    store: InvestigationStore,
+    investigation: Investigation,
+    control: dict,
+) -> Investigation | None:
+    """Append only at the validated ambiguous mode-identification boundary."""
+    if not (
+        investigation.status in {"COMPLETE", "HUMAN_REVIEW_REQUIRED"}
+        and control.get("schedulerAction") == "INVESTIGATION_COMPLETE"
+        and not any(stage.status == "RUNNING" for stage in investigation.stages)
+        and not any(
+            stage.handler_id == LONG_BASELINE_FREQUENCY_CONFIRMATION_HANDLER_ID
+            for stage in investigation.stages
+        )
+    ):
+        return None
+
+    mode = _latest_complete(
+        investigation, "openstar.tess.mode-identification.analyze"
+    )
+    physical = _latest_complete(investigation, "openstar.tess.physical.interpret")
+    localization = _latest_complete(
+        investigation, "openstar.tess.source-localization.analyze"
+    )
+    multimode = _latest_complete(
+        investigation, "openstar.tess.multimode.summarize"
+    )
+    time_frequency = _latest_complete(
+        investigation, "openstar.tess.time-frequency.summarize"
+    )
+    independent = _latest_complete(
+        investigation, "openstar.tess.independent.prepare"
+    )
+    prepared = next((
+        stage for stage in investigation.stages
+        if stage.id == "001-prepare-target"
+        and stage.status == "COMPLETE"
+        and isinstance(stage.result, dict)
+    ), None)
+    latest = investigation.stages[-1] if investigation.stages else None
+    if any(stage is None for stage in (
+        mode, physical, localization, multimode, time_frequency,
+        independent, prepared, latest,
+    )):
+        return None
+    if not (
+        isinstance(mode.result, dict)
+        and isinstance(physical.result, dict)
+        and isinstance(localization.result, dict)
+        and isinstance(multimode.result, dict)
+        and isinstance(time_frequency.result, dict)
+        and isinstance(independent.result, dict)
+        and latest.handler_id == "openstar.tess.finalize"
+        and latest.status == "COMPLETE"
+        and latest.stop is True
+        and latest.triggered_by_stage_id == mode.id
+        and latest.parameters.get("outputSuffix")
+        == "v20.9-mode-identification"
+        and latest.result
+        and latest.result.get("modeIdentification") == mode.result
+        and latest.result.get("multiModeDecomposition") == multimode.result
+        and latest.result.get("timeFrequencyEvolution") == time_frequency.result
+        and latest.result.get("sourceLocalization") == localization.result
+        and latest.result.get("recommendedNextTest")
+        == "LONG_BASELINE_TIME_FREQUENCY_CONFIRMATION"
+        and mode.parameters == {
+            "evidenceLineage": MULTIMODE_MODE_EVIDENCE_LINEAGE
+        }
+        and mode.triggered_by_stage_id == multimode.id
+    ):
+        return None
+    mode_index = investigation.stages.index(mode)
+    if tuple(investigation.stages[mode_index + 1:]) != (latest,):
+        return None
+
+    try:
+        mode_evidence = validate_ambiguous_mode_identification(mode.result)
+        contract = build_long_baseline_frequency_confirmation_contract(
+            mode.result
+        )
+        cycle = localization.result.get("physicalCycleEvidence")
+        period = validated_cycle_period(cycle)
+        physical_period = float(physical.result["physicalPeriodDays"])
+        localized_period = float(localization.result["physicalPeriodDays"])
+        time_frequency_period = float(
+            (time_frequency.result.get("periodReference") or {})["periodDays"]
+        )
+    except (KeyError, OSError, RuntimeError, TypeError, ValueError):
+        return None
+    cross = localization.result.get("crossSector") or {}
+    if not (
+        period is not None
+        and physical.result.get("physicalCycleEvidence") == cycle
+        and physical.result.get("physicalMechanismResolved") is False
+        and localization.result.get("version")
+        == "openstar.tess-pixel-localization.v1"
+        and cross.get("classification") == "TARGET_SOURCE_SUPPORTED"
+        and cross.get("variableSignalOrigin") == "TARGET_CONSISTENT"
+        and math.isclose(physical_period, period, rel_tol=1e-9, abs_tol=1e-12)
+        and math.isclose(localized_period, period, rel_tol=1e-9, abs_tol=1e-12)
+        and time_frequency.result.get("physicalMechanismResolved") is False
+        and math.isclose(
+            time_frequency_period, period, rel_tol=1e-9, abs_tol=1e-12
+        )
+    ):
+        return None
+
+    iterations = [
+        stage for stage in investigation.stages
+        if stage.handler_id == "openstar.tess.multimode.interpret"
+        and stage.status == "COMPLETE"
+        and isinstance(stage.result, dict)
+    ]
+    multimode_evidence = validated_multimode_mode_evidence(
+        multimode.result,
+        physical_period_days=period,
+        target_supporting_sectors=cross.get("targetSupportingSectors") or [],
+        iteration_count=len(iterations),
+    )
+    candidate = mode.result.get("residualCandidate") or {}
+    recurrent = multimode.result.get("bestRecurrentSecondaryMode") or {}
+    if not (
+        multimode_evidence is not None
+        and mode_evidence["independentSectors"]
+        == multimode_evidence["independentSectors"]
+        and math.isclose(
+            float(candidate.get("measuredFrequencyCyclesPerDay")),
+            float(recurrent.get("medianFrequency")),
+            rel_tol=1e-9,
+            abs_tol=1e-12,
+        )
+        and math.isclose(
+            float(mode_evidence["establishedPeriodDays"]),
+            period,
+            rel_tol=1e-9,
+            abs_tol=1e-12,
+        )
+    ):
+        return None
+
+    mode_hashes = mode.provenance.input_hashes if mode.provenance else {}
+    if not (
+        mode_hashes.get("multiModeDecomposition") == sha256_json(multimode.result)
+        and mode_hashes.get("resolvedCycle") == sha256_json(cycle)
+        and mode_hashes.get("physicalInterpretation") == sha256_json(physical.result)
+        and mode_hashes.get("sourceLocalization") == sha256_json(localization.result)
+        and mode_hashes.get("independentPreparation") == sha256_json(independent.result)
+        and all(
+            store.verified_terminal_stage_ledger_hash(investigation.id, stage)
+            for stage in (
+                prepared, independent, physical, localization,
+                multimode, time_frequency, mode, latest,
+            )
+        )
+        and _verified_stage_json(
+            mode, "mode-identification-v20.9.json"
+        )
+        and _verified_stage_json(
+            latest, "conclusion-v20.9-mode-identification.json"
+        )
+    ):
+        return None
+
+    support = set(mode_evidence["independentSectors"])
+    prepared_sectors = [
+        item for item in independent.result.get("preparedSectors") or []
+        if isinstance(item, dict)
+        and item.get("sector") is not None
+        and item.get("datasetPath")
+    ]
+    if not support.issubset({int(item["sector"]) for item in prepared_sectors}):
+        return None
+    try:
+        primary = prepared.result
+        dataset_specs = [{
+            "datasetID": primary["datasetID"],
+            "datasetPath": primary["datasetPath"],
+            "ticID": primary["ticID"],
+            "sector": primary["sector"],
+            "role": "PRIMARY",
+        }]
+        dataset_specs.extend({
+            "datasetID": item["datasetID"],
+            "datasetPath": item["datasetPath"],
+            "ticID": primary["ticID"],
+            "sector": int(item["sector"]),
+            "role": "INDEPENDENT",
+        } for item in prepared_sectors)
+        validate_frozen_dataset_lineage(
+            method_contract=contract,
+            dataset_specs=dataset_specs,
+        )
+    except (KeyError, OSError, RuntimeError, TypeError, ValueError):
+        return None
+
+    continuation = StageRequest(
+        id=_continuation_stage_id(
+            latest, "long-baseline-frequency-confirmation"
+        ),
+        handler_id=LONG_BASELINE_FREQUENCY_CONFIRMATION_HANDLER_ID,
+        parameters={},
+        triggered_by_stage_id=mode.id,
+    )
+    return store.set_control_state(
+        investigation,
+        status="RUNNING",
+        control_state={
+            "branchAssessments": [],
+            "selectedExperiment": asdict(continuation),
+            "schedulerAction": "RUN_EXPERIMENT",
+            "recovery": (
+                "TESS_AMBIGUOUS_MODE_LONG_BASELINE_FREQUENCY_CONFIRMATION"
+            ),
+        },
     )
 
 
@@ -2776,6 +3000,13 @@ def repair_obsolete_terminal_wait(
     mode_repair = _repair_mode_identification_terminal(store, investigation, control)
     if mode_repair is not None:
         return mode_repair
+
+    long_baseline_repair = \
+        _repair_long_baseline_frequency_confirmation_terminal(
+            store, investigation, control
+        )
+    if long_baseline_repair is not None:
+        return long_baseline_repair
 
     dynamic_repair = _repair_dynamic_harmonic_terminal(store, investigation, control)
     if dynamic_repair is not None:

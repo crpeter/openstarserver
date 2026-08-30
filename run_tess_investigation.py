@@ -15,6 +15,15 @@ from workflows.tess.tess_investigation import (
     WORKFLOW_VERSION,
     build_engine,
 )
+from workflows.tess.tess_long_baseline_frequency_confirmation import (
+    HANDLER_ID as LONG_BASELINE_FREQUENCY_CONFIRMATION_HANDLER_ID,
+    build_method_contract as build_long_baseline_frequency_confirmation_contract,
+    validate_ambiguous_mode_identification,
+    validate_frozen_dataset_lineage,
+)
+from workflows.tess.tess_mode_identification import (
+    MULTIMODE_MODE_EVIDENCE_LINEAGE,
+)
 
 
 def parse_args():
@@ -118,6 +127,15 @@ def parse_args():
             "Append v20.9 distributed long-baseline nonstationary mode modeling. "
             "The workflow creates ordinary generic Lomb-Scargle work units from "
             "deterministically time-warped residual datasets."
+        ),
+    )
+    recovery.add_argument(
+        "--continue-long-baseline-frequency-confirmation",
+        action="store_true",
+        help=(
+            "Append local, network-free leave-one-independent-sector-out "
+            "confirmation of an exact AMBIGUOUS_HARMONIC_OR_MODE result. "
+            "This is separate from --continue-nonstationary."
         ),
     )
     recovery.add_argument(
@@ -628,6 +646,145 @@ def _can_continue_nonstationary(investigation) -> None:
             "Investigation already contains v20.9 nonstationary modeling stages. "
             "Use --resume only if one is actually interrupted."
         )
+
+
+def _can_continue_long_baseline_frequency_confirmation(investigation) -> None:
+    """Validate the exact terminal ambiguity before any state mutation."""
+    if any(stage.status == "RUNNING" for stage in investigation.stages):
+        raise RuntimeError(
+            "Investigation contains a RUNNING stage. Use --resume before "
+            "long-baseline frequency confirmation."
+        )
+    if investigation.status not in {"COMPLETE", "HUMAN_REVIEW_REQUIRED"}:
+        raise RuntimeError(
+            "--continue-long-baseline-frequency-confirmation requires a "
+            "terminal investigation."
+        )
+    if any(
+        stage.handler_id == LONG_BASELINE_FREQUENCY_CONFIRMATION_HANDLER_ID
+        for stage in investigation.stages
+    ):
+        raise RuntimeError(
+            "Investigation already contains long-baseline frequency "
+            "confirmation. Use --resume only if it is actually interrupted."
+        )
+
+    mode_stage = next((
+        stage for stage in reversed(investigation.stages)
+        if stage.handler_id == "openstar.tess.mode-identification.analyze"
+        and stage.status == "COMPLETE"
+        and isinstance(stage.result, dict)
+    ), None)
+    if mode_stage is None:
+        raise RuntimeError(
+            "A completed mode-identification stage is required before "
+            "long-baseline frequency confirmation."
+        )
+    mode_evidence = validate_ambiguous_mode_identification(mode_stage.result)
+    contract = build_long_baseline_frequency_confirmation_contract(
+        mode_stage.result
+    )
+    mode_index = investigation.stages.index(mode_stage)
+    if any(
+        stage.status == "COMPLETE"
+        and stage.handler_id != "openstar.tess.finalize"
+        for stage in investigation.stages[mode_index + 1:]
+    ):
+        raise RuntimeError(
+            "Later scientific stages already consume the mode-identification "
+            "boundary."
+        )
+    latest = investigation.stages[-1] if investigation.stages else None
+    if not (
+        latest is not None
+        and latest.status == "COMPLETE"
+        and latest.handler_id == "openstar.tess.finalize"
+        and latest.stop is True
+    ):
+        raise RuntimeError(
+            "Long-baseline frequency confirmation requires a completed "
+            "terminal finalization stage."
+        )
+
+    required_handlers = (
+        "openstar.tess.source-localization.analyze",
+        "openstar.tess.multimode.summarize",
+        "openstar.tess.time-frequency.summarize",
+    )
+    if any(not any(
+        stage.handler_id == handler
+        and stage.status == "COMPLETE"
+        and isinstance(stage.result, dict)
+        for stage in investigation.stages
+    ) for handler in required_handlers):
+        raise RuntimeError(
+            "Completed source-localization, multi-mode, and time-frequency "
+            "evidence are required."
+        )
+    multimode_stage = next(
+        stage for stage in reversed(investigation.stages)
+        if stage.handler_id == "openstar.tess.multimode.summarize"
+        and stage.status == "COMPLETE"
+        and isinstance(stage.result, dict)
+    )
+    if not (
+        mode_stage.parameters == {
+            "evidenceLineage": MULTIMODE_MODE_EVIDENCE_LINEAGE
+        }
+        and mode_stage.triggered_by_stage_id == multimode_stage.id
+    ):
+        raise RuntimeError(
+            "Mode identification does not carry the exact recurrent "
+            "multi-mode lineage."
+        )
+
+    prepared_stage = next((
+        stage for stage in investigation.stages
+        if stage.id == "001-prepare-target"
+        and stage.status == "COMPLETE"
+        and isinstance(stage.result, dict)
+    ), None)
+    independent_stage = next((
+        stage for stage in reversed(investigation.stages)
+        if stage.handler_id == "openstar.tess.independent.prepare"
+        and stage.status == "COMPLETE"
+        and isinstance(stage.result, dict)
+    ), None)
+    if prepared_stage is None or independent_stage is None:
+        raise RuntimeError("Frozen primary/independent preparation is missing.")
+    prepared = prepared_stage.result
+    support = set(mode_evidence["independentSectors"])
+    independent = [
+        item for item in independent_stage.result.get("preparedSectors") or []
+        if isinstance(item, dict)
+        and item.get("sector") is not None
+        and item.get("datasetPath")
+    ]
+    if not support.issubset({int(item["sector"]) for item in independent}):
+        raise RuntimeError(
+            "Frozen independent datasets do not match mode-sector support."
+        )
+    try:
+        dataset_specs = [{
+            "datasetID": prepared["datasetID"],
+            "datasetPath": prepared["datasetPath"],
+            "ticID": prepared["ticID"],
+            "sector": prepared["sector"],
+            "role": "PRIMARY",
+        }]
+        dataset_specs.extend({
+            "datasetID": item["datasetID"],
+            "datasetPath": item["datasetPath"],
+            "ticID": prepared["ticID"],
+            "sector": int(item["sector"]),
+            "role": "INDEPENDENT",
+        } for item in independent)
+    except (KeyError, TypeError, ValueError):
+        raise RuntimeError("Frozen dataset lineage is incomplete.") from None
+    validate_frozen_dataset_lineage(
+        method_contract=contract,
+        dataset_specs=dataset_specs,
+    )
 
 
 def _can_continue_residual_mode_localization(investigation) -> None:
@@ -2147,6 +2304,7 @@ def main():
         or args.continue_physical_interpretation
         or args.continue_source_localization
         or args.continue_offset_source_identification
+        or args.continue_long_baseline_frequency_confirmation
     ):
         health = coordinator.health()
 
@@ -2323,6 +2481,27 @@ def main():
         initial_stage = StageRequest(
             id=f"{next_number:03d}-prepare-nonstationary",
             handler_id="openstar.tess.nonstationary.prepare",
+            parameters={},
+            triggered_by_stage_id=last_stage_id,
+        )
+    elif args.continue_long_baseline_frequency_confirmation:
+        investigation = store.load(args.investigation_id)
+        if investigation.workflow_id != WORKFLOW_ID:
+            raise RuntimeError(
+                "Cannot continue investigation with a different workflow: "
+                f"{investigation.workflow_id}"
+            )
+        _can_continue_long_baseline_frequency_confirmation(investigation)
+        last_stage_id = next(
+            stage.id for stage in reversed(investigation.stages)
+            if stage.handler_id == "openstar.tess.mode-identification.analyze"
+            and stage.status == "COMPLETE"
+        )
+        next_number = _next_stage_number(investigation)
+        investigation = store.set_status(investigation, "RUNNING")
+        initial_stage = StageRequest(
+            id=f"{next_number:03d}-long-baseline-frequency-confirmation",
+            handler_id=LONG_BASELINE_FREQUENCY_CONFIRMATION_HANDLER_ID,
             parameters={},
             triggered_by_stage_id=last_stage_id,
         )
@@ -3056,6 +3235,7 @@ def main():
         or args.continue_morphology
         or args.continue_physical_interpretation
         or args.continue_source_localization
+        or args.continue_long_baseline_frequency_confirmation
     ):
         print("Coordinator: not required for local/network non-distributed continuation")
     else:
@@ -3116,6 +3296,17 @@ def main():
         print("   coordinator required")
         print("   one compatible generic worker is sufficient; concurrency is not required")
         print("   worker executes ordinary Lomb-Scargle chunks on workflow-created time-warped residual datasets")
+    elif args.continue_long_baseline_frequency_confirmation:
+        print(
+            "🔭 Continuing terminal investigation with v20.9.1 "
+            "long-baseline frequency confirmation"
+        )
+        print(f"   stage: {initial_stage.id}")
+        print(f"   handler: {initial_stage.handler_id}")
+        print("   coordinator and distributed workers are not required")
+        print("   no archive query or new data download is performed")
+        print("   frozen primary and independent-sector light curves are reused")
+        print("   each independent sector is held out without frequency or phase leakage")
     elif args.continue_residual_mode_localization:
         print("🎯 Continuing terminal investigation with v20.10 distributed residual-mode pixel localization")
         print(f"   stage: {initial_stage.id}")

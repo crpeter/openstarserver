@@ -123,6 +123,12 @@ from .tess_mode_identification import (
     identify_residual_mode,
     validated_multimode_mode_evidence,
 )
+from .tess_long_baseline_frequency_confirmation import (
+    HANDLER_ID as LONG_BASELINE_FREQUENCY_CONFIRMATION_HANDLER_ID,
+    analyze_long_baseline_frequency_confirmation,
+    build_method_contract as build_long_baseline_frequency_confirmation_contract,
+    method_contract_hash as long_baseline_frequency_confirmation_contract_hash,
+)
 from .tess_dynamic_harmonic import (
     compare_unresolved_family_dynamic_harmonics,
     model_dynamic_harmonics,
@@ -322,7 +328,7 @@ from .tess_multisector import (
 WORKFLOW_ID = "openstar.workflow.tess-investigation.v1"
 WORKFLOW_VERSION = "20.2"
 SOFTWARE_ID = "openstar.tess-investigation-plugin"
-SOFTWARE_VERSION = "20.39"
+SOFTWARE_VERSION = "20.40"
 ADAPTIVE_BLIND_TRANSIT_ADDITIONAL_SECTORS = 8
 EXHAUSTED_RESIDUAL_RUN_HANDLER_ID = (
     "openstar.tess.blind-transit-distributed.run"
@@ -871,6 +877,32 @@ def mode_identification_continuation(summary: dict[str, Any], *, request_id: str
         handler_id=("openstar.tess.dynamic-harmonic.analyze" if dynamic else
                     ("openstar.tess.residual-mode-localization.prepare" if localize else "openstar.tess.finalize")),
         parameters={} if (localize or dynamic) else {"outputSuffix": "v20.9-mode-identification"},
+        triggered_by_stage_id=request_id,
+    )
+
+
+def long_baseline_frequency_confirmation_continuation(
+    summary: dict[str, Any], *, request_id: str
+) -> StageRequest:
+    """Finalize the append-only result while preserving its next-test advice."""
+    if summary.get("classification") not in {
+        "INDEPENDENT_STABLE_MODE_CONFIRMED",
+        "HARMONIC_LOCKED_ACROSS_BASELINE",
+        "NONSTATIONARY_OR_INTERMITTENT_STRUCTURE",
+        "LONG_BASELINE_CONFIRMATION_INCONCLUSIVE",
+    }:
+        raise RuntimeError("Long-baseline confirmation classification is invalid.")
+    if summary.get("physicalMechanismResolved") is not False:
+        raise RuntimeError(
+            "Long-baseline confirmation cannot resolve the physical mechanism."
+        )
+    return StageRequest(
+        id=_next_stage_id(request_id, "finalize"),
+        handler_id="openstar.tess.finalize",
+        parameters={
+            "outputSuffix":
+            "v20.9.1-long-baseline-frequency-confirmation"
+        },
         triggered_by_stage_id=request_id,
     )
 
@@ -1694,6 +1726,52 @@ def _render_report(conclusion: dict[str, Any]) -> str:
             f"- Physical mechanism resolved: {mode_identification.get('physicalMechanismResolved')}",
             f"- Recommended next test: {mode_identification.get('recommendedNextTest')}",
         ])
+
+    long_baseline_confirmation = conclusion.get(
+        "longBaselineFrequencyConfirmation"
+    )
+    if long_baseline_confirmation is not None:
+        stability = long_baseline_confirmation.get("frequencyStability") or {}
+        aggregate = long_baseline_confirmation.get("aggregateDecision") or {}
+        lines.extend([
+            "",
+            "## Long-baseline frequency confirmation",
+            "",
+            "- Method contract: "
+            f"{long_baseline_confirmation.get('methodContractID')}",
+            "- Method contract hash: "
+            f"{long_baseline_confirmation.get('methodContractHash')}",
+            "- Leave-one-independent-sector-out validation: True",
+            "- Long-baseline frequency resolution: "
+            f"{long_baseline_confirmation.get('longBaselineFrequencyResolutionCyclesPerDay')} "
+            "cycles/day",
+            f"- Frequency stability: {stability}",
+            f"- Aggregate predictive decision: {aggregate}",
+            f"- Classification: {long_baseline_confirmation.get('classification')}",
+            "- Physical mechanism resolved: "
+            f"{long_baseline_confirmation.get('physicalMechanismResolved')}",
+            "- Claim level changed: "
+            f"{long_baseline_confirmation.get('claimLevelChanged')}",
+            "- Recommended next test: "
+            f"{long_baseline_confirmation.get('recommendedNextTest')}",
+            "",
+            "### Held-out sector evidence",
+            "",
+        ])
+        for fold in long_baseline_confirmation.get("perSectorEvidence") or []:
+            lines.append(
+                "- Held-out sector "
+                f"{fold.get('heldOutSector')}: training={fold.get('trainingSectors')}, "
+                "learnedIndependentFrequency="
+                f"{fold.get('learnedIndependentFrequencyCyclesPerDay')}, "
+                f"exactHarmonicFrequency={fold.get('exactHarmonicFrequencyCyclesPerDay')}, "
+                f"separation={fold.get('frequencySeparationCyclesPerDay')}, "
+                f"predictiveBIC={fold.get('predictiveBIC')}, "
+                f"deltas={fold.get('predictiveBICDeltas')}, "
+                f"support={fold.get('support')}, "
+                "failureOrInsufficiencyReasons="
+                f"{fold.get('failureOrInsufficiencyReasons')}"
+            )
 
     dynamic_harmonic = conclusion.get("dynamicHarmonicModeling")
     if dynamic_harmonic is not None:
@@ -5140,6 +5218,224 @@ def build_engine(
             result=result,
             next_stage=mode_identification_continuation(result, request_id=request.id),
             input_hashes=input_hashes,
+            artifacts=(_artifact(artifact_path, "application/json"),),
+        )
+
+    def long_baseline_frequency_confirmation_stage(investigation, request):
+        """Resolve only the persisted ambiguous harmonic-or-mode boundary."""
+        prepared = _result(investigation, "001-prepare-target")
+        independent = _latest_result_for_handler(
+            investigation, "openstar.tess.independent.prepare"
+        )
+        mode_stage = next((
+            stage for stage in reversed(investigation.stages)
+            if stage.handler_id == "openstar.tess.mode-identification.analyze"
+            and stage.status == "COMPLETE"
+            and isinstance(stage.result, dict)
+        ), None)
+        multimode_stage = next((
+            stage for stage in reversed(investigation.stages)
+            if stage.handler_id == "openstar.tess.multimode.summarize"
+            and stage.status == "COMPLETE"
+            and isinstance(stage.result, dict)
+        ), None)
+        time_frequency_stage = next((
+            stage for stage in reversed(investigation.stages)
+            if stage.handler_id == "openstar.tess.time-frequency.summarize"
+            and stage.status == "COMPLETE"
+            and isinstance(stage.result, dict)
+        ), None)
+        if independent is None or any(stage is None for stage in (
+            mode_stage, multimode_stage, time_frequency_stage
+        )):
+            raise RuntimeError(
+                "Long-baseline confirmation requires completed frozen "
+                "independent-sector, multi-mode, time-frequency, and "
+                "mode-identification evidence."
+            )
+        if request.triggered_by_stage_id != mode_stage.id:
+            raise RuntimeError(
+                "Long-baseline confirmation must be triggered by the exact "
+                "completed mode-identification stage."
+            )
+        if not (
+            mode_stage.parameters == {
+                "evidenceLineage": MULTIMODE_MODE_EVIDENCE_LINEAGE
+            }
+            and mode_stage.triggered_by_stage_id == multimode_stage.id
+        ):
+            raise RuntimeError(
+                "Long-baseline confirmation requires the exact recurrent "
+                "multi-mode mode-identification lineage."
+            )
+
+        # This preregistration deliberately occurs before sha256_file or any
+        # dataset loader reads a frozen file containing flux values.
+        contract = build_long_baseline_frequency_confirmation_contract(
+            mode_stage.result
+        )
+        contract_hash = long_baseline_frequency_confirmation_contract_hash(
+            contract
+        )
+
+        physical_period, resolved_cycle, physical, localization = \
+            _validated_multimode_cycle(investigation)
+        iterations = _all_results_for_handler(
+            investigation, "openstar.tess.multimode.interpret"
+        )
+        multimode_evidence = validated_multimode_mode_evidence(
+            multimode_stage.result,
+            physical_period_days=physical_period,
+            target_supporting_sectors=(
+                (localization.get("crossSector") or {}).get(
+                    "targetSupportingSectors"
+                ) or []
+            ),
+            iteration_count=len(iterations),
+        )
+        if multimode_evidence is None:
+            raise RuntimeError(
+                "Long-baseline confirmation requires the exact validated "
+                "multi-mode decomposition lineage."
+            )
+        mode_evidence = contract["evidenceBoundary"]
+        mode_support = sorted(int(value) for value in
+                              mode_evidence["independentSectorSupport"]["sectors"])
+        mode_candidate = mode_evidence["residualCandidate"]
+        if not (
+            math.isclose(
+                float(mode_evidence["establishedPeriodFamily"][
+                    "referencePeriodDays"
+                ]),
+                float(physical_period),
+                rel_tol=1e-9,
+                abs_tol=1e-12,
+            )
+            and math.isclose(
+                float(mode_candidate["measuredFrequencyCyclesPerDay"]),
+                float((multimode_stage.result[
+                    "bestRecurrentSecondaryMode"
+                ])["medianFrequency"]),
+                rel_tol=1e-9,
+                abs_tol=1e-12,
+            )
+            and mode_support == multimode_evidence["independentSectors"]
+        ):
+            raise RuntimeError(
+                "Mode-identification evidence no longer matches the "
+                "authoritative cycle and multi-mode decomposition."
+            )
+
+        time_frequency = time_frequency_stage.result
+        period_reference = time_frequency.get("periodReference") or {}
+        try:
+            time_frequency_period = float(period_reference["periodDays"])
+        except (KeyError, TypeError, ValueError):
+            raise RuntimeError(
+                "Long-baseline confirmation requires a valid persisted "
+                "time-frequency family reference."
+            ) from None
+        if not (
+            time_frequency.get("physicalMechanismResolved") is False
+            and math.isclose(
+                time_frequency_period,
+                float(physical_period),
+                rel_tol=1e-9,
+                abs_tol=1e-12,
+            )
+        ):
+            raise RuntimeError(
+                "Time-frequency evidence does not match the authoritative cycle."
+            )
+
+        prepared_sectors = independent.get("preparedSectors") or []
+        if not all(isinstance(item, dict) for item in prepared_sectors):
+            raise RuntimeError("Frozen independent-sector preparation is invalid.")
+        selected_independent = [
+            item for item in prepared_sectors
+            if item.get("sector") is not None and item.get("datasetPath")
+        ]
+        prepared_sector_ids = {
+            int(item["sector"]) for item in selected_independent
+        }
+        if not set(mode_support).issubset(prepared_sector_ids):
+            raise RuntimeError(
+                "Frozen independent datasets do not match mode-sector support."
+            )
+        dataset_specs = [{
+            "datasetID": prepared["datasetID"],
+            "datasetPath": prepared["datasetPath"],
+            "ticID": prepared["ticID"],
+            "sector": prepared["sector"],
+            "role": "PRIMARY",
+        }]
+        dataset_specs.extend({
+            "datasetID": item["datasetID"],
+            "datasetPath": item["datasetPath"],
+            "ticID": prepared["ticID"],
+            "sector": int(item["sector"]),
+            "role": "INDEPENDENT",
+        } for item in selected_independent)
+        expected_paths = [str(item["datasetPath"]) for item in dataset_specs]
+        if expected_paths != mode_evidence["frozenDatasetPaths"]:
+            raise RuntimeError(
+                "Frozen dataset paths differ from the mode-identification record."
+            )
+
+        result = analyze_long_baseline_frequency_confirmation(
+            method_contract=contract,
+            dataset_specs=dataset_specs,
+        )
+        if not (
+            result.get("methodContractHash") == contract_hash
+            and result.get("physicalMechanismResolved") is False
+            and result.get("claimLevelChanged") is False
+        ):
+            raise RuntimeError(
+                "Long-baseline confirmation violated its frozen method contract."
+            )
+
+        print("🔭 Long-baseline harmonic-versus-mode confirmation")
+        print(f"   method contract: {result.get('methodContractID')}")
+        print(f"   method hash: {result.get('methodContractHash')}")
+        for fold in result.get("perSectorEvidence") or []:
+            print(
+                f"   held-out sector {fold.get('heldOutSector')}: "
+                f"support={fold.get('support')}, "
+                "learned frequency="
+                f"{fold.get('learnedIndependentFrequencyCyclesPerDay')}"
+            )
+        print(f"   classification: {result.get('classification')}")
+        print("   physical mechanism resolved: False")
+        print(f"   recommended next test: {result.get('recommendedNextTest')}")
+
+        artifact_path = (
+            store.directory_for(investigation.id)
+            / "artifacts"
+            / "long-baseline-frequency-confirmation"
+            / "long-baseline-frequency-confirmation-v20.9.1.json"
+        )
+        _write_json(artifact_path, result)
+        return StageOutcome(
+            result=result,
+            next_stage=long_baseline_frequency_confirmation_continuation(
+                result, request_id=request.id
+            ),
+            input_hashes={
+                "methodContract": contract_hash,
+                "resolvedCycle": sha256_json(resolved_cycle),
+                "physicalInterpretation": sha256_json(physical),
+                "sourceLocalization": sha256_json(localization),
+                "multiModeDecomposition": sha256_json(multimode_stage.result),
+                "timeFrequencyEvolution": sha256_json(time_frequency),
+                "modeIdentification": sha256_json(mode_stage.result),
+                "independentPreparation": sha256_json(independent),
+                **{
+                    f"frozenDataset:{spec['role']}:{spec['sector']}":
+                    sha256_file(spec["datasetPath"])
+                    for spec in dataset_specs
+                },
+            },
             artifacts=(_artifact(artifact_path, "application/json"),),
         )
 
@@ -10551,6 +10847,9 @@ def build_engine(
         mode_identification = _latest_result_for_handler(
             investigation, "openstar.tess.mode-identification.analyze",
         )
+        long_baseline_frequency_confirmation = _latest_result_for_handler(
+            investigation, LONG_BASELINE_FREQUENCY_CONFIRMATION_HANDLER_ID,
+        )
         dynamic_harmonic_modeling = _latest_result_for_handler(
             investigation, "openstar.tess.dynamic-harmonic.analyze",
         )
@@ -10858,6 +11157,24 @@ def build_engine(
             )
             existing_rationale.append(
                 f"Recommended next confirmation step: {time_frequency_evolution.get('recommendedNextTest')}."
+            )
+            claim_decision = {
+                "claim": claim_decision["claim"],
+                "rationale": existing_rationale,
+            }
+
+        if long_baseline_frequency_confirmation is not None:
+            existing_rationale = list(claim_decision.get("rationale") or [])
+            existing_rationale.append(
+                "v20.9.1 leave-one-independent-sector-out long-baseline "
+                "confirmation classifies the ambiguous residual as "
+                f"{long_baseline_frequency_confirmation.get('classification')}; "
+                "the held-out predictive analysis does not upgrade the claim "
+                "or resolve the physical mechanism."
+            )
+            existing_rationale.append(
+                "Recommended next confirmation step: "
+                f"{long_baseline_frequency_confirmation.get('recommendedNextTest')}."
             )
             claim_decision = {
                 "claim": claim_decision["claim"],
@@ -11773,7 +12090,11 @@ def build_engine(
             and stage.handler_id != "openstar.tess.finalize" and not stage.handler_id.startswith(
                 "openstar.tess.target-residual-archival-baseline.")
             for index, stage in enumerate(investigation.stages))
-        if target_residual_astrophysical_interpretation is not None:
+        if long_baseline_frequency_confirmation is not None:
+            recommended_next_test = long_baseline_frequency_confirmation.get(
+                "recommendedNextTest"
+            )
+        elif target_residual_astrophysical_interpretation is not None:
             recommended_next_test = target_residual_astrophysical_interpretation.get("recommendedNextTest")
         elif target_residual_multisector_source is not None:
             recommended_next_test = target_residual_multisector_source.get("recommendedNextTest")
@@ -11928,6 +12249,9 @@ def build_engine(
             "timeFrequencyEvolution": time_frequency_evolution,
             "nonstationaryModeling": nonstationary_modeling,
             "modeIdentification": mode_identification,
+            "longBaselineFrequencyConfirmation": (
+                long_baseline_frequency_confirmation
+            ),
             "dynamicHarmonicModeling": dynamic_harmonic_modeling,
             "dynamicHarmonicFrequencyRefinement": dynamic_harmonic_frequency_refinement,
             "residualModeLocalization": residual_mode_localization,
@@ -12479,6 +12803,10 @@ def build_engine(
     )
     engine.register_handler(
         "openstar.tess.mode-identification.analyze", mode_identification_stage,
+    )
+    engine.register_handler(
+        LONG_BASELINE_FREQUENCY_CONFIRMATION_HANDLER_ID,
+        long_baseline_frequency_confirmation_stage,
     )
     engine.register_handler(
         "openstar.tess.dynamic-harmonic.analyze", dynamic_harmonic_stage,
