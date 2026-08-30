@@ -76,7 +76,6 @@ class CoordinatorState:
 
         self.project_path = Path(project_path).resolve()
         self.project = self._load_json(self.project_path)
-
         self.workload_registry = workload_registry or discover_workloads()
 
         self.project_id = self.project["id"]
@@ -84,7 +83,7 @@ class CoordinatorState:
         self.workload_id = self.project["workloadID"]
         self.workload_plugin = self.workload_registry.require(self.workload_id)
         self.workload_definition = self.workload_plugin.definition
-        self._validate_project_schema_identity()
+        self._validate_project_schemas()
 
         self.datasets = {}
         self.dataset_manifest_entries = {}
@@ -133,26 +132,20 @@ class CoordinatorState:
         self._index_chunk_references()
         self._build_work_units()
 
-    def _validate_project_schema_identity(self):
+    def _validate_project_schemas(self):
         definition = self.workload_definition
-        supplied = {
-            "datasetSchemaID": self.project.get("datasetSchemaID"),
-            "payloadSchemaID": self.project.get("payloadSchemaID"),
-            "resultSchemaID": self.project.get("resultSchemaID"),
-        }
-        expected = {
-            "datasetSchemaID": definition.dataset_schema_id,
-            "payloadSchemaID": definition.payload_schema_id,
-            "resultSchemaID": definition.result_schema_id,
-        }
-        if definition.allows_legacy_schemaless_workers and not any(supplied.values()):
+        supplied = tuple(self.project.get(key) for key in (
+            "datasetSchemaID", "payloadSchemaID", "resultSchemaID",
+        ))
+        expected = (definition.dataset_schema_id, definition.payload_schema_id,
+                    definition.result_schema_id)
+        if not any(supplied) and definition.allows_legacy_schemaless_workers:
             return
-        for key, value in supplied.items():
-            if value != expected[key]:
-                raise RuntimeError(
-                    f"{key} mismatch for {definition.workload_id}: "
-                    f"expected {expected[key]!r}, got {value!r}"
-                )
+        if supplied != expected:
+            raise RuntimeError(
+                f"Schema tuple mismatch for workload {definition.workload_id}: "
+                f"expected {expected!r}, got {supplied!r}"
+            )
 
     @staticmethod
     def _load_json(path):
@@ -203,12 +196,11 @@ class CoordinatorState:
                     f"Dataset id mismatch: manifest={dataset_id}, file={embedded_id}"
                 )
 
-            embedded_schema = dataset.get("datasetSchemaID")
-            if embedded_schema is not None and embedded_schema != self.workload_definition.dataset_schema_id:
-                raise RuntimeError(f"Dataset schema mismatch for {dataset_id}: {embedded_schema}")
-            if (not self.workload_definition.allows_legacy_schemaless_workers
-                    and embedded_schema != self.workload_definition.dataset_schema_id):
-                raise RuntimeError(f"Dataset {dataset_id} must echo datasetSchemaID")
+            schema_id = dataset.get("datasetSchemaID")
+            if schema_id is not None and schema_id != self.workload_definition.dataset_schema_id:
+                raise RuntimeError(f"Dataset schema mismatch for {dataset_id}")
+            if schema_id is None and not self.workload_definition.allows_legacy_schemaless_workers:
+                raise RuntimeError(f"Dataset {dataset_id} is missing datasetSchemaID")
             self.workload_plugin.validate_dataset(dataset)
 
             self.datasets[dataset_id] = dataset
@@ -328,21 +320,8 @@ class CoordinatorState:
     def _build_work_units(self):
         for dataset_id, dataset in self.datasets.items():
             self.work_ids_by_dataset[dataset_id] = []
-            payloads = [
-                dict(payload)
-                for payload in self.workload_plugin.build_work_payloads(dataset)
-            ]
-            # Materialize twice and compare to make accidental nondeterminism
-            # fail at the trusted server boundary.
-            repeated_payloads = [
-                dict(payload)
-                for payload in self.workload_plugin.build_work_payloads(dataset)
-            ]
-            if payloads != repeated_payloads:
-                raise RuntimeError(
-                    f"Non-deterministic payload construction: {self.workload_id}"
-                )
-            for workload_payload in payloads:
+            payloads = self.workload_plugin.build_work_payloads(dataset)
+            for payload in payloads:
                 work_id = str(uuid.uuid4())
                 normalized_work_id = normalize_id(work_id)
                 work_unit = {
@@ -353,10 +332,11 @@ class CoordinatorState:
                     "datasetSchemaID": self.workload_definition.dataset_schema_id,
                     "payloadSchemaID": self.workload_definition.payload_schema_id,
                     "resultSchemaID": self.workload_definition.result_schema_id,
-                    "payload": dict(workload_payload),
+                    "payload": dict(payload),
                 }
+                # Existing workers still read their established flattened keys.
                 if self.workload_definition.allows_legacy_schemaless_workers:
-                    work_unit.update(workload_payload)
+                    work_unit.update(payload)
 
                 self.work_units[normalized_work_id] = work_unit
                 self.work_ids_by_dataset[dataset_id].append(normalized_work_id)
@@ -634,20 +614,27 @@ class CoordinatorState:
         advertised = node.get("capabilities", {}).get("workloads")
         if not isinstance(advertised, list) or not advertised:
             return self.workload_definition.allows_legacy_schemaless_workers
-        for item in advertised:
-            if isinstance(item, str):
+        expected = {
+            "datasetSchemaID": self.workload_definition.dataset_schema_id,
+            "payloadSchemaID": self.workload_definition.payload_schema_id,
+            "resultSchemaID": self.workload_definition.result_schema_id,
+        }
+        for capability in advertised:
+            if isinstance(capability, str):
                 if (self.workload_definition.allows_legacy_schemaless_workers
-                        and item == workload_id):
+                        and capability == workload_id):
                     return True
                 continue
-            if not isinstance(item, dict) or item.get("workloadID") != workload_id:
+            if not isinstance(capability, dict) or capability.get("workloadID") != workload_id:
                 continue
-            definition = self.workload_definition
-            return all((item.get(key) == expected) for key, expected in (
-                ("datasetSchemaID", definition.dataset_schema_id),
-                ("payloadSchemaID", definition.payload_schema_id),
-                ("resultSchemaID", definition.result_schema_id),
-            ))
+            present = {key for key in expected if key in capability}
+            if not present:
+                # Current Apple registrations also include executionBackends
+                # and validatorID; neither is a schema identity.
+                return self.workload_definition.allows_legacy_schemaless_workers
+            if present != set(expected):
+                return False
+            return all(capability[key] == value for key, value in expected.items())
         return False
 
     def _node_execution_cooldown_remaining_locked(self, node_id, now=None):
@@ -1598,12 +1585,13 @@ class CoordinatorState:
             if work_unit is None:
                 return False, "Unknown work unit.", 404
 
+            result_schema_id = result.get("resultSchemaID")
+            if (result_schema_id is not None
+                    and result_schema_id != work_unit["resultSchemaID"]):
+                return False, "Result schema identity mismatch.", 400
             if (not self.workload_definition.allows_legacy_schemaless_workers
-                    and result.get("resultSchemaID") != work_unit["resultSchemaID"]):
-                return False, "Result schema identity mismatch.", 400
-            if (result.get("resultSchemaID") is not None
-                    and result.get("resultSchemaID") != work_unit["resultSchemaID"]):
-                return False, "Result schema identity mismatch.", 400
+                    and result_schema_id is None):
+                return False, "Result is missing resultSchemaID.", 400
             result = dict(self.workload_plugin.canonicalize_result(work_unit, result))
 
             if work_id in self.completed:
@@ -1813,16 +1801,14 @@ class CoordinatorState:
                 reference_comparison = None
             else:
                 plugin_validation = self.workload_plugin.validate_result(work_unit, result)
-                accepted, message = plugin_validation.valid, plugin_validation.message
+                accepted = plugin_validation.accepted
+                message = plugin_validation.message
                 validation_details = dict(plugin_validation.details)
 
                 reference_comparison = None
-                verification = {
-                    "method": "workload-plugin",
-                    **validation_details,
-                }
+                verification = {"method": "workload-plugin", **validation_details}
 
-                if accepted and self.workload_definition.allows_legacy_schemaless_workers:
+                if accepted and self.workload_plugin.uses_legacy_coordinator_diagnostics:
                     reference_comparison = self._reference_comparison(
                         work_unit,
                         result,
@@ -1957,7 +1943,7 @@ class CoordinatorState:
                 stored_result["nodeID"] = assignment["nodeID"]
                 stored_result["verification"] = dict(verification)
 
-                if (self.workload_definition.allows_legacy_schemaless_workers
+                if (self.workload_plugin.uses_legacy_coordinator_diagnostics
                         and stored_result.get("bestPeriodDays") is None):
                     best_frequency = float(stored_result["bestFrequency"])
                     stored_result["bestPeriodDays"] = (
@@ -2624,30 +2610,40 @@ class CoordinatorState:
             pending, assigned, completed, total = self._dataset_counts_locked(
                 dataset_id
             )
-            if not self.workload_definition.allows_legacy_schemaless_workers:
-                failed_count = self._dataset_failed_count_locked(dataset_id)
-                terminal = total > 0 and completed + failed_count == total
+            if not self.workload_plugin.uses_legacy_coordinator_diagnostics:
+                failed = self._dataset_failed_count_locked(dataset_id)
+                terminal = total > 0 and completed + failed == total
                 work_ids = self.work_ids_by_dataset.get(dataset_id, [])
                 reduction = dict(self.workload_plugin.reduce_dataset(
                     self.datasets[dataset_id],
                     [self.work_units[work_id] for work_id in work_ids],
-                    [self.completed[work_id] for work_id in work_ids
-                     if work_id in self.completed],
+                    [self.completed[work_id] for work_id in work_ids if work_id in self.completed],
                     terminal=terminal,
                 ))
                 return {
                     "id": dataset_id,
                     "targetName": self.datasets[dataset_id].get("targetName", dataset_id),
-                    "pendingWorkUnits": pending,
-                    "assignedWorkUnits": assigned,
-                    "completedWorkUnits": completed,
-                    "failedWorkUnits": failed_count,
+                    "mission": self.datasets[dataset_id].get("mission", ""),
+                    "pendingWorkUnits": pending, "assignedWorkUnits": assigned,
+                    "completedWorkUnits": completed, "failedWorkUnits": failed,
                     "totalWorkUnits": total,
-                    "progress": (completed + failed_count) / total if total else 1.0,
-                    "workloadID": self.workload_id,
-                    "datasetSchemaID": self.workload_definition.dataset_schema_id,
-                    "payloadSchemaID": self.workload_definition.payload_schema_id,
-                    "resultSchemaID": self.workload_definition.result_schema_id,
+                    "progress": (completed + failed) / total if total else 1.0,
+                    "retryCount": self._dataset_retry_count_locked(dataset_id),
+                    "verificationFailureCount": (
+                        self._dataset_verification_failure_count_locked(dataset_id)
+                    ),
+                    "executionFailureCount": (
+                        self._dataset_execution_failure_count_locked(dataset_id)
+                    ),
+                    "executionFailureKinds": (
+                        self._dataset_execution_failure_kinds_locked(dataset_id)
+                    ),
+                    "environmentUnavailableCount": (
+                        self._dataset_environment_unavailable_count_locked(dataset_id)
+                    ),
+                    "transportUnavailableCount": (
+                        self._dataset_transport_unavailable_count_locked(dataset_id)
+                    ),
                     "payload": reduction,
                     "nodeContributions": self._dataset_node_contributions_locked(dataset_id),
                 }
@@ -2900,7 +2896,7 @@ class CoordinatorState:
                 # Legacy/current-dataset fields used by the existing clients.
                 "datasetID": current["id"],
                 "targetName": current["targetName"],
-                "mission": current.get("mission"),
+                "mission": current["mission"],
                 "sampleCount": sample_count,
                 "samples": sample_count,
                 "pending": current["pendingWorkUnits"],

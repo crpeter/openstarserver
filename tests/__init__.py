@@ -1,1 +1,1 @@
-"""Nested OpenStar test packages included by unittest discovery."""
+"""Nested server tests."""

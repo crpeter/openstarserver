@@ -1,1 +1,1 @@
-"""Platform and workload-plugin conformance tests."""
+"""Workload platform conformance tests."""

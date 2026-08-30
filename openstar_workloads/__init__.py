@@ -1,4 +1,4 @@
-"""Trusted, server-side workload plugin contracts and discovery."""
+"""Server-owned workload plugin infrastructure."""
 
 from .discovery import discover_workloads
 from .registry import WorkloadRegistry

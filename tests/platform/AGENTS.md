@@ -1,5 +1,4 @@
-# Platform conformance test ownership
+# Plugin platform tests
 
-Tests here exercise workload discovery, registration, schema matching, and the
-generic coordinator boundary. New workload packages must add their tests here
-without modifying coordinator root tests.
+New workload lanes must prove their complete coordinator path here without
+adding lane-specific branches to coordinator core.

@@ -1,26 +1,27 @@
-"""Deterministic discovery limited to the in-repository plugin package."""
-
-from __future__ import annotations
+"""Deterministic discovery from one trusted in-repository namespace."""
 
 import importlib
 import pkgutil
 
 from .registry import WorkloadRegistry
 
-TRUSTED_PACKAGE = "openstar_workloads.plugins"
+TRUSTED_PLUGIN_PACKAGE = "openstar_workloads.plugins"
 
 
-def discover_workloads() -> WorkloadRegistry:
-    package = importlib.import_module(TRUSTED_PACKAGE)
-    names = sorted(
-        item.name for item in pkgutil.iter_modules(package.__path__)
-        if not item.name.startswith("_")
+def discover_workloads():
+    package = importlib.import_module(TRUSTED_PLUGIN_PACKAGE)
+    module_names = sorted(
+        module.name for module in pkgutil.iter_modules(package.__path__)
+        if not module.name.startswith("_")
     )
     plugins = []
-    for name in names:
-        module = importlib.import_module(f"{TRUSTED_PACKAGE}.{name}")
+    for module_name in module_names:
+        module = importlib.import_module(f"{TRUSTED_PLUGIN_PACKAGE}.{module_name}")
         plugin = getattr(module, "PLUGIN", None)
         if plugin is None:
-            raise RuntimeError(f"Malformed workload module {module.__name__}: missing PLUGIN")
-        plugins.append(plugin)
+            raise RuntimeError(f"Trusted workload module lacks PLUGIN: {module.__name__}")
+        if isinstance(plugin, (tuple, list)):
+            plugins.extend(plugin)
+        else:
+            plugins.append(plugin)
     return WorkloadRegistry(plugins)

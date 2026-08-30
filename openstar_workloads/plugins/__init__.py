@@ -1,1 +1,1 @@
-"""Only packages below this namespace are eligible for discovery."""
+"""Trusted built-in workload implementations."""
