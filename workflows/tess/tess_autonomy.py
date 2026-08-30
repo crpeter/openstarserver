@@ -1721,6 +1721,142 @@ def _continue_finalized_physical_source_localization(
     )
 
 
+def _continue_finalized_source_localization_multimode(
+    store: InvestigationStore, investigation: Investigation, control: dict
+) -> Investigation | None:
+    """Append v20.7 after the exact finalized target-source v20.6 edge."""
+    if (
+        investigation.status != "COMPLETE"
+        or control.get("schedulerAction") != "INVESTIGATION_COMPLETE"
+        or not investigation.stages
+    ):
+        return None
+    localization = _latest_complete(
+        investigation, "openstar.tess.source-localization.analyze")
+    physical = _latest_complete(
+        investigation, "openstar.tess.physical.interpret")
+    if localization is None or physical is None:
+        return None
+    result = localization.result or {}
+    cross = result.get("crossSector") or {}
+    cycle = result.get("physicalCycleEvidence") or {}
+    period = _validated_persisted_nested_cycle_period(cycle)
+    try:
+        reported_period = float(result.get("physicalPeriodDays"))
+        reported_harmonic = float(
+            result.get("photometricFirstHarmonicPeriodDays"))
+        eligible = int(cross.get("independentEligibleSectorCount"))
+        required = int(cross.get("requiredIndependentSupportCount"))
+        target_support = sorted(
+            int(value) for value in cross.get("targetSupportingSectors") or [])
+        off_target = sorted(
+            int(value) for value in cross.get("offTargetSectors") or [])
+        ambiguous = sorted(
+            int(value) for value in cross.get("ambiguousSectors") or [])
+    except (TypeError, ValueError):
+        return None
+
+    independent = [
+        item for item in result.get("sectorResults") or []
+        if isinstance(item, dict)
+        and item.get("role") == "independent"
+        and item.get("available") is True
+    ]
+    try:
+        independent_sectors = [int(item["sector"]) for item in independent]
+        observed_target = sorted(
+            int(item["sector"]) for item in independent
+            if item.get("classification") == "TARGET_CONSISTENT"
+        )
+        observed_off_target = sorted(
+            int(item["sector"]) for item in independent
+            if item.get("classification") == "OFF_TARGET"
+        )
+        observed_ambiguous = sorted(
+            int(item["sector"]) for item in independent
+            if item.get("classification") == "AMBIGUOUS"
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+
+    latest = investigation.stages[-1]
+    physical_result = physical.result or {}
+    exact_boundary = (
+        period is not None
+        and result.get("version") == "openstar.tess-pixel-localization.v1"
+        and result.get("physicalCycleEvidence")
+        == physical_result.get("physicalCycleEvidence")
+        and math.isfinite(reported_period)
+        and math.isfinite(reported_harmonic)
+        and math.isclose(
+            reported_period, period, rel_tol=1e-9, abs_tol=1e-12)
+        and math.isclose(
+            reported_harmonic, period / 2.0,
+            rel_tol=1e-9, abs_tol=1e-12)
+        and localization.parameters.get("evidenceLineage")
+        == "PHYSICAL_INTERPRETATION_PIXEL_LOCALIZATION"
+        and localization.triggered_by_stage_id == physical.id
+        and cross.get("classification") == "TARGET_SOURCE_SUPPORTED"
+        and cross.get("variableSignalOrigin") == "TARGET_CONSISTENT"
+        and cross.get("recommendedNextTest")
+        == "MULTI_MODE_FREQUENCY_DECOMPOSITION"
+        and result.get("recommendedNextTest")
+        == "MULTI_MODE_FREQUENCY_DECOMPOSITION"
+        and (result.get("contaminationInterpretation") or {}).get(
+            "existingCatalogContaminationCanBeCleared") is False
+        and eligible == len(independent)
+        and len(set(independent_sectors)) == eligible
+        and eligible >= 3
+        and required == max(3, eligible // 2 + 1)
+        and (
+            len(observed_target)
+            + len(observed_off_target)
+            + len(observed_ambiguous)
+            == eligible
+        )
+        and len(target_support) >= required
+        and len(set(target_support)) == len(target_support)
+        and target_support == observed_target
+        and off_target == observed_off_target
+        and ambiguous == observed_ambiguous
+        and latest.status == "COMPLETE"
+        and latest.handler_id == "openstar.tess.finalize"
+        and latest.stop is True
+        and latest.triggered_by_stage_id == localization.id
+        and latest.parameters.get("outputSuffix") == "v20.6"
+        and not any(
+            stage.handler_id.startswith("openstar.tess.multimode.")
+            for stage in investigation.stages
+        )
+    )
+    if not exact_boundary:
+        return None
+    localization_index = investigation.stages.index(localization)
+    if tuple(investigation.stages[localization_index + 1:]) != (latest,):
+        return None
+    prefixes = [
+        int(stage.id.partition("-")[0])
+        for stage in investigation.stages
+        if stage.id.partition("-")[0].isdigit()
+    ]
+    request = StageRequest(
+        id=f"{max(prefixes, default=0) + 1:03d}-prepare-multimode-iteration-1",
+        handler_id="openstar.tess.multimode.prepare",
+        parameters={"iteration": 1},
+        triggered_by_stage_id=localization.id,
+    )
+    return store.set_control_state(
+        investigation,
+        status="RUNNING",
+        control_state={
+            "branchAssessments": [],
+            "selectedExperiment": asdict(request),
+            "schedulerAction": "RUN_EXPERIMENT",
+            "recovery": "TESS_V20_6_MULTI_MODE_FREQUENCY_DECOMPOSITION",
+        },
+    )
+
+
 def _repair_unresolved_dynamic_localization_review_failure(
     store: InvestigationStore, investigation: Investigation, control: dict
 ) -> Investigation | None:
@@ -2342,6 +2478,11 @@ def repair_obsolete_terminal_wait(
     )
     if period_repair is not None:
         return period_repair
+
+    multimode_continuation = _continue_finalized_source_localization_multimode(
+        store, investigation, control)
+    if multimode_continuation is not None:
+        return multimode_continuation
 
     physical_localization = _continue_finalized_physical_source_localization(
         store, investigation, control)
