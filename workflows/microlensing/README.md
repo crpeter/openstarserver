@@ -161,3 +161,50 @@ dataset. Identity remains sealed, while generic workers see only the ordinary
 CurveGrid payloads. This remains smooth-event modeling with the symmetric
 radial-amplification family; it is not yet planetary-anomaly recovery,
 classification, or a discovery claim.
+
+## Recenter a verified boundary refinement
+
+When the completed first refinement has an accepted winner on at least one
+axis boundary, build a second grid centered mechanically on that winner:
+
+```bash
+python -m workflows.microlensing.recenter_grid \
+  --prepared-root /path/to/microlensing-recovery-a-prepared \
+  --coarse-project-root /path/to/microlensing-recovery-a-coarse-grid \
+  --coarse-investigation-record \
+    /path/to/investigations/coarse-run/investigation.json \
+  --refinement-project-root \
+    /path/to/microlensing-recovery-a-refinement-grid \
+  --refinement-investigation-record \
+    /path/to/investigations/refinement-run/investigation.json \
+  --project-id openstar.microlensing-recovery-a.recentered-grid.v1 \
+  --output-root /path/to/microlensing-recovery-a-recentered-grid
+```
+
+The builder verifies the blind preparation and selected generic series; every
+coarse contract, dataset, project, build artifact, and immutable investigation
+ledger; every first-refinement artifact and recorded hash; and the completed
+three-stage first-refinement project-smoke investigation. It requires exact
+project and schema identities, stage causality, parameter and result hashes,
+node-contribution accounting, 95 completed and zero failed work units, and
+complete coverage of all 6,069 first-refinement candidates. The accepted
+winner must map exactly from its flattened grid index, agree with the dataset
+status, and lie on at least one first-refinement axis boundary. An interior
+winner makes recentering unjustified and is rejected.
+
+Every new axis retains its corresponding first-refinement step. The center
+axis has 21 points beginning ten center steps below the accepted center. The
+log-scale and log-shape axes each have 17 points beginning eight corresponding
+steps below their accepted values. The verified winner is therefore at new
+indices 10, 8, and 8. The resulting grid again contains exactly 6,069
+candidates and produces 95 work units at 64 candidates per work unit.
+
+The recentered contract and build manifest bind the preparation-manifest hash,
+all coarse artifact and investigation hashes, all first-refinement artifact
+and investigation hashes, every immutable first-refinement stage-ledger hash,
+the accepted run-stage ledger, the full accepted winner, and the frozen
+recentering derivation. The builder does not read `sealed/`, trust terminal
+output, or consult original identity or published event parameters.
+
+This is still known-event recovery and smooth-event convergence. It does not
+recover or classify a planetary anomaly and makes no discovery claim.
