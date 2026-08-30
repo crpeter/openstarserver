@@ -366,17 +366,40 @@ def _load_frozen_dataset(spec: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeError(f"Frozen dataset is not an object: {path}")
 
     source = dataset.get("source") or {}
+    metadata = dataset.get("metadata") or {}
+    if not isinstance(source, dict) or not isinstance(metadata, dict):
+        raise RuntimeError(
+            f"Frozen dataset target/sector lineage is incomplete: {path}"
+        )
     expected_id = str(spec["datasetID"])
     expected_tic = int(spec["ticID"])
     expected_sector = int(spec["sector"])
     try:
         observed_id = str(dataset["id"])
-        observed_tic = int(source["ticID"])
-        observed_sector = int(source["sector"])
+        tic_values = [
+            int(container["ticID"])
+            for container in (source, metadata)
+            if container.get("ticID") is not None
+        ]
+        sector_values = [
+            int(container["sector"])
+            for container in (source, metadata)
+            if container.get("sector") is not None
+        ]
     except (KeyError, TypeError, ValueError):
         raise RuntimeError(
             f"Frozen dataset target/sector lineage is incomplete: {path}"
         ) from None
+    if not tic_values or not sector_values:
+        raise RuntimeError(
+            f"Frozen dataset target/sector lineage is incomplete: {path}"
+        )
+    if len(set(tic_values)) != 1 or len(set(sector_values)) != 1:
+        raise RuntimeError(
+            f"Frozen dataset target/sector lineage mismatch: {path}"
+        )
+    observed_tic = tic_values[0]
+    observed_sector = sector_values[0]
     if (
         observed_id != expected_id
         or observed_tic != expected_tic
@@ -392,10 +415,26 @@ def _load_frozen_dataset(spec: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeError(f"Frozen dataset times/flux are missing: {path}")
     if len(raw_times) != len(raw_flux) or len(raw_times) < 16:
         raise RuntimeError(f"Frozen dataset has invalid sample counts: {path}")
-    origin = source.get("originalTimeOriginDays")
-    if origin is None:
-        origin = source.get("timeOriginDays")
-    time_offset = 0.0 if origin is None else float(origin)
+    origins = []
+    try:
+        for container in (source, metadata):
+            origin = container.get("originalTimeOriginDays")
+            if origin is None:
+                origin = container.get("timeOriginDays")
+            if origin is not None:
+                origins.append(float(origin))
+    except (TypeError, ValueError):
+        raise RuntimeError(
+            f"Frozen dataset has an invalid time origin: {path}"
+        ) from None
+    if origins and any(
+        not math.isclose(value, origins[0], rel_tol=1e-12, abs_tol=1e-12)
+        for value in origins[1:]
+    ):
+        raise RuntimeError(
+            f"Frozen dataset target/sector lineage mismatch: {path}"
+        )
+    time_offset = origins[0] if origins else 0.0
     if not math.isfinite(time_offset):
         raise RuntimeError(f"Frozen dataset has an invalid time origin: {path}")
     try:

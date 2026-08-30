@@ -370,6 +370,36 @@ class LongBaselineAnalysisTests(unittest.TestCase):
                     dataset_specs=specs,
                 )
 
+    def test_primary_scan_metadata_lineage_is_accepted_without_weakening(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths, specs = self._datasets(temporary)
+            primary = json.loads(paths[0].read_text(encoding="utf-8"))
+            primary["metadata"] = primary.pop("source")
+            paths[0].write_text(json.dumps(primary), encoding="utf-8")
+            contract = build_method_contract(_mode_result(paths))
+
+            datasets = validate_frozen_dataset_lineage(
+                method_contract=contract,
+                dataset_specs=specs,
+            )
+
+            self.assertEqual(datasets[0]["ticID"], TIC_ID)
+            self.assertEqual(datasets[0]["sector"], PRIMARY_SECTOR)
+
+            primary["source"] = {
+                "ticID": TIC_ID,
+                "sector": PRIMARY_SECTOR + 1,
+                "originalTimeOriginDays": primary["metadata"][
+                    "originalTimeOriginDays"
+                ],
+            }
+            paths[0].write_text(json.dumps(primary), encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "lineage mismatch"):
+                validate_frozen_dataset_lineage(
+                    method_contract=contract,
+                    dataset_specs=specs,
+                )
+
 
 class LongBaselineContinuationTests(unittest.TestCase):
     def _history(self, root, *, status="COMPLETE"):
