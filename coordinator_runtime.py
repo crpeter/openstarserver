@@ -10,10 +10,10 @@ from typing import Any
 
 from coordinator_state import CoordinatorState, first_value, normalize_id
 from openstar_contributions import (
-    DEFAULT_ACCOUNTING,
     ContributionStore,
     timing_metrics,
 )
+from openstar_workloads.discovery import discover_workloads
 
 MAX_WORK_UNITS_PER_CLAIM = 128
 HOT_PATH_PROGRESS_INTERVAL_SECONDS = 10.0
@@ -34,9 +34,10 @@ class NoActiveProjectError(RuntimeError):
 class CoordinatorRuntime:
     """Multi-project scheduler around isolated, project-local states."""
 
-    def __init__(self, contribution_db: str | Path | None = None):
+    def __init__(self, contribution_db: str | Path | None = None, workload_registry=None):
         self.lock = threading.RLock()
         self._states: dict[str, CoordinatorState] = {}
+        self.workload_registry = workload_registry or discover_workloads()
         self._project_order: list[str] = []
         self._work_project_index: dict[str, str] = {}
         self._node_registrations: dict[str, dict[str, Any]] = {}
@@ -321,7 +322,7 @@ class CoordinatorRuntime:
             with state.lock:
                 work_unit = state.work_units[normalized_work_id]
                 dataset_id = str(work_unit["datasetID"])
-                metrics = DEFAULT_ACCOUNTING.metrics(
+                metrics = state.workload_plugin.contribution_metrics(
                     work_unit, state.datasets[dataset_id]
                 )
                 accepted_result = state.completed[normalized_work_id]
@@ -399,7 +400,7 @@ class CoordinatorRuntime:
         resolved = Path(project_path).expanduser().resolve()
         if not resolved.exists():
             raise FileNotFoundError(f"Project manifest not found: {resolved}")
-        new_state = CoordinatorState(resolved)
+        new_state = CoordinatorState(resolved, self.workload_registry)
         new_state.terminal_observer = self._project_became_terminal
         project_id = str(new_state.project_id)
         new_work_ids = list(new_state.work_units)
