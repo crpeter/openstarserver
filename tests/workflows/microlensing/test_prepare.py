@@ -20,6 +20,8 @@ from workflows.microlensing.prepare import (
     PREPARATION_CONTRACT_SHA256,
     SERIES_SCHEMA_ID,
     PreparationError,
+    _assert_identity_isolated,
+    _IdentityIsolationChecks,
     parse_fixed_width_ipac,
     prepare_archive,
     select_and_normalize_observable,
@@ -413,14 +415,23 @@ class ArchivePreparationTests(unittest.TestCase):
         self.archive = self.root / "archive"
         self.archive.mkdir()
 
-    def build_two_source_archive(self, second_star_id=STAR_ID):
+    def build_two_source_archive(
+        self,
+        second_star_id=STAR_ID,
+        extra_metadata=(),
+    ):
         build_archive(
             self.archive,
             {
                 f"UID_{UID}_PLC_002.tbl": table_text(
-                    flux_rows(2456002.25), star_id=second_star_id
+                    flux_rows(2456002.25),
+                    star_id=second_star_id,
+                    extra_metadata=extra_metadata,
                 ),
-                f"UID_{UID}_PLC_001.tbl": table_text(flux_rows(2456000.25)),
+                f"UID_{UID}_PLC_001.tbl": table_text(
+                    flux_rows(2456000.25),
+                    extra_metadata=extra_metadata,
+                ),
             },
         )
 
@@ -556,6 +567,106 @@ class ArchivePreparationTests(unittest.TestCase):
                 output_root=output,
             )
         self.assertEqual("keep", marker.read_text(encoding="utf-8"))
+
+    def test_short_filter_metadata_does_not_match_ordinary_blind_text(self):
+        self.build_two_source_archive(
+            extra_metadata=('\\TIME_SERIES_DATA_FILTER = "I"',)
+        )
+        output = self.root / "prepared"
+
+        prepare_archive(
+            self.archive,
+            uid=UID,
+            blind_target_id=BLIND_TARGET_ID,
+            output_root=output,
+        )
+
+        serialized = b"\n".join(
+            path.read_bytes()
+            for path in sorted((output / "blind").rglob("*.json"))
+        ).decode("utf-8")
+        self.assertIn('"seriesID"', serialized)
+        self.assertIn('"inverseVariances"', serialized)
+
+    def test_other_short_filter_metadata_values_are_supported(self):
+        for filter_value in ("V", "H"):
+            with self.subTest(filter_value=filter_value):
+                archive = self.root / f"archive-{filter_value}"
+                archive.mkdir()
+                build_archive(
+                    archive,
+                    {
+                        f"UID_{UID}_PLC_001.tbl": table_text(
+                            flux_rows(),
+                            extra_metadata=(
+                                "\\TIME_SERIES_DATA_FILTER = "
+                                f'"{filter_value}"',
+                            ),
+                        )
+                    },
+                )
+
+                prepare_archive(
+                    archive,
+                    uid=UID,
+                    blind_target_id=BLIND_TARGET_ID,
+                    output_root=self.root / f"prepared-{filter_value}",
+                )
+
+    def test_exact_short_json_string_leak_is_still_rejected(self):
+        checks = _IdentityIsolationChecks(
+            raw_substrings=(),
+            exact_json_string_values=("I",),
+        )
+        _assert_identity_isolated(
+            [b'{"seriesID":"series-001","inverseVariances":[1.0]}'],
+            checks,
+        )
+
+        with self.assertRaisesRegex(PreparationError, "source identity"):
+            _assert_identity_isolated([b'{"value":"i"}'], checks)
+
+    def test_long_identity_and_provenance_leaks_remain_rejected(self):
+        canonical_source_url = (
+            "https://exoplanetarchive.ipac.caltech.edu/data/"
+            f"MICROLENSING/UID_{UID}_PLC_001.tbl"
+        )
+        raw_checks = _IdentityIsolationChecks(
+            raw_substrings=(
+                UID,
+                "OGLE",
+                STAR_ID,
+                f"UID_{UID}_PLC_001.tbl",
+                canonical_source_url,
+                "exoplanetarchive.ipac.caltech.edu",
+                "reference",
+                "bibcode",
+                "observatory",
+                "telescope",
+                "instrument",
+                "filter",
+            ),
+            exact_json_string_values=("Distinctive Source Reference",),
+        )
+        leaked_values = (
+            UID,
+            "ogle",
+            STAR_ID,
+            f"UID_{UID}_PLC_001.tbl",
+            canonical_source_url,
+            "REFERENCE",
+            "BIBCODE",
+            "OBSERVATORY",
+            "TELESCOPE",
+            "INSTRUMENT",
+            "FILTER",
+            "Distinctive Source Reference",
+        )
+        for leaked_value in leaked_values:
+            with self.subTest(leaked_value=leaked_value):
+                document = stable_json_bytes({"value": leaked_value})
+                with self.assertRaisesRegex(PreparationError, "source identity"):
+                    _assert_identity_isolated([document], raw_checks)
 
     def test_blind_directory_contains_no_source_identity_tokens(self):
         self.build_two_source_archive()

@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from workflows.microlensing.acquire import (
+    ARCHIVE_HOST,
     INVENTORY_RELATIVE_PATH,
     INVENTORY_SCHEMA_ID,
     MANIFEST_RELATIVE_PATH,
@@ -129,6 +130,12 @@ class _PreparedSource:
     metadata_lines: tuple[str, ...]
     metadata: Mapping[str, tuple[str, ...]]
     selected: SelectedObservable
+
+
+@dataclass(frozen=True, slots=True)
+class _IdentityIsolationChecks:
+    raw_substrings: tuple[str, ...]
+    exact_json_string_values: tuple[str, ...]
 
 
 _METADATA_ASSIGNMENT = re.compile(
@@ -544,46 +551,65 @@ def _relevant_metadata(
     return relevant
 
 
-def _source_identity_tokens(
+def _source_identity_checks(
     uid: str,
     star_id: str,
     prepared_sources: Sequence[_PreparedSource],
-) -> tuple[str, ...]:
-    tokens = {uid, star_id, SOURCE_SCRIPT_URL}
-    tokens.update(
+) -> _IdentityIsolationChecks:
+    raw_substrings = {
+        uid,
+        "OGLE",
+        star_id,
+        SOURCE_SCRIPT_URL,
+        ARCHIVE_HOST,
+    }
+    raw_substrings.update(
         word
         for word in re.findall(r"[A-Za-z0-9]+", star_id)
         if len(word) >= 4 and sum(character.isalpha() for character in word) >= 2
     )
-    identity_metadata_keys = (
-        "RA",
-        "DEC",
-        "REFERENCE",
-        "BIBCODE",
-        "OBSERVATORY",
-        "TELESCOPE",
-        "INSTRUMENT",
-        "FILTER",
+    raw_substrings.update(
+        {
+            "reference",
+            "bibcode",
+            "observatory",
+            "telescope",
+            "instrument",
+            "filter",
+        }
     )
-    tokens.update(
-        {"reference", "bibcode", "observatory", "telescope", "instrument", "filter"}
-    )
+    exact_json_string_values = {"RA", "DEC"}
     for source in prepared_sources:
-        tokens.add(source.relative_filename)
-        tokens.add(Path(source.relative_filename).name)
-        tokens.add(source.canonical_source_url)
-        for key, values in source.metadata.items():
-            if any(marker in key for marker in identity_metadata_keys):
-                tokens.update(value for value in values if value)
-    return tuple(sorted((token for token in tokens if token), key=str.casefold))
+        raw_substrings.add(source.relative_filename)
+        raw_substrings.add(Path(source.relative_filename).name)
+        raw_substrings.add(source.canonical_source_url)
+        for values in source.metadata.values():
+            exact_json_string_values.update(value for value in values if value)
+    return _IdentityIsolationChecks(
+        raw_substrings=tuple(
+            sorted(
+                (token for token in raw_substrings if token),
+                key=str.casefold,
+            )
+        ),
+        exact_json_string_values=tuple(
+            sorted(exact_json_string_values, key=str.casefold)
+        ),
+    )
 
 
 def _assert_identity_isolated(
-    documents: Sequence[bytes], tokens: Sequence[str]
+    documents: Sequence[bytes], checks: _IdentityIsolationChecks
 ) -> None:
     serialized = b"\n".join(documents).decode("utf-8").casefold()
-    for token in tokens:
+    for token in checks.raw_substrings:
         if token.casefold() in serialized:
+            raise PreparationError(
+                "blind output would contain source identity or provenance"
+            )
+    for value in checks.exact_json_string_values:
+        json_literal = json.dumps(value, ensure_ascii=False).casefold()
+        if json_literal in serialized:
             raise PreparationError(
                 "blind output would contain source identity or provenance"
             )
@@ -798,7 +824,7 @@ def prepare_archive(
     ]
     _assert_identity_isolated(
         blind_documents,
-        _source_identity_tokens(uid, star_id, prepared_sources),
+        _source_identity_checks(uid, star_id, prepared_sources),
     )
 
     try:
