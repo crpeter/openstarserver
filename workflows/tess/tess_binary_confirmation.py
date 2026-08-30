@@ -12,6 +12,11 @@ import statistics
 from pathlib import Path
 from typing import Any
 
+from .tess_resolved_cycle import (
+    authoritative_resolved_cycle,
+    validated_cycle_period,
+)
+
 
 RESULT_VERSION = "2.0"
 MORPHOLOGY_EVENT_SCREEN_ENTRY = "MORPHOLOGY_RESOLVED_PERIODIC_EVENT_SCREEN"
@@ -23,17 +28,16 @@ MIN_EVENT_SNR = 6.0
 
 
 def physical_interpretation_continuation(physical: dict[str, Any],
-                                         morphology: dict[str, Any]) -> bool:
+                                         resolved_cycle: dict[str, Any]) -> bool:
     """Return true only at the exact persisted scientific boundary."""
-    try:
-        period = float(morphology.get("resolvedPhysicalPeriodDays"))
-    except (TypeError, ValueError):
-        return False
+    cycle = resolved_cycle
+    if cycle.get("contractVersion") is None:
+        cycle = authoritative_resolved_cycle(morphology=resolved_cycle) or {}
+    period = validated_cycle_period(cycle)
     return (physical.get("recommendedNextTest") == "INDEPENDENT_BINARY_CONFIRMATION"
             and physical.get("physicalMechanismResolved") is False
             and physical.get("preferredPhotometricHypothesis") == "BINARY_LIKE_DOUBLE_WAVE"
-            and morphology.get("physicalCycleResolved") is True
-            and math.isfinite(period) and period > 0)
+            and period is not None)
 
 
 def morphology_event_screening_continuation(
@@ -287,20 +291,26 @@ def _ephemeris(
 def analyze_binary_confirmation(*, primary_dataset_path: str | Path,
                                 independent_spec: dict[str, Any], morphology: dict[str, Any],
                                 physical_interpretation: dict[str, Any] | None,
-                                entry_mode: str = "PHYSICAL_INTERPRETATION") -> dict[str, Any]:
+                                entry_mode: str = "PHYSICAL_INTERPRETATION",
+                                resolved_cycle: dict[str, Any] | None = None) -> dict[str, Any]:
     morphology_screen = entry_mode == MORPHOLOGY_EVENT_SCREEN_ENTRY
     if morphology_screen:
         if not morphology_event_screening_continuation(morphology, independent_spec):
             raise ValueError("authoritative morphology event-screen input gate is not satisfied")
-    elif not physical_interpretation_continuation(
-        physical_interpretation or {}, morphology
-    ):
-        raise ValueError("authoritative binary-confirmation input gate is not satisfied")
+        cycle = authoritative_resolved_cycle(morphology=morphology)
+    else:
+        cycle = resolved_cycle or authoritative_resolved_cycle(morphology=morphology)
+        if not physical_interpretation_continuation(
+            physical_interpretation or {}, cycle or {}
+        ):
+            raise ValueError("authoritative binary-confirmation input gate is not satisfied")
     prepared = [item for item in independent_spec.get("preparedSectors") or []
                 if item.get("datasetPath")]
     if len(prepared) < MIN_INDEPENDENT_SUPPORTERS:
         raise ValueError("at least three frozen independent-sector datasets are required")
-    period = float(morphology["resolvedPhysicalPeriodDays"])
+    period = validated_cycle_period(cycle)
+    if period is None:
+        raise ValueError("authoritative resolved-cycle contract is not satisfied")
     results = [_sector(_load(primary_dataset_path), period, "PRIMARY")]
     results += [_sector(_load(item["datasetPath"]), period, "INDEPENDENT") for item in prepared]
     supporters = [item for item in results if item["role"] == "INDEPENDENT" and item.get("usable")]
@@ -371,7 +381,9 @@ def analyze_binary_confirmation(*, primary_dataset_path: str | Path,
     return {"resultVersion": RESULT_VERSION, "experiment": "FIXED_PERIOD_ECLIPSE_GEOMETRY_REPLICATION",
             "entryBoundary": (MORPHOLOGY_EVENT_SCREEN_ENTRY if morphology_screen
                               else "PHYSICAL_INTERPRETATION_BINARY_RECOMMENDATION"),
-            "physicalPeriodInputDays": period, "sectorResults": results,
+            "physicalPeriodInputDays": period,
+            "physicalCycleEvidence": cycle,
+            "sectorResults": results,
             "independentEvidence": {"classification": (
                 "REPLICATED_ECLIPSE_LIKE_EVENT_SUPPORTED" if supported else
                 "ECLIPSE_LIKE_EVENT_UNRESOLVED"),

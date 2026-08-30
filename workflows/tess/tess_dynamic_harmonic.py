@@ -15,6 +15,16 @@ from .tess_mode_identification import GENERIC_REFINEMENT_WORKLOAD_ID, MIN_BIC_IM
 
 
 MIN_ALIAS_SUPPORTING_HELD_OUT_SECTORS = 3
+NESTED_ALIAS_METHOD = (
+    "NESTED_EVEN_ONLY_VS_EVEN_PLUS_ODD_LEAVE_ONE_SECTOR_OUT_PREDICTION"
+)
+NESTED_ALIAS_RESOLVED_CLASSIFICATION = (
+    "DOUBLE_CYCLE_ODD_HARMONICS_PREDICTIVELY_SUPPORTED"
+)
+NESTED_ALIAS_EVIDENCE_LINEAGES = frozenset({
+    "UNRESOLVED_FAMILY_TIME_FREQUENCY_RECOMMENDATION",
+    "UNRESOLVED_FAMILY_NESTED_ODD_HARMONIC_REASSESSMENT",
+})
 
 
 def read_frozen_light_curve(path: str | Path, position: int = 0) -> dict[str, Any]:
@@ -466,7 +476,7 @@ def compare_unresolved_family_dynamic_harmonics(
         selected_relation = "DOUBLE_CYCLE"
         selected_period = double_period
         selected_model = full_double_model
-        classification = "DOUBLE_CYCLE_ODD_HARMONICS_PREDICTIVELY_SUPPORTED"
+        classification = NESTED_ALIAS_RESOLVED_CLASSIFICATION
     else:
         selected_relation = None
         selected_period = None
@@ -474,7 +484,7 @@ def compare_unresolved_family_dynamic_harmonics(
         classification = "UNRESOLVED_FAMILY_DYNAMIC_HARMONIC_ALIAS_AMBIGUOUS"
 
     alias_resolution = {
-        "method": "NESTED_EVEN_ONLY_VS_EVEN_PLUS_ODD_LEAVE_ONE_SECTOR_OUT_PREDICTION",
+        "method": NESTED_ALIAS_METHOD,
         "criterion": "BIC",
         "conservativeThreshold": MIN_BIC_IMPROVEMENT,
         "equalHalfEvenHarmonicOrders": list(even_orders),

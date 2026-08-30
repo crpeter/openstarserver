@@ -121,6 +121,12 @@ from .tess_dynamic_harmonic import (
     model_dynamic_harmonics,
     refine_harmonic_family_frequency,
 )
+from .tess_resolved_cycle import (
+    CORROBORATED_SOURCE as CORROBORATED_RESOLVED_CYCLE_SOURCE,
+    NESTED_ALIAS_SOURCE as NESTED_ALIAS_RESOLVED_CYCLE_SOURCE,
+    authoritative_resolved_cycle,
+    validated_cycle_period,
+)
 from .tess_residual_localization import (
     build_residual_mode_pixel_project,
     interpret_residual_mode_pixel_project,
@@ -880,6 +886,16 @@ def dynamic_harmonic_continuation(summary: dict[str, Any], *, request_id: str) -
     """Route dynamic-family evidence without assigning a physical mechanism."""
     residual = summary.get("recommendedNextTest") == "RESIDUAL_MULTIMODE_LOCALIZATION"
     refine = summary.get("recommendedNextTest") == "LOMB_SCARGLE_FREQUENCY_REFINEMENT"
+    resolved_cycle = authoritative_resolved_cycle(
+        morphology=None,
+        dynamic_harmonic=summary,
+    )
+    interpret_physical = (
+        summary.get("recommendedNextTest")
+        == "BINARY_ROTATION_EXTERNAL_EVIDENCE"
+        and resolved_cycle is not None
+        and resolved_cycle.get("sourceKind") == NESTED_ALIAS_RESOLVED_CYCLE_SOURCE
+    )
     try:
         resolved_period = float(summary.get("resolvedPhysicalPeriodDays"))
         reference_period = float(summary.get("referenceFamilyPeriodDays"))
@@ -899,10 +915,16 @@ def dynamic_harmonic_continuation(summary: dict[str, Any], *, request_id: str) -
             resolved_period, reference_period, rel_tol=1e-9, abs_tol=1e-12)
     )
     return StageRequest(
-        id=_next_stage_id(request_id, "refine-harmonic-frequency" if refine else
-                          ("prepare-time-frequency" if residual else "finalize")),
+        id=_next_stage_id(
+            request_id,
+            "refine-harmonic-frequency" if refine else
+            ("prepare-time-frequency" if residual else
+             ("physical-interpretation" if interpret_physical else "finalize")),
+        ),
         handler_id=("openstar.tess.dynamic-harmonic.frequency-refinement" if refine else
-                    ("openstar.tess.time-frequency.prepare" if residual else "openstar.tess.finalize")),
+                    ("openstar.tess.time-frequency.prepare" if residual else
+                     ("openstar.tess.physical.interpret" if interpret_physical else
+                      "openstar.tess.finalize"))),
         parameters=({} if refine else
                     ({"entryReason": (
                         "RESOLVED_DYNAMIC_HARMONIC_RESIDUAL"
@@ -911,12 +933,15 @@ def dynamic_harmonic_continuation(summary: dict[str, Any], *, request_id: str) -
                             or predictively_resolved)
                         else "DYNAMIC_HARMONIC_RESIDUAL")}
                      if residual else
+                    ({"evidenceLineage":
+                      "NESTED_ODD_HARMONIC_RESOLVED_CYCLE"}
+                     if interpret_physical else
                     {"outputSuffix": (
                         "v20.10.1-nested-cycle-alias"
                         if summary.get("evidenceLineage")
                         == "UNRESOLVED_FAMILY_NESTED_ODD_HARMONIC_REASSESSMENT"
                         else "v20.10-dynamic-harmonic"
-                    )})),
+                    )}))),
         triggered_by_stage_id=request_id,
     )
 
@@ -3778,16 +3803,40 @@ def build_engine(
             investigation,
             "openstar.tess.morphology.analyze",
         )
+        dynamic = _latest_result_for_handler(
+            investigation,
+            "openstar.tess.dynamic-harmonic.analyze",
+        )
         if identity is None:
             raise RuntimeError("Physical interpretation requires the completed catalog-identity stage.")
         if independent_prepare is None:
             raise RuntimeError("Physical interpretation requires frozen independent-sector light curves.")
-        if morphology is None or not morphology.get("physicalCycleResolved"):
-            raise RuntimeError("Physical interpretation requires a morphology-resolved physical cycle.")
+        if morphology is None:
+            raise RuntimeError("Physical interpretation requires completed morphology analysis.")
+        resolved_cycle = authoritative_resolved_cycle(
+            morphology=morphology,
+            dynamic_harmonic=dynamic,
+        )
+        physical_period = validated_cycle_period(resolved_cycle)
+        if physical_period is None:
+            raise RuntimeError(
+                "Physical interpretation requires an authoritative resolved-cycle contract."
+            )
+        if (
+            request.parameters.get("evidenceLineage")
+            == "NESTED_ODD_HARMONIC_RESOLVED_CYCLE"
+            and resolved_cycle.get("sourceKind") not in {
+                NESTED_ALIAS_RESOLVED_CYCLE_SOURCE,
+                CORROBORATED_RESOLVED_CYCLE_SOURCE,
+            }
+        ):
+            raise RuntimeError(
+                "Nested-cycle physical interpretation requires exact predictive alias evidence."
+            )
 
-        physical_period = morphology.get("resolvedPhysicalPeriodDays")
         print("🔬 Discriminating physical mechanisms from frozen multi-sector evidence")
         print(f"   resolved physical period: {physical_period} days")
+        print(f"   resolved-cycle source: {resolved_cycle.get('sourceKind')}")
         print("   fitting fundamental + first harmonic in every frozen sector")
         print("   existing identity metadata only; no MAST and no distributed compute")
 
@@ -3797,6 +3846,7 @@ def build_engine(
             identity=identity,
             morphology=morphology,
             broad_interpretation=broad,
+            resolved_cycle=resolved_cycle,
         )
 
         fourier = interpretation.get("crossSectorFourierSummary") or {}
@@ -3823,19 +3873,27 @@ def build_engine(
         print(f"   physical mechanism resolved: {interpretation.get('physicalMechanismResolved')}")
         print(f"   recommended next test: {interpretation.get('recommendedNextTest')}")
 
+        dynamic_cycle = resolved_cycle.get("sourceKind") in {
+            NESTED_ALIAS_RESOLVED_CYCLE_SOURCE,
+            CORROBORATED_RESOLVED_CYCLE_SOURCE,
+        }
         artifact_path = (
             store.directory_for(investigation.id)
             / "artifacts"
             / "physical"
-            / "physical-interpretation-v20.5.json"
+            / ("physical-interpretation-v20.5.1-dynamic-cycle.json"
+               if dynamic_cycle else "physical-interpretation-v20.5.json")
         )
         _write_json(artifact_path, interpretation)
 
         input_hashes = {
             "identity": sha256_json(identity),
             "morphology": sha256_json(morphology),
+            "resolvedCycle": sha256_json(resolved_cycle),
             "primaryDataset": sha256_file(Path(prepared["datasetPath"])),
         }
+        if dynamic_cycle and dynamic is not None:
+            input_hashes["dynamicHarmonic"] = sha256_json(dynamic)
         if broad is not None:
             input_hashes["broadIndependentInterpretation"] = sha256_json(broad)
         for item in independent_prepare.get("preparedSectors") or []:
@@ -3844,7 +3902,9 @@ def build_engine(
             if path:
                 input_hashes[f"independentSector{sector}"] = sha256_file(Path(path))
 
-        if physical_interpretation_continuation(interpretation, morphology):
+        if physical_interpretation_continuation(
+            interpretation, resolved_cycle
+        ):
             next_stage = StageRequest(
                 id=_next_stage_id(request.id, "binary-confirmation"),
                 handler_id="openstar.tess.binary-confirmation.analyze",
@@ -3855,7 +3915,9 @@ def build_engine(
             next_stage = StageRequest(
                 id=_next_stage_id(request.id, "finalize"),
                 handler_id="openstar.tess.finalize",
-                parameters={"outputSuffix": "v20.5"},
+                parameters={"outputSuffix": (
+                    "v20.5.1-dynamic-cycle" if dynamic_cycle else "v20.5"
+                )},
                 triggered_by_stage_id=request.id,
             )
 
@@ -3872,6 +3934,8 @@ def build_engine(
             investigation, "openstar.tess.independent.prepare")
         morphology = _required_latest_result_for_handler(
             investigation, "openstar.tess.morphology.analyze")
+        dynamic = _latest_result_for_handler(
+            investigation, "openstar.tess.dynamic-harmonic.analyze")
         entry_mode = request.parameters.get("entryMode") or "PHYSICAL_INTERPRETATION"
         physical = _latest_result_for_handler(
             investigation, "openstar.tess.physical.interpret")
@@ -3879,12 +3943,28 @@ def build_engine(
             raise RuntimeError(
                 "Binary confirmation requires completed physical interpretation."
             )
+        resolved_cycle = (
+            authoritative_resolved_cycle(morphology=morphology)
+            if entry_mode == MORPHOLOGY_EVENT_SCREEN_ENTRY
+            else authoritative_resolved_cycle(
+                morphology=morphology,
+                dynamic_harmonic=dynamic,
+            )
+        )
+        if (
+            entry_mode != MORPHOLOGY_EVENT_SCREEN_ENTRY
+            and (physical or {}).get("physicalCycleEvidence") != resolved_cycle
+        ):
+            raise RuntimeError(
+                "Binary confirmation requires the physical interpretation's exact resolved-cycle evidence."
+            )
         result = analyze_binary_confirmation(
             primary_dataset_path=prepared["datasetPath"],
             independent_spec=independent_prepare,
             morphology=morphology,
             physical_interpretation=physical,
             entry_mode=entry_mode,
+            resolved_cycle=resolved_cycle,
         )
         print("🌘 Replicating narrow events at the frozen physical clock")
         print(f"   classification: {(result.get('independentEvidence') or {}).get('classification')}")
@@ -3897,11 +3977,21 @@ def build_engine(
         _write_json(artifact_path, result)
         input_hashes = {
             "morphology": sha256_json(morphology),
+            "resolvedCycle": sha256_json(resolved_cycle),
             "primaryDataset": sha256_file(Path(prepared["datasetPath"])),
             "independentPreparation": sha256_json(independent_prepare),
         }
         if physical is not None:
             input_hashes["physicalInterpretation"] = sha256_json(physical)
+        if (
+            dynamic is not None
+            and resolved_cycle is not None
+            and resolved_cycle.get("sourceKind") in {
+                NESTED_ALIAS_RESOLVED_CYCLE_SOURCE,
+                CORROBORATED_RESOLVED_CYCLE_SOURCE,
+            }
+        ):
+            input_hashes["dynamicHarmonic"] = sha256_json(dynamic)
         if entry_mode == MORPHOLOGY_EVENT_SCREEN_ENTRY:
             input_hashes["eventScreenEntryBoundary"] = sha256_json({
                 "entryMode": entry_mode,

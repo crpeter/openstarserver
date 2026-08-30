@@ -1463,6 +1463,127 @@ def _repair_unmatched_alias_model_terminal(
     )
 
 
+def _continue_finalized_nested_cycle_physical_interpretation(
+    store: InvestigationStore, investigation: Investigation, control: dict
+) -> Investigation | None:
+    """Append mechanism interpretation after the exact resolved v20.10.1 edge."""
+    if (
+        investigation.status != "COMPLETE"
+        or control.get("schedulerAction") != "INVESTIGATION_COMPLETE"
+        or not investigation.stages
+    ):
+        return None
+    dynamic = _latest_complete(
+        investigation, "openstar.tess.dynamic-harmonic.analyze")
+    if dynamic is None:
+        return None
+    result = dynamic.result or {}
+    alias = result.get("periodAliasResolution") or {}
+    latest = investigation.stages[-1]
+    try:
+        raw_period = float(result.get("rawFamilyPeriodDays"))
+        resolved_period = float(result.get("resolvedPhysicalPeriodDays"))
+        reference_period = float(result.get("referenceFamilyPeriodDays"))
+        selected_period = float(alias.get("selectedPeriodDays"))
+        possible_double = float(result.get("possibleDoubleCycleDays"))
+        threshold = float(alias.get("conservativeThreshold"))
+        aggregate = float(
+            alias.get("aggregateIndependentDeltaBicFullMinusEvenOnly"))
+        primary = int(alias.get("primarySector"))
+        minimum = int(alias.get("minimumSupportingIndependentHeldOutSectors"))
+        supporters = [int(value) for value in (
+            alias.get("oddHarmonicSupportingIndependentHeldOutSectors") or [])]
+    except (TypeError, ValueError):
+        return None
+    comparison_support = set()
+    try:
+        for comparison in alias.get("comparisons") or []:
+            if (
+                isinstance(comparison, dict)
+                and comparison.get("role") == "INDEPENDENT"
+                and comparison.get("oddHarmonicStructureSupported") is True
+            ):
+                comparison_support.add(int(comparison.get("sector")))
+    except (TypeError, ValueError):
+        return None
+    exact_boundary = (
+        result.get("evidenceLineage")
+        in {
+            "UNRESOLVED_FAMILY_TIME_FREQUENCY_RECOMMENDATION",
+            "UNRESOLVED_FAMILY_NESTED_ODD_HARMONIC_REASSESSMENT",
+        }
+        and result.get("classification")
+        == "DOUBLE_CYCLE_ODD_HARMONICS_PREDICTIVELY_SUPPORTED"
+        and result.get("physicalCycleResolved") is True
+        and result.get("physicalMechanismResolved") is False
+        and result.get("referencePeriodRole")
+        == "PREDICTIVELY_RESOLVED_PHOTOMETRIC_CYCLE"
+        and result.get("recommendedNextTest")
+        == "BINARY_ROTATION_EXTERNAL_EVIDENCE"
+        and alias.get("method")
+        == "NESTED_EVEN_ONLY_VS_EVEN_PLUS_ODD_LEAVE_ONE_SECTOR_OUT_PREDICTION"
+        and alias.get("criterion") == "BIC"
+        and alias.get("physicalCycleResolved") is True
+        and alias.get("selectedPeriodRelation") == "DOUBLE_CYCLE"
+        and alias.get("equalHalfEvenHarmonicOrders") == [2, 4, 6, 8]
+        and alias.get("discriminatingOddHarmonicOrders") == [1, 3, 5, 7]
+        and alias.get("fullDoubleCycleHarmonicOrders") == list(range(1, 9))
+        and alias.get("maximumAbsoluteFrequencyMatched") is True
+        and all(math.isfinite(value) and value > 0 for value in (
+            raw_period, resolved_period, reference_period, selected_period,
+            possible_double, threshold, aggregate,
+        ))
+        and math.isclose(
+            resolved_period, 2.0 * raw_period, rel_tol=1e-9, abs_tol=1e-12)
+        and all(math.isclose(
+            value, resolved_period, rel_tol=1e-9, abs_tol=1e-12)
+            for value in (reference_period, selected_period, possible_double))
+        and math.isclose(threshold, 10.0, rel_tol=0.0, abs_tol=1e-12)
+        and aggregate >= threshold
+        and minimum == 3
+        and len(supporters) >= minimum
+        and len(set(supporters)) == len(supporters)
+        and primary not in supporters
+        and set(supporters).issubset(comparison_support)
+        and latest.status == "COMPLETE"
+        and latest.handler_id == "openstar.tess.finalize"
+        and latest.stop is True
+        and latest.triggered_by_stage_id == dynamic.id
+        and not any(
+            stage.handler_id == "openstar.tess.physical.interpret"
+            for stage in investigation.stages
+        )
+    )
+    if not exact_boundary:
+        return None
+    dynamic_index = investigation.stages.index(dynamic)
+    if tuple(investigation.stages[dynamic_index + 1:]) != (latest,):
+        return None
+    prefixes = [
+        int(stage.id.partition("-")[0])
+        for stage in investigation.stages
+        if stage.id.partition("-")[0].isdigit()
+    ]
+    request = StageRequest(
+        id=f"{max(prefixes, default=0) + 1:03d}-physical-interpretation",
+        handler_id="openstar.tess.physical.interpret",
+        parameters={
+            "evidenceLineage": "NESTED_ODD_HARMONIC_RESOLVED_CYCLE",
+        },
+        triggered_by_stage_id=dynamic.id,
+    )
+    return store.set_control_state(
+        investigation,
+        status="RUNNING",
+        control_state={
+            "branchAssessments": [],
+            "selectedExperiment": asdict(request),
+            "schedulerAction": "RUN_EXPERIMENT",
+            "recovery": "TESS_NESTED_CYCLE_PHYSICAL_INTERPRETATION",
+        },
+    )
+
+
 def _repair_unresolved_dynamic_localization_review_failure(
     store: InvestigationStore, investigation: Investigation, control: dict
 ) -> Investigation | None:
@@ -2084,6 +2205,12 @@ def repair_obsolete_terminal_wait(
     )
     if period_repair is not None:
         return period_repair
+
+    nested_cycle_continuation = \
+        _continue_finalized_nested_cycle_physical_interpretation(
+            store, investigation, control)
+    if nested_cycle_continuation is not None:
+        return nested_cycle_continuation
 
     nested_alias_repair = _repair_unmatched_alias_model_terminal(
         store, investigation, control)

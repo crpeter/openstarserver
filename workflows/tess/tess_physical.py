@@ -6,6 +6,12 @@ import statistics
 from pathlib import Path
 from typing import Any
 
+from .tess_resolved_cycle import (
+    MORPHOLOGY_SOURCE,
+    authoritative_resolved_cycle,
+    validated_cycle_period,
+)
+
 from .tess_hypotheses import rotational_sanity
 
 
@@ -443,10 +449,16 @@ def analyze_physical_interpretation(
     identity: dict[str, Any],
     morphology: dict[str, Any],
     broad_interpretation: dict[str, Any] | None,
+    resolved_cycle: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    physical_period = _float(morphology.get("resolvedPhysicalPeriodDays"))
-    if not morphology.get("physicalCycleResolved") or physical_period is None or physical_period <= 0:
-        raise ValueError("v20.5 physical interpretation requires a morphology-resolved physical period.")
+    cycle = resolved_cycle or authoritative_resolved_cycle(
+        morphology=morphology,
+    )
+    physical_period = validated_cycle_period(cycle)
+    if physical_period is None:
+        raise ValueError(
+            "physical interpretation requires an authoritative resolved-cycle contract."
+        )
 
     descriptors = [_dataset_descriptor(primary_dataset_path, role="primary")]
     for item in independent_spec.get("preparedSectors") or []:
@@ -540,9 +552,14 @@ def analyze_physical_interpretation(
         next_test = "MULTI_MODE_FREQUENCY_DECOMPOSITION"
 
     return {
-        "version": "openstar.tess-physical-interpretation.v1",
+        "version": (
+            "openstar.tess-physical-interpretation.v1"
+            if cycle.get("sourceKind") == MORPHOLOGY_SOURCE
+            else "openstar.tess-physical-interpretation.v2"
+        ),
         "physicalPeriodDays": physical_period,
         "photometricFirstHarmonicPeriodDays": physical_period / 2.0,
+        "physicalCycleEvidence": cycle,
         "physicalMechanismResolved": False,
         "preferredPhotometricHypothesis": preferred_photometric_hypothesis,
         "preferredHypothesisScoreMargin": margin,
@@ -562,6 +579,6 @@ def analyze_physical_interpretation(
         "sectorResults": sector_results,
         "recommendedNextTest": next_test,
         "interpretationGuard": (
-            "v20.5 ranks photometric mechanism hypotheses but does not convert morphology alone into a physical binary, rotation, or pulsation classification."
+            "The authoritative photometric cycle is resolved, but this stage only ranks mechanism hypotheses and does not convert photometry alone into a physical binary, rotation, or pulsation classification."
         ),
     }
