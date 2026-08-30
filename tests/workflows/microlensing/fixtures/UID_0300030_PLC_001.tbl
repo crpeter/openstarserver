@@ -1,0 +1,7 @@
+\catalog = 'mini-primary'
+| time | value |
+| double | double |
+| day | arbitrary |
+| null | null |
+1.0 2.0
+2.0 3.0

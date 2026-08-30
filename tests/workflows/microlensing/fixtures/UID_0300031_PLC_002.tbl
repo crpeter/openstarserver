@@ -1,0 +1,6 @@
+\catalog = 'mini-secondary'
+| epoch | flux | uncertainty |
+| double | double | double |
+| day | arbitrary | arbitrary |
+| null | null | null |
+1.0 10.0 0.1
