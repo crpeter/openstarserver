@@ -1,3 +1,4 @@
+import copy
 import json
 import shutil
 import tempfile
@@ -2233,6 +2234,171 @@ class TessPhysicalSourceLocalizationCompatibilityTests(unittest.TestCase):
                     investigation,
                     repair_obsolete_terminal_wait(store, investigation),
                 )
+
+
+class TessSourceLocalizationMultimodeCompatibilityTests(unittest.TestCase):
+    def _completed(self, root, *, mutate=None):
+        store = InvestigationStore(root)
+        investigation = store.create(
+            "tic-38707949-v20-6", WORKFLOW_ID, "20.6",
+            metadata={"controlState": {
+                "schedulerAction": "INVESTIGATION_COMPLETE",
+            }},
+        )
+        cycle = authoritative_resolved_cycle(
+            morphology=None, dynamic_harmonic=nested_result())
+        physical = {
+            "version": "openstar.tess-physical-interpretation.v2",
+            "physicalPeriodDays": 13.0,
+            "photometricFirstHarmonicPeriodDays": 6.5,
+            "physicalCycleEvidence": copy.deepcopy(cycle),
+            "physicalMechanismResolved": False,
+            "contaminationScreen": {"flaggedByExistingMetadata": True},
+            "recommendedNextTest": "PIXEL_LEVEL_SOURCE_LOCALIZATION",
+        }
+        sector_results = [{
+            "sector": sector,
+            "role": "primary" if sector == 1 else "independent",
+            "available": True,
+            "classification": "TARGET_CONSISTENT",
+        } for sector in (1, 2, 4, 97, 98)]
+        localization = {
+            "version": "openstar.tess-pixel-localization.v1",
+            "physicalPeriodDays": 13.0,
+            "photometricFirstHarmonicPeriodDays": 6.5,
+            "physicalCycleEvidence": copy.deepcopy(cycle),
+            "sectorResults": sector_results,
+            "crossSector": {
+                "classification": "TARGET_SOURCE_SUPPORTED",
+                "variableSignalOrigin": "TARGET_CONSISTENT",
+                "independentEligibleSectorCount": 4,
+                "requiredIndependentSupportCount": 3,
+                "targetSupportingSectors": [2, 4, 97, 98],
+                "offTargetSectors": [],
+                "ambiguousSectors": [],
+                "recommendedNextTest":
+                "MULTI_MODE_FREQUENCY_DECOMPOSITION",
+            },
+            "contaminationInterpretation": {
+                "existingCatalogContaminationCanBeCleared": False,
+            },
+            "recommendedNextTest": "MULTI_MODE_FREQUENCY_DECOMPOSITION",
+        }
+        if mutate is not None:
+            mutate(localization)
+        stages = (
+            InvestigationStage(
+                "019-physical-interpretation",
+                "openstar.tess.physical.interpret", "COMPLETE",
+                "017-nested-cycle-alias-reassessment", {
+                    "evidenceLineage":
+                    "NESTED_ODD_HARMONIC_RESOLVED_CYCLE",
+                }, result=physical),
+            InvestigationStage(
+                "020-finalize", "openstar.tess.finalize", "COMPLETE",
+                "019-physical-interpretation",
+                {"outputSuffix": "v20.5.1-dynamic-cycle"},
+                result={"claim": "INDEPENDENT_PERIOD_ESTIMATE"}, stop=True),
+            InvestigationStage(
+                "021-source-localization",
+                "openstar.tess.source-localization.analyze", "COMPLETE",
+                "019-physical-interpretation", {
+                    "evidenceLineage":
+                    "PHYSICAL_INTERPRETATION_PIXEL_LOCALIZATION",
+                }, result=localization),
+            InvestigationStage(
+                "022-finalize", "openstar.tess.finalize", "COMPLETE",
+                "021-source-localization", {"outputSuffix": "v20.6"},
+                result={"claim": "INDEPENDENT_PERIOD_ESTIMATE"}, stop=True),
+        )
+        investigation = replace(
+            investigation, status="COMPLETE", stages=stages)
+        store.save(investigation)
+        return store, investigation
+
+    def test_reopens_exact_target_source_boundary_append_only(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store, investigation = self._completed(temporary)
+            immutable_stages = tuple(
+                json.dumps(asdict(stage), sort_keys=True)
+                for stage in investigation.stages
+            )
+
+            repaired = repair_obsolete_terminal_wait(store, investigation)
+
+            self.assertEqual("RUNNING", repaired.status)
+            self.assertEqual(immutable_stages, tuple(
+                json.dumps(asdict(stage), sort_keys=True)
+                for stage in repaired.stages
+            ))
+            control = repaired.metadata["controlState"]
+            self.assertEqual(
+                "TESS_V20_6_MULTI_MODE_FREQUENCY_DECOMPOSITION",
+                control["recovery"],
+            )
+            self.assertEqual({
+                "id": "023-prepare-multimode-iteration-1",
+                "handler_id": "openstar.tess.multimode.prepare",
+                "parameters": {"iteration": 1},
+                "triggered_by_stage_id": "021-source-localization",
+            }, control["selectedExperiment"])
+            self.assertEqual(
+                repaired, repair_obsolete_terminal_wait(store, repaired))
+
+    def test_repair_rejects_changed_localization_evidence(self):
+        for mutate in (
+            lambda result: result.update(version="other"),
+            lambda result: result.update(physicalPeriodDays=12.0),
+            lambda result: result.update(recommendedNextTest="OTHER"),
+            lambda result: result["physicalCycleEvidence"].update(
+                conservativeThreshold=9.0),
+            lambda result: result["crossSector"].update(
+                classification="SOURCE_LOCALIZATION_UNRESOLVED"),
+            lambda result: result["crossSector"].update(
+                variableSignalOrigin="OFF_TARGET"),
+            lambda result: result["crossSector"].update(
+                recommendedNextTest="SOURCE_LOCALIZATION_REVIEW"),
+            lambda result: result["crossSector"].update(
+                targetSupportingSectors=[2, 4, 97]),
+            lambda result: result["contaminationInterpretation"].update(
+                existingCatalogContaminationCanBeCleared=True),
+        ):
+            with self.subTest(mutate=mutate), \
+                    tempfile.TemporaryDirectory() as temporary:
+                store, investigation = self._completed(
+                    temporary, mutate=mutate)
+                self.assertEqual(
+                    investigation,
+                    repair_obsolete_terminal_wait(store, investigation),
+                )
+
+    def test_repair_rejects_changed_lineage_or_later_science(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store, investigation = self._completed(temporary)
+            localization = investigation.stages[-2]
+            changed = replace(
+                investigation,
+                stages=investigation.stages[:-2] + (
+                    replace(localization, parameters={
+                        "evidenceLineage": "OTHER",
+                    }),
+                    investigation.stages[-1],
+                ),
+            )
+            store.save(changed)
+            self.assertEqual(
+                changed, repair_obsolete_terminal_wait(store, changed))
+
+        with tempfile.TemporaryDirectory() as temporary:
+            store, investigation = self._completed(temporary)
+            later = InvestigationStage(
+                "023-unrelated", "openstar.tess.unrelated.analyze", "COMPLETE",
+                "022-finalize", {}, result={}, stop=True)
+            changed = replace(
+                investigation, stages=investigation.stages + (later,))
+            store.save(changed)
+            self.assertEqual(
+                changed, repair_obsolete_terminal_wait(store, changed))
 
 
 if __name__ == "__main__":

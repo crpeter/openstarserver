@@ -569,6 +569,84 @@ def _all_results_for_handler(
     ]
 
 
+def _validated_multimode_cycle(
+    investigation: Investigation,
+) -> tuple[float, dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Return the exact physical cycle carried through target localization."""
+    physical = _latest_result_for_handler(
+        investigation,
+        "openstar.tess.physical.interpret",
+    )
+    localization = _latest_result_for_handler(
+        investigation,
+        "openstar.tess.source-localization.analyze",
+    )
+    if physical is None or localization is None:
+        raise RuntimeError(
+            "v20.7 requires completed physical interpretation and source localization."
+        )
+
+    cycle = localization.get("physicalCycleEvidence")
+    period = validated_cycle_period(cycle)
+    cross = localization.get("crossSector") or {}
+    try:
+        physical_period = float(physical.get("physicalPeriodDays"))
+        physical_harmonic = float(
+            physical.get("photometricFirstHarmonicPeriodDays")
+        )
+        localized_period = float(localization.get("physicalPeriodDays"))
+        localized_harmonic = float(
+            localization.get("photometricFirstHarmonicPeriodDays")
+        )
+    except (TypeError, ValueError):
+        raise RuntimeError(
+            "v20.7 requires finite, consistent physical-cycle periods."
+        ) from None
+
+    exact_cycle = (
+        period is not None
+        and physical.get("physicalCycleEvidence") == cycle
+        and physical.get("physicalMechanismResolved") is False
+        and localization.get("version")
+        == "openstar.tess-pixel-localization.v1"
+        and cross.get("classification") == "TARGET_SOURCE_SUPPORTED"
+        and cross.get("variableSignalOrigin") == "TARGET_CONSISTENT"
+        and cross.get("recommendedNextTest")
+        == "MULTI_MODE_FREQUENCY_DECOMPOSITION"
+        and localization.get("recommendedNextTest")
+        == "MULTI_MODE_FREQUENCY_DECOMPOSITION"
+        and all(
+            math.isfinite(value)
+            for value in (
+                physical_period,
+                physical_harmonic,
+                localized_period,
+                localized_harmonic,
+            )
+        )
+        and math.isclose(
+            physical_period, period, rel_tol=1e-9, abs_tol=1e-12
+        )
+        and math.isclose(
+            localized_period, period, rel_tol=1e-9, abs_tol=1e-12
+        )
+        and math.isclose(
+            physical_harmonic, period / 2.0,
+            rel_tol=1e-9, abs_tol=1e-12,
+        )
+        and math.isclose(
+            localized_harmonic, period / 2.0,
+            rel_tol=1e-9, abs_tol=1e-12,
+        )
+    )
+    if not exact_cycle:
+        raise RuntimeError(
+            "v20.7 requires the exact authoritative physical-cycle evidence "
+            "carried through TARGET_SOURCE_SUPPORTED localization."
+        )
+    return period, cycle, physical, localization
+
+
 def _artifact(path: Path, media_type: str) -> ArtifactReference:
     return ArtifactReference(
         path=str(path.resolve()),
@@ -4459,23 +4537,16 @@ def build_engine(
             investigation,
             "openstar.tess.morphology.analyze",
         )
-        localization = _latest_result_for_handler(
-            investigation,
-            "openstar.tess.source-localization.analyze",
-        )
         if independent_prepare is None:
             raise RuntimeError("v20.7 requires the frozen independent-sector preparation.")
-        if morphology is None or not morphology.get("physicalCycleResolved"):
-            raise RuntimeError("v20.7 requires a morphology-resolved physical period.")
-        if localization is None or (localization.get("crossSector") or {}).get("classification") != "TARGET_SOURCE_SUPPORTED":
-            raise RuntimeError("v20.7 requires TARGET_SOURCE_SUPPORTED source localization.")
+        physical_period, resolved_cycle, physical, localization = \
+            _validated_multimode_cycle(investigation)
 
         iteration = int(request.parameters.get("iteration") or 1)
         prior_iterations = _all_results_for_handler(
             investigation,
             "openstar.tess.multimode.interpret",
         )
-        physical_period = float(morphology["resolvedPhysicalPeriodDays"])
         artifact_root = store.directory_for(investigation.id) / "artifacts"
 
         print(f"🧹 Preparing residual multi-mode search iteration {iteration}/{MAX_RESIDUAL_ITERATIONS}")
@@ -4525,7 +4596,10 @@ def build_engine(
                 triggered_by_stage_id=request.id,
             ),
             input_hashes={
-                "morphology": sha256_json(morphology),
+                **({"morphology": sha256_json(morphology)}
+                   if morphology is not None else {}),
+                "resolvedCycle": sha256_json(resolved_cycle),
+                "physicalInterpretation": sha256_json(physical),
                 "sourceLocalization": sha256_json(localization),
                 "independentPreparation": sha256_json(independent_prepare),
             },
@@ -4624,15 +4698,15 @@ def build_engine(
             investigation,
             "openstar.tess.morphology.analyze",
         )
-        if morphology is None or not morphology.get("physicalCycleResolved"):
-            raise RuntimeError("Multi-mode summary requires a resolved physical period.")
+        physical_period, resolved_cycle, physical, localization = \
+            _validated_multimode_cycle(investigation)
         iterations = _all_results_for_handler(
             investigation,
             "openstar.tess.multimode.interpret",
         )
         summary = summarize_multimode_decomposition(
             iteration_results=iterations,
-            physical_period_days=float(morphology["resolvedPhysicalPeriodDays"]),
+            physical_period_days=physical_period,
         )
         print("🎛️ Multi-mode frequency decomposition")
         print(f"   iterations completed: {summary.get('iterationsCompleted')}")
@@ -4664,7 +4738,11 @@ def build_engine(
                 triggered_by_stage_id=request.id,
             ),
             input_hashes={
-                "morphology": sha256_json(morphology),
+                **({"morphology": sha256_json(morphology)}
+                   if morphology is not None else {}),
+                "resolvedCycle": sha256_json(resolved_cycle),
+                "physicalInterpretation": sha256_json(physical),
+                "sourceLocalization": sha256_json(localization),
                 "iterationResults": sha256_json(iterations),
             },
             artifacts=(_artifact(artifact_path, "application/json"),),
