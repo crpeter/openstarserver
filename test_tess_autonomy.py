@@ -21,6 +21,7 @@ from workflows.tess.tess_autonomy import (
     repair_obsolete_terminal_wait,
 )
 from workflows.tess.tess_autonomy import WORKFLOW_ID, WORKFLOW_VERSION
+from test_tess_resolved_cycle import nested_result
 
 
 class TessAutonomyIntegrationTests(unittest.TestCase):
@@ -2056,6 +2057,87 @@ class TessNestedAliasCompatibilityTests(unittest.TestCase):
                 investigation,
                 repair_obsolete_terminal_wait(store, investigation),
             )
+
+
+class TessNestedCyclePhysicalInterpretationCompatibilityTests(unittest.TestCase):
+    def _completed(self, root, *, mutate=None):
+        store = InvestigationStore(root)
+        investigation = store.create(
+            "tic-38707949", WORKFLOW_ID, "20.10.1",
+            metadata={"controlState": {
+                "schedulerAction": "INVESTIGATION_COMPLETE",
+            }},
+        )
+        result = nested_result()
+        if mutate is not None:
+            mutate(result)
+        stages = (
+            InvestigationStage(
+                "017-nested-cycle-alias-reassessment",
+                "openstar.tess.dynamic-harmonic.analyze", "COMPLETE",
+                "015-dynamic-harmonic-modeling", {
+                    "evidenceLineage":
+                    "UNRESOLVED_FAMILY_NESTED_ODD_HARMONIC_REASSESSMENT",
+                }, result=result),
+            InvestigationStage(
+                "018-finalize", "openstar.tess.finalize", "COMPLETE",
+                "017-nested-cycle-alias-reassessment",
+                {"outputSuffix": "v20.10.1-nested-cycle-alias"},
+                result={"claim": "INDEPENDENT_PERIOD_ESTIMATE"}, stop=True),
+        )
+        investigation = replace(
+            investigation, status="COMPLETE", stages=stages)
+        store.save(investigation)
+        return store, investigation
+
+    def test_reopens_exact_resolved_nested_cycle_append_only(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store, investigation = self._completed(temporary)
+            immutable_stages = tuple(
+                json.dumps(asdict(stage), sort_keys=True)
+                for stage in investigation.stages
+            )
+
+            repaired = repair_obsolete_terminal_wait(store, investigation)
+
+            self.assertEqual("RUNNING", repaired.status)
+            self.assertEqual(immutable_stages, tuple(
+                json.dumps(asdict(stage), sort_keys=True)
+                for stage in repaired.stages
+            ))
+            control = repaired.metadata["controlState"]
+            self.assertEqual(
+                "TESS_NESTED_CYCLE_PHYSICAL_INTERPRETATION",
+                control["recovery"],
+            )
+            self.assertEqual({
+                "id": "019-physical-interpretation",
+                "handler_id": "openstar.tess.physical.interpret",
+                "parameters": {
+                    "evidenceLineage": "NESTED_ODD_HARMONIC_RESOLVED_CYCLE",
+                },
+                "triggered_by_stage_id":
+                "017-nested-cycle-alias-reassessment",
+            }, control["selectedExperiment"])
+            self.assertEqual(
+                repaired, repair_obsolete_terminal_wait(store, repaired))
+
+    def test_repair_rejects_weakened_nested_cycle_gate(self):
+        for mutate in (
+            lambda result: result["periodAliasResolution"].update(
+                conservativeThreshold=9.0),
+            lambda result: result["periodAliasResolution"].update(
+                oddHarmonicSupportingIndependentHeldOutSectors=[2, 4]),
+            lambda result: result.update(physicalCycleResolved=False),
+        ):
+            with self.subTest(mutate=mutate), \
+                    tempfile.TemporaryDirectory() as temporary:
+                store, investigation = self._completed(
+                    temporary, mutate=mutate)
+                self.assertEqual(
+                    investigation,
+                    repair_obsolete_terminal_wait(store, investigation),
+                )
 
 
 if __name__ == "__main__":

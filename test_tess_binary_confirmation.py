@@ -12,7 +12,9 @@ from workflows.tess.tess_binary_confirmation import (
     physical_interpretation_continuation,
 )
 from workflows.tess.tess_target_residual_astrophysical_interpretation import newest_authoritative_recommendation
+from workflows.tess.tess_resolved_cycle import authoritative_resolved_cycle
 from openstar_investigation import InvestigationStage
+from test_tess_resolved_cycle import nested_result
 
 
 PERIOD = 2.0
@@ -230,6 +232,36 @@ class BinaryConfirmationTests(unittest.TestCase):
                            ("preferredPhotometricHypothesis", "ROTATION_LIKE")):
             changed = dict(self.physical); changed[key] = value
             self.assertFalse(physical_interpretation_continuation(changed, self.morphology))
+
+    def test_nested_resolved_cycle_can_continue_without_morphology_promotion(self):
+        cycle = authoritative_resolved_cycle(
+            morphology=None, dynamic_harmonic=nested_result(raw_period=1.0))
+        self.assertTrue(physical_interpretation_continuation(
+            self.physical, cycle))
+        primary = self.root / "nested-primary.json"
+        primary.write_text(
+            json.dumps(dataset(1, 1000.0)), encoding="utf-8")
+        sectors = []
+        for sector in range(2, 6):
+            path = self.root / f"nested-{sector}.json"
+            path.write_text(
+                json.dumps(dataset(
+                    sector, 1000.0 + (sector - 1) * 30.0)),
+                encoding="utf-8",
+            )
+            sectors.append({"sector": sector, "datasetPath": str(path)})
+        result = analyze_binary_confirmation(
+            primary_dataset_path=primary,
+            independent_spec={"preparedSectors": sectors},
+            morphology={
+                "physicalCycleResolved": False,
+                "resolvedPhysicalPeriodDays": None,
+            },
+            physical_interpretation=self.physical,
+            resolved_cycle=cycle,
+        )
+        self.assertEqual(PERIOD, result["physicalPeriodInputDays"])
+        self.assertEqual(cycle, result["physicalCycleEvidence"])
 
     def test_resolved_double_wave_enters_blind_event_screen_without_physical_label(self):
         independent = {

@@ -57,6 +57,8 @@ from workflows.tess.tess_prf_refinement import (
     run_prf_deblending,
 )
 from workflows.tess.tess_spoc_prf import _render_prf_template
+from workflows.tess.tess_resolved_cycle import authoritative_resolved_cycle
+from test_tess_resolved_cycle import nested_result
 
 # The dependency stub exists only to make the optional-handler import graph
 # loadable.  Leaving it in sys.modules makes later test modules mistake the
@@ -496,6 +498,8 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
                 morphology=morphology,
                 physical_interpretation=None,
                 entry_mode="MORPHOLOGY_RESOLVED_PERIODIC_EVENT_SCREEN",
+                resolved_cycle=authoritative_resolved_cycle(
+                    morphology=morphology),
             )
             hashes = completed.stages[-1].provenance.input_hashes
             self.assertNotIn("physicalInterpretation", hashes)
@@ -906,6 +910,99 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
                          resolved.handler_id)
         self.assertEqual("RESOLVED_DYNAMIC_HARMONIC_RESIDUAL",
                          resolved.parameters["entryReason"])
+
+    def test_predictively_resolved_nested_cycle_routes_to_physical_interpretation(self):
+        request = dynamic_harmonic_continuation(
+            nested_result(), request_id="017-nested-cycle-alias-reassessment")
+        self.assertEqual("openstar.tess.physical.interpret", request.handler_id)
+        self.assertEqual(
+            {"evidenceLineage": "NESTED_ODD_HARMONIC_RESOLVED_CYCLE"},
+            request.parameters,
+        )
+
+        tampered = nested_result()
+        tampered["periodAliasResolution"]["conservativeThreshold"] = 9.0
+        request = dynamic_harmonic_continuation(
+            tampered, request_id="017-nested-cycle-alias-reassessment")
+        self.assertEqual("openstar.tess.finalize", request.handler_id)
+
+    def test_physical_handler_consumes_nested_cycle_without_rewriting_morphology(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        store = InvestigationStore(root / "investigations")
+        investigation = store.create("nested-physical", WORKFLOW_ID, WORKFLOW_VERSION)
+        paths = [
+            self._write_light_curve(root, f"nested-{sector}", sector, 0.0)
+            for sector in (1, 2, 4, 98)
+        ]
+        morphology = {
+            "physicalCycleResolved": False,
+            "resolvedPhysicalPeriodDays": None,
+            "morphologyClass": "UNRESOLVED_DOUBLE_WAVE_ALIAS",
+        }
+        dynamic = nested_result()
+        for stage_id, handler, result in (
+            ("001-prepare-target", "openstar.tess.prepare-target", {
+                "datasetPath": str(paths[0]),
+            }),
+            ("003-catalog-identity", "openstar.tess.catalog-identity", {}),
+            ("006-prepare-independent", "openstar.tess.independent.prepare", {
+                "preparedSectors": [
+                    {"sector": sector, "datasetPath": str(path)}
+                    for sector, path in zip((2, 4, 98), paths[1:])
+                ],
+            }),
+            ("010-morphology", "openstar.tess.morphology.analyze", morphology),
+            ("017-nested-cycle-alias-reassessment",
+             "openstar.tess.dynamic-harmonic.analyze", dynamic),
+        ):
+            investigation = self._complete(
+                store, investigation, stage_id, handler, result)
+
+        interpretation = {
+            "physicalMechanismResolved": False,
+            "preferredPhotometricHypothesis": None,
+            "recommendedNextTest": "MULTI_MODE_FREQUENCY_DECOMPOSITION",
+            "crossSectorFourierSummary": {},
+            "rotationConstraint": {},
+            "contaminationScreen": {},
+            "mechanismRankings": [],
+        }
+        engine = build_engine(
+            store, coordinator=types.SimpleNamespace(),
+            poll_interval=0.0, timeout=None)
+        engine.chain_stages = False
+        with mock.patch(
+            "workflows.tess.tess_investigation.analyze_physical_interpretation",
+            return_value=interpretation,
+        ) as analyze:
+            completed, next_request = engine.run_stage(
+                investigation,
+                StageRequest(
+                    "018-physical-interpretation",
+                    "openstar.tess.physical.interpret",
+                    {"evidenceLineage":
+                     "NESTED_ODD_HARMONIC_RESOLVED_CYCLE"},
+                    "017-nested-cycle-alias-reassessment",
+                ),
+                software_id="integration",
+                software_version="20.31",
+            )
+
+        resolved_cycle = analyze.call_args.kwargs["resolved_cycle"]
+        self.assertEqual(13.0, resolved_cycle["periodDays"])
+        self.assertEqual(
+            "NESTED_ODD_HARMONIC_PREDICTIVE_RESOLUTION",
+            resolved_cycle["sourceKind"],
+        )
+        self.assertFalse(morphology["physicalCycleResolved"])
+        stage = completed.stages[-1]
+        self.assertIn("dynamicHarmonic", stage.provenance.input_hashes)
+        self.assertIn("resolvedCycle", stage.provenance.input_hashes)
+        self.assertTrue(stage.artifacts[0].path.endswith(
+            "physical-interpretation-v20.5.1-dynamic-cycle.json"))
+        self.assertEqual("openstar.tess.finalize", next_request.handler_id)
 
     def _complete(self, store, investigation, stage_id, handler_id, result):
         running = InvestigationStage(stage_id, handler_id, "RUNNING", None, {})
