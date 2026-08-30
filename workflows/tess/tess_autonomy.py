@@ -20,6 +20,10 @@ from openstar_path_relocation import (
 from openstar_targets import InvestigationTarget
 from openstar_workflow import StageRequest, WorkflowEngine
 from .tess_localization_evidence import frozen_residual_localization_family
+from .tess_mode_identification import (
+    MULTIMODE_MODE_EVIDENCE_LINEAGE,
+    validated_multimode_mode_evidence,
+)
 from .tess_source_pair_lineage import frozen_source_pair_evidence
 
 # Kept identical to the public identifiers in tess_investigation.  Importing that
@@ -1857,6 +1861,264 @@ def _continue_finalized_source_localization_multimode(
     )
 
 
+def _continue_finalized_multimode_mode_identification(
+    store: InvestigationStore, investigation: Investigation, control: dict
+) -> Investigation | None:
+    """Append v20.9 after the exact finalized recurrent-mode v20.7 edge."""
+    if (
+        investigation.status != "COMPLETE"
+        or control.get("schedulerAction") != "INVESTIGATION_COMPLETE"
+        or not investigation.stages
+    ):
+        return None
+    summary = _latest_complete(
+        investigation, "openstar.tess.multimode.summarize")
+    localization = _latest_complete(
+        investigation, "openstar.tess.source-localization.analyze")
+    physical = _latest_complete(
+        investigation, "openstar.tess.physical.interpret")
+    if summary is None or localization is None or physical is None:
+        return None
+    localization_result = localization.result or {}
+    physical_result = physical.result or {}
+    cross = localization_result.get("crossSector") or {}
+    cycle = localization_result.get("physicalCycleEvidence") or {}
+    physical_period = _validated_persisted_nested_cycle_period(cycle)
+    try:
+        reported_physical_period = float(
+            physical_result.get("physicalPeriodDays"))
+        reported_physical_harmonic = float(
+            physical_result.get("photometricFirstHarmonicPeriodDays"))
+        localized_period = float(
+            localization_result.get("physicalPeriodDays"))
+        localized_harmonic = float(
+            localization_result.get("photometricFirstHarmonicPeriodDays"))
+        eligible = int(cross.get("independentEligibleSectorCount"))
+        required = int(cross.get("requiredIndependentSupportCount"))
+        target_support = sorted(int(value) for value in (
+            cross.get("targetSupportingSectors") or []))
+        off_target = sorted(int(value) for value in (
+            cross.get("offTargetSectors") or []))
+        ambiguous = sorted(int(value) for value in (
+            cross.get("ambiguousSectors") or []))
+    except (TypeError, ValueError):
+        return None
+    independent = [
+        item for item in localization_result.get("sectorResults") or []
+        if isinstance(item, dict)
+        and item.get("role") == "independent"
+        and item.get("available") is True
+    ]
+    try:
+        independent_sectors = [int(item["sector"]) for item in independent]
+        observed_target = sorted(
+            int(item["sector"]) for item in independent
+            if item.get("classification") == "TARGET_CONSISTENT"
+        )
+        observed_off_target = sorted(
+            int(item["sector"]) for item in independent
+            if item.get("classification") == "OFF_TARGET"
+        )
+        observed_ambiguous = sorted(
+            int(item["sector"]) for item in independent
+            if item.get("classification") == "AMBIGUOUS"
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+    preparations = [
+        stage for stage in investigation.stages
+        if stage.handler_id == "openstar.tess.multimode.prepare"
+        and stage.status == "COMPLETE"
+    ]
+    runs = [
+        stage for stage in investigation.stages
+        if stage.handler_id == "openstar.tess.multimode.run"
+        and stage.status == "COMPLETE"
+    ]
+    interpretations = [
+        stage for stage in investigation.stages
+        if stage.handler_id == "openstar.tess.multimode.interpret"
+        and stage.status == "COMPLETE"
+    ]
+    if physical_period is None:
+        return None
+    mode_evidence = validated_multimode_mode_evidence(
+        summary.result,
+        physical_period_days=physical_period,
+        target_supporting_sectors=target_support,
+        iteration_count=len(interpretations),
+    )
+    if mode_evidence is None:
+        return None
+
+    iteration_count = len(interpretations)
+    if not (
+        iteration_count >= 1
+        and iteration_count <= 3
+        and len(preparations) == iteration_count
+        and len(runs) == iteration_count
+        and physical_result.get("version")
+        == "openstar.tess-physical-interpretation.v2"
+        and localization_result.get("version")
+        == "openstar.tess-pixel-localization.v1"
+        and localization_result.get("physicalCycleEvidence")
+        == physical_result.get("physicalCycleEvidence")
+        and all(math.isfinite(value) and value > 0 for value in (
+            reported_physical_period,
+            reported_physical_harmonic,
+            localized_period,
+            localized_harmonic,
+        ))
+        and math.isclose(
+            reported_physical_period, physical_period,
+            rel_tol=1e-9, abs_tol=1e-12)
+        and math.isclose(
+            reported_physical_harmonic, physical_period / 2.0,
+            rel_tol=1e-9, abs_tol=1e-12)
+        and math.isclose(
+            localized_period, physical_period,
+            rel_tol=1e-9, abs_tol=1e-12)
+        and math.isclose(
+            localized_harmonic, physical_period / 2.0,
+            rel_tol=1e-9, abs_tol=1e-12)
+        and physical_result.get("physicalMechanismResolved") is False
+        and (physical_result.get("contaminationScreen") or {}).get(
+            "flaggedByExistingMetadata") is True
+        and physical_result.get("recommendedNextTest")
+        == "PIXEL_LEVEL_SOURCE_LOCALIZATION"
+        and localization.parameters.get("evidenceLineage")
+        == "PHYSICAL_INTERPRETATION_PIXEL_LOCALIZATION"
+        and localization.triggered_by_stage_id == physical.id
+        and cross.get("classification") == "TARGET_SOURCE_SUPPORTED"
+        and cross.get("variableSignalOrigin") == "TARGET_CONSISTENT"
+        and cross.get("recommendedNextTest")
+        == "MULTI_MODE_FREQUENCY_DECOMPOSITION"
+        and localization_result.get("recommendedNextTest")
+        == "MULTI_MODE_FREQUENCY_DECOMPOSITION"
+        and (localization_result.get("contaminationInterpretation") or {}).get(
+            "existingCatalogContaminationCanBeCleared") is False
+        and eligible == len(independent)
+        and len(set(independent_sectors)) == eligible
+        and eligible >= 3
+        and required == max(3, eligible // 2 + 1)
+        and (
+            len(observed_target)
+            + len(observed_off_target)
+            + len(observed_ambiguous)
+            == eligible
+        )
+        and len(target_support) >= required
+        and len(set(target_support)) == len(target_support)
+        and target_support == observed_target
+        and off_target == observed_off_target
+        and ambiguous == observed_ambiguous
+        and set(mode_evidence["independentSectors"]).issubset(
+            target_support)
+        and summary.status == "COMPLETE"
+        and not summary.stop
+        and not any(
+            stage.handler_id == "openstar.tess.mode-identification.analyze"
+            for stage in investigation.stages
+        )
+    ):
+        return None
+
+    expected_multimode = []
+    previous_interpretation = None
+    for iteration, (preparation, run, interpretation) in enumerate(
+        zip(preparations, runs, interpretations), start=1
+    ):
+        preparation_result = preparation.result or {}
+        interpretation_result = interpretation.result or {}
+        expected_trigger = (
+            localization.id
+            if previous_interpretation is None
+            else previous_interpretation.id
+        )
+        if not (
+            preparation.parameters == {"iteration": iteration}
+            and preparation_result.get("iteration") == iteration
+            and preparation.triggered_by_stage_id == expected_trigger
+            and run.parameters.get("iteration") == iteration
+            and run.triggered_by_stage_id == preparation.id
+            and interpretation.parameters == {"iteration": iteration}
+            and interpretation_result.get("iteration") == iteration
+            and interpretation.triggered_by_stage_id == run.id
+            and (
+                iteration == iteration_count
+                or interpretation_result.get("continueRecommended") is True
+            )
+        ):
+            return None
+        expected_multimode.extend((preparation, run, interpretation))
+        previous_interpretation = interpretation
+    final_interpretation = interpretations[-1]
+    if (
+        iteration_count < 3
+        and (final_interpretation.result or {}).get(
+            "continueRecommended") is not False
+    ):
+        return None
+    if summary.triggered_by_stage_id != final_interpretation.id:
+        return None
+    expected_multimode.append(summary)
+
+    source_finalize = next((
+        stage for stage in investigation.stages
+        if stage.handler_id == "openstar.tess.finalize"
+        and stage.status == "COMPLETE"
+        and stage.stop is True
+        and stage.triggered_by_stage_id == localization.id
+        and stage.parameters.get("outputSuffix") == "v20.6"
+    ), None)
+    latest = investigation.stages[-1]
+    if source_finalize is None or not (
+        latest.status == "COMPLETE"
+        and latest.handler_id == "openstar.tess.finalize"
+        and latest.stop is True
+        and latest.triggered_by_stage_id == summary.id
+        and latest.parameters.get("outputSuffix") == "v20.7"
+    ):
+        return None
+    localization_index = investigation.stages.index(localization)
+    first_prepare_index = investigation.stages.index(preparations[0])
+    summary_index = investigation.stages.index(summary)
+    if not (
+        tuple(investigation.stages[
+            localization_index + 1:first_prepare_index
+        ]) == (source_finalize,)
+        and tuple(investigation.stages[
+            first_prepare_index:summary_index + 1
+        ]) == tuple(expected_multimode)
+        and tuple(investigation.stages[summary_index + 1:]) == (latest,)
+    ):
+        return None
+
+    prefixes = [
+        int(stage.id.partition("-")[0])
+        for stage in investigation.stages
+        if stage.id.partition("-")[0].isdigit()
+    ]
+    request = StageRequest(
+        id=f"{max(prefixes, default=0) + 1:03d}-mode-identification",
+        handler_id="openstar.tess.mode-identification.analyze",
+        parameters={
+            "evidenceLineage": MULTIMODE_MODE_EVIDENCE_LINEAGE,
+        },
+        triggered_by_stage_id=summary.id,
+    )
+    return store.set_control_state(
+        investigation,
+        status="RUNNING",
+        control_state={
+            "branchAssessments": [],
+            "selectedExperiment": asdict(request),
+            "schedulerAction": "RUN_EXPERIMENT",
+            "recovery": "TESS_V20_7_MULTI_MODE_IDENTIFICATION",
+        },
+    )
+
+
 def _repair_unresolved_dynamic_localization_review_failure(
     store: InvestigationStore, investigation: Investigation, control: dict
 ) -> Investigation | None:
@@ -2478,6 +2740,11 @@ def repair_obsolete_terminal_wait(
     )
     if period_repair is not None:
         return period_repair
+
+    mode_continuation = _continue_finalized_multimode_mode_identification(
+        store, investigation, control)
+    if mode_continuation is not None:
+        return mode_continuation
 
     multimode_continuation = _continue_finalized_source_localization_multimode(
         store, investigation, control)
