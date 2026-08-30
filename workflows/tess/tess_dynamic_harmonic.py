@@ -14,6 +14,9 @@ from typing import Any, Iterable
 from .tess_mode_identification import GENERIC_REFINEMENT_WORKLOAD_ID, MIN_BIC_IMPROVEMENT, _solve
 
 
+MIN_ALIAS_SUPPORTING_HELD_OUT_SECTORS = 3
+
+
 def read_frozen_light_curve(path: str | Path, position: int = 0) -> dict[str, Any]:
     """Normalize OpenStar's authoritative frozen ``times``/``flux`` schema.
 
@@ -24,14 +27,26 @@ def read_frozen_light_curve(path: str | Path, position: int = 0) -> dict[str, An
     with resolved.open(encoding="utf-8") as handle:
         raw = json.load(handle)
     source = raw.get("source") or {}
-    offset = source.get("originalTimeOriginDays", source.get("timeOriginDays", 0.0))
+    metadata = raw.get("metadata") or {}
+    offset = source.get("originalTimeOriginDays")
+    if offset is None:
+        offset = source.get("timeOriginDays")
+    if offset is None:
+        offset = metadata.get("originalTimeOriginDays")
+    if offset is None:
+        offset = metadata.get("timeOriginDays", 0.0)
     pairs = [(float(t) + float(offset or 0), float(y)) for t, y in zip(raw.get("times") or [], raw.get("flux") or [])
              if math.isfinite(float(t)) and math.isfinite(float(y))]
     if len(pairs) < 16:
         raise RuntimeError("Frozen dataset has too few finite samples for dynamic harmonic modeling.")
-    sector = source.get("sector", raw.get("sector", position))
+    sector = source.get("sector")
+    if sector is None:
+        sector = raw.get("sector")
+    if sector is None:
+        sector = metadata.get("sector", position)
     return {"path": str(resolved), "sector": int(sector), "times": [p[0] for p in pairs],
             "flux": [p[1] for p in pairs], "source": dict(source),
+            "metadata": dict(metadata),
             "appliedTimeOriginDays": float(offset or 0)}
 
 
@@ -254,6 +269,247 @@ def model_dynamic_harmonics(*, dataset_paths: Iterable[str | Path], reference_pe
             "physicalMechanismResolved": False, "recommendedNextTest": recommended,
             "dataReuse": {"frozenDatasetPaths": [str(Path(p).expanduser().resolve()) for p in paths], "downloadPerformed": False},
             "frequencyRefinement": {"genericDistributedWorkloadIfNeeded": GENERIC_REFINEMENT_WORKLOAD_ID}}
+
+
+def _held_out_sector_prediction(
+    training: list[dict[str, Any]],
+    held_out: dict[str, Any],
+    frequency: float,
+    orders: tuple[int, ...],
+) -> dict[str, Any]:
+    """Predict one sector with phases learned only from the other sectors.
+
+    The held-out fit may choose its own offset and signed amplitude for each
+    harmonic.  Its harmonic phases remain frozen from the training sectors, so
+    evolving amplitude cannot masquerade as predictive phase coherence.
+    """
+    rows: list[list[float]] = []
+    values: list[float] = []
+    for sector_index, item in enumerate(training):
+        for time, value in zip(item["times"], item["flux"]):
+            row = [1.0 if index == sector_index else 0.0
+                   for index in range(len(training))]
+            row.extend(
+                component
+                for order in orders
+                for component in (
+                    math.sin(2 * math.pi * order * frequency * time),
+                    math.cos(2 * math.pi * order * frequency * time),
+                )
+            )
+            rows.append(row)
+            values.append(value)
+    training_fit = _linear_fit(rows, values)
+    coefficient_offset = len(training)
+    phases = [
+        math.atan2(
+            training_fit["coefficients"][coefficient_offset + 2 * index + 1],
+            training_fit["coefficients"][coefficient_offset + 2 * index],
+        )
+        for index in range(len(orders))
+    ]
+
+    held_out_rows = [
+        [1.0] + [
+            math.sin(2 * math.pi * order * frequency * time + phase)
+            for order, phase in zip(orders, phases)
+        ]
+        for time in held_out["times"]
+    ]
+    predictive = _linear_fit(held_out_rows, held_out["flux"])
+    null = _linear_fit([[1.0] for _ in held_out["times"]], held_out["flux"])
+    return {
+        "sector": held_out["sector"],
+        "sampleCount": predictive["sampleCount"],
+        "predictiveRss": predictive["rss"],
+        "predictiveBic": predictive["bic"],
+        "nullRss": null["rss"],
+        "nullBic": null["bic"],
+        "bicImprovementOverNull": null["bic"] - predictive["bic"],
+        "trainingSectorIDs": sorted(item["sector"] for item in training),
+        "heldOutParametersFitted": ["offset", "signed-amplitude-per-harmonic"],
+        "phasesLearnedFromTrainingSectorsOnly": True,
+    }
+
+
+def _leave_one_sector_out_predictions(
+    data: list[dict[str, Any]],
+    period_days: float,
+    orders: tuple[int, ...],
+) -> list[dict[str, Any]]:
+    frequency = 1.0 / period_days
+    return [
+        _held_out_sector_prediction(
+            [item for index, item in enumerate(data) if index != held_out_index],
+            held_out,
+            frequency,
+            orders,
+        )
+        for held_out_index, held_out in enumerate(data)
+    ]
+
+
+def compare_unresolved_family_dynamic_harmonics(
+    *,
+    dataset_paths: Iterable[str | Path],
+    raw_period_days: float,
+    double_cycle_period_days: float,
+    harmonic_orders: Iterable[int] = (1, 2, 3, 4),
+) -> dict[str, Any]:
+    """Compare frozen raw and double-cycle hypotheses without assuming either.
+
+    Resolution requires the existing conservative BIC threshold in aggregate,
+    independently predictive support in at least three held-out sectors, and no
+    held-out sector that strongly supports the opposing hypothesis.  Otherwise
+    the physical cycle remains unresolved.
+    """
+    raw_period = float(raw_period_days)
+    double_period = float(double_cycle_period_days)
+    if not (
+        math.isfinite(raw_period)
+        and math.isfinite(double_period)
+        and raw_period > 0.0
+        and double_period > 0.0
+        and math.isclose(double_period, 2.0 * raw_period, rel_tol=1e-9, abs_tol=1e-12)
+    ):
+        raise ValueError(
+            "Unresolved-family dynamic modeling requires an exact raw/2x cycle pair."
+        )
+    paths = tuple(dataset_paths)
+    orders = tuple(sorted({int(order) for order in harmonic_orders}))
+    if not paths or not orders or orders[0] < 1:
+        raise ValueError("Frozen datasets and positive harmonic orders are required.")
+    data = [_read(path, index) for index, path in enumerate(paths)]
+    sectors = [item["sector"] for item in data]
+    if len(data) < MIN_ALIAS_SUPPORTING_HELD_OUT_SECTORS:
+        raise RuntimeError(
+            "Unresolved-family alias comparison requires at least three frozen sectors."
+        )
+    if len(set(sectors)) != len(sectors):
+        raise RuntimeError(
+            "Unresolved-family alias comparison requires distinct frozen sectors."
+        )
+
+    raw_model = model_dynamic_harmonics(
+        dataset_paths=paths,
+        reference_period_days=raw_period,
+        harmonic_orders=orders,
+    )
+    double_model = model_dynamic_harmonics(
+        dataset_paths=paths,
+        reference_period_days=double_period,
+        harmonic_orders=orders,
+    )
+    raw_predictions = _leave_one_sector_out_predictions(data, raw_period, orders)
+    double_predictions = _leave_one_sector_out_predictions(data, double_period, orders)
+    comparisons = []
+    raw_support: list[int] = []
+    double_support: list[int] = []
+    for raw, double in zip(raw_predictions, double_predictions):
+        if raw["sector"] != double["sector"]:
+            raise RuntimeError("Held-out sector identity changed between hypotheses.")
+        delta = double["predictiveBic"] - raw["predictiveBic"]
+        raw_supported = bool(
+            delta >= MIN_BIC_IMPROVEMENT
+            and raw["bicImprovementOverNull"] >= MIN_BIC_IMPROVEMENT
+        )
+        double_supported = bool(
+            -delta >= MIN_BIC_IMPROVEMENT
+            and double["bicImprovementOverNull"] >= MIN_BIC_IMPROVEMENT
+        )
+        if raw_supported:
+            raw_support.append(raw["sector"])
+        if double_supported:
+            double_support.append(raw["sector"])
+        comparisons.append({
+            "sector": raw["sector"],
+            "rawHypothesis": raw,
+            "doubleCycleHypothesis": double,
+            "deltaBicDoubleMinusRaw": delta,
+            "rawHypothesisSupported": raw_supported,
+            "doubleCycleHypothesisSupported": double_supported,
+        })
+
+    aggregate_delta = sum(
+        item["doubleCycleHypothesis"]["predictiveBic"]
+        - item["rawHypothesis"]["predictiveBic"]
+        for item in comparisons
+    )
+    raw_resolved = bool(
+        aggregate_delta >= MIN_BIC_IMPROVEMENT
+        and len(raw_support) >= MIN_ALIAS_SUPPORTING_HELD_OUT_SECTORS
+        and not double_support
+    )
+    double_resolved = bool(
+        -aggregate_delta >= MIN_BIC_IMPROVEMENT
+        and len(double_support) >= MIN_ALIAS_SUPPORTING_HELD_OUT_SECTORS
+        and not raw_support
+    )
+    if raw_resolved:
+        selected_relation = "RAW_PERIOD"
+        selected_period = raw_period
+        selected_model = raw_model
+        classification = "RAW_FAMILY_PREDICTIVELY_PREFERRED"
+    elif double_resolved:
+        selected_relation = "DOUBLE_CYCLE"
+        selected_period = double_period
+        selected_model = double_model
+        classification = "DOUBLE_CYCLE_PREDICTIVELY_PREFERRED"
+    else:
+        selected_relation = None
+        selected_period = None
+        selected_model = None
+        classification = "UNRESOLVED_FAMILY_DYNAMIC_HARMONIC_ALIAS_AMBIGUOUS"
+
+    alias_resolution = {
+        "method": "LEAVE_ONE_SECTOR_OUT_PHASE_PREDICTION_WITH_SECTOR_AMPLITUDES",
+        "criterion": "BIC",
+        "conservativeThreshold": MIN_BIC_IMPROVEMENT,
+        "minimumSupportingHeldOutSectors": MIN_ALIAS_SUPPORTING_HELD_OUT_SECTORS,
+        "contradictingHeldOutSectorsAllowed": 0,
+        "aggregateDeltaBicDoubleMinusRaw": aggregate_delta,
+        "rawSupportingHeldOutSectors": sorted(raw_support),
+        "doubleCycleSupportingHeldOutSectors": sorted(double_support),
+        "selectedPeriodRelation": selected_relation,
+        "selectedPeriodDays": selected_period,
+        "physicalCycleResolved": selected_model is not None,
+        "comparisons": comparisons,
+    }
+    common = {
+        "classification": classification,
+        "rawFamilyPeriodDays": raw_period,
+        "possibleDoubleCycleDays": double_period,
+        "periodAliasResolution": alias_resolution,
+        "periodHypothesisModels": {
+            "rawFamily": raw_model,
+            "doubleCycle": double_model,
+        },
+        "physicalCycleResolved": selected_model is not None,
+        "resolvedPhysicalPeriodDays": selected_period,
+        "physicalMechanismResolved": False,
+        "dataReuse": {
+            "frozenDatasetPaths": [
+                str(Path(path).expanduser().resolve()) for path in paths
+            ],
+            "downloadPerformed": False,
+        },
+    }
+    if selected_model is None:
+        return {
+            **common,
+            "referenceFamilyPeriodDays": double_period,
+            "referencePeriodRole": "UNRESOLVED_FAMILY_ANALYSIS_REFERENCE",
+            "recommendedNextTest": (
+                "ADDITIONAL_INDEPENDENT_SECTOR_CYCLE_ALIAS_CONFIRMATION"
+            ),
+        }
+    return {
+        **selected_model,
+        **common,
+        "referenceFamilyPeriodDays": selected_period,
+        "referencePeriodRole": "PREDICTIVELY_RESOLVED_PHOTOMETRIC_CYCLE",
+        "recommendedNextTest": selected_model.get("recommendedNextTest"),
+    }
 
 
 def refine_harmonic_family_frequency(dynamic_result: dict[str, Any]) -> dict[str, Any]:

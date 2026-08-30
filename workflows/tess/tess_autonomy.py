@@ -1305,6 +1305,94 @@ def _repair_dynamic_harmonic_terminal(
     )
 
 
+def _repair_unresolved_family_dynamic_harmonic_terminal(
+    store: InvestigationStore, investigation: Investigation, control: dict
+) -> Investigation | None:
+    """Append the new unresolved-family alias test at its exact old boundary."""
+    if (investigation.status != "COMPLETE"
+            or control.get("schedulerAction") != "INVESTIGATION_COMPLETE"
+            or not investigation.stages):
+        return None
+    summary = _latest_complete(
+        investigation, "openstar.tess.time-frequency.summarize")
+    morphology = _latest_complete(
+        investigation, "openstar.tess.morphology.analyze")
+    result = (summary.result or {}) if summary is not None else {}
+    morphology_result = (morphology.result or {}) if morphology is not None else {}
+    period_reference = result.get("periodReference") or {}
+    continuation = morphology_result.get("continuationEvidence") or {}
+    try:
+        raw_period = float(morphology_result.get("rawPeriodDays"))
+        double_period = float(morphology_result.get("possibleDoubleCycleDays"))
+        analysis_period = float(continuation.get("analysisReferencePeriodDays"))
+        summary_period = float(period_reference.get("periodDays"))
+    except (TypeError, ValueError):
+        return None
+    latest = investigation.stages[-1]
+    exact_boundary = (
+        summary is not None
+        and morphology is not None
+        and result.get("recommendedNextTest") == "DYNAMIC_HARMONIC_MODELING"
+        and result.get("physicalMechanismResolved") is False
+        and period_reference.get("kind")
+        == "UNRESOLVED_FAMILY_ANALYSIS_REFERENCE"
+        and period_reference.get("physicalCycleResolved") is False
+        and morphology_result.get("physicalCycleResolved") is False
+        and morphology_result.get("resolvedPhysicalPeriodDays") is None
+        and continuation.get("timeFrequencyEvolutionWarranted") is True
+        and continuation.get("periodReferenceKind")
+        == "UNRESOLVED_FAMILY_ANALYSIS_REFERENCE"
+        and all(math.isfinite(value) and value > 0 for value in (
+            raw_period, double_period, analysis_period, summary_period,
+        ))
+        and math.isclose(
+            double_period, 2.0 * raw_period, rel_tol=1e-9, abs_tol=1e-12)
+        and math.isclose(
+            analysis_period, double_period, rel_tol=1e-9, abs_tol=1e-12)
+        and math.isclose(
+            summary_period, double_period, rel_tol=1e-9, abs_tol=1e-12)
+        and latest.status == "COMPLETE"
+        and latest.handler_id == "openstar.tess.finalize"
+        and latest.stop is True
+        and latest.triggered_by_stage_id == summary.id
+        and not any(
+            stage.handler_id == "openstar.tess.dynamic-harmonic.analyze"
+            for stage in investigation.stages
+        )
+    )
+    if not exact_boundary:
+        return None
+    summary_index = investigation.stages.index(summary)
+    if tuple(investigation.stages[summary_index + 1:]) != (latest,):
+        return None
+    prefixes = [
+        int(stage.id.partition("-")[0])
+        for stage in investigation.stages
+        if stage.id.partition("-")[0].isdigit()
+    ]
+    continuation_request = StageRequest(
+        id=f"{max(prefixes, default=0) + 1:03d}-dynamic-harmonic-modeling",
+        handler_id="openstar.tess.dynamic-harmonic.analyze",
+        parameters={
+            "evidenceLineage":
+            "UNRESOLVED_FAMILY_TIME_FREQUENCY_RECOMMENDATION"
+        },
+        triggered_by_stage_id=summary.id,
+    )
+    return store.set_control_state(
+        investigation,
+        status="RUNNING",
+        control_state={
+            "branchAssessments": [],
+            "selectedExperiment": asdict(continuation_request),
+            "schedulerAction": "RUN_EXPERIMENT",
+            "recovery": (
+                "TESS_UNRESOLVED_FAMILY_DYNAMIC_HARMONIC_CONTINUATION"
+            ),
+        },
+    )
+
+
 def _repair_unresolved_dynamic_localization_review_failure(
     store: InvestigationStore, investigation: Investigation, control: dict
 ) -> Investigation | None:
@@ -1926,6 +2014,12 @@ def repair_obsolete_terminal_wait(
     )
     if period_repair is not None:
         return period_repair
+
+    unresolved_dynamic_repair = \
+        _repair_unresolved_family_dynamic_harmonic_terminal(
+            store, investigation, control)
+    if unresolved_dynamic_repair is not None:
+        return unresolved_dynamic_repair
 
     mode_repair = _repair_mode_identification_terminal(store, investigation, control)
     if mode_repair is not None:

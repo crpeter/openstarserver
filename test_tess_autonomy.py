@@ -1870,5 +1870,105 @@ class TessIndependentPeriodCharacterizationCompatibilityTests(unittest.TestCase)
             )
 
 
+class TessUnresolvedFamilyDynamicCompatibilityTests(unittest.TestCase):
+    def _completed(self, root, *, period_kind="UNRESOLVED_FAMILY_ANALYSIS_REFERENCE",
+                   final_stop=True):
+        store = InvestigationStore(root)
+        investigation = store.create(
+            "tic-38707949", WORKFLOW_ID, "20.2",
+            metadata={"controlState": {
+                "schedulerAction": "INVESTIGATION_COMPLETE",
+            }},
+        )
+        morphology = {
+            "rawPeriodDays": 6.669183505131958,
+            "possibleDoubleCycleDays": 13.338367010263916,
+            "physicalCycleResolved": False,
+            "resolvedPhysicalPeriodDays": None,
+            "continuationEvidence": {
+                "timeFrequencyEvolutionWarranted": True,
+                "analysisReferencePeriodDays": 13.338367010263916,
+                "periodReferenceKind":
+                "UNRESOLVED_FAMILY_ANALYSIS_REFERENCE",
+            },
+        }
+        summary = {
+            "classification": "FAMILY_AMPLITUDE_EVOLUTION",
+            "physicalMechanismResolved": False,
+            "recommendedNextTest": "DYNAMIC_HARMONIC_MODELING",
+            "periodReference": {
+                "kind": period_kind,
+                "physicalCycleResolved": False,
+                "periodDays": 13.338367010263916,
+            },
+        }
+        stages = (
+            InvestigationStage(
+                "010-morphology", "openstar.tess.morphology.analyze",
+                "COMPLETE", "009-broad", {}, result=morphology),
+            InvestigationStage(
+                "014-summarize-time-frequency",
+                "openstar.tess.time-frequency.summarize", "COMPLETE",
+                "013-interpret-time-frequency", {}, result=summary),
+            InvestigationStage(
+                "015-finalize", "openstar.tess.finalize", "COMPLETE",
+                "014-summarize-time-frequency", {},
+                result={"claim": "INDEPENDENT_PERIOD_ESTIMATE"},
+                stop=final_stop),
+        )
+        investigation = replace(
+            investigation, status="COMPLETE", stages=stages)
+        store.save(investigation)
+        return store, investigation
+
+    def test_reopens_exact_terminal_append_only_and_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store, investigation = self._completed(temporary)
+            immutable_stages = tuple(
+                json.dumps(asdict(stage), sort_keys=True)
+                for stage in investigation.stages
+            )
+
+            repaired = repair_obsolete_terminal_wait(store, investigation)
+
+            self.assertEqual("RUNNING", repaired.status)
+            self.assertEqual(immutable_stages, tuple(
+                json.dumps(asdict(stage), sort_keys=True)
+                for stage in repaired.stages
+            ))
+            control = repaired.metadata["controlState"]
+            self.assertEqual("RUN_EXPERIMENT", control["schedulerAction"])
+            self.assertEqual(
+                "TESS_UNRESOLVED_FAMILY_DYNAMIC_HARMONIC_CONTINUATION",
+                control["recovery"],
+            )
+            self.assertEqual({
+                "id": "016-dynamic-harmonic-modeling",
+                "handler_id": "openstar.tess.dynamic-harmonic.analyze",
+                "parameters": {
+                    "evidenceLineage":
+                    "UNRESOLVED_FAMILY_TIME_FREQUENCY_RECOMMENDATION",
+                },
+                "triggered_by_stage_id": "014-summarize-time-frequency",
+            }, control["selectedExperiment"])
+            self.assertEqual(
+                repaired, repair_obsolete_terminal_wait(store, repaired))
+
+    def test_repair_fails_closed_outside_exact_boundary(self):
+        for period_kind, final_stop in (
+            ("MORPHOLOGY_RESOLVED_PHYSICAL_PERIOD", True),
+            ("UNRESOLVED_FAMILY_ANALYSIS_REFERENCE", False),
+        ):
+            with self.subTest(period_kind=period_kind, final_stop=final_stop), \
+                    tempfile.TemporaryDirectory() as temporary:
+                store, investigation = self._completed(
+                    temporary, period_kind=period_kind,
+                    final_stop=final_stop)
+                self.assertEqual(
+                    investigation,
+                    repair_obsolete_terminal_wait(store, investigation),
+                )
+
+
 if __name__ == "__main__":
     unittest.main()
