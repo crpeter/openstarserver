@@ -1004,6 +1004,121 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
             "physical-interpretation-v20.5.1-dynamic-cycle.json"))
         self.assertEqual("openstar.tess.finalize", next_request.handler_id)
 
+    def test_nested_physical_contamination_runs_existing_pixel_localization(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        store = InvestigationStore(root / "investigations")
+        investigation = store.create(
+            "nested-localization", WORKFLOW_ID, WORKFLOW_VERSION)
+        paths = [
+            self._write_light_curve(
+                root, f"localization-{sector}", sector, 0.0)
+            for sector in (1, 2, 4, 98)
+        ]
+        morphology = {
+            "physicalCycleResolved": False,
+            "resolvedPhysicalPeriodDays": None,
+            "morphologyClass": "UNRESOLVED_DOUBLE_WAVE_ALIAS",
+        }
+        dynamic = nested_result()
+        independent = {
+            "preparedSectors": [
+                {"sector": sector, "datasetPath": str(path)}
+                for sector, path in zip((2, 4, 98), paths[1:])
+            ],
+        }
+        for stage_id, handler, result in (
+            ("001-prepare-target", "openstar.tess.prepare-target", {
+                "datasetPath": str(paths[0]),
+                "ticID": 38707949,
+                "sector": 1,
+            }),
+            ("003-catalog-identity", "openstar.tess.catalog-identity", {}),
+            ("006-prepare-independent", "openstar.tess.independent.prepare",
+             independent),
+            ("010-morphology", "openstar.tess.morphology.analyze", morphology),
+            ("017-nested-cycle-alias-reassessment",
+             "openstar.tess.dynamic-harmonic.analyze", dynamic),
+        ):
+            investigation = self._complete(
+                store, investigation, stage_id, handler, result)
+
+        cycle = authoritative_resolved_cycle(
+            morphology=None, dynamic_harmonic=dynamic)
+        physical = {
+            "version": "openstar.tess-physical-interpretation.v2",
+            "physicalPeriodDays": 13.0,
+            "photometricFirstHarmonicPeriodDays": 6.5,
+            "physicalCycleEvidence": cycle,
+            "physicalMechanismResolved": False,
+            "preferredPhotometricHypothesis": "ROTATIONAL_DOUBLE_WAVE",
+            "contaminationScreen": {"flaggedByExistingMetadata": True},
+            "crossSectorFourierSummary": {},
+            "rotationConstraint": {},
+            "mechanismRankings": [],
+            "recommendedNextTest": "PIXEL_LEVEL_SOURCE_LOCALIZATION",
+        }
+        engine = build_engine(
+            store, coordinator=types.SimpleNamespace(),
+            poll_interval=0.0, timeout=None)
+        engine.chain_stages = False
+        with mock.patch(
+            "workflows.tess.tess_investigation."
+            "analyze_physical_interpretation",
+            return_value=physical,
+        ):
+            physical_completed, localization_request = engine.run_stage(
+                investigation,
+                StageRequest(
+                    "019-physical-interpretation",
+                    "openstar.tess.physical.interpret",
+                    {"evidenceLineage":
+                     "NESTED_ODD_HARMONIC_RESOLVED_CYCLE"},
+                    "017-nested-cycle-alias-reassessment",
+                ),
+                software_id="integration",
+                software_version="20.32",
+            )
+        self.assertEqual(
+            "openstar.tess.source-localization.analyze",
+            localization_request.handler_id,
+        )
+        self.assertEqual({
+            "evidenceLineage":
+            "PHYSICAL_INTERPRETATION_PIXEL_LOCALIZATION",
+        }, localization_request.parameters)
+
+        localization = {
+            "version": "openstar.tess-pixel-localization.v1",
+            "sectorResults": [],
+            "crossSector": {
+                "classification": "SOURCE_LOCALIZATION_UNRESOLVED",
+                "variableSignalOrigin": "UNRESOLVED",
+            },
+            "recommendedNextTest": "SOURCE_LOCALIZATION_REVIEW",
+        }
+        with mock.patch(
+            "workflows.tess.tess_investigation.localize_periodic_source",
+            return_value=localization,
+        ) as localize:
+            completed, next_request = engine.run_stage(
+                physical_completed,
+                localization_request,
+                software_id="integration",
+                software_version="20.32",
+            )
+
+        self.assertEqual(13.0, localize.call_args.kwargs[
+            "physical_period_days"])
+        stage = completed.stages[-1]
+        self.assertEqual(cycle, stage.result["physicalCycleEvidence"])
+        self.assertIn("resolvedCycle", stage.provenance.input_hashes)
+        self.assertIn("dynamicHarmonic", stage.provenance.input_hashes)
+        self.assertTrue(stage.artifacts[0].path.endswith(
+            "pixel-localization-v20.6.json"))
+        self.assertEqual("openstar.tess.finalize", next_request.handler_id)
+
     def _complete(self, store, investigation, stage_id, handler_id, result):
         running = InvestigationStage(stage_id, handler_id, "RUNNING", None, {})
         investigation = store.append_running_stage(investigation, running)

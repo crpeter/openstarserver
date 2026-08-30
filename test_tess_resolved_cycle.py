@@ -5,7 +5,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from workflows.tess.tess_physical import analyze_physical_interpretation
+from workflows.tess.tess_physical import (
+    analyze_physical_interpretation,
+    physical_source_localization_continuation,
+)
 from workflows.tess.tess_resolved_cycle import (
     MORPHOLOGY_SOURCE,
     NESTED_ALIAS_SOURCE,
@@ -154,6 +157,35 @@ class AuthoritativeResolvedCycleTests(unittest.TestCase):
             self.assertEqual(2.0, result["physicalPeriodDays"])
             self.assertEqual(cycle, result["physicalCycleEvidence"])
             self.assertFalse(morphology["physicalCycleResolved"])
+
+    def test_exact_physical_contamination_boundary_routes_localization(self):
+        cycle = authoritative_resolved_cycle(
+            morphology=None, dynamic_harmonic=nested_result())
+        physical = {
+            "version": "openstar.tess-physical-interpretation.v2",
+            "physicalPeriodDays": 13.0,
+            "photometricFirstHarmonicPeriodDays": 6.5,
+            "physicalCycleEvidence": cycle,
+            "physicalMechanismResolved": False,
+            "contaminationScreen": {"flaggedByExistingMetadata": True},
+            "recommendedNextTest": "PIXEL_LEVEL_SOURCE_LOCALIZATION",
+        }
+        self.assertTrue(physical_source_localization_continuation(
+            physical, cycle))
+        for key, value in (
+            ("physicalPeriodDays", 12.0),
+            ("physicalCycleEvidence", None),
+            ("physicalMechanismResolved", True),
+            ("recommendedNextTest", "OTHER"),
+        ):
+            with self.subTest(key=key):
+                changed = {**physical, key: value}
+                self.assertFalse(physical_source_localization_continuation(
+                    changed, cycle))
+        changed = copy.deepcopy(physical)
+        changed["contaminationScreen"]["flaggedByExistingMetadata"] = False
+        self.assertFalse(physical_source_localization_continuation(
+            changed, cycle))
 
 
 if __name__ == "__main__":

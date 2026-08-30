@@ -21,6 +21,7 @@ from workflows.tess.tess_autonomy import (
     repair_obsolete_terminal_wait,
 )
 from workflows.tess.tess_autonomy import WORKFLOW_ID, WORKFLOW_VERSION
+from workflows.tess.tess_resolved_cycle import authoritative_resolved_cycle
 from test_tess_resolved_cycle import nested_result
 
 
@@ -2129,6 +2130,100 @@ class TessNestedCyclePhysicalInterpretationCompatibilityTests(unittest.TestCase)
             lambda result: result["periodAliasResolution"].update(
                 oddHarmonicSupportingIndependentHeldOutSectors=[2, 4]),
             lambda result: result.update(physicalCycleResolved=False),
+        ):
+            with self.subTest(mutate=mutate), \
+                    tempfile.TemporaryDirectory() as temporary:
+                store, investigation = self._completed(
+                    temporary, mutate=mutate)
+                self.assertEqual(
+                    investigation,
+                    repair_obsolete_terminal_wait(store, investigation),
+                )
+
+
+class TessPhysicalSourceLocalizationCompatibilityTests(unittest.TestCase):
+    def _completed(self, root, *, mutate=None):
+        store = InvestigationStore(root)
+        investigation = store.create(
+            "tic-38707949", WORKFLOW_ID, "20.5.1",
+            metadata={"controlState": {
+                "schedulerAction": "INVESTIGATION_COMPLETE",
+            }},
+        )
+        cycle = authoritative_resolved_cycle(
+            morphology=None, dynamic_harmonic=nested_result())
+        physical = {
+            "version": "openstar.tess-physical-interpretation.v2",
+            "physicalPeriodDays": 13.0,
+            "photometricFirstHarmonicPeriodDays": 6.5,
+            "physicalCycleEvidence": cycle,
+            "physicalMechanismResolved": False,
+            "preferredPhotometricHypothesis": "ROTATIONAL_DOUBLE_WAVE",
+            "contaminationScreen": {"flaggedByExistingMetadata": True},
+            "recommendedNextTest": "PIXEL_LEVEL_SOURCE_LOCALIZATION",
+        }
+        if mutate is not None:
+            mutate(physical)
+        stages = (
+            InvestigationStage(
+                "019-physical-interpretation",
+                "openstar.tess.physical.interpret", "COMPLETE",
+                "017-nested-cycle-alias-reassessment", {
+                    "evidenceLineage":
+                    "NESTED_ODD_HARMONIC_RESOLVED_CYCLE",
+                }, result=physical),
+            InvestigationStage(
+                "020-finalize", "openstar.tess.finalize", "COMPLETE",
+                "019-physical-interpretation",
+                {"outputSuffix": "v20.5.1-dynamic-cycle"},
+                result={"claim": "INDEPENDENT_PERIOD_ESTIMATE"}, stop=True),
+        )
+        investigation = replace(
+            investigation, status="COMPLETE", stages=stages)
+        store.save(investigation)
+        return store, investigation
+
+    def test_reopens_exact_physical_contamination_boundary_append_only(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store, investigation = self._completed(temporary)
+            immutable_stages = tuple(
+                json.dumps(asdict(stage), sort_keys=True)
+                for stage in investigation.stages
+            )
+
+            repaired = repair_obsolete_terminal_wait(store, investigation)
+
+            self.assertEqual("RUNNING", repaired.status)
+            self.assertEqual(immutable_stages, tuple(
+                json.dumps(asdict(stage), sort_keys=True)
+                for stage in repaired.stages
+            ))
+            control = repaired.metadata["controlState"]
+            self.assertEqual(
+                "TESS_V20_5_1_PIXEL_SOURCE_LOCALIZATION",
+                control["recovery"],
+            )
+            self.assertEqual({
+                "id": "021-source-localization",
+                "handler_id": "openstar.tess.source-localization.analyze",
+                "parameters": {
+                    "evidenceLineage":
+                    "PHYSICAL_INTERPRETATION_PIXEL_LOCALIZATION",
+                },
+                "triggered_by_stage_id": "019-physical-interpretation",
+            }, control["selectedExperiment"])
+            self.assertEqual(
+                repaired, repair_obsolete_terminal_wait(store, repaired))
+
+    def test_repair_rejects_changed_physical_or_cycle_evidence(self):
+        for mutate in (
+            lambda physical: physical.update(
+                recommendedNextTest="OTHER"),
+            lambda physical: physical["contaminationScreen"].update(
+                flaggedByExistingMetadata=False),
+            lambda physical: physical["physicalCycleEvidence"].update(
+                conservativeThreshold=9.0),
+            lambda physical: physical.update(physicalPeriodDays=12.0),
         ):
             with self.subTest(mutate=mutate), \
                     tempfile.TemporaryDirectory() as temporary:

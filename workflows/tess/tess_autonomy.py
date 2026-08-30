@@ -1584,6 +1584,143 @@ def _continue_finalized_nested_cycle_physical_interpretation(
     )
 
 
+def _validated_persisted_nested_cycle_period(
+    cycle: dict,
+) -> float | None:
+    """Validate the dependency-light persisted form of the resolved cycle."""
+    try:
+        period = float(cycle.get("periodDays"))
+        raw_period = float(cycle.get("rawFamilyPeriodDays"))
+        possible_double = float(cycle.get("possibleDoubleCycleDays"))
+        reference_period = float(cycle.get("referenceFamilyPeriodDays"))
+        selected_period = float(cycle.get("selectedPeriodDays"))
+        threshold = float(cycle.get("conservativeThreshold"))
+        aggregate = float(
+            cycle.get("aggregateIndependentDeltaBicFullMinusEvenOnly"))
+        minimum = int(cycle.get("minimumSupportingIndependentSectors"))
+        supporters = [int(value) for value in (
+            cycle.get("supportingIndependentSectors") or [])]
+    except (TypeError, ValueError):
+        return None
+    valid = (
+        cycle.get("contractVersion")
+        == "openstar.tess-authoritative-resolved-cycle.v1"
+        and cycle.get("sourceKind") in {
+            "NESTED_ODD_HARMONIC_PREDICTIVE_RESOLUTION",
+            "MORPHOLOGY_AND_NESTED_PREDICTION_CONSISTENT",
+        }
+        and cycle.get("sourceClassification")
+        == "DOUBLE_CYCLE_ODD_HARMONICS_PREDICTIVELY_SUPPORTED"
+        and cycle.get("sourceEvidenceLineage") in {
+            "UNRESOLVED_FAMILY_TIME_FREQUENCY_RECOMMENDATION",
+            "UNRESOLVED_FAMILY_NESTED_ODD_HARMONIC_REASSESSMENT",
+        }
+        and cycle.get("physicalCycleResolved") is True
+        and cycle.get("physicalMechanismResolved") is False
+        and cycle.get("criterion") == "BIC"
+        and all(math.isfinite(value) and value > 0 for value in (
+            period, raw_period, possible_double, reference_period,
+            selected_period, threshold, aggregate,
+        ))
+        and math.isclose(
+            period, 2.0 * raw_period, rel_tol=1e-9, abs_tol=1e-12)
+        and all(math.isclose(
+            value, period, rel_tol=1e-9, abs_tol=1e-12)
+            for value in (
+                possible_double, reference_period, selected_period))
+        and math.isclose(threshold, 10.0, rel_tol=0.0, abs_tol=1e-12)
+        and aggregate >= threshold
+        and minimum == 3
+        and len(supporters) >= minimum
+        and len(set(supporters)) == len(supporters)
+        and cycle.get("primarySectorExcludedFromSupport") is True
+        and cycle.get("maximumAbsoluteFrequencyMatched") is True
+    )
+    return period if valid else None
+
+
+def _continue_finalized_physical_source_localization(
+    store: InvestigationStore, investigation: Investigation, control: dict
+) -> Investigation | None:
+    """Append v20.6 after the exact finalized v20.5.1 contamination edge."""
+    if (
+        investigation.status != "COMPLETE"
+        or control.get("schedulerAction") != "INVESTIGATION_COMPLETE"
+        or not investigation.stages
+    ):
+        return None
+    physical = _latest_complete(
+        investigation, "openstar.tess.physical.interpret")
+    if physical is None:
+        return None
+    result = physical.result or {}
+    cycle = result.get("physicalCycleEvidence") or {}
+    period = _validated_persisted_nested_cycle_period(cycle)
+    try:
+        reported_period = float(result.get("physicalPeriodDays"))
+        reported_harmonic = float(
+            result.get("photometricFirstHarmonicPeriodDays"))
+    except (TypeError, ValueError):
+        return None
+    latest = investigation.stages[-1]
+    exact_boundary = (
+        period is not None
+        and result.get("version")
+        == "openstar.tess-physical-interpretation.v2"
+        and math.isfinite(reported_period)
+        and math.isfinite(reported_harmonic)
+        and math.isclose(
+            reported_period, period, rel_tol=1e-9, abs_tol=1e-12)
+        and math.isclose(
+            reported_harmonic, period / 2.0,
+            rel_tol=1e-9, abs_tol=1e-12)
+        and result.get("physicalMechanismResolved") is False
+        and (result.get("contaminationScreen") or {}).get(
+            "flaggedByExistingMetadata") is True
+        and result.get("recommendedNextTest")
+        == "PIXEL_LEVEL_SOURCE_LOCALIZATION"
+        and latest.status == "COMPLETE"
+        and latest.handler_id == "openstar.tess.finalize"
+        and latest.stop is True
+        and latest.triggered_by_stage_id == physical.id
+        and latest.parameters.get("outputSuffix")
+        == "v20.5.1-dynamic-cycle"
+        and not any(
+            stage.handler_id == "openstar.tess.source-localization.analyze"
+            for stage in investigation.stages
+        )
+    )
+    if not exact_boundary:
+        return None
+    physical_index = investigation.stages.index(physical)
+    if tuple(investigation.stages[physical_index + 1:]) != (latest,):
+        return None
+    prefixes = [
+        int(stage.id.partition("-")[0])
+        for stage in investigation.stages
+        if stage.id.partition("-")[0].isdigit()
+    ]
+    request = StageRequest(
+        id=f"{max(prefixes, default=0) + 1:03d}-source-localization",
+        handler_id="openstar.tess.source-localization.analyze",
+        parameters={
+            "evidenceLineage":
+            "PHYSICAL_INTERPRETATION_PIXEL_LOCALIZATION",
+        },
+        triggered_by_stage_id=physical.id,
+    )
+    return store.set_control_state(
+        investigation,
+        status="RUNNING",
+        control_state={
+            "branchAssessments": [],
+            "selectedExperiment": asdict(request),
+            "schedulerAction": "RUN_EXPERIMENT",
+            "recovery": "TESS_V20_5_1_PIXEL_SOURCE_LOCALIZATION",
+        },
+    )
+
+
 def _repair_unresolved_dynamic_localization_review_failure(
     store: InvestigationStore, investigation: Investigation, control: dict
 ) -> Investigation | None:
@@ -2205,6 +2342,11 @@ def repair_obsolete_terminal_wait(
     )
     if period_repair is not None:
         return period_repair
+
+    physical_localization = _continue_finalized_physical_source_localization(
+        store, investigation, control)
+    if physical_localization is not None:
+        return physical_localization
 
     nested_cycle_continuation = \
         _continue_finalized_nested_cycle_physical_interpretation(
