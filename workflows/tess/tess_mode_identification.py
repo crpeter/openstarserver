@@ -16,6 +16,144 @@ from typing import Any, Iterable
 MIN_BIC_IMPROVEMENT = 10.0
 MIN_INDEPENDENT_SECTOR_SUPPORT = 3
 GENERIC_REFINEMENT_WORKLOAD_ID = "openstar.lomb-scargle.v1"
+MULTIMODE_MODE_EVIDENCE_LINEAGE = (
+    "MULTIMODE_RECURRENT_SECONDARY_FREQUENCY"
+)
+
+
+def validated_multimode_mode_evidence(
+    summary: dict[str, Any] | None,
+    *,
+    physical_period_days: float,
+    target_supporting_sectors: Iterable[int],
+    iteration_count: int | None = None,
+) -> dict[str, Any] | None:
+    """Validate the persisted v20.7 recurrent-mode contract fail closed."""
+    value = summary or {}
+    recurrent = value.get("bestRecurrentSecondaryMode") or {}
+    members = recurrent.get("members") or []
+    clusters = value.get("frequencyClusters") or []
+    accepted = value.get("acceptedResidualModes") or []
+    try:
+        established_period = float(physical_period_days)
+        reported_period = float(value.get("physicalPeriodDays"))
+        reported_frequency = float(value.get("physicalFrequency"))
+        first_harmonic = float(value.get("firstHarmonicFrequency"))
+        residual_period = float(recurrent.get("medianPeriodDays"))
+        residual_frequency = float(recurrent.get("medianFrequency"))
+        support = sorted(int(item) for item in (
+            recurrent.get("independentSectors") or []))
+        target_support = {int(item) for item in target_supporting_sectors}
+        reported_support_count = int(
+            recurrent.get("independentSectorCount"))
+        minimum_support = int(
+            value.get("minimumRecurrentIndependentSectorCount"))
+        reported_iterations = int(value.get("iterationsCompleted"))
+        cluster_tolerance = float(value.get("clusterRelativeTolerance"))
+        accepted_support = sorted(int(item) for item in (
+            value.get("independentSectorsWithAcceptedResidualModes") or []))
+    except (TypeError, ValueError):
+        return None
+
+    finite_positive = (
+        established_period,
+        reported_period,
+        reported_frequency,
+        first_harmonic,
+        residual_period,
+        residual_frequency,
+        cluster_tolerance,
+    )
+    if not all(math.isfinite(item) and item > 0 for item in finite_positive):
+        return None
+    if not (
+        value.get("classification") == "MULTI_MODE_RECURRENT"
+        and value.get("physicalMechanismResolved") is False
+        and value.get("claimLevelChanged") is False
+        and value.get("recommendedNextTest")
+        == "MODE_IDENTIFICATION_OR_PULSATION_MODELING"
+        and math.isclose(
+            reported_period, established_period,
+            rel_tol=1e-9, abs_tol=1e-12)
+        and math.isclose(
+            reported_frequency, 1.0 / established_period,
+            rel_tol=1e-9, abs_tol=1e-12)
+        and math.isclose(
+            first_harmonic, 2.0 / established_period,
+            rel_tol=1e-9, abs_tol=1e-12)
+        and math.isclose(
+            residual_period, 1.0 / residual_frequency,
+            rel_tol=1e-9, abs_tol=1e-12)
+        and reported_iterations >= 1
+        and reported_iterations <= 3
+        and (iteration_count is None
+             or reported_iterations == int(iteration_count))
+        and minimum_support == MIN_INDEPENDENT_SECTOR_SUPPORT
+        and math.isclose(
+            cluster_tolerance, 0.05, rel_tol=0.0, abs_tol=1e-12)
+        and len(support) == reported_support_count
+        and len(set(support)) == len(support)
+        and len(support) >= minimum_support
+        and set(support).issubset(target_support)
+        and len(set(accepted_support)) == len(accepted_support)
+        and set(support).issubset(accepted_support)
+        and any(item == recurrent for item in clusters)
+    ):
+        return None
+
+    observed_support: set[int] = set()
+    for member in members:
+        if not isinstance(member, dict):
+            return None
+        try:
+            frequency = float(member.get("frequency"))
+            period = float(member.get("periodDays"))
+            iteration = int(member.get("iteration"))
+        except (TypeError, ValueError):
+            return None
+        if not (
+            math.isfinite(frequency)
+            and frequency > 0
+            and math.isfinite(period)
+            and period > 0
+            and math.isclose(
+                period, 1.0 / frequency,
+                rel_tol=1e-9, abs_tol=1e-12)
+            and 1 <= iteration <= reported_iterations
+            and abs(frequency - residual_frequency) / residual_frequency
+            <= cluster_tolerance
+        ):
+            return None
+        if (
+            member.get("role") == "independent-residual-multimode"
+            and member.get("sector") is not None
+        ):
+            try:
+                observed_support.add(int(member["sector"]))
+            except (TypeError, ValueError):
+                return None
+        matching_point = next((
+            point for point in accepted
+            if isinstance(point, dict)
+            and point.get("iteration") == member.get("iteration")
+            and point.get("sector") == member.get("sector")
+            and point.get("role") == member.get("role")
+            and point.get("candidateFrequency") == member.get("frequency")
+            and point.get("candidatePeriodDays") == member.get("periodDays")
+            and point.get("candidatePeakProminenceRatio")
+            == member.get("prominence")
+            and point.get("acceptedDistinctMode") is True
+        ), None)
+        if matching_point is None:
+            return None
+    if observed_support != set(support):
+        return None
+    return {
+        "evidenceLineage": MULTIMODE_MODE_EVIDENCE_LINEAGE,
+        "establishedPeriodDays": established_period,
+        "residualPeriodDays": residual_period,
+        "independentSectors": support,
+    }
 
 
 def _load_dataset(path: str | Path) -> tuple[list[float], list[float]]:

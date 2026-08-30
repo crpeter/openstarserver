@@ -2401,5 +2401,221 @@ class TessSourceLocalizationMultimodeCompatibilityTests(unittest.TestCase):
                 changed, repair_obsolete_terminal_wait(store, changed))
 
 
+class TessMultimodeModeIdentificationCompatibilityTests(
+    TessSourceLocalizationMultimodeCompatibilityTests
+):
+    @staticmethod
+    def _summary():
+        frequency = 0.3
+        points = [{
+            "iteration": 1,
+            "sector": sector,
+            "role": "independent-residual-multimode",
+            "candidateFrequency": frequency,
+            "candidatePeriodDays": 1.0 / frequency,
+            "candidatePeakProminenceRatio": 4.0,
+            "acceptedDistinctMode": True,
+        } for sector in (2, 4, 97, 98)]
+        members = [{
+            "iteration": item["iteration"],
+            "sector": item["sector"],
+            "role": item["role"],
+            "frequency": item["candidateFrequency"],
+            "periodDays": item["candidatePeriodDays"],
+            "prominence": item["candidatePeakProminenceRatio"],
+        } for item in points]
+        recurrent = {
+            "medianFrequency": frequency,
+            "medianPeriodDays": 1.0 / frequency,
+            "independentSectors": [2, 4, 97, 98],
+            "independentSectorCount": 4,
+            "combinedSupport": False,
+            "members": members,
+        }
+        return {
+            "classification": "MULTI_MODE_RECURRENT",
+            "physicalPeriodDays": 13.0,
+            "physicalFrequency": 1.0 / 13.0,
+            "firstHarmonicFrequency": 2.0 / 13.0,
+            "iterationsCompleted": 2,
+            "acceptedResidualModes": points,
+            "frequencyClusters": [recurrent],
+            "bestRecurrentSecondaryMode": recurrent,
+            "independentSectorsWithAcceptedResidualModes": [2, 4, 97, 98],
+            "minimumRecurrentIndependentSectorCount": 3,
+            "clusterRelativeTolerance": 0.05,
+            "physicalMechanismResolved": False,
+            "claimLevelChanged": False,
+            "recommendedNextTest":
+            "MODE_IDENTIFICATION_OR_PULSATION_MODELING",
+        }
+
+    def _completed_multimode(self, root, *, mutate=None):
+        store, investigation = super()._completed(root)
+        summary = self._summary()
+        if mutate is not None:
+            mutate(summary)
+        points = copy.deepcopy(summary["acceptedResidualModes"])
+        stages = (
+            InvestigationStage(
+                "023-prepare-multimode-iteration-1",
+                "openstar.tess.multimode.prepare", "COMPLETE",
+                "021-source-localization", {"iteration": 1},
+                result={"iteration": 1}),
+            InvestigationStage(
+                "024-run-multimode-iteration-1",
+                "openstar.tess.multimode.run", "COMPLETE",
+                "023-prepare-multimode-iteration-1", {"iteration": 1},
+                result={}),
+            InvestigationStage(
+                "025-interpret-multimode-iteration-1",
+                "openstar.tess.multimode.interpret", "COMPLETE",
+                "024-run-multimode-iteration-1", {"iteration": 1},
+                result={"iteration": 1, "datasetResults": points,
+                        "continueRecommended": True}),
+            InvestigationStage(
+                "026-prepare-multimode-iteration-2",
+                "openstar.tess.multimode.prepare", "COMPLETE",
+                "025-interpret-multimode-iteration-1", {"iteration": 2},
+                result={"iteration": 2}),
+            InvestigationStage(
+                "027-run-multimode-iteration-2",
+                "openstar.tess.multimode.run", "COMPLETE",
+                "026-prepare-multimode-iteration-2", {"iteration": 2},
+                result={}),
+            InvestigationStage(
+                "028-interpret-multimode-iteration-2",
+                "openstar.tess.multimode.interpret", "COMPLETE",
+                "027-run-multimode-iteration-2", {"iteration": 2},
+                result={"iteration": 2, "datasetResults": [],
+                        "continueRecommended": False}),
+            InvestigationStage(
+                "029-summarize-multimode",
+                "openstar.tess.multimode.summarize", "COMPLETE",
+                "028-interpret-multimode-iteration-2", {}, result=summary),
+            InvestigationStage(
+                "030-finalize", "openstar.tess.finalize", "COMPLETE",
+                "029-summarize-multimode", {"outputSuffix": "v20.7"},
+                result={"claim": "INDEPENDENT_PERIOD_ESTIMATE"}, stop=True),
+        )
+        investigation = replace(
+            investigation,
+            status="COMPLETE",
+            stages=investigation.stages + stages,
+        )
+        store.save(investigation)
+        return store, investigation
+
+    def test_reopens_exact_recurrent_multimode_boundary_append_only(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store, investigation = self._completed_multimode(temporary)
+            immutable_stages = tuple(
+                json.dumps(asdict(stage), sort_keys=True)
+                for stage in investigation.stages
+            )
+
+            repaired = repair_obsolete_terminal_wait(store, investigation)
+
+            self.assertEqual("RUNNING", repaired.status)
+            self.assertEqual(immutable_stages, tuple(
+                json.dumps(asdict(stage), sort_keys=True)
+                for stage in repaired.stages
+            ))
+            control = repaired.metadata["controlState"]
+            self.assertEqual(
+                "TESS_V20_7_MULTI_MODE_IDENTIFICATION",
+                control["recovery"],
+            )
+            self.assertEqual({
+                "id": "031-mode-identification",
+                "handler_id": "openstar.tess.mode-identification.analyze",
+                "parameters": {
+                    "evidenceLineage":
+                    "MULTIMODE_RECURRENT_SECONDARY_FREQUENCY",
+                },
+                "triggered_by_stage_id": "029-summarize-multimode",
+            }, control["selectedExperiment"])
+            self.assertEqual(
+                repaired, repair_obsolete_terminal_wait(store, repaired))
+
+    def test_repair_rejects_tampered_multimode_summary(self):
+        mutations = (
+            lambda value: value.update(classification="OTHER"),
+            lambda value: value.update(physicalPeriodDays=12.0),
+            lambda value: value.update(recommendedNextTest="OTHER"),
+            lambda value: value["bestRecurrentSecondaryMode"].update(
+                medianPeriodDays=4.0),
+            lambda value: value["bestRecurrentSecondaryMode"].update(
+                independentSectors=[2, 4, 96, 97]),
+            lambda value: value.update(iterationsCompleted=1),
+        )
+        for mutate in mutations:
+            with self.subTest(mutate=mutate), \
+                    tempfile.TemporaryDirectory() as temporary:
+                store, investigation = self._completed_multimode(
+                    temporary, mutate=mutate)
+                self.assertEqual(
+                    investigation,
+                    repair_obsolete_terminal_wait(store, investigation),
+                )
+
+    def test_repair_rejects_changed_iteration_lineage_or_later_science(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store, investigation = self._completed_multimode(temporary)
+            stages = list(investigation.stages)
+            stages[-6] = replace(
+                stages[-6], triggered_by_stage_id="OTHER")
+            changed = replace(investigation, stages=tuple(stages))
+            store.save(changed)
+            self.assertEqual(
+                changed, repair_obsolete_terminal_wait(store, changed))
+
+        with tempfile.TemporaryDirectory() as temporary:
+            store, investigation = self._completed_multimode(temporary)
+            mode = InvestigationStage(
+                "031-mode-identification",
+                "openstar.tess.mode-identification.analyze", "COMPLETE",
+                "029-summarize-multimode", {}, result={})
+            changed = replace(
+                investigation, stages=investigation.stages[:-1] + (
+                    mode, investigation.stages[-1]))
+            store.save(changed)
+            self.assertEqual(
+                changed, repair_obsolete_terminal_wait(store, changed))
+
+    def test_repair_rejects_changed_upstream_physical_or_source_evidence(self):
+        changes = (
+            (
+                "openstar.tess.physical.interpret",
+                lambda result: result.update(physicalPeriodDays=12.0),
+            ),
+            (
+                "openstar.tess.source-localization.analyze",
+                lambda result: result.update(recommendedNextTest="OTHER"),
+            ),
+            (
+                "openstar.tess.source-localization.analyze",
+                lambda result: result["sectorResults"][1].update(
+                    classification="OFF_TARGET"),
+            ),
+        )
+        for handler_id, mutate in changes:
+            with self.subTest(handler_id=handler_id), \
+                    tempfile.TemporaryDirectory() as temporary:
+                store, investigation = self._completed_multimode(temporary)
+                stages = list(investigation.stages)
+                index = next(
+                    index for index, stage in enumerate(stages)
+                    if stage.handler_id == handler_id
+                )
+                result = copy.deepcopy(stages[index].result)
+                mutate(result)
+                stages[index] = replace(stages[index], result=result)
+                changed = replace(investigation, stages=tuple(stages))
+                store.save(changed)
+                self.assertEqual(
+                    changed, repair_obsolete_terminal_wait(store, changed))
+
+
 if __name__ == "__main__":
     unittest.main()

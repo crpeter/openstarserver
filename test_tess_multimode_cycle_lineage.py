@@ -10,6 +10,9 @@ from openstar_workflow import StageRequest
 from test_tess_resolved_cycle import nested_result
 from workflows.tess.tess_autonomy import WORKFLOW_ID, WORKFLOW_VERSION
 from workflows.tess.tess_investigation import build_engine
+from workflows.tess.tess_mode_identification import (
+    MULTIMODE_MODE_EVIDENCE_LINEAGE,
+)
 from workflows.tess.tess_resolved_cycle import authoritative_resolved_cycle
 
 
@@ -49,6 +52,7 @@ class TessMultimodeCycleLineageTests(unittest.TestCase):
             "crossSector": {
                 "classification": "TARGET_SOURCE_SUPPORTED",
                 "variableSignalOrigin": "TARGET_CONSISTENT",
+                "targetSupportingSectors": [2, 4, 97, 98],
                 "recommendedNextTest":
                 "MULTI_MODE_FREQUENCY_DECOMPOSITION",
             },
@@ -86,6 +90,52 @@ class TessMultimodeCycleLineageTests(unittest.TestCase):
         investigation = replace(investigation, stages=stages)
         store.save(investigation)
         return store, investigation, cycle
+
+    @staticmethod
+    def _recurrent_multimode_summary():
+        frequency = 0.3
+        points = [{
+            "iteration": 1,
+            "sector": sector,
+            "role": "independent-residual-multimode",
+            "candidateFrequency": frequency,
+            "candidatePeriodDays": 1.0 / frequency,
+            "candidatePeakProminenceRatio": 4.0,
+            "acceptedDistinctMode": True,
+        } for sector in (2, 4, 97, 98)]
+        members = [{
+            "iteration": item["iteration"],
+            "sector": item["sector"],
+            "role": item["role"],
+            "frequency": item["candidateFrequency"],
+            "periodDays": item["candidatePeriodDays"],
+            "prominence": item["candidatePeakProminenceRatio"],
+        } for item in points]
+        recurrent = {
+            "medianFrequency": frequency,
+            "medianPeriodDays": 1.0 / frequency,
+            "independentSectors": [2, 4, 97, 98],
+            "independentSectorCount": 4,
+            "combinedSupport": False,
+            "members": members,
+        }
+        return {
+            "classification": "MULTI_MODE_RECURRENT",
+            "physicalPeriodDays": 13.0,
+            "physicalFrequency": 1.0 / 13.0,
+            "firstHarmonicFrequency": 2.0 / 13.0,
+            "iterationsCompleted": 2,
+            "acceptedResidualModes": points,
+            "frequencyClusters": [recurrent],
+            "bestRecurrentSecondaryMode": recurrent,
+            "independentSectorsWithAcceptedResidualModes": [2, 4, 97, 98],
+            "minimumRecurrentIndependentSectorCount": 3,
+            "clusterRelativeTolerance": 0.05,
+            "physicalMechanismResolved": False,
+            "claimLevelChanged": False,
+            "recommendedNextTest":
+            "MODE_IDENTIFICATION_OR_PULSATION_MODELING",
+        }
 
     @staticmethod
     def _prepared_spec(root):
@@ -215,6 +265,77 @@ class TessMultimodeCycleLineageTests(unittest.TestCase):
                     software_id="integration",
                     software_version="20.7",
                 )
+
+    def test_mode_identification_consumes_recurrent_multimode_lineage(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store, investigation, _ = self._investigation(
+                temporary, nested=True)
+            summary = self._recurrent_multimode_summary()
+            investigation = replace(
+                investigation,
+                stages=investigation.stages + (
+                    InvestigationStage(
+                        "025-interpret-multimode-iteration-1",
+                        "openstar.tess.multimode.interpret", "COMPLETE",
+                        "024-run-multimode-iteration-1", {"iteration": 1},
+                        result={"iteration": 1}),
+                    InvestigationStage(
+                        "028-interpret-multimode-iteration-2",
+                        "openstar.tess.multimode.interpret", "COMPLETE",
+                        "027-run-multimode-iteration-2", {"iteration": 2},
+                        result={"iteration": 2}),
+                    InvestigationStage(
+                        "029-summarize-multimode",
+                        "openstar.tess.multimode.summarize", "COMPLETE",
+                        "028-interpret-multimode-iteration-2", {},
+                        result=summary),
+                ),
+            )
+            store.save(investigation)
+            engine = build_engine(
+                store, coordinator=mock.Mock(),
+                poll_interval=0.0, timeout=None)
+            engine.chain_stages = False
+            result = {
+                "classification": "HIGHER_ORDER_HARMONIC_STRUCTURE",
+                "independentModeEvidenceSurvived": False,
+                "physicalMechanismResolved": False,
+                "recommendedNextTest": "DYNAMIC_HARMONIC_MODELING",
+            }
+            with mock.patch(
+                "workflows.tess.tess_investigation.identify_residual_mode",
+                return_value=result,
+            ) as identify:
+                completed, next_request = engine.run_stage(
+                    investigation,
+                    StageRequest(
+                        "031-mode-identification",
+                        "openstar.tess.mode-identification.analyze",
+                        {"evidenceLineage":
+                         MULTIMODE_MODE_EVIDENCE_LINEAGE},
+                        "029-summarize-multimode",
+                    ),
+                    software_id="integration",
+                    software_version="20.9",
+                )
+
+            self.assertEqual(
+                13.0, identify.call_args.kwargs["established_period_days"])
+            self.assertEqual(
+                1.0 / 0.3,
+                identify.call_args.kwargs["residual_period_days"])
+            self.assertEqual(
+                [2, 4, 97, 98],
+                identify.call_args.kwargs["independent_sectors"])
+            self.assertEqual(
+                "openstar.tess.dynamic-harmonic.analyze",
+                next_request.handler_id)
+            hashes = completed.stages[-1].provenance.input_hashes
+            self.assertIn("multiModeDecomposition", hashes)
+            self.assertIn("resolvedCycle", hashes)
+            self.assertIn("physicalInterpretation", hashes)
+            self.assertIn("sourceLocalization", hashes)
+            self.assertNotIn("timeFrequencyEvolution", hashes)
 
 
 if __name__ == "__main__":

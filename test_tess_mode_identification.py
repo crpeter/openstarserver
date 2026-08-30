@@ -1,3 +1,4 @@
+import copy
 import json
 import math
 import tempfile
@@ -7,11 +8,94 @@ from pathlib import Path
 
 from workflows.tess.tess_mode_identification import (
     GENERIC_REFINEMENT_WORKLOAD_ID,
+    MULTIMODE_MODE_EVIDENCE_LINEAGE,
     identify_residual_mode,
+    validated_multimode_mode_evidence,
 )
 
 
 class TessModeIdentificationTests(unittest.TestCase):
+    @staticmethod
+    def _multimode_summary():
+        frequency = 0.3
+        points = [{
+            "iteration": 1,
+            "sector": sector,
+            "role": "independent-residual-multimode",
+            "candidateFrequency": frequency,
+            "candidatePeriodDays": 1.0 / frequency,
+            "candidatePeakProminenceRatio": 4.0,
+            "acceptedDistinctMode": True,
+        } for sector in (2, 4, 97, 98)]
+        members = [{
+            "iteration": item["iteration"],
+            "sector": item["sector"],
+            "role": item["role"],
+            "frequency": item["candidateFrequency"],
+            "periodDays": item["candidatePeriodDays"],
+            "prominence": item["candidatePeakProminenceRatio"],
+        } for item in points]
+        recurrent = {
+            "medianFrequency": frequency,
+            "medianPeriodDays": 1.0 / frequency,
+            "independentSectors": [2, 4, 97, 98],
+            "independentSectorCount": 4,
+            "combinedSupport": False,
+            "members": members,
+        }
+        return {
+            "classification": "MULTI_MODE_RECURRENT",
+            "physicalPeriodDays": 13.0,
+            "physicalFrequency": 1.0 / 13.0,
+            "firstHarmonicFrequency": 2.0 / 13.0,
+            "iterationsCompleted": 2,
+            "acceptedResidualModes": points,
+            "frequencyClusters": [recurrent],
+            "bestRecurrentSecondaryMode": recurrent,
+            "independentSectorsWithAcceptedResidualModes": [2, 4, 97, 98],
+            "minimumRecurrentIndependentSectorCount": 3,
+            "clusterRelativeTolerance": 0.05,
+            "physicalMechanismResolved": False,
+            "claimLevelChanged": False,
+            "recommendedNextTest":
+            "MODE_IDENTIFICATION_OR_PULSATION_MODELING",
+        }
+
+    def test_validates_recurrent_multimode_input_contract(self):
+        evidence = validated_multimode_mode_evidence(
+            self._multimode_summary(),
+            physical_period_days=13.0,
+            target_supporting_sectors=[2, 4, 97, 98],
+            iteration_count=2,
+        )
+        self.assertEqual(MULTIMODE_MODE_EVIDENCE_LINEAGE,
+                         evidence["evidenceLineage"])
+        self.assertEqual(13.0, evidence["establishedPeriodDays"])
+        self.assertEqual([2, 4, 97, 98], evidence["independentSectors"])
+
+    def test_recurrent_multimode_input_contract_fails_closed(self):
+        mutations = (
+            lambda value: value.update(physicalPeriodDays=12.0),
+            lambda value: value.update(recommendedNextTest="OTHER"),
+            lambda value: value["bestRecurrentSecondaryMode"].update(
+                medianPeriodDays=4.0),
+            lambda value: value["bestRecurrentSecondaryMode"].update(
+                independentSectors=[2, 4, 96, 97]),
+            lambda value: value.update(frequencyClusters=[]),
+            lambda value: value["acceptedResidualModes"][0].update(
+                acceptedDistinctMode=False),
+        )
+        for mutate in mutations:
+            with self.subTest(mutate=mutate):
+                summary = copy.deepcopy(self._multimode_summary())
+                mutate(summary)
+                self.assertIsNone(validated_multimode_mode_evidence(
+                    summary,
+                    physical_period_days=13.0,
+                    target_supporting_sectors=[2, 4, 97, 98],
+                    iteration_count=2,
+                ))
+
     def _datasets(self, root, *, family_period=10.0, residual_period=None,
                   residual_amplitude=0.0, sectors=4):
         paths = []

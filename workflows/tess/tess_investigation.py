@@ -118,7 +118,11 @@ from .tess_nonstationary import (
     interpret_nonstationary_project,
     summarize_nonstationary_modeling,
 )
-from .tess_mode_identification import identify_residual_mode
+from .tess_mode_identification import (
+    MULTIMODE_MODE_EVIDENCE_LINEAGE,
+    identify_residual_mode,
+    validated_multimode_mode_evidence,
+)
 from .tess_dynamic_harmonic import (
     compare_unresolved_family_dynamic_harmonics,
     model_dynamic_harmonics,
@@ -5029,33 +5033,113 @@ def build_engine(
     def mode_identification_stage(investigation, request):
         prepared = _result(investigation, "001-prepare-target")
         independent = _latest_result_for_handler(investigation, "openstar.tess.independent.prepare")
-        time_frequency = _latest_result_for_handler(investigation, "openstar.tess.time-frequency.summarize")
-        if independent is None or time_frequency is None:
-            raise RuntimeError("Mode identification requires frozen sector data and time-frequency evidence.")
-        if time_frequency.get("recommendedNextTest") != "MODE_IDENTIFICATION_OR_PULSATION_MODELING":
-            raise RuntimeError("Mode identification was not recommended by time-frequency analysis.")
-        best = ((time_frequency.get("residualEvolution") or {}).get("bestCluster") or {})
-        residual_period = best.get("medianPeriodDays")
-        period_reference = time_frequency.get("periodReference") or {}
-        established_period = period_reference.get("periodDays") or time_frequency.get("physicalPeriodDays")
-        if residual_period is None or established_period is None:
-            raise RuntimeError("Mode identification requires measured family and residual periods.")
+        if independent is None:
+            raise RuntimeError(
+                "Mode identification requires frozen independent-sector data.")
+        evidence_lineage = request.parameters.get("evidenceLineage")
+        input_hashes = {
+            "independentPreparation": sha256_json(independent),
+        }
+        if evidence_lineage == MULTIMODE_MODE_EVIDENCE_LINEAGE:
+            multimode_stage = next((
+                stage for stage in reversed(investigation.stages)
+                if stage.handler_id == "openstar.tess.multimode.summarize"
+                and stage.status == "COMPLETE"
+                and isinstance(stage.result, dict)
+            ), None)
+            if (
+                multimode_stage is None
+                or request.triggered_by_stage_id != multimode_stage.id
+            ):
+                raise RuntimeError(
+                    "Multi-mode mode identification requires its exact "
+                    "v20.7 summary lineage."
+                )
+            physical_period, resolved_cycle, physical, localization = \
+                _validated_multimode_cycle(investigation)
+            iterations = _all_results_for_handler(
+                investigation, "openstar.tess.multimode.interpret")
+            mode_evidence = validated_multimode_mode_evidence(
+                multimode_stage.result,
+                physical_period_days=physical_period,
+                target_supporting_sectors=(
+                    (localization.get("crossSector") or {}).get(
+                        "targetSupportingSectors") or []
+                ),
+                iteration_count=len(iterations),
+            )
+            if mode_evidence is None:
+                raise RuntimeError(
+                    "Mode identification requires an internally consistent "
+                    "recurrent v20.7 multi-mode result."
+                )
+            established_period = mode_evidence["establishedPeriodDays"]
+            residual_period = mode_evidence["residualPeriodDays"]
+            support = mode_evidence["independentSectors"]
+            input_hashes.update({
+                "multiModeDecomposition": sha256_json(
+                    multimode_stage.result),
+                "resolvedCycle": sha256_json(resolved_cycle),
+                "physicalInterpretation": sha256_json(physical),
+                "sourceLocalization": sha256_json(localization),
+            })
+        elif evidence_lineage is None:
+            time_frequency = _latest_result_for_handler(
+                investigation, "openstar.tess.time-frequency.summarize")
+            if time_frequency is None:
+                raise RuntimeError(
+                    "Mode identification requires time-frequency evidence.")
+            if time_frequency.get("recommendedNextTest") != (
+                "MODE_IDENTIFICATION_OR_PULSATION_MODELING"
+            ):
+                raise RuntimeError(
+                    "Mode identification was not recommended by "
+                    "time-frequency analysis."
+                )
+            best = ((time_frequency.get("residualEvolution") or {}).get(
+                "bestCluster") or {})
+            residual_period = best.get("medianPeriodDays")
+            period_reference = time_frequency.get("periodReference") or {}
+            established_period = (
+                period_reference.get("periodDays")
+                or time_frequency.get("physicalPeriodDays")
+            )
+            if residual_period is None or established_period is None:
+                raise RuntimeError(
+                    "Mode identification requires measured family and "
+                    "residual periods."
+                )
+            support = (
+                best.get("independentSectors")
+                or time_frequency.get("acceptedIndependentSectors")
+                or []
+            )
+            input_hashes["timeFrequencyEvolution"] = sha256_json(
+                time_frequency)
+        else:
+            raise RuntimeError(
+                "Mode identification evidence lineage is unsupported.")
         paths = [prepared["datasetPath"]]
         paths.extend(item["datasetPath"] for item in independent.get("preparedSectors") or []
                      if item.get("datasetPath"))
-        support = best.get("independentSectors") or time_frequency.get("acceptedIndependentSectors") or []
         result = identify_residual_mode(dataset_paths=paths,
                                         established_period_days=float(established_period),
                                         residual_period_days=float(residual_period),
                                         independent_sectors=support)
+        print("🎼 Identifying the recurrent residual frequency")
+        print(f"   established physical period: {established_period} days")
+        print(f"   recurrent residual period: {residual_period} days")
+        print(f"   classification: {result.get('classification')}")
+        print("   independent mode evidence survived: "
+              f"{result.get('independentModeEvidenceSurvived')}")
+        print(f"   recommended next test: {result.get('recommendedNextTest')}")
         artifact_path = (store.directory_for(investigation.id) / "artifacts" /
                          "mode-identification" / "mode-identification-v20.9.json")
         _write_json(artifact_path, result)
         return StageOutcome(
             result=result,
             next_stage=mode_identification_continuation(result, request_id=request.id),
-            input_hashes={"timeFrequencyEvolution": sha256_json(time_frequency),
-                          "independentPreparation": sha256_json(independent)},
+            input_hashes=input_hashes,
             artifacts=(_artifact(artifact_path, "application/json"),),
         )
 
