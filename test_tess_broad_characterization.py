@@ -1209,6 +1209,83 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
                 else:
                     self.assertIsNone(conclusion["selectedPeriodDays"])
 
+    def test_finalization_uses_strict_nested_predictive_cycle_resolution(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = InvestigationStore(root / "investigations")
+            investigation = store.create(
+                "nested-alias-finalize", WORKFLOW_ID, WORKFLOW_VERSION)
+            broad = self._interpret([6.65, 6.67, 6.69], [2.0, 2.1, 1.9])
+            dynamic = {
+                "classification":
+                "DOUBLE_CYCLE_ODD_HARMONICS_PREDICTIVELY_SUPPORTED",
+                "physicalCycleResolved": True,
+                "resolvedPhysicalPeriodDays": 13.34,
+                "referenceFamilyPeriodDays": 13.34,
+                "referencePeriodRole":
+                "PREDICTIVELY_RESOLVED_PHOTOMETRIC_CYCLE",
+                "physicalMechanismResolved": False,
+                "recommendedNextTest": "BINARY_ROTATION_EXTERNAL_EVIDENCE",
+                "periodAliasResolution": {
+                    "method": (
+                        "NESTED_EVEN_ONLY_VS_EVEN_PLUS_ODD_LEAVE_ONE_SECTOR_"
+                        "OUT_PREDICTION"),
+                    "selectedPeriodRelation": "DOUBLE_CYCLE",
+                },
+            }
+            for stage_id, handler, result in (
+                ("001-prepare-target", "openstar.tess.prepare-target", {
+                    "datasetID": "tic-38707949", "ticID": 38707949,
+                    "targetName": "TIC 38707949", "sector": 1,
+                }),
+                ("002-hypotheses", "openstar.tess.hypotheses", {
+                    "rawCandidatePeriodDays": 6.67,
+                    "observedPeriodDays": 6.67,
+                }),
+                ("003-planner", "openstar.tess.planner", {
+                    "claimDecision": {
+                        "claim": "CANDIDATE_PERIOD", "rationale": []},
+                }),
+                ("009-broad", "openstar.tess.independent.broad.interpret", broad),
+                ("010-morphology", "openstar.tess.morphology.analyze", {
+                    "physicalCycleResolved": False,
+                    "resolvedPhysicalPeriodDays": None,
+                    "morphologyClass":
+                    "EVOLVING_OR_MIXED_MORPHOLOGY_UNRESOLVED",
+                    "phenomenology":
+                    "SECTOR_EVOLVING_OR_MULTI_COMPONENT_VARIABILITY",
+                }),
+                ("015-dynamic", "openstar.tess.dynamic-harmonic.analyze",
+                 dynamic),
+            ):
+                investigation = self._complete(
+                    store, investigation, stage_id, handler, result)
+
+            engine = build_engine(
+                store, coordinator=types.SimpleNamespace(),
+                poll_interval=0.0, timeout=None)
+            engine.chain_stages = False
+            completed, next_request = engine.run_stage(
+                investigation,
+                StageRequest(
+                    "016-finalize", "openstar.tess.finalize", {},
+                    "015-dynamic"),
+                software_id="integration", software_version="20.30")
+
+            self.assertIsNone(next_request)
+            conclusion = completed.stages[-1].result
+            self.assertEqual(
+                "INDEPENDENT_PERIOD_ESTIMATE", conclusion["claim"]["claim"])
+            self.assertTrue(conclusion["periodEvidence"]["physicalCycleResolved"])
+            self.assertEqual(13.34, conclusion["selectedPeriodDays"])
+            self.assertEqual(
+                "leave-one-independent-sector-out-odd-harmonic-prediction",
+                conclusion["selectedSource"],
+            )
+            self.assertFalse(
+                conclusion["dynamicHarmonicModeling"][
+                    "physicalMechanismResolved"])
+
     def test_actual_finalizer_uses_physical_then_binary_recommendation(self):
         def run(include_binary, joint_model=None):
             root = Path(tempfile.mkdtemp())
@@ -3160,6 +3237,7 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
             dataset_paths=paths,
             raw_period_days=6.86,
             double_cycle_period_days=13.72,
+            primary_sector=0,
             harmonic_orders=(1, 2, 3, 4),
         )
         stage = completed.stages[-1]
@@ -3176,6 +3254,124 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
             "independentPreparation": sha256_json(independent),
         }, stage.provenance.input_hashes)
         self.assertEqual("openstar.tess.finalize", next_request.handler_id)
+
+    def test_nested_alias_reassessment_preserves_prior_dynamic_artifact_boundary(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        store = InvestigationStore(root / "investigations")
+        investigation = store.create(
+            "nested-alias-reassessment", WORKFLOW_ID, WORKFLOW_VERSION)
+        paths = []
+        for sector in range(4):
+            path = root / f"sector-{sector}.json"
+            path.write_text("{}", encoding="utf-8")
+            paths.append(str(path))
+        prepared = {"datasetPath": paths[0], "sector": 0}
+        independent = {"preparedSectors": [
+            {"sector": sector, "datasetPath": paths[sector]}
+            for sector in range(1, 4)
+        ]}
+        morphology = {
+            "rawPeriodDays": 6.86,
+            "possibleDoubleCycleDays": 13.72,
+            "physicalCycleResolved": False,
+            "resolvedPhysicalPeriodDays": None,
+            "continuationEvidence": {
+                "timeFrequencyEvolutionWarranted": True,
+                "analysisReferencePeriodDays": 13.72,
+                "periodReferenceKind":
+                "UNRESOLVED_FAMILY_ANALYSIS_REFERENCE",
+            },
+        }
+        summary = {
+            "physicalMechanismResolved": False,
+            "recommendedNextTest": "DYNAMIC_HARMONIC_MODELING",
+            "periodReference": {
+                "kind": "UNRESOLVED_FAMILY_ANALYSIS_REFERENCE",
+                "physicalCycleResolved": False,
+                "periodDays": 13.72,
+            },
+        }
+        prior_dynamic = {
+            "evidenceLineage":
+            "UNRESOLVED_FAMILY_TIME_FREQUENCY_RECOMMENDATION",
+            "classification":
+            "UNRESOLVED_FAMILY_DYNAMIC_HARMONIC_ALIAS_AMBIGUOUS",
+            "physicalCycleResolved": False,
+            "resolvedPhysicalPeriodDays": None,
+            "periodAliasResolution": {
+                "method":
+                "LEAVE_ONE_SECTOR_OUT_PHASE_PREDICTION_WITH_SECTOR_AMPLITUDES",
+            },
+            "periodHypothesisModels": {
+                "rawFamily": {"harmonicOrdersTested": [1, 2, 3, 4]},
+                "doubleCycle": {"harmonicOrdersTested": [1, 2, 3, 4]},
+            },
+        }
+        for stage_id, handler, result in (
+            ("001-prepare-target", "openstar.tess.prepare-target", prepared),
+            ("006-prepare-independent", "openstar.tess.independent.prepare",
+             independent),
+            ("010-morphology", "openstar.tess.morphology.analyze", morphology),
+            ("014-summarize-time-frequency",
+             "openstar.tess.time-frequency.summarize", summary),
+            ("015-dynamic-harmonic-modeling",
+             "openstar.tess.dynamic-harmonic.analyze", prior_dynamic),
+        ):
+            investigation = self._complete(
+                store, investigation, stage_id, handler, result)
+
+        reassessed = {
+            "classification":
+            "DOUBLE_CYCLE_ODD_HARMONICS_PREDICTIVELY_SUPPORTED",
+            "physicalCycleResolved": True,
+            "resolvedPhysicalPeriodDays": 13.72,
+            "referenceFamilyPeriodDays": 13.72,
+            "referencePeriodRole": "PREDICTIVELY_RESOLVED_PHOTOMETRIC_CYCLE",
+            "physicalMechanismResolved": False,
+            "recommendedNextTest": "BINARY_ROTATION_EXTERNAL_EVIDENCE",
+        }
+        request = StageRequest(
+            id="017-nested-cycle-alias-reassessment",
+            handler_id="openstar.tess.dynamic-harmonic.analyze",
+            parameters={
+                "evidenceLineage":
+                "UNRESOLVED_FAMILY_NESTED_ODD_HARMONIC_REASSESSMENT",
+            },
+            triggered_by_stage_id="015-dynamic-harmonic-modeling",
+        )
+        engine = build_engine(
+            store, coordinator=types.SimpleNamespace(),
+            poll_interval=0.0, timeout=None)
+        engine.chain_stages = False
+        with mock.patch(
+            "workflows.tess.tess_investigation."
+            "compare_unresolved_family_dynamic_harmonics",
+            return_value=dict(reassessed),
+        ) as compare:
+            completed, next_request = engine.run_stage(
+                investigation, request, software_id="integration",
+                software_version="20.30")
+
+        compare.assert_called_once_with(
+            dataset_paths=paths,
+            raw_period_days=6.86,
+            double_cycle_period_days=13.72,
+            primary_sector=0,
+            harmonic_orders=(1, 2, 3, 4),
+        )
+        stage = completed.stages[-1]
+        self.assertEqual(
+            sha256_json(prior_dynamic),
+            stage.provenance.input_hashes["priorDynamicHarmonic"],
+        )
+        self.assertTrue(stage.artifacts[0].path.endswith(
+            "dynamic-harmonic-nested-cycle-alias-v20.10.1.json"))
+        self.assertEqual(
+            "v20.10.1-nested-cycle-alias",
+            next_request.parameters["outputSuffix"],
+        )
 
     def test_direct_dynamic_harmonic_handler_uses_frozen_resolved_lineage(self):
         temporary = tempfile.TemporaryDirectory()

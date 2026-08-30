@@ -276,6 +276,7 @@ def _held_out_sector_prediction(
     held_out: dict[str, Any],
     frequency: float,
     orders: tuple[int, ...],
+    phase_learning_orders: tuple[int, ...] | None = None,
 ) -> dict[str, Any]:
     """Predict one sector with phases learned only from the other sectors.
 
@@ -283,6 +284,9 @@ def _held_out_sector_prediction(
     harmonic.  Its harmonic phases remain frozen from the training sectors, so
     evolving amplitude cannot masquerade as predictive phase coherence.
     """
+    learned_orders = phase_learning_orders or orders
+    if any(order not in learned_orders for order in orders):
+        raise ValueError("Prediction orders must be present in phase-learning orders.")
     rows: list[list[float]] = []
     values: list[float] = []
     for sector_index, item in enumerate(training):
@@ -291,7 +295,7 @@ def _held_out_sector_prediction(
                    for index in range(len(training))]
             row.extend(
                 component
-                for order in orders
+                for order in learned_orders
                 for component in (
                     math.sin(2 * math.pi * order * frequency * time),
                     math.cos(2 * math.pi * order * frequency * time),
@@ -306,13 +310,15 @@ def _held_out_sector_prediction(
             training_fit["coefficients"][coefficient_offset + 2 * index + 1],
             training_fit["coefficients"][coefficient_offset + 2 * index],
         )
-        for index in range(len(orders))
+        for index in range(len(learned_orders))
     ]
+    phase_by_order = dict(zip(learned_orders, phases))
 
     held_out_rows = [
         [1.0] + [
             math.sin(2 * math.pi * order * frequency * time + phase)
-            for order, phase in zip(orders, phases)
+            for order in orders
+            for phase in (phase_by_order[order],)
         ]
         for time in held_out["times"]
     ]
@@ -327,6 +333,8 @@ def _held_out_sector_prediction(
         "nullBic": null["bic"],
         "bicImprovementOverNull": null["bic"] - predictive["bic"],
         "trainingSectorIDs": sorted(item["sector"] for item in training),
+        "predictedHarmonicOrders": list(orders),
+        "phaseLearningHarmonicOrders": list(learned_orders),
         "heldOutParametersFitted": ["offset", "signed-amplitude-per-harmonic"],
         "phasesLearnedFromTrainingSectorsOnly": True,
     }
@@ -336,6 +344,7 @@ def _leave_one_sector_out_predictions(
     data: list[dict[str, Any]],
     period_days: float,
     orders: tuple[int, ...],
+    phase_learning_orders: tuple[int, ...] | None = None,
 ) -> list[dict[str, Any]]:
     frequency = 1.0 / period_days
     return [
@@ -344,6 +353,7 @@ def _leave_one_sector_out_predictions(
             held_out,
             frequency,
             orders,
+            phase_learning_orders,
         )
         for held_out_index, held_out in enumerate(data)
     ]
@@ -354,14 +364,16 @@ def compare_unresolved_family_dynamic_harmonics(
     dataset_paths: Iterable[str | Path],
     raw_period_days: float,
     double_cycle_period_days: float,
+    primary_sector: int,
     harmonic_orders: Iterable[int] = (1, 2, 3, 4),
 ) -> dict[str, Any]:
-    """Compare frozen raw and double-cycle hypotheses without assuming either.
+    """Test whether odd harmonics establish the doubled photometric cycle.
 
-    Resolution requires the existing conservative BIC threshold in aggregate,
-    independently predictive support in at least three held-out sectors, and no
-    held-out sector that strongly supports the opposing hypothesis.  Otherwise
-    the physical cycle remains unresolved.
+    Both nested hypotheses use the doubled-cycle frequency and the same maximum
+    absolute frequency.  The equal-half null contains only even orders (the raw
+    family expressed at the doubled period); the full model adds the intervening
+    odd orders.  Absence of odd-order support cannot establish the shorter
+    physical cycle, so only the doubled cycle can be resolved by this test.
     """
     raw_period = float(raw_period_days)
     double_period = float(double_cycle_period_days)
@@ -379,82 +391,82 @@ def compare_unresolved_family_dynamic_harmonics(
     orders = tuple(sorted({int(order) for order in harmonic_orders}))
     if not paths or not orders or orders[0] < 1:
         raise ValueError("Frozen datasets and positive harmonic orders are required.")
+    if orders != tuple(range(1, orders[-1] + 1)):
+        raise ValueError(
+            "Raw-family harmonic orders must be contiguous from one for a "
+            "matched-frequency nested alias test."
+        )
     data = [_read(path, index) for index, path in enumerate(paths)]
     sectors = [item["sector"] for item in data]
-    if len(data) < MIN_ALIAS_SUPPORTING_HELD_OUT_SECTORS:
+    primary = int(primary_sector)
+    if primary not in sectors:
         raise RuntimeError(
-            "Unresolved-family alias comparison requires at least three frozen sectors."
+            "Unresolved-family alias comparison requires the frozen primary sector."
+        )
+    if len(data) < MIN_ALIAS_SUPPORTING_HELD_OUT_SECTORS + 1:
+        raise RuntimeError(
+            "Unresolved-family alias comparison requires a primary and at least "
+            "three independent frozen sectors."
         )
     if len(set(sectors)) != len(sectors):
         raise RuntimeError(
             "Unresolved-family alias comparison requires distinct frozen sectors."
         )
 
-    raw_model = model_dynamic_harmonics(
-        dataset_paths=paths,
-        reference_period_days=raw_period,
-        harmonic_orders=orders,
-    )
-    double_model = model_dynamic_harmonics(
+    even_orders = tuple(2 * order for order in orders)
+    full_orders = tuple(range(1, even_orders[-1] + 1))
+    odd_orders = tuple(order for order in full_orders if order % 2 == 1)
+    full_double_model = model_dynamic_harmonics(
         dataset_paths=paths,
         reference_period_days=double_period,
-        harmonic_orders=orders,
+        harmonic_orders=full_orders,
     )
-    raw_predictions = _leave_one_sector_out_predictions(data, raw_period, orders)
-    double_predictions = _leave_one_sector_out_predictions(data, double_period, orders)
+    even_predictions = _leave_one_sector_out_predictions(
+        data, double_period, even_orders, full_orders)
+    full_predictions = _leave_one_sector_out_predictions(
+        data, double_period, full_orders, full_orders)
     comparisons = []
-    raw_support: list[int] = []
-    double_support: list[int] = []
-    for raw, double in zip(raw_predictions, double_predictions):
-        if raw["sector"] != double["sector"]:
+    odd_support: list[int] = []
+    independent_odd_support: list[int] = []
+    for even, full in zip(even_predictions, full_predictions):
+        if even["sector"] != full["sector"]:
             raise RuntimeError("Held-out sector identity changed between hypotheses.")
-        delta = double["predictiveBic"] - raw["predictiveBic"]
-        raw_supported = bool(
+        # Positive values favor the full model.  BIC includes the additional
+        # held-out signed amplitudes, so this does not waive their complexity.
+        delta = even["predictiveBic"] - full["predictiveBic"]
+        supported = bool(
             delta >= MIN_BIC_IMPROVEMENT
-            and raw["bicImprovementOverNull"] >= MIN_BIC_IMPROVEMENT
+            and full["bicImprovementOverNull"] >= MIN_BIC_IMPROVEMENT
         )
-        double_supported = bool(
-            -delta >= MIN_BIC_IMPROVEMENT
-            and double["bicImprovementOverNull"] >= MIN_BIC_IMPROVEMENT
-        )
-        if raw_supported:
-            raw_support.append(raw["sector"])
-        if double_supported:
-            double_support.append(raw["sector"])
+        if supported:
+            odd_support.append(even["sector"])
+            if even["sector"] != primary:
+                independent_odd_support.append(even["sector"])
         comparisons.append({
-            "sector": raw["sector"],
-            "rawHypothesis": raw,
-            "doubleCycleHypothesis": double,
-            "deltaBicDoubleMinusRaw": delta,
-            "rawHypothesisSupported": raw_supported,
-            "doubleCycleHypothesisSupported": double_supported,
+            "sector": even["sector"],
+            "role": "PRIMARY" if even["sector"] == primary else "INDEPENDENT",
+            "equalHalfEvenOnlyHypothesis": even,
+            "fullDoubleCycleHypothesis": full,
+            "deltaBicFullMinusEvenOnly": delta,
+            "oddHarmonicStructureSupported": supported,
         })
 
-    aggregate_delta = sum(
-        item["doubleCycleHypothesis"]["predictiveBic"]
-        - item["rawHypothesis"]["predictiveBic"]
-        for item in comparisons
-    )
-    raw_resolved = bool(
-        aggregate_delta >= MIN_BIC_IMPROVEMENT
-        and len(raw_support) >= MIN_ALIAS_SUPPORTING_HELD_OUT_SECTORS
-        and not double_support
+    independent_comparisons = [
+        item for item in comparisons if item["role"] == "INDEPENDENT"
+    ]
+    aggregate_independent_delta = sum(
+        item["deltaBicFullMinusEvenOnly"] for item in independent_comparisons
     )
     double_resolved = bool(
-        -aggregate_delta >= MIN_BIC_IMPROVEMENT
-        and len(double_support) >= MIN_ALIAS_SUPPORTING_HELD_OUT_SECTORS
-        and not raw_support
+        aggregate_independent_delta >= MIN_BIC_IMPROVEMENT
+        and len(independent_odd_support)
+        >= MIN_ALIAS_SUPPORTING_HELD_OUT_SECTORS
     )
-    if raw_resolved:
-        selected_relation = "RAW_PERIOD"
-        selected_period = raw_period
-        selected_model = raw_model
-        classification = "RAW_FAMILY_PREDICTIVELY_PREFERRED"
-    elif double_resolved:
+    if double_resolved:
         selected_relation = "DOUBLE_CYCLE"
         selected_period = double_period
-        selected_model = double_model
-        classification = "DOUBLE_CYCLE_PREDICTIVELY_PREFERRED"
+        selected_model = full_double_model
+        classification = "DOUBLE_CYCLE_ODD_HARMONICS_PREDICTIVELY_SUPPORTED"
     else:
         selected_relation = None
         selected_period = None
@@ -462,14 +474,28 @@ def compare_unresolved_family_dynamic_harmonics(
         classification = "UNRESOLVED_FAMILY_DYNAMIC_HARMONIC_ALIAS_AMBIGUOUS"
 
     alias_resolution = {
-        "method": "LEAVE_ONE_SECTOR_OUT_PHASE_PREDICTION_WITH_SECTOR_AMPLITUDES",
+        "method": "NESTED_EVEN_ONLY_VS_EVEN_PLUS_ODD_LEAVE_ONE_SECTOR_OUT_PREDICTION",
         "criterion": "BIC",
         "conservativeThreshold": MIN_BIC_IMPROVEMENT,
-        "minimumSupportingHeldOutSectors": MIN_ALIAS_SUPPORTING_HELD_OUT_SECTORS,
-        "contradictingHeldOutSectorsAllowed": 0,
-        "aggregateDeltaBicDoubleMinusRaw": aggregate_delta,
-        "rawSupportingHeldOutSectors": sorted(raw_support),
-        "doubleCycleSupportingHeldOutSectors": sorted(double_support),
+        "equalHalfEvenHarmonicOrders": list(even_orders),
+        "discriminatingOddHarmonicOrders": list(odd_orders),
+        "fullDoubleCycleHarmonicOrders": list(full_orders),
+        "maximumAbsoluteFrequencyMatched": True,
+        "primarySector": primary,
+        "minimumSupportingIndependentHeldOutSectors": (
+            MIN_ALIAS_SUPPORTING_HELD_OUT_SECTORS
+        ),
+        "aggregateIndependentDeltaBicFullMinusEvenOnly": (
+            aggregate_independent_delta
+        ),
+        "oddHarmonicSupportingHeldOutSectors": sorted(odd_support),
+        "oddHarmonicSupportingIndependentHeldOutSectors": sorted(
+            independent_odd_support
+        ),
+        "equalHalfOutcomeInterpretation": (
+            "NON_RESOLUTION_ONLY; ABSENCE_OF_ODD_HARMONICS_DOES_NOT_ESTABLISH_"
+            "THE_SHORTER_PHYSICAL_CYCLE"
+        ),
         "selectedPeriodRelation": selected_relation,
         "selectedPeriodDays": selected_period,
         "physicalCycleResolved": selected_model is not None,
@@ -481,8 +507,12 @@ def compare_unresolved_family_dynamic_harmonics(
         "possibleDoubleCycleDays": double_period,
         "periodAliasResolution": alias_resolution,
         "periodHypothesisModels": {
-            "rawFamily": raw_model,
-            "doubleCycle": double_model,
+            "equalHalfEvenOnly": {
+                "referencePeriodDays": double_period,
+                "harmonicOrdersTested": list(even_orders),
+                "absoluteFrequencySpanMatched": True,
+            },
+            "fullDoubleCycle": full_double_model,
         },
         "physicalCycleResolved": selected_model is not None,
         "resolvedPhysicalPeriodDays": selected_period,
