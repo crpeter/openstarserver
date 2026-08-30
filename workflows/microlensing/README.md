@@ -127,3 +127,37 @@ generic CurveGrid dataset and workload contract. The bounded stage fits only
 the smooth single-lens-like symmetric radial-amplification curve. Completing
 it is not yet recovery or classification of a planetary anomaly and is not a
 discovery claim.
+
+## Build the verified blind refinement project
+
+After the coarse project has completed through the generic project-smoke
+investigation, derive a narrower refinement grid from its persisted winner:
+
+```bash
+python -m workflows.microlensing.refine_grid \
+  --prepared-root /path/to/microlensing-recovery-a-prepared \
+  --coarse-project-root /path/to/microlensing-recovery-a-coarse-grid \
+  --coarse-investigation-record \
+    /path/to/investigations/coarse-run/investigation.json \
+  --project-id openstar.microlensing-recovery-a.refinement-grid.v1 \
+  --output-root /path/to/microlensing-recovery-a-refinement-grid
+```
+
+The builder re-verifies the blind preparation, every coarse project artifact,
+the completed smoke-investigation record, and the exact immutable JSON ledger
+for every completed stage. It binds the new contract to the verified coarse
+run-stage ledger hash. It never reads `sealed/` or trusts terminal console
+output.
+
+The refinement axes are derived mechanically from the accepted coarse winner.
+The center range spans one coarse center step on either side with one-tenth
+steps and 21 points. The log-scale and log-shape ranges each span the adjacent
+coarse cells with one-eighth steps and 17 points. This produces exactly 6,069
+candidates and 95 expected work units at 64 candidates per work unit.
+
+The provenance chain is therefore blind preparation → coarse contract and
+dataset → immutable coarse investigation ledgers → refinement contract and
+dataset. Identity remains sealed, while generic workers see only the ordinary
+CurveGrid payloads. This remains smooth-event modeling with the symmetric
+radial-amplification family; it is not yet planetary-anomaly recovery,
+classification, or a discovery claim.
