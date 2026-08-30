@@ -33,7 +33,13 @@ class CoordinatorRuntimeTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
 
-    def manifest(self, project_id, workload="workload", dataset_id="shared", name=None):
+    def manifest(
+        self,
+        project_id,
+        workload="openstar.lomb-scargle.v1",
+        dataset_id="shared",
+        name=None,
+    ):
         directory = self.root / (name or project_id)
         directory.mkdir()
         dataset = directory / "dataset.json"
@@ -290,13 +296,20 @@ class CoordinatorRuntimeTests(unittest.TestCase):
     def test_empty_and_incompatible_projects_are_skipped(self):
         runtime = CoordinatorRuntime()
         runtime.activate_project(
-            self.manifest("a", "unsupported"), require_terminal=False
+            self.manifest("a", "openstar.tess-period-search.v1"),
+            require_terminal=False,
         )
         runtime.activate_project(
-            self.manifest("b", "supported"), require_terminal=False
+            self.manifest("b", "openstar.lomb-scargle.v1"),
+            require_terminal=False,
         )
         runtime.register_node(
-            {"nodeID": "node", "capabilities": {"workloads": ["supported"]}}
+            {
+                "nodeID": "node",
+                "capabilities": {
+                    "workloads": ["openstar.lomb-scargle.v1"]
+                },
+            }
         )
         self.assertEqual("b", runtime.claim_work("node")["projectID"])
 
@@ -317,6 +330,8 @@ class CoordinatorRuntimeTests(unittest.TestCase):
         other = "b" if owner == "a" else "a"
         result = {
             "status": "completed",
+            "workUnitID": work["id"],
+            "nodeID": "node",
             "bestFrequency": 1.0,
             "bestPower": 0.5,
             "bestFrequencyIndex": 0,

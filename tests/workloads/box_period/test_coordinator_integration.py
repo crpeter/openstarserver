@@ -3,10 +3,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from coordinator_state import BOX_PERIOD_SEARCH_V1, CoordinatorState
+from coordinator_state import CoordinatorState
+from openstar_workloads.plugins.box_period import BOX_PERIOD_SEARCH_V1
 
 
-class BoxPeriodSearchCoordinatorTests(unittest.TestCase):
+class BoxPeriodCoordinatorIntegrationTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
@@ -62,7 +63,11 @@ class BoxPeriodSearchCoordinatorTests(unittest.TestCase):
             "bestPhaseBin": 0, "inBoxSamples": 20, "outOfBoxSamples": 60,
         }
         accepted = self.state.submit_result(work["id"], {
-            "status": "completed", "payload": result_payload})
+            "status": "completed",
+            "workUnitID": work["id"],
+            "nodeID": "box-node",
+            "payload": result_payload,
+        })
         self.assertTrue(accepted[0])
         stored = self.state.completed[work["id"]]
         self.assertEqual(8.714213, stored["bestScore"])
@@ -72,7 +77,10 @@ class BoxPeriodSearchCoordinatorTests(unittest.TestCase):
         self.state.register_node({"nodeID": "box-node", "capabilities": {}})
         work = self.state.claim_work("box-node")
         accepted = self.state.submit_result(work["id"], {
-            "status": "completed", "payload": {
+            "status": "completed",
+            "workUnitID": work["id"],
+            "nodeID": "box-node",
+            "payload": {
                 "bestFrequency": 0.6, "bestScore": 1.0,
                 "bestPhase": 0.0, "bestDurationFraction": 0.15,
                 "bestFrequencyIndex": 22, "bestDurationIndex": 1,
@@ -91,7 +99,10 @@ class BoxPeriodSearchCoordinatorTests(unittest.TestCase):
             "bestPhaseBin": 0, "inBoxSamples": 20, "outOfBoxSamples": 60,
         }
         fractional = self.state.submit_result(work["id"], {
-            "status": "completed", "payload": {
+            "status": "completed",
+            "workUnitID": work["id"],
+            "nodeID": "box-node",
+            "payload": {
                 **base, "bestFrequencyIndex": 22.5,
             }})
         self.assertFalse(fractional[0])
@@ -105,7 +116,10 @@ class BoxPeriodSearchCoordinatorTests(unittest.TestCase):
             "bestFrequencyIndex": payload["frequencyStartIndex"],
         }
         incomplete = self.state.submit_result(work["id"], {
-            "status": "completed", "payload": {
+            "status": "completed",
+            "workUnitID": work["id"],
+            "nodeID": "box-node",
+            "payload": {
                 **base, "inBoxSamples": 19,
             }})
         self.assertFalse(incomplete[0])
@@ -121,7 +135,10 @@ class BoxPeriodSearchCoordinatorTests(unittest.TestCase):
             frequency_index = payload["frequencyStartIndex"]
             duration_bins = int(payload["durationFractions"][0] * payload["phaseBinCount"] + 0.5)
             self.assertTrue(self.state.submit_result(work["id"], {
-                "status": "completed", "payload": {
+                "status": "completed",
+                "workUnitID": work["id"],
+                "nodeID": "box-node",
+                "payload": {
                     "bestFrequency": payload["startFrequency"],
                     "bestScore": float(payload["familyRank"]),
                     "bestPhase": 0.0,

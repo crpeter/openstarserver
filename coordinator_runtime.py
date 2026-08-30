@@ -5,15 +5,16 @@ import logging
 import threading
 import time
 import uuid
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 from coordinator_state import CoordinatorState, first_value, normalize_id
 from openstar_contributions import (
-    DEFAULT_ACCOUNTING,
     ContributionStore,
     timing_metrics,
 )
+from openstar_workloads.discovery import discover_workloads
 
 MAX_WORK_UNITS_PER_CLAIM = 128
 HOT_PATH_PROGRESS_INTERVAL_SECONDS = 10.0
@@ -34,9 +35,18 @@ class NoActiveProjectError(RuntimeError):
 class CoordinatorRuntime:
     """Multi-project scheduler around isolated, project-local states."""
 
-    def __init__(self, contribution_db: str | Path | None = None):
+    def __init__(
+        self,
+        contribution_db: str | Path | None = None,
+        workload_registry=None,
+    ):
         self.lock = threading.RLock()
         self._states: dict[str, CoordinatorState] = {}
+        self.workload_registry = (
+            workload_registry
+            if workload_registry is not None
+            else discover_workloads()
+        )
         self._project_order: list[str] = []
         self._work_project_index: dict[str, str] = {}
         self._node_registrations: dict[str, dict[str, Any]] = {}
@@ -128,11 +138,14 @@ class CoordinatorRuntime:
             self._progress_assigned = 0
             self._progress_accepted = 0
             self._progress_last_logged_at = now
-        print(message)
+        self._operational_print(message)
 
     def _ledger_failed(self, operation: str, error: Exception) -> None:
         self._ledger_error = f"{operation}: {type(error).__name__}: {error}"
-        logging.exception("Contribution ledger %s failed", operation)
+        try:
+            logging.exception("Contribution ledger %s failed", operation)
+        except Exception:
+            pass
 
     def ledger_health(self) -> dict[str, Any]:
         return {
@@ -247,18 +260,26 @@ class CoordinatorRuntime:
             raise KeyError("Missing node ID.")
         normalized = dict(payload)
         normalized["nodeID"] = str(node_id)
-        if self.contribution_store is not None:
-            try:
-                self.contribution_store.upsert_node(normalized, time.time())
-            except Exception as error:
-                self._ledger_failed("node registration", error)
+        capabilities = normalized.get("capabilities", {})
+        if not isinstance(capabilities, Mapping):
+            raise TypeError("Node capabilities must be a mapping.")
+        normalized["capabilities"] = dict(capabilities)
+
+        # Registration cache and all live project copies advance in one
+        # serialized order, so concurrent re-registration cannot replay an
+        # older capability tuple over a newer one.
         with self.lock:
+            if self.contribution_store is not None:
+                try:
+                    self.contribution_store.upsert_node(normalized, time.time())
+                except Exception as error:
+                    self._ledger_failed("node registration", error)
             self._node_registrations[self._node_key(node_id)] = copy.deepcopy(
                 normalized
             )
             states = list(self._states.values())
-        for state in states:
-            state.register_node(normalized)
+            for state in states:
+                state.register_node(normalized)
 
     def claim_work(self, node_id: Any):
         # Keep the legacy call path intact as well as its single-object result.
@@ -317,24 +338,25 @@ class CoordinatorRuntime:
             return False, "Unknown work unit.", 404
         response = state.submit_result(work_id, payload)
         if response[0] and self.contribution_store is not None:
-            normalized_work_id = normalize_id(work_id)
-            with state.lock:
-                work_unit = state.work_units[normalized_work_id]
-                dataset_id = str(work_unit["datasetID"])
-                metrics = DEFAULT_ACCOUNTING.metrics(
-                    work_unit, state.datasets[dataset_id]
-                )
-                accepted_result = state.completed[normalized_work_id]
-                record = {
-                    "project_id": str(work_unit.get("projectID") or ""),
-                    "workload_id": str(work_unit.get("workloadID") or ""),
-                    "dataset_id": dataset_id,
-                    "work_unit_id": str(work_unit["id"]),
-                    "node_id": str(accepted_result["nodeID"]),
-                    "work_metrics": dict(metrics),
-                    "timing_metrics": timing_metrics(accepted_result),
-                }
             try:
+                normalized_work_id = normalize_id(work_id)
+                with state.lock:
+                    work_unit = state.work_units[normalized_work_id]
+                    dataset_id = str(work_unit["datasetID"])
+                    metrics = state.workload_plugin.contribution_metrics(
+                        work_unit,
+                        state.datasets[dataset_id],
+                    )
+                    accepted_result = state.completed[normalized_work_id]
+                    record = {
+                        "project_id": str(work_unit.get("projectID") or ""),
+                        "workload_id": str(work_unit.get("workloadID") or ""),
+                        "dataset_id": dataset_id,
+                        "work_unit_id": str(work_unit["id"]),
+                        "node_id": str(accepted_result["nodeID"]),
+                        "work_metrics": dict(metrics),
+                        "timing_metrics": timing_metrics(accepted_result),
+                    }
                 self.contribution_store.record(
                     session_id=self.coordinator_session_id,
                     accepted_at=time.time(),
@@ -399,7 +421,7 @@ class CoordinatorRuntime:
         resolved = Path(project_path).expanduser().resolve()
         if not resolved.exists():
             raise FileNotFoundError(f"Project manifest not found: {resolved}")
-        new_state = CoordinatorState(resolved)
+        new_state = CoordinatorState(resolved, self.workload_registry)
         new_state.terminal_observer = self._project_became_terminal
         project_id = str(new_state.project_id)
         new_work_ids = list(new_state.work_units)
