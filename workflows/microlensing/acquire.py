@@ -800,12 +800,7 @@ def _parse_ipac_header_row(line: str, line_number: int) -> tuple[str, ...]:
         raise TableStructureError(
             f"line {line_number}: malformed IPAC header row"
         )
-    cells = tuple(cell.strip() for cell in stripped[1:-1].split("|"))
-    if not cells or any(not cell for cell in cells):
-        raise TableStructureError(
-            f"line {line_number}: empty IPAC header field"
-        )
-    return cells
+    return tuple(cell.strip() for cell in stripped[1:-1].split("|"))
 
 
 def inspect_ipac_table(path: str | Path) -> TableStructure:
@@ -841,6 +836,8 @@ def inspect_ipac_table(path: str | Path) -> TableStructure:
     if not header_rows:
         raise TableStructureError("missing IPAC header")
     columns = header_rows[0]
+    if any(not column for column in columns):
+        raise TableStructureError("empty column name")
     if len(set(columns)) != len(columns):
         raise TableStructureError("duplicate column names")
     for index, header_row in enumerate(header_rows[1:], 2):

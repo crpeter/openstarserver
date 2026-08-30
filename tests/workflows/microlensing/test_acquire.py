@@ -13,9 +13,11 @@ from workflows.microlensing.acquire import (
     MANIFEST_RELATIVE_PATH,
     SOURCE_SCRIPT_RELATIVE_PATH,
     SOURCE_SCRIPT_URL,
+    TableStructureError,
     WgetScriptError,
     acquire_archive,
     extract_uid,
+    inspect_ipac_table,
     inventory_archive,
     parse_wget_script,
 )
@@ -23,6 +25,12 @@ from workflows.microlensing.acquire import (
 
 FIXTURES = Path(__file__).parent / "fixtures"
 FIXED_TIME = datetime(2026, 8, 30, 16, 0, tzinfo=timezone.utc)
+REAL_FIVE_COLUMN_TABLE = """\
+| JD | RELATIVE_MAGNITUDE | MAGNITUDE_UNCERTAINTY | RELATIVE_FLUX | FLUX_UNCERTAINTY |
+| real | real | real | real | real |
+| days | mag | mag | | |
+1.0 2.0 0.1 3.0 0.2
+"""
 
 
 class FakeFetcher:
@@ -81,6 +89,13 @@ def write_manifest(root, manifest):
         + "\n",
         encoding="utf-8",
     )
+
+
+def inspect_table_text(text):
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "table.tbl"
+        path.write_text(text, encoding="utf-8")
+        return inspect_ipac_table(path)
 
 
 class WgetScriptParsingTests(unittest.TestCase):
@@ -157,6 +172,100 @@ class WgetScriptParsingTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(WgetScriptError, "conflicting URLs"):
             parse_wget_script(conflicting)
+
+
+class IpacTableStructureTests(unittest.TestCase):
+    def test_blank_optional_unit_cells_are_accepted_and_preserved(self):
+        structure = inspect_table_text(
+            "| coordinate | value | uncertainty |\n"
+            "| real | real | real |\n"
+            "| days | | |\n"
+            "1.0 2.0 0.1\n"
+        )
+
+        self.assertEqual(
+            ("days", "", ""),
+            structure.header_rows[2],
+        )
+
+    def test_real_five_column_structural_shape_is_preserved(self):
+        structure = inspect_table_text(REAL_FIVE_COLUMN_TABLE)
+
+        self.assertEqual(
+            (
+                "JD",
+                "RELATIVE_MAGNITUDE",
+                "MAGNITUDE_UNCERTAINTY",
+                "RELATIVE_FLUX",
+                "FLUX_UNCERTAINTY",
+            ),
+            structure.columns,
+        )
+        self.assertEqual(
+            ("days", "mag", "mag", "", ""),
+            structure.header_rows[2],
+        )
+        self.assertEqual(1, structure.row_count)
+
+    def test_empty_column_name_remains_rejected(self):
+        with self.assertRaisesRegex(TableStructureError, "empty column name"):
+            inspect_table_text(
+                "| coordinate | | uncertainty |\n"
+                "| real | real | real |\n"
+            )
+
+    def test_duplicate_column_names_remain_rejected(self):
+        with self.assertRaisesRegex(TableStructureError, "duplicate column"):
+            inspect_table_text(
+                "| coordinate | value | value |\n"
+                "| real | real | real |\n"
+            )
+
+    def test_subsequent_header_row_with_wrong_width_remains_rejected(self):
+        with self.assertRaisesRegex(TableStructureError, "expected 3"):
+            inspect_table_text(
+                "| coordinate | value | uncertainty |\n"
+                "| real | real |\n"
+            )
+
+    def test_malformed_header_delimiters_remain_rejected(self):
+        with self.assertRaisesRegex(TableStructureError, "malformed"):
+            inspect_table_text(
+                "| coordinate | value\n"
+                "1.0 2.0\n"
+            )
+
+    def test_schema_signature_deterministically_includes_empty_cells(self):
+        first = inspect_table_text(REAL_FIVE_COLUMN_TABLE)
+        second = inspect_table_text(REAL_FIVE_COLUMN_TABLE)
+        filled = inspect_table_text(
+            REAL_FIVE_COLUMN_TABLE.replace(
+                "| days | mag | mag | | |",
+                "| days | mag | mag | flux | flux |",
+            )
+        )
+        signature_value = {
+            "columns": list(first.columns),
+            "headerRows": [
+                list(row) for row in first.header_rows[1:]
+            ],
+        }
+        expected = hashlib.sha256(
+            json.dumps(
+                signature_value,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+
+        self.assertEqual(first.schema_signature, second.schema_signature)
+        self.assertEqual(expected, first.schema_signature)
+        self.assertNotEqual(first.schema_signature, filled.schema_signature)
+        self.assertEqual(
+            ["days", "mag", "mag", "", ""],
+            signature_value["headerRows"][1],
+        )
 
 
 class ArchiveAcquisitionTests(unittest.TestCase):
@@ -386,6 +495,14 @@ class ArchiveInventoryTests(unittest.TestCase):
                 ["epoch", "flux", "uncertainty"],
                 next(
                     item["columns"]
+                    for item in inventory["files"]
+                    if item["uid"] == "0300031"
+                ),
+            )
+            self.assertEqual(
+                ["day", "arbitrary", ""],
+                next(
+                    item["headerRows"][2]
                     for item in inventory["files"]
                     if item["uid"] == "0300031"
                 ),
