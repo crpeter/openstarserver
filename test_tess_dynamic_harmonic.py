@@ -73,6 +73,7 @@ class TessDynamicHarmonicTests(unittest.TestCase):
             dataset_paths=self._alias_data(root.name, components),
             raw_period_days=5.0,
             double_cycle_period_days=10.0,
+            primary_sector=0,
         )
 
     def test_coherent_static_family(self):
@@ -141,40 +142,76 @@ class TessDynamicHarmonicTests(unittest.TestCase):
         self.assertTrue(result["modelComparison"]["highestTestedHarmonicSupported"])
         self.assertFalse(result["physicalMechanismResolved"])
 
-    def test_unresolved_alias_comparison_predictively_selects_raw_family(self):
+    def test_equal_half_waveform_cannot_resolve_shorter_physical_cycle(self):
         result = self._compare_alias((
             (1 / 5.0, 0.9, 0.2),
             (3 / 5.0, 0.45, -0.3),
         ))
-        self.assertEqual("RAW_FAMILY_PREDICTIVELY_PREFERRED",
+        self.assertEqual("UNRESOLVED_FAMILY_DYNAMIC_HARMONIC_ALIAS_AMBIGUOUS",
                          result["classification"])
-        self.assertTrue(result["physicalCycleResolved"])
-        self.assertEqual(5.0, result["resolvedPhysicalPeriodDays"])
+        self.assertFalse(result["physicalCycleResolved"])
+        self.assertIsNone(result["resolvedPhysicalPeriodDays"])
         resolution = result["periodAliasResolution"]
-        self.assertEqual([0, 1, 2, 3],
-                         resolution["rawSupportingHeldOutSectors"])
-        self.assertEqual([], resolution["doubleCycleSupportingHeldOutSectors"])
+        self.assertEqual([],
+                         resolution["oddHarmonicSupportingHeldOutSectors"])
+        self.assertIn("NON_RESOLUTION_ONLY",
+                      resolution["equalHalfOutcomeInterpretation"])
 
-    def test_unresolved_alias_comparison_predictively_selects_double_cycle(self):
+    def test_odd_harmonics_predictively_select_double_cycle(self):
         result = self._compare_alias((
             (1 / 10.0, 0.9, 0.2),
             (3 / 10.0, 0.45, -0.3),
         ))
-        self.assertEqual("DOUBLE_CYCLE_PREDICTIVELY_PREFERRED",
+        self.assertEqual("DOUBLE_CYCLE_ODD_HARMONICS_PREDICTIVELY_SUPPORTED",
                          result["classification"])
         self.assertTrue(result["physicalCycleResolved"])
         self.assertEqual(10.0, result["resolvedPhysicalPeriodDays"])
         resolution = result["periodAliasResolution"]
         self.assertEqual([0, 1, 2, 3],
-                         resolution["doubleCycleSupportingHeldOutSectors"])
-        self.assertEqual([], resolution["rawSupportingHeldOutSectors"])
+                         resolution["oddHarmonicSupportingHeldOutSectors"])
+        self.assertEqual([1, 2, 3],
+                         resolution[
+                             "oddHarmonicSupportingIndependentHeldOutSectors"])
+        self.assertEqual([2, 4, 6, 8], result["periodHypothesisModels"]
+                         ["equalHalfEvenOnly"]["harmonicOrdersTested"])
+        self.assertEqual(list(range(1, 9)), result["periodHypothesisModels"]
+                         ["fullDoubleCycle"]["harmonicOrdersTested"])
+        comparison = resolution["comparisons"][0]
+        self.assertEqual(
+            list(range(1, 9)),
+            comparison["equalHalfEvenOnlyHypothesis"]
+            ["phaseLearningHarmonicOrders"],
+        )
+        self.assertEqual(
+            comparison["equalHalfEvenOnlyHypothesis"]
+            ["phaseLearningHarmonicOrders"],
+            comparison["fullDoubleCycleHypothesis"]
+            ["phaseLearningHarmonicOrders"],
+        )
 
-    def test_unresolved_alias_comparison_keeps_shared_harmonic_ambiguous(self):
+    def test_primary_sector_does_not_veto_independent_odd_harmonic_support(self):
         result = self._compare_alias(lambda sector: (
             (1 / 5.0, 0.9, 0.2),
             ((3 / 5.0, 0.45, -0.3)
-             if sector < 2 else
+             if sector == 0 else
              (1 / 10.0, 0.45, -0.3)),
+        ))
+        self.assertEqual(
+            "DOUBLE_CYCLE_ODD_HARMONICS_PREDICTIVELY_SUPPORTED",
+            result["classification"],
+        )
+        self.assertEqual(
+            [1, 2, 3],
+            result["periodAliasResolution"]
+            ["oddHarmonicSupportingIndependentHeldOutSectors"],
+        )
+
+    def test_two_independent_odd_harmonic_sectors_remain_ambiguous(self):
+        result = self._compare_alias(lambda sector: (
+            (1 / 5.0, 0.9, 0.2),
+            ((1 / 10.0, 0.45, -0.3)
+             if sector in (1, 2) else
+             (3 / 5.0, 0.45, -0.3)),
         ))
         self.assertEqual(
             "UNRESOLVED_FAMILY_DYNAMIC_HARMONIC_ALIAS_AMBIGUOUS",
@@ -200,12 +237,14 @@ class TessDynamicHarmonicTests(unittest.TestCase):
                 dataset_paths=paths,
                 raw_period_days=5.0,
                 double_cycle_period_days=9.9,
+                primary_sector=0,
             )
-        with self.assertRaisesRegex(RuntimeError, "at least three"):
+        with self.assertRaisesRegex(RuntimeError, "primary and at least three"):
             compare_unresolved_family_dynamic_harmonics(
                 dataset_paths=paths[:2],
                 raw_period_days=5.0,
                 double_cycle_period_days=10.0,
+                primary_sector=0,
             )
 
 

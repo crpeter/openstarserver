@@ -1970,5 +1970,93 @@ class TessUnresolvedFamilyDynamicCompatibilityTests(unittest.TestCase):
                 )
 
 
+class TessNestedAliasCompatibilityTests(unittest.TestCase):
+    def _completed(self, root, *, method=(
+            "LEAVE_ONE_SECTOR_OUT_PHASE_PREDICTION_WITH_SECTOR_AMPLITUDES")):
+        store = InvestigationStore(root)
+        investigation = store.create(
+            "tic-38707949", WORKFLOW_ID, "20.10",
+            metadata={"controlState": {
+                "schedulerAction": "INVESTIGATION_COMPLETE",
+            }},
+        )
+        dynamic_result = {
+            "evidenceLineage":
+            "UNRESOLVED_FAMILY_TIME_FREQUENCY_RECOMMENDATION",
+            "classification":
+            "UNRESOLVED_FAMILY_DYNAMIC_HARMONIC_ALIAS_AMBIGUOUS",
+            "physicalCycleResolved": False,
+            "resolvedPhysicalPeriodDays": None,
+            "periodAliasResolution": {"method": method},
+            "periodHypothesisModels": {
+                "rawFamily": {"harmonicOrdersTested": [1, 2, 3, 4]},
+                "doubleCycle": {"harmonicOrdersTested": [1, 2, 3, 4]},
+            },
+        }
+        stages = (
+            InvestigationStage(
+                "015-dynamic-harmonic-modeling",
+                "openstar.tess.dynamic-harmonic.analyze", "COMPLETE",
+                "014-summarize-time-frequency", {
+                    "evidenceLineage":
+                    "UNRESOLVED_FAMILY_TIME_FREQUENCY_RECOMMENDATION",
+                }, result=dynamic_result),
+            InvestigationStage(
+                "016-finalize", "openstar.tess.finalize", "COMPLETE",
+                "015-dynamic-harmonic-modeling",
+                {"outputSuffix": "v20.10-dynamic-harmonic"},
+                result={"claim": "INDEPENDENT_PERIOD_ESTIMATE"}, stop=True),
+        )
+        investigation = replace(
+            investigation, status="COMPLETE", stages=stages)
+        store.save(investigation)
+        return store, investigation
+
+    def test_reopens_obsolete_unmatched_alias_result_append_only(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store, investigation = self._completed(temporary)
+            immutable_stages = tuple(
+                json.dumps(asdict(stage), sort_keys=True)
+                for stage in investigation.stages
+            )
+
+            repaired = repair_obsolete_terminal_wait(store, investigation)
+
+            self.assertEqual("RUNNING", repaired.status)
+            self.assertEqual(immutable_stages, tuple(
+                json.dumps(asdict(stage), sort_keys=True)
+                for stage in repaired.stages
+            ))
+            control = repaired.metadata["controlState"]
+            self.assertEqual(
+                "TESS_NESTED_ODD_HARMONIC_ALIAS_REASSESSMENT",
+                control["recovery"],
+            )
+            self.assertEqual({
+                "id": "017-nested-cycle-alias-reassessment",
+                "handler_id": "openstar.tess.dynamic-harmonic.analyze",
+                "parameters": {
+                    "evidenceLineage":
+                    "UNRESOLVED_FAMILY_NESTED_ODD_HARMONIC_REASSESSMENT",
+                },
+                "triggered_by_stage_id": "015-dynamic-harmonic-modeling",
+            }, control["selectedExperiment"])
+            self.assertEqual(
+                repaired, repair_obsolete_terminal_wait(store, repaired))
+
+    def test_repair_rejects_nonobsolete_alias_method(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store, investigation = self._completed(
+                temporary,
+                method=(
+                    "NESTED_EVEN_ONLY_VS_EVEN_PLUS_ODD_LEAVE_ONE_SECTOR_"
+                    "OUT_PREDICTION"),
+            )
+            self.assertEqual(
+                investigation,
+                repair_obsolete_terminal_wait(store, investigation),
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

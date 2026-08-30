@@ -1393,6 +1393,76 @@ def _repair_unresolved_family_dynamic_harmonic_terminal(
     )
 
 
+def _repair_unmatched_alias_model_terminal(
+    store: InvestigationStore, investigation: Investigation, control: dict
+) -> Investigation | None:
+    """Append the matched-frequency alias test after the obsolete v20.10 result."""
+    if (investigation.status != "COMPLETE"
+            or control.get("schedulerAction") != "INVESTIGATION_COMPLETE"
+            or not investigation.stages):
+        return None
+    dynamic = _latest_complete(
+        investigation, "openstar.tess.dynamic-harmonic.analyze")
+    if dynamic is None:
+        return None
+    result = dynamic.result or {}
+    alias = result.get("periodAliasResolution") or {}
+    models = result.get("periodHypothesisModels") or {}
+    raw_model = models.get("rawFamily") or {}
+    double_model = models.get("doubleCycle") or {}
+    latest = investigation.stages[-1]
+    exact_boundary = (
+        result.get("evidenceLineage")
+        == "UNRESOLVED_FAMILY_TIME_FREQUENCY_RECOMMENDATION"
+        and result.get("classification")
+        == "UNRESOLVED_FAMILY_DYNAMIC_HARMONIC_ALIAS_AMBIGUOUS"
+        and result.get("physicalCycleResolved") is False
+        and result.get("resolvedPhysicalPeriodDays") is None
+        and alias.get("method")
+        == "LEAVE_ONE_SECTOR_OUT_PHASE_PREDICTION_WITH_SECTOR_AMPLITUDES"
+        and raw_model.get("harmonicOrdersTested") == [1, 2, 3, 4]
+        and double_model.get("harmonicOrdersTested") == [1, 2, 3, 4]
+        and latest.status == "COMPLETE"
+        and latest.handler_id == "openstar.tess.finalize"
+        and latest.stop is True
+        and latest.triggered_by_stage_id == dynamic.id
+        and not any(
+            (stage.parameters or {}).get("evidenceLineage")
+            == "UNRESOLVED_FAMILY_NESTED_ODD_HARMONIC_REASSESSMENT"
+            for stage in investigation.stages
+        )
+    )
+    if not exact_boundary:
+        return None
+    dynamic_index = investigation.stages.index(dynamic)
+    if tuple(investigation.stages[dynamic_index + 1:]) != (latest,):
+        return None
+    prefixes = [
+        int(stage.id.partition("-")[0])
+        for stage in investigation.stages
+        if stage.id.partition("-")[0].isdigit()
+    ]
+    continuation_request = StageRequest(
+        id=f"{max(prefixes, default=0) + 1:03d}-nested-cycle-alias-reassessment",
+        handler_id="openstar.tess.dynamic-harmonic.analyze",
+        parameters={
+            "evidenceLineage":
+            "UNRESOLVED_FAMILY_NESTED_ODD_HARMONIC_REASSESSMENT"
+        },
+        triggered_by_stage_id=dynamic.id,
+    )
+    return store.set_control_state(
+        investigation,
+        status="RUNNING",
+        control_state={
+            "branchAssessments": [],
+            "selectedExperiment": asdict(continuation_request),
+            "schedulerAction": "RUN_EXPERIMENT",
+            "recovery": "TESS_NESTED_ODD_HARMONIC_ALIAS_REASSESSMENT",
+        },
+    )
+
+
 def _repair_unresolved_dynamic_localization_review_failure(
     store: InvestigationStore, investigation: Investigation, control: dict
 ) -> Investigation | None:
@@ -2014,6 +2084,11 @@ def repair_obsolete_terminal_wait(
     )
     if period_repair is not None:
         return period_repair
+
+    nested_alias_repair = _repair_unmatched_alias_model_terminal(
+        store, investigation, control)
+    if nested_alias_repair is not None:
+        return nested_alias_repair
 
     unresolved_dynamic_repair = \
         _repair_unresolved_family_dynamic_harmonic_terminal(

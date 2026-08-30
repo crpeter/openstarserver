@@ -886,8 +886,10 @@ def dynamic_harmonic_continuation(summary: dict[str, Any], *, request_id: str) -
     except (TypeError, ValueError):
         resolved_period = reference_period = math.nan
     predictively_resolved = (
-        summary.get("evidenceLineage")
-        == "UNRESOLVED_FAMILY_TIME_FREQUENCY_RECOMMENDATION"
+        summary.get("evidenceLineage") in {
+            "UNRESOLVED_FAMILY_TIME_FREQUENCY_RECOMMENDATION",
+            "UNRESOLVED_FAMILY_NESTED_ODD_HARMONIC_REASSESSMENT",
+        }
         and summary.get("physicalCycleResolved") is True
         and summary.get("referencePeriodRole")
         == "PREDICTIVELY_RESOLVED_PHOTOMETRIC_CYCLE"
@@ -909,7 +911,12 @@ def dynamic_harmonic_continuation(summary: dict[str, Any], *, request_id: str) -
                             or predictively_resolved)
                         else "DYNAMIC_HARMONIC_RESIDUAL")}
                      if residual else
-                     {"outputSuffix": "v20.10-dynamic-harmonic"})),
+                    {"outputSuffix": (
+                        "v20.10.1-nested-cycle-alias"
+                        if summary.get("evidenceLineage")
+                        == "UNRESOLVED_FAMILY_NESTED_ODD_HARMONIC_REASSESSMENT"
+                        else "v20.10-dynamic-harmonic"
+                    )})),
         triggered_by_stage_id=request_id,
     )
 
@@ -1591,6 +1598,8 @@ def _render_report(conclusion: dict[str, Any]) -> str:
             f"- Harmonic ratios: {dynamic_harmonic.get('harmonicAmplitudeRatios')}",
             f"- Coherence assessment: {dynamic_harmonic.get('coherenceAssessment')}",
             f"- Residual unexplained variance: {dynamic_harmonic.get('residualUnexplainedVarianceFraction')}",
+            f"- Cycle-alias resolution: {dynamic_harmonic.get('periodAliasResolution')}",
+            f"- Resolved photometric cycle: {dynamic_harmonic.get('resolvedPhysicalPeriodDays')} days",
             f"- Classification: {dynamic_harmonic.get('classification')}",
             f"- Physical mechanism resolved: {dynamic_harmonic.get('physicalMechanismResolved')}",
             f"- Recommended next test: {dynamic_harmonic.get('recommendedNextTest')}",
@@ -4845,8 +4854,11 @@ def build_engine(
         )
 
     def dynamic_harmonic_stage(investigation, request):
-        if request.parameters.get("evidenceLineage") == \
-                "UNRESOLVED_FAMILY_TIME_FREQUENCY_RECOMMENDATION":
+        evidence_lineage = request.parameters.get("evidenceLineage")
+        if evidence_lineage in {
+                "UNRESOLVED_FAMILY_TIME_FREQUENCY_RECOMMENDATION",
+                "UNRESOLVED_FAMILY_NESTED_ODD_HARMONIC_REASSESSMENT",
+        }:
             prepared = _result(investigation, "001-prepare-target")
             independent = _latest_result_for_handler(
                 investigation, "openstar.tess.independent.prepare")
@@ -4910,26 +4922,57 @@ def build_engine(
                 raise RuntimeError(
                     "Unresolved-family dynamic harmonic modeling requires a "
                     "consistent unresolved raw/2x time-frequency lineage.")
-            if (len(independent_paths) < 2
+            if (len(independent_paths) < 3
                     or any(not isinstance(path, str) or not Path(path).is_file()
                            for path in paths)):
                 raise RuntimeError(
                     "Unresolved-family dynamic harmonic modeling requires at "
-                    "least three available frozen sector datasets.")
+                    "least three independent available frozen sector datasets.")
+            prior_dynamic = None
+            if evidence_lineage == \
+                    "UNRESOLVED_FAMILY_NESTED_ODD_HARMONIC_REASSESSMENT":
+                prior_dynamic = _latest_result_for_handler(
+                    investigation, "openstar.tess.dynamic-harmonic.analyze")
+                prior_alias = (
+                    (prior_dynamic or {}).get("periodAliasResolution") or {})
+                prior_models = (
+                    (prior_dynamic or {}).get("periodHypothesisModels") or {})
+                raw_model = prior_models.get("rawFamily") or {}
+                double_model = prior_models.get("doubleCycle") or {}
+                exact_obsolete_boundary = (
+                    isinstance(prior_dynamic, dict)
+                    and prior_dynamic.get("evidenceLineage")
+                    == "UNRESOLVED_FAMILY_TIME_FREQUENCY_RECOMMENDATION"
+                    and prior_dynamic.get("classification")
+                    == "UNRESOLVED_FAMILY_DYNAMIC_HARMONIC_ALIAS_AMBIGUOUS"
+                    and prior_dynamic.get("physicalCycleResolved") is False
+                    and prior_dynamic.get("resolvedPhysicalPeriodDays") is None
+                    and prior_alias.get("method")
+                    == "LEAVE_ONE_SECTOR_OUT_PHASE_PREDICTION_WITH_SECTOR_AMPLITUDES"
+                    and raw_model.get("harmonicOrdersTested") == [1, 2, 3, 4]
+                    and double_model.get("harmonicOrdersTested") == [1, 2, 3, 4]
+                )
+                if not exact_obsolete_boundary:
+                    raise RuntimeError(
+                        "Nested odd-harmonic reassessment requires the exact "
+                        "obsolete unmatched-frequency alias result.")
             result = compare_unresolved_family_dynamic_harmonics(
                 dataset_paths=paths,
                 raw_period_days=raw_period,
                 double_cycle_period_days=double_period,
+                primary_sector=int(prepared.get("sector")),
                 harmonic_orders=(1, 2, 3, 4),
             )
-            result["evidenceLineage"] = \
-                "UNRESOLVED_FAMILY_TIME_FREQUENCY_RECOMMENDATION"
+            result["evidenceLineage"] = evidence_lineage
             input_hashes = {
                 "morphology": sha256_json(morphology),
                 "timeFrequencySummary": sha256_json(time_frequency),
                 "primaryPreparation": sha256_json(prepared),
                 "independentPreparation": sha256_json(independent),
             }
+            if prior_dynamic is not None:
+                input_hashes["priorDynamicHarmonic"] = sha256_json(
+                    prior_dynamic)
         elif request.parameters.get("evidenceLineage") == \
                 "MORPHOLOGY_RESOLVED_TIME_FREQUENCY_RECOMMENDATION":
             prepared = _result(investigation, "001-prepare-target")
@@ -4999,8 +5042,14 @@ def build_engine(
             result = model_dynamic_harmonics(dataset_paths=paths, reference_period_days=float(period),
                                              harmonic_orders=(1, 2, 3, 4))
             input_hashes = {"modeIdentification": sha256_json(mode)}
+        artifact_name = (
+            "dynamic-harmonic-nested-cycle-alias-v20.10.1.json"
+            if evidence_lineage
+            == "UNRESOLVED_FAMILY_NESTED_ODD_HARMONIC_REASSESSMENT"
+            else "dynamic-harmonic-v20.10.json"
+        )
         artifact_path = (store.directory_for(investigation.id) / "artifacts" /
-                         "dynamic-harmonic" / "dynamic-harmonic-v20.10.json")
+                         "dynamic-harmonic" / artifact_name)
         _write_json(artifact_path, result)
         return StageOutcome(
             result=result,
@@ -11315,6 +11364,44 @@ def build_engine(
                 )
                 period_evidence["interpretation"] = "morphology-resolved-physical-cycle"
                 period_evidence["candidateSource"] = "multi-sector-morphology-discrimination"
+        dynamic_alias = (
+            (dynamic_harmonic_modeling or {}).get("periodAliasResolution") or {})
+        try:
+            dynamic_resolved_period = float(
+                (dynamic_harmonic_modeling or {}).get(
+                    "resolvedPhysicalPeriodDays"))
+        except (TypeError, ValueError):
+            dynamic_resolved_period = math.nan
+        predictive_dynamic_cycle = (
+            (dynamic_harmonic_modeling or {}).get("physicalCycleResolved") is True
+            and (dynamic_harmonic_modeling or {}).get("referencePeriodRole")
+            == "PREDICTIVELY_RESOLVED_PHOTOMETRIC_CYCLE"
+            and dynamic_alias.get("method")
+            == "NESTED_EVEN_ONLY_VS_EVEN_PLUS_ODD_LEAVE_ONE_SECTOR_OUT_PREDICTION"
+            and dynamic_alias.get("selectedPeriodRelation") == "DOUBLE_CYCLE"
+            and math.isfinite(dynamic_resolved_period)
+            and dynamic_resolved_period > 0
+        )
+        if predictive_dynamic_cycle:
+            period_evidence["physicalCycleResolved"] = True
+            period_evidence["physicalPeriodDays"] = dynamic_resolved_period
+            period_evidence["resolvedPhysicalPeriodDays"] = (
+                dynamic_resolved_period)
+            period_evidence["interpretation"] = (
+                "nested-predictive-odd-harmonic-resolved-photometric-cycle")
+            period_evidence["candidateSource"] = (
+                "leave-one-independent-sector-out-odd-harmonic-prediction")
+            existing_rationale = list(claim_decision.get("rationale") or [])
+            existing_rationale.append(
+                "A matched-frequency nested comparison resolves the doubled "
+                "photometric cycle through predictive odd-harmonic support in "
+                "at least three independent held-out sectors. The claim level "
+                "and physical mechanism remain unchanged."
+            )
+            claim_decision = {
+                "claim": claim_decision["claim"],
+                "rationale": existing_rationale,
+            }
         if (blind_transit_search or {}).get("classification") == (
             "REPLICATED_BLIND_TRANSIT_LIKE_CANDIDATE"
         ):
