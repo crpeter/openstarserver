@@ -2269,7 +2269,10 @@ def main():
         initial_stage = StageRequest(
             id=f"{next_number:03d}-source-localization",
             handler_id="openstar.tess.source-localization.analyze",
-            parameters={},
+            parameters={
+                "evidenceLineage":
+                "PHYSICAL_INTERPRETATION_PIXEL_LOCALIZATION",
+            },
             triggered_by_stage_id=last_stage_id,
         )
     elif args.continue_multimode:

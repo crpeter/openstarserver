@@ -45,7 +45,10 @@ from .tess_hypotheses import (
 )
 from .tess_identity import collect_identity, transient_required_catalog_failures
 from .tess_morphology import analyze_morphology
-from .tess_physical import analyze_physical_interpretation
+from .tess_physical import (
+    analyze_physical_interpretation,
+    physical_source_localization_continuation,
+)
 from .tess_binary_confirmation import (
     MORPHOLOGY_EVENT_SCREEN_ENTRY,
     analyze_binary_confirmation,
@@ -3911,6 +3914,18 @@ def build_engine(
                 parameters={},
                 triggered_by_stage_id=request.id,
             )
+        elif physical_source_localization_continuation(
+            interpretation, resolved_cycle
+        ):
+            next_stage = StageRequest(
+                id=_next_stage_id(request.id, "source-localization"),
+                handler_id="openstar.tess.source-localization.analyze",
+                parameters={
+                    "evidenceLineage":
+                    "PHYSICAL_INTERPRETATION_PIXEL_LOCALIZATION",
+                },
+                triggered_by_stage_id=request.id,
+            )
         else:
             next_stage = StageRequest(
                 id=_next_stage_id(request.id, "finalize"),
@@ -4343,18 +4358,31 @@ def build_engine(
             investigation,
             "openstar.tess.morphology.analyze",
         )
+        dynamic = _latest_result_for_handler(
+            investigation,
+            "openstar.tess.dynamic-harmonic.analyze",
+        )
         if identity is None:
             raise RuntimeError("Source localization requires the completed catalog-identity stage.")
         if independent_prepare is None:
             raise RuntimeError("Source localization requires frozen independent-sector metadata.")
-        if physical is None:
-            raise RuntimeError("Source localization requires completed v20.5 physical interpretation.")
-        if physical.get("recommendedNextTest") != "PIXEL_LEVEL_SOURCE_LOCALIZATION":
-            raise RuntimeError("v20.5 did not recommend pixel-level source localization.")
-        physical_period = (physical.get("physicalPeriodDays") or
-                           (morphology or {}).get("resolvedPhysicalPeriodDays"))
-        if physical_period is None:
-            raise RuntimeError("Source localization requires a resolved physical period.")
+        resolved_cycle = authoritative_resolved_cycle(
+            morphology=morphology,
+            dynamic_harmonic=dynamic,
+        )
+        physical_period = validated_cycle_period(resolved_cycle)
+        if physical is None or not physical_source_localization_continuation(
+            physical, resolved_cycle
+        ):
+            raise RuntimeError(
+                "Source localization requires the exact unresolved physical-interpretation contamination boundary."
+            )
+        if request.parameters.get("evidenceLineage") != (
+            "PHYSICAL_INTERPRETATION_PIXEL_LOCALIZATION"
+        ):
+            raise RuntimeError(
+                "Source localization requires its authoritative physical-interpretation lineage."
+            )
 
         print("🎯 Localizing the periodic signal on TESS pixels")
         print(f"   TIC: {prepared.get('ticID')}")
@@ -4376,6 +4404,10 @@ def build_engine(
             physical_period_days=float(physical_period),
             artifact_root=artifact_root,
         )
+        localization = {
+            **localization,
+            "physicalCycleEvidence": resolved_cycle,
+        }
         cross = localization.get("crossSector") or {}
         print("🎯 Cross-sector source localization")
         print(f"   classification: {cross.get('classification')}")
@@ -4388,6 +4420,7 @@ def build_engine(
         print(f"   recommended next test: {localization.get('recommendedNextTest')}")
 
         main_path = artifact_root / "pixel-localization-v20.6.json"
+        _write_json(main_path, localization)
         artifacts = [_artifact(main_path, "application/json")]
         for item in localization.get("sectorResults") or []:
             sector = item.get("sector")
@@ -4406,7 +4439,12 @@ def build_engine(
             input_hashes={
                 "identity": sha256_json(identity),
                 "physicalInterpretation": sha256_json(physical),
+                "resolvedCycle": sha256_json(resolved_cycle),
                 "independentPreparation": sha256_json(independent_prepare),
+                **({"morphology": sha256_json(morphology)}
+                   if morphology is not None else {}),
+                **({"dynamicHarmonic": sha256_json(dynamic)}
+                   if dynamic is not None else {}),
             },
             artifacts=tuple(artifacts),
         )

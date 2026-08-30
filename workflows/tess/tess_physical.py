@@ -33,6 +33,37 @@ def _float(value: Any) -> float | None:
     return result if math.isfinite(result) else None
 
 
+def physical_source_localization_continuation(
+    physical: dict[str, Any],
+    resolved_cycle: dict[str, Any] | None,
+) -> bool:
+    """Route only an exact unresolved contamination-attribution boundary."""
+    period = validated_cycle_period(resolved_cycle)
+    reported_period = _float(physical.get("physicalPeriodDays"))
+    reported_harmonic = _float(
+        physical.get("photometricFirstHarmonicPeriodDays"))
+    return bool(
+        period is not None
+        and reported_period is not None
+        and reported_harmonic is not None
+        and math.isclose(
+            reported_period, period, rel_tol=1e-9, abs_tol=1e-12)
+        and math.isclose(
+            reported_harmonic, period / 2.0,
+            rel_tol=1e-9, abs_tol=1e-12)
+        and physical.get("version") in {
+            "openstar.tess-physical-interpretation.v1",
+            "openstar.tess-physical-interpretation.v2",
+        }
+        and physical.get("physicalCycleEvidence") == resolved_cycle
+        and physical.get("physicalMechanismResolved") is False
+        and (physical.get("contaminationScreen") or {}).get(
+            "flaggedByExistingMetadata") is True
+        and physical.get("recommendedNextTest")
+        == "PIXEL_LEVEL_SOURCE_LOCALIZATION"
+    )
+
+
 def _load_json(path: str | Path) -> dict[str, Any]:
     with Path(path).expanduser().resolve().open("r", encoding="utf-8") as handle:
         return json.load(handle)
