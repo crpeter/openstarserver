@@ -58,6 +58,7 @@ from workflows.microlensing.validate_residual_grid import (
     _held_out_result,
     _overall_classification,
     _parser,
+    _verify_run_counter_scopes,
     validate_residual_grid,
 )
 
@@ -196,13 +197,14 @@ def write_residual_grid_investigation(root, grid_root):
     expected_work_units = len(statuses) * WORK_UNITS_PER_DATASET
     if expected_work_units != 105:
         raise AssertionError("synthetic fixture must exercise 105 work units")
+    final_status = statuses[-1]
     run_result = {
-        "assignedWorkUnits": 0,
-        "completedWorkUnits": expected_work_units,
+        "assignedWorkUnits": final_status["assignedWorkUnits"],
+        "completedWorkUnits": final_status["completedWorkUnits"],
         "datasets": statuses,
-        "failedWorkUnits": 0,
+        "failedWorkUnits": final_status["failedWorkUnits"],
         "nodeContributions": dict(contributions),
-        "pendingWorkUnits": 0,
+        "pendingWorkUnits": final_status["pendingWorkUnits"],
         "projectAssignedWorkUnits": 0,
         "projectCompletedWorkUnits": expected_work_units,
         "projectFailedWorkUnits": 0,
@@ -212,7 +214,7 @@ def write_residual_grid_investigation(root, grid_root):
         "projectProgress": 1.0,
         "projectTotalWorkUnits": expected_work_units,
         "status": "COMPLETE",
-        "totalWorkUnits": expected_work_units,
+        "totalWorkUnits": final_status["totalWorkUnits"],
         "workloadID": WORKLOAD_ID,
     }
     prepare_parameters = {"projectPath": str(project_path)}
@@ -421,6 +423,23 @@ class ResidualCrossValidationFixture(ResidualPreparationFixture):
 
 
 class ResidualCrossValidationSuccessTests(ResidualCrossValidationFixture):
+    def test_multidataset_run_uses_distinct_counter_scopes(self):
+        run_result = read_json(self.investigation)["stages"][1]["result"]
+        final_status = run_result["datasets"][-1]
+        for field_name in (
+            "assignedWorkUnits",
+            "completedWorkUnits",
+            "failedWorkUnits",
+            "pendingWorkUnits",
+            "totalWorkUnits",
+        ):
+            self.assertEqual(final_status[field_name], run_result[field_name])
+        self.assertEqual(35, run_result["completedWorkUnits"])
+        self.assertEqual(35, run_result["totalWorkUnits"])
+        self.assertEqual(105, run_result["projectCompletedWorkUnits"])
+        self.assertEqual(105, run_result["projectTotalWorkUnits"])
+        self.validate("multidataset-counter-output")
+
     def test_success_is_deterministic_complete_and_identity_free(self):
         first, first_result = self.validate("first-output")
         second, _ = self.validate("second-output")
@@ -517,6 +536,28 @@ class ResidualCrossValidationSuccessTests(ResidualCrossValidationFixture):
 
 
 class FrozenValidationDecisionTests(unittest.TestCase):
+    def test_single_dataset_counter_scopes_naturally_coincide(self):
+        final_status = {
+            "assignedWorkUnits": 0,
+            "completedWorkUnits": WORK_UNITS_PER_DATASET,
+            "failedWorkUnits": 0,
+            "pendingWorkUnits": 0,
+            "totalWorkUnits": WORK_UNITS_PER_DATASET,
+        }
+        run_result = {
+            **final_status,
+            "projectAssignedWorkUnits": 0,
+            "projectCompletedWorkUnits": WORK_UNITS_PER_DATASET,
+            "projectFailedWorkUnits": 0,
+            "projectPendingWorkUnits": 0,
+            "projectTotalWorkUnits": WORK_UNITS_PER_DATASET,
+        }
+        _verify_run_counter_scopes(
+            run_result,
+            final_status,
+            expected_project_work_units=WORK_UNITS_PER_DATASET,
+        )
+
     def test_same_sign_held_out_component_passes(self):
         result = _held_out_result(
             synthetic_winner(amplitude=2.0),
@@ -622,7 +663,7 @@ class ResidualCrossValidationRejectionTests(ResidualCrossValidationFixture):
         finally:
             target.write_bytes(original)
 
-    def test_mutated_investigation_result_and_ledger_are_rejected(self):
+    def test_project_counter_and_mutated_ledger_are_rejected(self):
         original_record = self.investigation.read_bytes()
         stage_document = read_json(self.investigation)["stages"][1]
         ledger = (
@@ -637,11 +678,21 @@ class ResidualCrossValidationRejectionTests(ResidualCrossValidationFixture):
                 stage["result"]["projectCompletedWorkUnits"] = 104
 
             rewrite_investigation_stage(self.investigation, 1, mutate)
-            self.assert_rejected(output_name="mutated-result")
+            self.assert_rejected(
+                "project counters",
+                output_name="wrong-project-counter",
+            )
         finally:
             self.investigation.write_bytes(original_record)
             ledger.write_bytes(original_ledger)
 
+    def test_mutated_stage_ledger_is_rejected(self):
+        stage_document = read_json(self.investigation)["stages"][1]
+        ledger = (
+            self.investigation.parent
+            / "stages"
+            / f"{stage_document['id']}.json"
+        )
         original_ledger = ledger.read_bytes()
         try:
             document = read_json(ledger)
@@ -649,6 +700,75 @@ class ResidualCrossValidationRejectionTests(ResidualCrossValidationFixture):
             write_json(ledger, document)
             self.assert_rejected(output_name="mutated-ledger")
         finally:
+            ledger.write_bytes(original_ledger)
+
+    def test_unprefixed_counters_must_match_final_dataset(self):
+        original_record = self.investigation.read_bytes()
+        stage_document = read_json(self.investigation)["stages"][1]
+        ledger = (
+            self.investigation.parent
+            / "stages"
+            / f"{stage_document['id']}.json"
+        )
+        original_ledger = ledger.read_bytes()
+        try:
+
+            def mutate(stage):
+                stage["result"]["completedWorkUnits"] = 34
+
+            rewrite_investigation_stage(self.investigation, 1, mutate)
+            self.assert_rejected(
+                "current-dataset counters",
+                output_name="wrong-current-dataset-counter",
+            )
+        finally:
+            self.investigation.write_bytes(original_record)
+            ledger.write_bytes(original_ledger)
+
+    def test_terminal_counters_must_match_project_totals(self):
+        original_record = self.investigation.read_bytes()
+        stage_document = read_json(self.investigation)["stages"][2]
+        ledger = (
+            self.investigation.parent
+            / "stages"
+            / f"{stage_document['id']}.json"
+        )
+        original_ledger = ledger.read_bytes()
+        try:
+
+            def mutate(stage):
+                stage["result"]["completedWorkUnits"] = 104
+
+            rewrite_investigation_stage(self.investigation, 2, mutate)
+            self.assert_rejected(
+                "terminal check",
+                output_name="wrong-terminal-counter",
+            )
+        finally:
+            self.investigation.write_bytes(original_record)
+            ledger.write_bytes(original_ledger)
+
+    def test_per_dataset_incomplete_coverage_remains_rejected(self):
+        original_record = self.investigation.read_bytes()
+        stage_document = read_json(self.investigation)["stages"][1]
+        ledger = (
+            self.investigation.parent
+            / "stages"
+            / f"{stage_document['id']}.json"
+        )
+        original_ledger = ledger.read_bytes()
+        try:
+
+            def mutate(stage):
+                stage["result"]["datasets"][1]["completedWorkUnits"] = 34
+
+            rewrite_investigation_stage(self.investigation, 1, mutate)
+            self.assert_rejected(
+                "dataset coverage",
+                output_name="incomplete-dataset-coverage",
+            )
+        finally:
+            self.investigation.write_bytes(original_record)
             ledger.write_bytes(original_ledger)
 
     def test_aggregate_disagreement_and_changed_winner_are_rejected(self):

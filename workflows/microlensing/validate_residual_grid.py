@@ -1141,6 +1141,59 @@ def _winner_from_status(
     )
 
 
+def _verify_run_counter_scopes(
+    run_result: Mapping[str, Any],
+    final_dataset_status: Mapping[str, Any],
+    *,
+    expected_project_work_units: int,
+) -> None:
+    project_counters = {
+        "projectAssignedWorkUnits": 0,
+        "projectCompletedWorkUnits": expected_project_work_units,
+        "projectFailedWorkUnits": 0,
+        "projectPendingWorkUnits": 0,
+        "projectTotalWorkUnits": expected_project_work_units,
+    }
+    if any(
+        _exact_count(
+            run_result.get(field_name),
+            f"project run {field_name}",
+        )
+        != expected
+        for field_name, expected in project_counters.items()
+    ):
+        raise _fail(
+            "residual-grid investigation project counters lack exact "
+            "complete coverage"
+        )
+
+    final_dataset_counters = {
+        field_name: _exact_count(
+            final_dataset_status.get(field_name),
+            f"final dataset {field_name}",
+        )
+        for field_name in (
+            "assignedWorkUnits",
+            "completedWorkUnits",
+            "failedWorkUnits",
+            "pendingWorkUnits",
+            "totalWorkUnits",
+        )
+    }
+    if any(
+        _exact_count(
+            run_result.get(field_name),
+            f"project run {field_name}",
+        )
+        != expected
+        for field_name, expected in final_dataset_counters.items()
+    ):
+        raise _fail(
+            "residual-grid investigation current-dataset counters disagree "
+            "with the final canonical dataset"
+        )
+
+
 def _verify_investigation(
     path: Path,
     grid: _VerifiedGrid,
@@ -1295,24 +1348,17 @@ def _verify_investigation(
     ) != expected_work_units:
         raise _fail(f"{label} node contributions do not match completed work")
     run_result = run_stage["result"]
-    required_run = {
-        "assignedWorkUnits": 0,
-        "completedWorkUnits": expected_work_units,
-        "failedWorkUnits": 0,
-        "pendingWorkUnits": 0,
-        "projectAssignedWorkUnits": 0,
-        "projectCompletedWorkUnits": expected_work_units,
-        "projectFailedWorkUnits": 0,
+    required_run_envelope = {
         "projectID": project_id,
         "projectPath": expected_path_string,
-        "projectPendingWorkUnits": 0,
-        "projectTotalWorkUnits": expected_work_units,
         "status": "COMPLETE",
-        "totalWorkUnits": expected_work_units,
         "workloadID": WORKLOAD_ID,
     }
-    if any(run_result.get(key) != value for key, value in required_run.items()):
-        raise _fail(f"{label} project run lacks exact complete coverage")
+    if any(
+        run_result.get(key) != value
+        for key, value in required_run_envelope.items()
+    ):
+        raise _fail(f"{label} project run envelope is invalid")
     if run_result.get("nodeContributions") != contributions:
         raise _fail(f"{label} node contributions disagree")
     statuses = run_result.get("datasets")
@@ -1363,6 +1409,11 @@ def _verify_investigation(
         winners.append(_winner_from_status(status, dataset))
     if dataset_contribution_totals != contributions:
         raise _fail(f"{label} dataset and project contributions disagree")
+    _verify_run_counter_scopes(
+        run_result,
+        statuses[-1],
+        expected_project_work_units=expected_work_units,
+    )
 
     expected_terminal = {
         "completedWorkUnits": expected_work_units,
