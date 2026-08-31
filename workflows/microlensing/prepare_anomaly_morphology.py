@@ -40,8 +40,8 @@ from workflows.microlensing.validate_residual_grid import (
     _VerifiedInvestigation,
     _VerifiedResiduals,
     _contract as _expected_cross_validation_contract,
-    _exact_count,
-    _finite_number,
+    _exact_count as _validation_exact_count,
+    _finite_number as _validation_finite_number,
     _read_json_file,
     _regular_directory,
     _reject_symlink_components,
@@ -152,6 +152,20 @@ class _PreparedWindow:
 
 def _fail(message: str) -> AnomalyMorphologyPreparationError:
     return AnomalyMorphologyPreparationError(message)
+
+
+def _finite_number(value: Any, field_name: str) -> float:
+    try:
+        return _validation_finite_number(value, field_name)
+    except ResidualGridValidationError as error:
+        raise _fail(str(error)) from error
+
+
+def _exact_count(value: Any, field_name: str) -> int:
+    try:
+        return _validation_exact_count(value, field_name)
+    except ResidualGridValidationError as error:
+        raise _fail(str(error)) from error
 
 
 def _sha256_string(value: Any, field_name: str) -> str:
@@ -1230,9 +1244,15 @@ def _prepare_anomaly_morphology_impl(
     }
     if any(series_id not in residual_by_id for series_id in selected_ids):
         raise _fail("selected morphology series is absent from residual preparation")
+    source_sha256s = {
+        record["genericSeriesID"]: residuals.series_file_sha256s[
+            record["outputFile"]
+        ]
+        for record in residuals.manifest["series"]
+    }
     window = _prepare_window(
         [residual_by_id[series_id] for series_id in selected_ids],
-        source_sha256s=residuals.series_file_sha256s,
+        source_sha256s=source_sha256s,
         negative=negative,
         positive=positive,
     )
