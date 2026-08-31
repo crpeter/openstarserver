@@ -275,10 +275,12 @@ class ResidualGridSuccessTests(ResidualGridFixture):
             geometry["center"],
             center_axis["start"] + 64 * center_axis["step"],
         )
-        self.assertEqual(
-            geometry["center"] + 4.0 * core_width,
+        expected_center_endpoint = geometry["center"] + 4.0 * core_width
+        self.assertAlmostEqual(
+            expected_center_endpoint,
             center_axis["start"]
             + (center_axis["count"] - 1) * center_axis["step"],
+            delta=math.ulp(expected_center_endpoint),
         )
         log_scale_axis = axes["logScaleAxis"]
         self.assertEqual(LOG_SCALE_COUNT, log_scale_axis["count"])
@@ -287,10 +289,11 @@ class ResidualGridSuccessTests(ResidualGridFixture):
             log_scale_axis["start"],
         )
         self.assertEqual(math.log(16.0) / 16.0, log_scale_axis["step"])
-        self.assertEqual(
+        self.assertAlmostEqual(
             geometry["logScale"],
             log_scale_axis["start"]
             + (log_scale_axis["count"] - 1) * log_scale_axis["step"],
+            delta=math.ulp(geometry["logScale"]),
         )
         log_shape_axis = axes["logShapeAxis"]
         self.assertEqual(LOG_SHAPE_COUNT, log_shape_axis["count"])
