@@ -27,6 +27,7 @@ from workflows.tess.tess_mode_identification import (
 from workflows.tess.tess_nonstationary import (
     CONFIRMED_NONSTATIONARY_EVIDENCE_LINEAGE,
     build_confirmed_nonstationary_method_contract,
+    validate_confirmed_nonstationary_localization_boundary,
 )
 
 
@@ -855,6 +856,40 @@ def _can_continue_residual_mode_localization(investigation) -> None:
         raise RuntimeError(
             "v20.9 did not recommend RESIDUAL_MODE_PIXEL_LOCALIZATION for this investigation."
         )
+    if (nonstationary.get("evidenceLineage")
+            == CONFIRMED_NONSTATIONARY_EVIDENCE_LINEAGE):
+        confirmation = next((
+            stage.result for stage in reversed(investigation.stages)
+            if stage.handler_id == LONG_BASELINE_FREQUENCY_CONFIRMATION_HANDLER_ID
+            and stage.status == "COMPLETE" and isinstance(stage.result, dict)
+        ), None)
+        localization = next((
+            stage.result for stage in reversed(investigation.stages)
+            if stage.handler_id == "openstar.tess.source-localization.analyze"
+            and stage.status == "COMPLETE" and isinstance(stage.result, dict)
+        ), None)
+        cycle = (
+            localization.get("physicalCycleEvidence")
+            if isinstance(localization, dict) else None
+        )
+        validate_confirmed_nonstationary_localization_boundary(
+            nonstationary, confirmation, cycle
+        )
+        latest = investigation.stages[-1] if investigation.stages else None
+        if not (
+            latest is not None
+            and latest.handler_id == "openstar.tess.finalize"
+            and latest.status == "COMPLETE"
+            and latest.stop is True
+            and latest.parameters.get("outputSuffix")
+            == "v20.9.2-confirmed-nonstationary"
+            and (latest.result or {}).get("nonstationaryModeling")
+            == nonstationary
+        ):
+            raise RuntimeError(
+                "Confirmed residual localization requires the exact finalized "
+                "v20.9.2 boundary."
+            )
     if already_done:
         raise RuntimeError(
             "Investigation already contains v20.10 residual-mode localization stages. "

@@ -122,6 +122,7 @@ from .tess_nonstationary import (
     interpret_nonstationary_project,
     summarize_nonstationary_modeling,
     validate_confirmed_nonstationary_boundary,
+    validate_confirmed_nonstationary_localization_boundary,
 )
 from .tess_mode_identification import (
     MULTIMODE_MODE_EVIDENCE_LINEAGE,
@@ -333,7 +334,7 @@ from .tess_multisector import (
 WORKFLOW_ID = "openstar.workflow.tess-investigation.v1"
 WORKFLOW_VERSION = "20.2"
 SOFTWARE_ID = "openstar.tess-investigation-plugin"
-SOFTWARE_VERSION = "20.41"
+SOFTWARE_VERSION = "20.42"
 ADAPTIVE_BLIND_TRANSIT_ADDITIONAL_SECTORS = 8
 EXHAUSTED_RESIDUAL_RUN_HANDLER_ID = (
     "openstar.tess.blind-transit-distributed.run"
@@ -5918,6 +5919,14 @@ def build_engine(
             investigation,
             "openstar.tess.nonstationary.summarize",
         )
+        confirmation = _latest_result_for_handler(
+            investigation,
+            LONG_BASELINE_FREQUENCY_CONFIRMATION_HANDLER_ID,
+        )
+        source_localization = _latest_result_for_handler(
+            investigation,
+            "openstar.tess.source-localization.analyze",
+        )
         mode_identification = _latest_result_for_handler(
             investigation, "openstar.tess.mode-identification.analyze",
         )
@@ -5940,21 +5949,31 @@ def build_engine(
         mode_path = (mode_identification is not None
                      and mode_identification.get("independentModeEvidenceSurvived") is True
                      and mode_identification.get("recommendedNextTest") == "RESIDUAL_MODE_PIXEL_LOCALIZATION")
+        confirmed_path = (
+            isinstance(nonstationary, dict)
+            and nonstationary.get("evidenceLineage")
+            == CONFIRMED_NONSTATIONARY_EVIDENCE_LINEAGE
+        )
         if morphology is None:
             raise RuntimeError("v20.10 requires morphology evidence.")
-        if not mode_path and not morphology.get("physicalCycleResolved"):
+        if (not mode_path and not confirmed_path
+                and not morphology.get("physicalCycleResolved")):
             raise RuntimeError("v20.10 requires the morphology-resolved physical period.")
         if not mode_path and (nonstationary is None or nonstationary.get("recommendedNextTest") != "RESIDUAL_MODE_PIXEL_LOCALIZATION"):
             raise RuntimeError("v20.10 requires v20.9 to recommend RESIDUAL_MODE_PIXEL_LOCALIZATION.")
 
-        physical_period = float(
-            ((mode_identification or {}).get("establishedPeriodFamily") or {}).get("referencePeriodDays")
-            if mode_path else morphology["resolvedPhysicalPeriodDays"]
-        )
+        physical_period = None
+        period_reference_kind = "MORPHOLOGY_RESOLVED_PHYSICAL_PERIOD"
         harmonic_orders = (1, 2)
         if dynamic_path is not None:
             physical_period, harmonic_orders, nonstationary = dynamic_path
+            period_reference_kind = "UNRESOLVED_FAMILY_ANALYSIS_REFERENCE"
         elif mode_path:
+            physical_period = float(
+                ((mode_identification or {}).get("establishedPeriodFamily") or {})[
+                    "referencePeriodDays"
+                ]
+            )
             candidate = mode_identification["modeCandidate"]
             nonstationary = {
                 "preferredFrequencyAtReference": candidate["frequencyCyclesPerDay"],
@@ -5964,6 +5983,17 @@ def build_engine(
                 "preferredModel": {"signalSectors": candidate["supportingSectors"]},
                 "recommendedNextTest": "RESIDUAL_MODE_PIXEL_LOCALIZATION",
             }
+        elif confirmed_path:
+            cycle = (
+                source_localization.get("physicalCycleEvidence")
+                if isinstance(source_localization, dict) else None
+            )
+            physical_period = validate_confirmed_nonstationary_localization_boundary(
+                nonstationary, confirmation, cycle
+            )
+            period_reference_kind = "AUTHORITATIVE_RESOLVED_PHYSICAL_CYCLE"
+        else:
+            physical_period = float(morphology["resolvedPhysicalPeriodDays"])
         artifact_root = store.directory_for(investigation.id) / "artifacts"
         print("🎯 Preparing distributed drifting residual-mode pixel localization")
         print(f"   TIC: {prepared.get('ticID')}")
@@ -5986,8 +6016,7 @@ def build_engine(
         )
         spec["periodReference"] = {
             "periodDays": physical_period,
-            "kind": ("UNRESOLVED_FAMILY_ANALYSIS_REFERENCE" if dynamic_path is not None
-                     else "MORPHOLOGY_RESOLVED_PHYSICAL_PERIOD"),
+            "kind": period_reference_kind,
             "physicalCycleResolved": dynamic_path is None,
         }
         spec["physicalMechanismResolved"] = False
@@ -6018,6 +6047,8 @@ def build_engine(
                 "modeIdentification": sha256_json(mode_identification),
                 "dynamicHarmonicModeling": sha256_json(dynamic_harmonic),
                 "timeFrequencyEvolution": sha256_json(time_frequency),
+                "longBaselineFrequencyConfirmation": sha256_json(confirmation),
+                "sourceLocalization": sha256_json(source_localization),
             },
             artifacts=tuple(artifacts),
         )
