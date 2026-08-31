@@ -9,6 +9,14 @@ from typing import Any
 
 import numpy as np
 
+from openstar_investigation import sha256_json
+
+from .tess_long_baseline_frequency_confirmation import (
+    METHOD_CONTRACT_ID as LONG_BASELINE_CONFIRMATION_METHOD_CONTRACT_ID,
+    classify_long_baseline_confirmation,
+    method_contract_hash as long_baseline_confirmation_contract_hash,
+)
+
 
 DRIFT_GRID_COUNT = 33
 MAX_EDGE_FRACTIONAL_DRIFT = 0.30
@@ -24,6 +32,13 @@ LOMB_SCARGLE_WORKLOAD_ALIASES = {
     GENERIC_LOMB_SCARGLE_WORKLOAD_ID,
     "openstar.tess-period-search.v1",
 }
+CONFIRMED_NONSTATIONARY_EVIDENCE_LINEAGE = (
+    "LONG_BASELINE_FREQUENCY_CONFIRMATION_NONSTATIONARY"
+)
+CONFIRMED_NONSTATIONARY_METHOD_CONTRACT_ID = (
+    "openstar.tess.confirmed-nonstationary-mode-modeling.v1"
+)
+CONFIRMED_NONSTATIONARY_METHOD_CONTRACT_VERSION = 1
 
 
 def _load_json(path: str | Path) -> dict[str, Any]:
@@ -76,12 +91,222 @@ def _dataset_arrays(dataset: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
 
 
 def _source_time_origin(dataset: dict[str, Any]) -> float | None:
-    source = dataset.get("source") or {}
-    for key in ("originalTimeOriginDays", "timeOriginDays"):
-        value = _float(source.get(key))
-        if value is not None:
-            return value
-    return None
+    containers = []
+    for name in ("source", "metadata"):
+        value = dataset.get(name)
+        if value is None:
+            continue
+        if not isinstance(value, dict):
+            raise RuntimeError(f"Dataset {name} lineage is not an object.")
+        containers.append(value)
+    origins = []
+    for container in containers:
+        for key in ("originalTimeOriginDays", "timeOriginDays"):
+            if container.get(key) is None:
+                continue
+            value = _float(container.get(key))
+            if value is None:
+                raise RuntimeError("Dataset time-origin lineage is invalid.")
+            origins.append(value)
+            break
+    if origins and any(
+        not math.isclose(value, origins[0], rel_tol=1e-12, abs_tol=1e-12)
+        for value in origins[1:]
+    ):
+        raise RuntimeError("Dataset time-origin lineage is internally inconsistent.")
+    return origins[0] if origins else None
+
+
+def validate_confirmed_nonstationary_boundary(
+    confirmation: dict[str, Any],
+) -> dict[str, Any]:
+    """Validate the exact v20.9.1 result before deriving modeling choices."""
+    if not isinstance(confirmation, dict):
+        raise RuntimeError("Long-baseline confirmation result is missing.")
+    if not (
+        confirmation.get("classification")
+        == "NONSTATIONARY_OR_INTERMITTENT_STRUCTURE"
+        and confirmation.get("recommendedNextTest")
+        == "LONG_BASELINE_NONSTATIONARY_MODE_MODELING"
+        and confirmation.get("physicalMechanismResolved") is False
+        and confirmation.get("claimLevelChanged") is False
+        and confirmation.get("automaticDiscoveryClaim") is False
+        and confirmation.get("leaveOneIndependentSectorOut") is True
+    ):
+        raise RuntimeError(
+            "Confirmed nonstationary modeling requires the exact conservative "
+            "v20.9.1 nonstationary/intermittent boundary."
+        )
+
+    source_contract = confirmation.get("methodContract")
+    source_hash = confirmation.get("methodContractHash")
+    if not (
+        isinstance(source_contract, dict)
+        and source_contract.get("methodContractID")
+        == LONG_BASELINE_CONFIRMATION_METHOD_CONTRACT_ID
+        and isinstance(source_hash, str)
+        and source_hash == long_baseline_confirmation_contract_hash(source_contract)
+    ):
+        raise RuntimeError("Long-baseline confirmation method-contract lineage is invalid.")
+
+    folds = confirmation.get("perSectorEvidence")
+    resolution = _float(
+        confirmation.get("longBaselineFrequencyResolutionCyclesPerDay")
+    )
+    if not isinstance(folds, list) or resolution is None or resolution <= 0:
+        raise RuntimeError("Long-baseline confirmation fold evidence is incomplete.")
+    expected_sectors = {
+        int(value)
+        for value in (
+            ((source_contract.get("evidenceBoundary") or {})
+             .get("independentSectorSupport") or {}).get("sectors") or []
+        )
+    }
+    held_out = []
+    sufficient_sectors = []
+    for fold in folds:
+        if not isinstance(fold, dict):
+            raise RuntimeError("Long-baseline confirmation fold evidence is malformed.")
+        sector = _int(fold.get("heldOutSector"))
+        training = [_int(value) for value in fold.get("trainingSectors") or []]
+        if (
+            sector is None
+            or any(value is None for value in training)
+            or sector in training
+            or not (expected_sectors - {sector}).issubset(set(training))
+        ):
+            raise RuntimeError(
+                "Long-baseline confirmation contains held-out-sector leakage or "
+                "incomplete training lineage."
+            )
+        held_out.append(sector)
+        if fold.get("support") != "INSUFFICIENT":
+            sufficient_sectors.append(sector)
+    if (
+        len(held_out) != len(set(held_out))
+        or set(held_out) != expected_sectors
+        or len(sufficient_sectors) < 3
+    ):
+        raise RuntimeError(
+            "Confirmed nonstationary modeling requires at least three unique "
+            "sufficient held-out independent sectors."
+        )
+
+    try:
+        recomputed = classify_long_baseline_confirmation(
+            folds,
+            long_baseline_frequency_resolution=resolution,
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise RuntimeError(
+            "Long-baseline confirmation aggregate evidence cannot be reproduced."
+        ) from error
+    if any(
+        confirmation.get(key) != recomputed.get(key)
+        for key in (
+            "classification", "recommendedNextTest",
+            "aggregateDecision", "frequencyStability",
+        )
+    ):
+        raise RuntimeError(
+            "Long-baseline confirmation aggregate evidence is internally inconsistent."
+        )
+
+    stability = confirmation.get("frequencyStability") or {}
+    center_frequency = _float(stability.get("medianFrequencyCyclesPerDay"))
+    if center_frequency is None or center_frequency <= 0:
+        raise RuntimeError(
+            "Confirmed nonstationary modeling requires a finite persisted median frequency."
+        )
+    frozen_paths = (confirmation.get("dataReuse") or {}).get(
+        "frozenDatasetPaths"
+    )
+    source_paths = (source_contract.get("evidenceBoundary") or {}).get(
+        "frozenDatasetPaths"
+    )
+    if not (
+        isinstance(frozen_paths, list)
+        and frozen_paths == source_paths
+        and len(frozen_paths) >= len(expected_sectors) + 1
+        and (confirmation.get("dataReuse") or {}).get("downloadPerformed") is False
+    ):
+        raise RuntimeError("Confirmed nonstationary frozen-dataset lineage is invalid.")
+
+    family = (source_contract.get("evidenceBoundary") or {}).get(
+        "establishedPeriodFamily"
+    ) or {}
+    established_period = _float(family.get("referencePeriodDays"))
+    if established_period is None or established_period <= 0:
+        raise RuntimeError("Confirmed nonstationary physical-period lineage is invalid.")
+    return {
+        "sourceMethodContractHash": source_hash,
+        "establishedPeriodDays": established_period,
+        "residualCenterFrequencyCyclesPerDay": center_frequency,
+        "sufficientHeldOutSectors": sorted(sufficient_sectors),
+        "independentSectors": sorted(expected_sectors),
+        "frozenDatasetPaths": list(frozen_paths),
+        "longBaselineDays": _float(confirmation.get("longBaselineDays")),
+        "longBaselineFrequencyResolutionCyclesPerDay": resolution,
+    }
+
+
+def build_confirmed_nonstationary_method_contract(
+    confirmation: dict[str, Any],
+) -> dict[str, Any]:
+    """Freeze the v20.9.2 choices before any frozen flux is read."""
+    evidence = validate_confirmed_nonstationary_boundary(confirmation)
+    return {
+        "methodContractID": CONFIRMED_NONSTATIONARY_METHOD_CONTRACT_ID,
+        "methodContractVersion": CONFIRMED_NONSTATIONARY_METHOD_CONTRACT_VERSION,
+        "evidenceLineage": CONFIRMED_NONSTATIONARY_EVIDENCE_LINEAGE,
+        "execution": "DISTRIBUTED_GENERIC_LOMB_SCARGLE",
+        "dataPolicy": {
+            "reuseFrozenPrimaryAndIndependentSectorDatasets": True,
+            "downloadNewData": False,
+            "contractCreatedBeforeReadingFlux": True,
+        },
+        "evidenceBoundary": {
+            "sourceClassification": confirmation["classification"],
+            "sourceRecommendation": confirmation["recommendedNextTest"],
+            "sourceMethodContractHash": evidence["sourceMethodContractHash"],
+            "physicalMechanismResolved": False,
+            "establishedPeriodDays": evidence["establishedPeriodDays"],
+            "residualCenterFrequencyCyclesPerDay": evidence[
+                "residualCenterFrequencyCyclesPerDay"
+            ],
+            "sufficientHeldOutSectors": evidence["sufficientHeldOutSectors"],
+            "independentSectors": evidence["independentSectors"],
+            "frozenDatasetPaths": evidence["frozenDatasetPaths"],
+            "longBaselineDays": evidence["longBaselineDays"],
+            "longBaselineFrequencyResolutionCyclesPerDay": evidence[
+                "longBaselineFrequencyResolutionCyclesPerDay"
+            ],
+        },
+        "modeling": {
+            "establishedFamilySubtraction": [1, 2],
+            "driftGridCount": DRIFT_GRID_COUNT,
+            "maximumEdgeFractionalDrift": MAX_EDGE_FRACTIONAL_DRIFT,
+            "frequencyHalfWidthFraction": FREQUENCY_HALF_WIDTH_FRACTION,
+            "minimumFrequencyHard": MINIMUM_FREQUENCY_HARD,
+            "maximumFrequencyHard": MAXIMUM_FREQUENCY_HARD,
+            "totalFrequencies": TOTAL_FREQUENCIES,
+            "frequenciesPerWorkUnit": FREQUENCIES_PER_WORK_UNIT,
+            "minimumPeakProminence": MIN_PEAK_PROMINENCE,
+            "modelComparisonCriterion": "BIC",
+            "minimumBICImprovement": MIN_BIC_IMPROVEMENT,
+        },
+        "claimPolicy": {
+            "claimLevelChanged": False,
+            "physicalMechanismResolved": False,
+            "automaticDiscoveryClaim": False,
+        },
+    }
+
+
+def confirmed_nonstationary_method_contract_hash(
+    contract: dict[str, Any],
+) -> str:
+    return sha256_json(contract)
 
 
 def _source_items(
@@ -197,9 +422,10 @@ def build_nonstationary_project(
     primary_sector: int | None,
     independent_spec: dict[str, Any],
     physical_period_days: float,
-    time_frequency_summary: dict[str, Any],
+    time_frequency_summary: dict[str, Any] | None,
     output_dir: str | Path,
     investigation_id: str,
+    confirmed_method_contract: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if physical_period_days <= 0:
         raise ValueError("physical_period_days must be positive")
@@ -213,22 +439,56 @@ def build_nonstationary_project(
         )
     workload_id = GENERIC_LOMB_SCARGLE_WORKLOAD_ID
     physical_frequency = 1.0 / float(physical_period_days)
+    confirmed = confirmed_method_contract is not None
+    if confirmed:
+        if not (
+            isinstance(confirmed_method_contract, dict)
+            and confirmed_method_contract.get("methodContractID")
+            == CONFIRMED_NONSTATIONARY_METHOD_CONTRACT_ID
+            and confirmed_method_contract.get("evidenceLineage")
+            == CONFIRMED_NONSTATIONARY_EVIDENCE_LINEAGE
+        ):
+            raise RuntimeError("Confirmed nonstationary method contract is invalid.")
+        boundary = confirmed_method_contract.get("evidenceBoundary") or {}
+        center_frequency = _float(
+            boundary.get("residualCenterFrequencyCyclesPerDay")
+        )
+        supporting_sectors = sorted({
+            int(value)
+            for value in boundary.get("sufficientHeldOutSectors") or []
+            if _int(value) is not None
+        })
+        if center_frequency is None or center_frequency <= 0:
+            raise RuntimeError(
+                "Confirmed nonstationary method contract has no center frequency."
+            )
+        support_group_id = "confirmed-sufficient-held-out-sectors"
+        support_group_label = (
+            "v20.9.1 sufficient held-out independent sectors"
+        )
+    else:
+        if not isinstance(time_frequency_summary, dict):
+            raise RuntimeError("v20.9 requires a v20.8 time-frequency summary.")
+        best_cluster = (
+            (time_frequency_summary.get("residualEvolution") or {})
+            .get("bestCluster") or {}
+        )
+        center_frequency = _float(best_cluster.get("medianFrequency"))
+        if center_frequency is None or center_frequency <= 0:
+            center_period = _float(best_cluster.get("medianPeriodDays"))
+            if center_period is None or center_period <= 0:
+                raise RuntimeError("v20.9 requires a v20.8 best residual cluster.")
+            center_frequency = 1.0 / center_period
+        supporting_sectors = sorted({
+            int(value)
+            for value in (best_cluster.get("independentSectors") or [])
+            if _int(value) is not None
+        })
+        support_group_id = "v20.8-support-sectors"
+        support_group_label = "v20.8 best-cluster supporting sectors"
+
     root = Path(output_dir) / "nonstationary"
     root.mkdir(parents=True, exist_ok=True)
-
-    best_cluster = ((time_frequency_summary.get("residualEvolution") or {}).get("bestCluster") or {})
-    center_frequency = _float(best_cluster.get("medianFrequency"))
-    if center_frequency is None or center_frequency <= 0:
-        center_period = _float(best_cluster.get("medianPeriodDays"))
-        if center_period is None or center_period <= 0:
-            raise RuntimeError("v20.9 requires a v20.8 best residual cluster.")
-        center_frequency = 1.0 / center_period
-
-    supporting_sectors = sorted({
-        int(value)
-        for value in (best_cluster.get("independentSectors") or [])
-        if _int(value) is not None
-    })
 
     source_items = _source_items(
         primary_dataset_path=primary_dataset_path,
@@ -309,8 +569,8 @@ def build_nonstationary_project(
         support_mask = np.isin(sector_ids, np.asarray(supporting_sectors, dtype=np.int32))
         if int(np.count_nonzero(support_mask)) >= 256:
             groups.append({
-                "groupID": "v20.8-support-sectors",
-                "label": "v20.8 best-cluster supporting sectors",
+                "groupID": support_group_id,
+                "label": support_group_label,
                 "mask": support_mask,
                 "sectors": supporting_sectors,
             })
@@ -387,9 +647,13 @@ def build_nonstationary_project(
             })
             dataset_entries.append(manifest_entry)
 
+    project_suffix = (
+        "confirmed-long-baseline-nonstationary-v1"
+        if confirmed else "long-baseline-nonstationary-v1"
+    )
     project_id = (
         f"{source_project['id']}.investigation.{_safe(investigation_id)}."
-        "long-baseline-nonstationary-v1"
+        f"{project_suffix}"
     )
     manifest = {
         "id": project_id,
@@ -407,12 +671,29 @@ def build_nonstationary_project(
             "physicalPeriodDays": float(physical_period_days),
             "residualCenterFrequency": float(center_frequency),
             "supportingSectors": supporting_sectors,
+            "evidenceLineage": (
+                CONFIRMED_NONSTATIONARY_EVIDENCE_LINEAGE
+                if confirmed else "V20.8_TIME_FREQUENCY_RECOMMENDATION"
+            ),
+            **({
+                "methodContractID": confirmed_method_contract[
+                    "methodContractID"
+                ],
+                "methodContractHash": (
+                    confirmed_nonstationary_method_contract_hash(
+                        confirmed_method_contract
+                    )
+                ),
+            } if confirmed else {}),
         },
     }
     manifest_path = root / f"{_safe(project_id)}.json"
     _write_json(manifest_path, manifest)
 
-    analysis_series_path = root / "long-baseline-series-v20.9.json"
+    analysis_series_path = root / (
+        "long-baseline-series-v20.9.2.json"
+        if confirmed else "long-baseline-series-v20.9.json"
+    )
     _write_json(analysis_series_path, {
         "timeReferenceDays": reference_time,
         "physicalPeriodDays": float(physical_period_days),
@@ -438,6 +719,18 @@ def build_nonstationary_project(
         "residualCenterFrequency": float(center_frequency),
         "residualCenterPeriodDays": 1.0 / float(center_frequency),
         "supportingSectors": supporting_sectors,
+        "supportGroupID": support_group_id,
+        "evidenceLineage": (
+            CONFIRMED_NONSTATIONARY_EVIDENCE_LINEAGE
+            if confirmed else "V20.8_TIME_FREQUENCY_RECOMMENDATION"
+        ),
+        **({
+            "methodContractID": confirmed_method_contract["methodContractID"],
+            "methodContractHash": confirmed_nonstationary_method_contract_hash(
+                confirmed_method_contract
+            ),
+            "methodContract": copy.deepcopy(confirmed_method_contract),
+        } if confirmed else {}),
         "timeReferenceDays": reference_time,
         "timeSpanDays": float(np.max(relative_times) - np.min(relative_times)),
         "frequencySearch": search,
@@ -651,7 +944,10 @@ def summarize_nonstationary_modeling(
     groups = interpretation.get("groups") or {}
 
     all_group = groups.get("all-sectors") or {}
-    support_group = groups.get("v20.8-support-sectors") or {}
+    support_group_id = str(
+        preparation.get("supportGroupID") or "v20.8-support-sectors"
+    )
+    support_group = groups.get(support_group_id) or {}
     all_stationary = all_group.get("stationaryCandidate") or {}
     all_best = all_group.get("bestCandidate") or all_stationary
     support_stationary = support_group.get("stationaryCandidate") or {}
@@ -788,6 +1084,12 @@ def summarize_nonstationary_modeling(
     )
 
     return {
+        "evidenceLineage": preparation.get("evidenceLineage"),
+        **({
+            "methodContractID": preparation.get("methodContractID"),
+            "methodContractHash": preparation.get("methodContractHash"),
+            "methodContract": copy.deepcopy(preparation.get("methodContract")),
+        } if preparation.get("methodContractID") else {}),
         "classification": classification,
         "distributedModeling": {
             "workloadID": preparation.get("workloadID"),
