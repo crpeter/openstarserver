@@ -35,6 +35,10 @@ from .tess_nonstationary import (
     build_confirmed_nonstationary_method_contract,
     validate_confirmed_nonstationary_localization_boundary,
 )
+from .tess_residual_external_evidence import (
+    HANDLER_ID as RESIDUAL_EXTERNAL_EVIDENCE_HANDLER_ID,
+    validate_target_supported_boundary,
+)
 from .tess_resolved_cycle import validated_cycle_period
 from .tess_source_pair_lineage import frozen_source_pair_evidence
 
@@ -1623,6 +1627,108 @@ def _repair_confirmed_residual_localization_terminal(
     )
 
 
+def _repair_target_supported_residual_external_evidence_terminal(
+    store: InvestigationStore, investigation: Investigation, control: dict
+) -> Investigation | None:
+    """Append v20.10.1 only at the exact finalized target-supported boundary."""
+    if not (
+        investigation.status in {"COMPLETE", "HUMAN_REVIEW_REQUIRED"}
+        and control.get("schedulerAction") == "INVESTIGATION_COMPLETE"
+        and control.get("selectedExperiment") in (None, {})
+        and not any(stage.status == "RUNNING" for stage in investigation.stages)
+        and not any(
+            stage.handler_id == RESIDUAL_EXTERNAL_EVIDENCE_HANDLER_ID
+            for stage in investigation.stages
+        )
+    ):
+        return None
+    localization = _latest_complete(
+        investigation, "openstar.tess.residual-mode-localization.interpret"
+    )
+    nonstationary = _latest_complete(
+        investigation, "openstar.tess.nonstationary.summarize"
+    )
+    confirmation = _latest_complete(
+        investigation, LONG_BASELINE_FREQUENCY_CONFIRMATION_HANDLER_ID
+    )
+    source_localization = _latest_complete(
+        investigation, "openstar.tess.source-localization.analyze"
+    )
+    identity = _latest_complete(investigation, "openstar.tess.catalog-identity")
+    prepared = next((
+        stage for stage in investigation.stages
+        if stage.id == "001-prepare-target" and stage.status == "COMPLETE"
+        and isinstance(stage.result, dict)
+    ), None)
+    latest = investigation.stages[-1] if investigation.stages else None
+    if any(stage is None for stage in (
+        localization, nonstationary, confirmation, source_localization,
+        identity, prepared, latest,
+    )):
+        return None
+    if not (
+        isinstance(localization.result, dict)
+        and isinstance(nonstationary.result, dict)
+        and isinstance(confirmation.result, dict)
+        and isinstance(source_localization.result, dict)
+        and isinstance(identity.result, dict)
+        and latest.handler_id == "openstar.tess.finalize"
+        and latest.status == "COMPLETE" and latest.stop is True
+        and latest.triggered_by_stage_id == localization.id
+        and latest.parameters == {"outputSuffix": "v20.10"}
+        and (latest.result or {}).get("residualModeLocalization")
+        == localization.result
+        and (latest.result or {}).get("recommendedNextTest")
+        == "EXTERNAL_VARIABILITY_CLASSIFICATION_AND_BINARY_EVIDENCE"
+    ):
+        return None
+    index = investigation.stages.index(localization)
+    if tuple(investigation.stages[index + 1:]) != (latest,):
+        return None
+    try:
+        validate_target_supported_boundary(
+            localization=localization.result,
+            nonstationary=nonstationary.result,
+            confirmation=confirmation.result,
+            physical_cycle=source_localization.result.get("physicalCycleEvidence"),
+            identity=identity.result,
+            expected_tic_id=int(prepared.result["ticID"]),
+        )
+    except (KeyError, RuntimeError, TypeError, ValueError):
+        return None
+    hashes = localization.provenance.input_hashes if localization.provenance else {}
+    if not (
+        hashes.get("nonstationaryModeling") == sha256_json(nonstationary.result)
+        and all(
+            store.verified_terminal_stage_ledger_hash(investigation.id, stage)
+            for stage in (
+                prepared, identity, confirmation, source_localization,
+                nonstationary, localization, latest,
+            )
+        )
+        and _verified_stage_json(
+            localization, "residual-mode-localization-v20.10.json"
+        )
+        and _verified_stage_json(latest, "conclusion-v20.10.json")
+    ):
+        return None
+    continuation = StageRequest(
+        id=_continuation_stage_id(latest, "residual-external-evidence"),
+        handler_id=RESIDUAL_EXTERNAL_EVIDENCE_HANDLER_ID,
+        parameters={},
+        triggered_by_stage_id=localization.id,
+    )
+    return store.set_control_state(
+        investigation, status="RUNNING",
+        control_state={
+            "branchAssessments": [],
+            "selectedExperiment": asdict(continuation),
+            "schedulerAction": "RUN_EXPERIMENT",
+            "recovery": "TESS_TARGET_SUPPORTED_RESIDUAL_EXTERNAL_EVIDENCE",
+        },
+    )
+
+
 def _repair_dynamic_harmonic_terminal(
     store: InvestigationStore, investigation: Investigation, control: dict
 ) -> Investigation | None:
@@ -3144,6 +3250,13 @@ def repair_obsolete_terminal_wait(
         )
     if confirmed_localization_repair is not None:
         return confirmed_localization_repair
+
+    residual_external_repair = \
+        _repair_target_supported_residual_external_evidence_terminal(
+            store, investigation, control
+        )
+    if residual_external_repair is not None:
+        return residual_external_repair
 
     dynamic_repair = _repair_dynamic_harmonic_terminal(store, investigation, control)
     if dynamic_repair is not None:

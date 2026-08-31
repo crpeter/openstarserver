@@ -150,6 +150,10 @@ from .tess_residual_localization import (
     build_residual_mode_pixel_project,
     interpret_residual_mode_pixel_project,
 )
+from .tess_residual_external_evidence import (
+    HANDLER_ID as RESIDUAL_EXTERNAL_EVIDENCE_HANDLER_ID,
+    analyze_residual_external_evidence,
+)
 from .tess_residual_localization_review import (
     build_residual_mode_localization_review_project,
     interpret_residual_mode_localization_review_project,
@@ -1094,24 +1098,34 @@ def nonstationary_continuation(summary: dict[str, Any], *, request_id: str) -> S
 def residual_mode_localization_continuation(
     summary: dict[str, Any], *, request_id: str
 ) -> StageRequest:
-    """Route only the persisted, unresolved source-localization review request."""
+    """Route only the two persisted residual-localization recommendations."""
 
     run_review = (
         summary.get("recommendedNextTest")
         == "RESIDUAL_MODE_SOURCE_LOCALIZATION_REVIEW"
         and summary.get("physicalMechanismResolved") is False
     )
+    run_external = (
+        summary.get("recommendedNextTest")
+        == "EXTERNAL_VARIABILITY_CLASSIFICATION_AND_BINARY_EVIDENCE"
+        and summary.get("physicalMechanismResolved") is False
+        and (summary.get("crossSector") or {}).get("classification")
+        == "RESIDUAL_MODE_TARGET_SUPPORTED"
+    )
     return StageRequest(
         id=_next_stage_id(
             request_id,
-            "prepare-residual-mode-localization-review" if run_review else "finalize",
+            "prepare-residual-mode-localization-review" if run_review else
+            ("residual-external-evidence" if run_external else "finalize"),
         ),
         handler_id=(
             "openstar.tess.residual-mode-localization-review.prepare"
-            if run_review
+            if run_review else
+            (RESIDUAL_EXTERNAL_EVIDENCE_HANDLER_ID if run_external
             else "openstar.tess.finalize"
+            )
         ),
-        parameters={} if run_review else {"outputSuffix": "v20.10"},
+        parameters={} if (run_review or run_external) else {"outputSuffix": "v20.10"},
         triggered_by_stage_id=request_id,
     )
 
@@ -1842,6 +1856,40 @@ def _render_report(conclusion: dict[str, Any]) -> str:
                 f"peakPower={item.get('peakPower')}, "
                 f"powerContrast={item.get('powerContrast')}, "
                 f"classification={item.get('classification')}"
+            )
+
+    residual_external = conclusion.get("residualExternalEvidence")
+    if residual_external is not None:
+        spatial = residual_external.get("spatialEvidence") or {}
+        lines.extend([
+            "",
+            "## Frozen external variability and binary evidence",
+            "",
+            f"- Method contract: {residual_external.get('methodContractID')}",
+            f"- Method contract hash: {residual_external.get('methodContractHash')}",
+            f"- Classification: {residual_external.get('classification')}",
+            f"- Catalog coverage complete: {residual_external.get('catalogCoverageComplete')}",
+            f"- Residual period: {residual_external.get('residualPeriodAtReferenceDays')} days",
+            f"- Established physical period: {residual_external.get('establishedPhysicalPeriodDays')} days",
+            f"- Target-supporting residual sectors: {spatial.get('targetSupportingSectors')}",
+            f"- Retained off-target residual sectors: {spatial.get('offTargetSectors')}",
+            f"- Spatial cautions: {spatial.get('cautions')}",
+            f"- Insufficiency reasons: {residual_external.get('insufficiencyReasons')}",
+            f"- Physical mechanism resolved: {residual_external.get('physicalMechanismResolved')}",
+            f"- Claim level changed: {residual_external.get('claimLevelChanged')}",
+            f"- Recommended next test: {residual_external.get('recommendedNextTest')}",
+            "",
+            "### Catalog evidence",
+            "",
+        ])
+        for item in residual_external.get("catalogEvidence") or []:
+            lines.append(
+                f"- {item.get('source')} {item.get('stableObjectID')}: "
+                f"classification={item.get('classification')}, "
+                f"family={item.get('classificationFamily')}, "
+                f"targetAssociated={item.get('targetAssociated')}, "
+                f"catalogPeriodDays={item.get('catalogPeriodDays')}, "
+                f"periodComparisons={item.get('periodComparisons')}"
             )
 
 
@@ -6129,6 +6177,78 @@ def build_engine(
                         investigation,
                         "openstar.tess.nonstationary.summarize",
                     )
+                ),
+            },
+            artifacts=(_artifact(artifact_path, "application/json"),),
+        )
+
+
+    def residual_external_evidence_stage(investigation, request):
+        prepared = _result(investigation, "001-prepare-target")
+        identity = _required_latest_result_for_handler(
+            investigation, "openstar.tess.catalog-identity"
+        )
+        localization = _required_latest_result_for_handler(
+            investigation, "openstar.tess.residual-mode-localization.interpret"
+        )
+        nonstationary = _required_latest_result_for_handler(
+            investigation, "openstar.tess.nonstationary.summarize"
+        )
+        confirmation = _required_latest_result_for_handler(
+            investigation, LONG_BASELINE_FREQUENCY_CONFIRMATION_HANDLER_ID
+        )
+        source_localization = _required_latest_result_for_handler(
+            investigation, "openstar.tess.source-localization.analyze"
+        )
+        result = analyze_residual_external_evidence(
+            localization=localization,
+            nonstationary=nonstationary,
+            confirmation=confirmation,
+            physical_cycle=source_localization.get("physicalCycleEvidence"),
+            identity=identity,
+            expected_tic_id=int(prepared["ticID"]),
+        )
+        print("📚 Frozen external variability and binary evidence")
+        print(f"   method contract: {result.get('methodContractID')}")
+        print(f"   method hash: {result.get('methodContractHash')}")
+        print(f"   classification: {result.get('classification')}")
+        print(
+            "   target-associated binary records: "
+            f"{len(result.get('targetAssociatedBinaryEvidence') or [])}"
+        )
+        print(
+            "   target-associated nonbinary variability records: "
+            f"{len(result.get('targetAssociatedNonbinaryVariabilityEvidence') or [])}"
+        )
+        print(
+            "   retained off-target sectors: "
+            f"{(result.get('spatialEvidence') or {}).get('offTargetSectors')}"
+        )
+        print(f"   physical mechanism resolved: {result.get('physicalMechanismResolved')}")
+        print(f"   recommended next test: {result.get('recommendedNextTest')}")
+
+        artifact_path = (
+            store.directory_for(investigation.id)
+            / "artifacts"
+            / "residual-external-evidence"
+            / "residual-external-evidence-v20.10.1.json"
+        )
+        _write_json(artifact_path, result)
+        return StageOutcome(
+            result=result,
+            next_stage=StageRequest(
+                id=_next_stage_id(request.id, "finalize"),
+                handler_id="openstar.tess.finalize",
+                parameters={"outputSuffix": "v20.10.1-residual-external-evidence"},
+                triggered_by_stage_id=request.id,
+            ),
+            input_hashes={
+                "catalogIdentity": sha256_json(identity),
+                "residualModeLocalization": sha256_json(localization),
+                "nonstationaryModeling": sha256_json(nonstationary),
+                "longBaselineFrequencyConfirmation": sha256_json(confirmation),
+                "physicalCycleEvidence": sha256_json(
+                    source_localization.get("physicalCycleEvidence")
                 ),
             },
             artifacts=(_artifact(artifact_path, "application/json"),),
@@ -10937,6 +11057,9 @@ def build_engine(
             investigation,
             "openstar.tess.residual-mode-localization.interpret",
         )
+        residual_external_evidence = _latest_result_for_handler(
+            investigation, RESIDUAL_EXTERNAL_EVIDENCE_HANDLER_ID,
+        )
         residual_mode_localization_review = _latest_result_for_handler(
             investigation,
             "openstar.tess.residual-mode-localization-review.interpret",
@@ -11291,6 +11414,25 @@ def build_engine(
                 )
             existing_rationale.append(
                 f"Recommended next confirmation step: {residual_mode_localization.get('recommendedNextTest')}."
+            )
+            claim_decision = {
+                "claim": claim_decision["claim"],
+                "rationale": existing_rationale,
+            }
+
+        if residual_external_evidence is not None:
+            existing_rationale = list(claim_decision.get("rationale") or [])
+            existing_rationale.append(
+                "v20.10.1 adjudicates only the external variability and binary "
+                "classifications already frozen by the catalog-identity stage, "
+                "classifying that context as "
+                f"{residual_external_evidence.get('classification')}. It retains "
+                "discordant off-target sector evidence and does not resolve the "
+                "physical mechanism or change the claim level."
+            )
+            existing_rationale.append(
+                "Recommended next confirmation step: "
+                f"{residual_external_evidence.get('recommendedNextTest')}."
             )
             claim_decision = {
                 "claim": claim_decision["claim"],
@@ -12167,7 +12309,11 @@ def build_engine(
             and stage.handler_id != "openstar.tess.finalize" and not stage.handler_id.startswith(
                 "openstar.tess.target-residual-archival-baseline.")
             for index, stage in enumerate(investigation.stages))
-        if long_baseline_frequency_confirmation is not None:
+        if residual_external_evidence is not None:
+            recommended_next_test = residual_external_evidence.get(
+                "recommendedNextTest"
+            )
+        elif long_baseline_frequency_confirmation is not None:
             recommended_next_test = long_baseline_frequency_confirmation.get(
                 "recommendedNextTest"
             )
@@ -12332,6 +12478,7 @@ def build_engine(
             "dynamicHarmonicModeling": dynamic_harmonic_modeling,
             "dynamicHarmonicFrequencyRefinement": dynamic_harmonic_frequency_refinement,
             "residualModeLocalization": residual_mode_localization,
+            "residualExternalEvidence": residual_external_evidence,
             "residualModeLocalizationReview": residual_mode_localization_review,
             "multiSourceResidualDecomposition": multisource_residual,
             "targetResidualMechanismPredictiveValidation": (
@@ -12536,8 +12683,22 @@ def build_engine(
             residual_cross = residual_mode_localization.get("crossSector") or {}
             print(f"   residual-mode localization: {residual_cross.get('classification')}")
             print(f"   residual-mode origin: {residual_cross.get('residualModeOrigin')}")
-            if residual_mode_localization_review is None:
+            if (residual_mode_localization_review is None
+                    and residual_external_evidence is None):
                 print(f"   recommended next test: {residual_mode_localization.get('recommendedNextTest')}")
+        if residual_external_evidence is not None:
+            print(
+                "   frozen external variability/binary evidence: "
+                f"{residual_external_evidence.get('classification')}"
+            )
+            print(
+                "   retained off-target residual sectors: "
+                f"{(residual_external_evidence.get('spatialEvidence') or {}).get('offTargetSectors')}"
+            )
+            print(
+                "   recommended next test: "
+                f"{residual_external_evidence.get('recommendedNextTest')}"
+            )
         if residual_mode_localization_review is not None:
             review_cross = residual_mode_localization_review.get("crossTime") or {}
             print(f"   time-resolved residual localization: {review_cross.get('classification')}")
@@ -12915,6 +13076,10 @@ def build_engine(
     engine.register_handler(
         "openstar.tess.residual-mode-localization.interpret",
         residual_mode_localization_interpret_stage,
+    )
+    engine.register_handler(
+        RESIDUAL_EXTERNAL_EVIDENCE_HANDLER_ID,
+        residual_external_evidence_stage,
     )
     engine.register_handler(
         "openstar.tess.residual-mode-localization-review.prepare",

@@ -29,6 +29,10 @@ from workflows.tess.tess_nonstationary import (
     build_confirmed_nonstationary_method_contract,
     validate_confirmed_nonstationary_localization_boundary,
 )
+from workflows.tess.tess_residual_external_evidence import (
+    HANDLER_ID as RESIDUAL_EXTERNAL_EVIDENCE_HANDLER_ID,
+    validate_target_supported_boundary,
+)
 
 
 def parse_args():
@@ -156,6 +160,15 @@ def parse_args():
             "Append v20.10 distributed pixel localization of the v20.9 drifting residual mode. "
             "The workflow prewhitens and time-warps TESS pixel light curves, then exposes each "
             "usable pixel as an ordinary openstar.lomb-scargle.v1 dataset."
+        ),
+    )
+    recovery.add_argument(
+        "--continue-residual-external-evidence",
+        action="store_true",
+        help=(
+            "Append v20.10.1 network-free adjudication of the frozen external "
+            "variability and binary classifications after target-supported v20.10 "
+            "residual-mode localization."
         ),
     )
     recovery.add_argument(
@@ -895,6 +908,67 @@ def _can_continue_residual_mode_localization(investigation) -> None:
             "Investigation already contains v20.10 residual-mode localization stages. "
             "Use --resume only if one is actually interrupted."
         )
+
+
+def _can_continue_residual_external_evidence(investigation) -> None:
+    if any(stage.status == "RUNNING" for stage in investigation.stages):
+        raise RuntimeError(
+            "Investigation contains a RUNNING stage. Use --resume before "
+            "residual external-evidence continuation."
+        )
+    if investigation.status not in {"COMPLETE", "HUMAN_REVIEW_REQUIRED"}:
+        raise RuntimeError(
+            "--continue-residual-external-evidence requires a terminal investigation."
+        )
+    if any(stage.handler_id == RESIDUAL_EXTERNAL_EVIDENCE_HANDLER_ID
+           for stage in investigation.stages):
+        raise RuntimeError(
+            "Investigation already contains residual external-evidence analysis."
+        )
+    def completed(handler_id):
+        return next((
+            stage for stage in reversed(investigation.stages)
+            if stage.handler_id == handler_id and stage.status == "COMPLETE"
+            and isinstance(stage.result, dict)
+        ), None)
+    localization = completed("openstar.tess.residual-mode-localization.interpret")
+    nonstationary = completed("openstar.tess.nonstationary.summarize")
+    confirmation = completed(LONG_BASELINE_FREQUENCY_CONFIRMATION_HANDLER_ID)
+    source_localization = completed("openstar.tess.source-localization.analyze")
+    identity = completed("openstar.tess.catalog-identity")
+    prepared = next((
+        stage for stage in investigation.stages
+        if stage.id == "001-prepare-target" and stage.status == "COMPLETE"
+        and isinstance(stage.result, dict)
+    ), None)
+    latest = investigation.stages[-1] if investigation.stages else None
+    if any(stage is None for stage in (
+        localization, nonstationary, confirmation, source_localization,
+        identity, prepared, latest,
+    )):
+        raise RuntimeError(
+            "The completed v20.9.1/v20.9.2/v20.10 evidence lineage is required."
+        )
+    if not (
+        latest.handler_id == "openstar.tess.finalize"
+        and latest.status == "COMPLETE" and latest.stop is True
+        and latest.triggered_by_stage_id == localization.id
+        and latest.parameters == {"outputSuffix": "v20.10"}
+        and (latest.result or {}).get("residualModeLocalization")
+        == localization.result
+    ):
+        raise RuntimeError("The exact finalized v20.10 boundary is required.")
+    index = investigation.stages.index(localization)
+    if tuple(investigation.stages[index + 1:]) != (latest,):
+        raise RuntimeError("Later stages already consume the v20.10 boundary.")
+    validate_target_supported_boundary(
+        localization=localization.result,
+        nonstationary=nonstationary.result,
+        confirmation=confirmation.result,
+        physical_cycle=source_localization.result.get("physicalCycleEvidence"),
+        identity=identity.result,
+        expected_tic_id=int(prepared.result["ticID"]),
+    )
 
 
 
@@ -2612,6 +2686,28 @@ def main():
             parameters={},
             triggered_by_stage_id=last_stage_id,
         )
+    elif args.continue_residual_external_evidence:
+        investigation = store.load(args.investigation_id)
+        if investigation.workflow_id != WORKFLOW_ID:
+            raise RuntimeError(
+                "Cannot continue investigation with a different workflow: "
+                f"{investigation.workflow_id}"
+            )
+        _can_continue_residual_external_evidence(investigation)
+        localization_stage_id = next(
+            stage.id for stage in reversed(investigation.stages)
+            if stage.handler_id
+            == "openstar.tess.residual-mode-localization.interpret"
+            and stage.status == "COMPLETE"
+        )
+        next_number = _next_stage_number(investigation)
+        investigation = store.set_status(investigation, "RUNNING")
+        initial_stage = StageRequest(
+            id=f"{next_number:03d}-residual-external-evidence",
+            handler_id=RESIDUAL_EXTERNAL_EVIDENCE_HANDLER_ID,
+            parameters={},
+            triggered_by_stage_id=localization_stage_id,
+        )
     elif args.continue_residual_mode_localization_review:
         investigation = store.load(args.investigation_id)
         if investigation.workflow_id != WORKFLOW_ID:
@@ -3410,6 +3506,17 @@ def main():
         print("   coordinator required")
         print("   one compatible generic worker is sufficient; concurrency is not required")
         print("   MAST pixel download occurs during preparation; each usable pixel then runs as ordinary Lomb-Scargle work")
+    elif args.continue_residual_external_evidence:
+        print(
+            "📚 Continuing the target-supported v20.10 boundary with v20.10.1 "
+            "frozen external variability and binary evidence"
+        )
+        print(f"   stage: {initial_stage.id}")
+        print(f"   handler: {initial_stage.handler_id}")
+        print("   coordinator and distributed workers are not required")
+        print("   no catalog query, archive query, or download is performed")
+        print("   the completed TIC, SIMBAD, VSX, and Gaia evidence is reused")
+        print("   discordant off-target residual sectors remain explicit cautions")
     elif args.continue_residual_mode_localization_review:
         print("🧭 Continuing terminal investigation with v20.11 distributed time-resolved residual-mode source localization review")
         print(f"   stage: {initial_stage.id}")
