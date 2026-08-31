@@ -208,3 +208,60 @@ output, or consult original identity or published event parameters.
 
 This is still known-event recovery and smooth-event convergence. It does not
 recover or classify a planetary anomaly and makes no discovery claim.
+
+## Build the verified blind second recenter
+
+After the first recentered grid has completed through a separate generic
+project-smoke investigation, build another ordinary CurveGrid project from
+the complete immutable chain:
+
+```bash
+python -m workflows.microlensing.second_recenter_grid \
+  --prepared-root /path/to/microlensing-recovery-a-prepared \
+  --coarse-project-root /path/to/microlensing-recovery-a-coarse-grid \
+  --coarse-investigation-record \
+    /path/to/investigations/coarse-run/investigation.json \
+  --refinement-project-root \
+    /path/to/microlensing-recovery-a-refinement-grid \
+  --refinement-investigation-record \
+    /path/to/investigations/refinement-run/investigation.json \
+  --first-recenter-project-root \
+    /path/to/microlensing-recovery-a-recentered-grid \
+  --first-recenter-investigation-record \
+    /path/to/investigations/first-recenter-run/investigation.json \
+  --project-id openstar.microlensing-recovery-a.second-recentered-grid.v1 \
+  --output-root /path/to/microlensing-recovery-a-second-recentered-grid
+```
+
+The required parents are the verified blind preparation, coarse project and
+completed investigation, first-refinement project and completed
+investigation, and first-recenter project and completed investigation. The
+builder reconstructs each parent artifact from its verified ancestry, checks
+every immutable stage ledger, and requires the first-recenter project-smoke
+result to have zero failures, all 95 work units complete, and complete
+coverage of all 6,069 candidates. Execution of the produced project remains a
+separate project-smoke step; the builder never activates a coordinator or
+executes work.
+
+For each axis, the second recenter retains the parent count and step and uses
+the exact rule `newStart = winner - ((count - 1) / 2) * step`. Thus the
+accepted first-recenter winner becomes index 10 on the 21-point center axis
+and index 8 on each 17-point logarithmic axis, whether that parent winner was
+interior or on a boundary. The grid remains 6,069 candidates at 64 candidates
+per work unit, for 95 expected work units.
+
+The output root is published transactionally and contains:
+
+- `second-recentered-search-contract.json`
+- `datasets/primary-series.json`
+- `project.json`
+- `build-manifest.json`
+
+The contract and manifest bind every parent project and investigation ID,
+parent artifact and ledger hashes, the accepted first-recenter winner, parent
+and derived axes, sample and work accounting, and output hashes. The builder
+does not read `sealed/` or consult source filenames, event names, catalog
+identifiers, publications, sky coordinates, or published physical
+parameters. This remains a blind known-event benchmark and smooth-event
+convergence phase, not planetary-anomaly recovery, classification, or a
+discovery claim.
