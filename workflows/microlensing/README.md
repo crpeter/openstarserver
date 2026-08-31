@@ -335,3 +335,92 @@ parameters. This phase only prepares residuals after deterministic convergence
 of the smooth symmetric model. Searching those residuals for an anomaly is a
 later, separate phase; residual preparation does not detect, classify, or
 claim a planetary anomaly.
+
+## Build the blind localized residual grid
+
+After residual preparation, build one ordinary multi-dataset CurveGrid
+project for generic localized residual modeling:
+
+```bash
+python -m workflows.microlensing.residual_grid \
+  --prepared-root /path/to/microlensing-recovery-a-prepared \
+  --coarse-project-root /path/to/microlensing-recovery-a-coarse-grid \
+  --coarse-investigation-record \
+    /path/to/investigations/coarse-run/investigation.json \
+  --refinement-project-root \
+    /path/to/microlensing-recovery-a-refinement-grid \
+  --refinement-investigation-record \
+    /path/to/investigations/refinement-run/investigation.json \
+  --first-recenter-project-root \
+    /path/to/microlensing-recovery-a-recentered-grid \
+  --first-recenter-investigation-record \
+    /path/to/investigations/first-recenter-run/investigation.json \
+  --second-recenter-project-root \
+    /path/to/microlensing-recovery-a-second-recentered-grid \
+  --second-recenter-investigation-record \
+    /path/to/investigations/second-recenter-run/investigation.json \
+  --residual-root /path/to/microlensing-recovery-a-residuals \
+  --project-id openstar.microlensing-recovery-a.residual-grid.v1 \
+  --output-root /path/to/microlensing-recovery-a-residual-grid
+```
+
+The builder reconstructs the complete immutable ancestry from blind
+preparation through both recenter investigations, then regenerates residual
+preparation in a private temporary root and requires the supplied residual
+contract, manifest, and every ordered residual-series artifact to match that
+deterministic reconstruction byte for byte. This re-verifies sample counts,
+input and output hashes, frozen geometry, nuisance fits, model and residual
+values, weights, per-series WRSS, the manifest total, and all parent artifact
+and stage-ledger provenance. The same convergence gate applies: the verified
+second-recenter winner must be interior on all three axes, and its center,
+log scale, log shape, and WRSS must exactly equal the verified first-recenter
+winner.
+
+The search geometry is derived without inspecting residual values. With
+`coreWidth = exp(frozenLogScale) * exp(frozenLogShape)`, every admitted series
+uses the same `openstar.curve-family.symmetric-radial-amplification.v1` grid:
+
+- center: 129 values beginning at `eventCenter - 4 * coreWidth`, with step
+  `coreWidth / 16`; the event center is index 64 and the final value is
+  `eventCenter + 4 * coreWidth`
+- log scale: 17 values beginning at `frozenLogScale - log(16)`, with step
+  `log(16) / 16`
+- log shape: one value at `frozenLogShape`, with a positive finite schema step
+  that cannot change that sole value
+- 64 candidates per work unit, giving 2,193 candidates and 35 expected work
+  units per admitted dataset
+
+Admission also cannot inspect residual values. For every generic series, it
+counts positive-weight samples in the inclusive interval
+`eventCenter ± 4 * coreWidth` and admits the complete series only when that
+count is at least eight. Every admission and exclusion is recorded. An
+admitted dataset retains all coordinates, signed residual values, and inverse
+variances; it is not cropped to the admission window or to a residual peak.
+Totals are derived from the actual admissions rather than from expected
+series IDs or an expected dataset count.
+
+The previously nonexistent output root is published atomically with this
+layout:
+
+- `residual-search-contract.json`
+- `datasets/residual-series-001.json` and one sequential file per admitted
+  series
+- `project.json`
+- `build-manifest.json`
+
+Project execution is a separate operation. Run the generic project-smoke
+workflow only when the coordinator and workers are intentionally available:
+
+```bash
+python run_investigation.py \
+  --project /path/to/microlensing-recovery-a-residual-grid/project.json \
+  --investigation-id generic-residual-grid-investigation \
+  --store /path/to/investigations
+```
+
+The builder never reads `sealed/`, archive sources, source filenames, event
+names, catalog identifiers, publications, identity coordinates, or published
+physical parameters. Its window and admissions use only verified frozen
+geometry, coordinates, weights, and fixed coverage rules. This is generic
+residual localization, not planetary classification or a discovery claim;
+anomaly interpretation is a later, separate phase.
