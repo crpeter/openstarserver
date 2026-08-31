@@ -30,6 +30,10 @@ from .tess_long_baseline_frequency_confirmation import (
     validate_ambiguous_mode_identification,
     validate_frozen_dataset_lineage,
 )
+from .tess_nonstationary import (
+    CONFIRMED_NONSTATIONARY_EVIDENCE_LINEAGE,
+    build_confirmed_nonstationary_method_contract,
+)
 from .tess_resolved_cycle import validated_cycle_period
 from .tess_source_pair_lineage import frozen_source_pair_evidence
 
@@ -1495,6 +1499,62 @@ def _repair_long_baseline_frequency_confirmation_terminal(
             "recovery": (
                 "TESS_AMBIGUOUS_MODE_LONG_BASELINE_FREQUENCY_CONFIRMATION"
             ),
+        },
+    )
+
+
+def _repair_confirmed_nonstationary_terminal(
+    store: InvestigationStore, investigation: Investigation, control: dict
+) -> Investigation | None:
+    """Append modeling only at the exact finalized v20.9.1 boundary."""
+    if not (
+        investigation.status in {"COMPLETE", "HUMAN_REVIEW_REQUIRED"}
+        and control.get("schedulerAction") == "INVESTIGATION_COMPLETE"
+        and not any(stage.status == "RUNNING" for stage in investigation.stages)
+        and not any(stage.handler_id.startswith("openstar.tess.nonstationary.")
+                    for stage in investigation.stages)
+    ):
+        return None
+    confirmation = _latest_complete(
+        investigation, LONG_BASELINE_FREQUENCY_CONFIRMATION_HANDLER_ID)
+    latest = investigation.stages[-1] if investigation.stages else None
+    if confirmation is None or latest is None or not (
+        isinstance(confirmation.result, dict)
+        and latest.handler_id == "openstar.tess.finalize"
+        and latest.status == "COMPLETE" and latest.stop is True
+        and latest.triggered_by_stage_id == confirmation.id
+        and latest.parameters.get("outputSuffix")
+        == "v20.9.1-long-baseline-frequency-confirmation"
+        and (latest.result or {}).get("longBaselineFrequencyConfirmation")
+        == confirmation.result
+    ):
+        return None
+    index = investigation.stages.index(confirmation)
+    if tuple(investigation.stages[index + 1:]) != (latest,):
+        return None
+    try:
+        contract = build_confirmed_nonstationary_method_contract(
+            confirmation.result)
+        paths = (contract.get("evidenceBoundary") or {}).get(
+            "frozenDatasetPaths") or []
+        if not paths or any(not isinstance(path, str) or not Path(path).is_file()
+                            for path in paths):
+            return None
+    except (KeyError, OSError, RuntimeError, TypeError, ValueError):
+        return None
+    continuation = StageRequest(
+        id=_continuation_stage_id(latest, "prepare-confirmed-nonstationary"),
+        handler_id="openstar.tess.nonstationary.prepare",
+        parameters={"evidenceLineage": CONFIRMED_NONSTATIONARY_EVIDENCE_LINEAGE},
+        triggered_by_stage_id=confirmation.id,
+    )
+    return store.set_control_state(
+        investigation, status="RUNNING",
+        control_state={
+            "branchAssessments": [],
+            "selectedExperiment": asdict(continuation),
+            "schedulerAction": "RUN_EXPERIMENT",
+            "recovery": "TESS_CONFIRMED_NONSTATIONARY_MODE_MODELING",
         },
     )
 
@@ -3007,6 +3067,12 @@ def repair_obsolete_terminal_wait(
         )
     if long_baseline_repair is not None:
         return long_baseline_repair
+
+    confirmed_nonstationary_repair = _repair_confirmed_nonstationary_terminal(
+        store, investigation, control
+    )
+    if confirmed_nonstationary_repair is not None:
+        return confirmed_nonstationary_repair
 
     dynamic_repair = _repair_dynamic_harmonic_terminal(store, investigation, control)
     if dynamic_repair is not None:

@@ -24,6 +24,10 @@ from workflows.tess.tess_long_baseline_frequency_confirmation import (
 from workflows.tess.tess_mode_identification import (
     MULTIMODE_MODE_EVIDENCE_LINEAGE,
 )
+from workflows.tess.tess_nonstationary import (
+    CONFIRMED_NONSTATIONARY_EVIDENCE_LINEAGE,
+    build_confirmed_nonstationary_method_contract,
+)
 
 
 def parse_args():
@@ -137,6 +141,12 @@ def parse_args():
             "confirmation of an exact AMBIGUOUS_HARMONIC_OR_MODE result. "
             "This is separate from --continue-nonstationary."
         ),
+    )
+    recovery.add_argument(
+        "--continue-confirmed-nonstationary-mode-modeling",
+        action="store_true",
+        help=("Append v20.9.2 distributed nonstationary modeling from the exact "
+              "completed v20.9.1 nonstationary/intermittent confirmation boundary."),
     )
     recovery.add_argument(
         "--continue-residual-mode-localization",
@@ -785,6 +795,35 @@ def _can_continue_long_baseline_frequency_confirmation(investigation) -> None:
         method_contract=contract,
         dataset_specs=dataset_specs,
     )
+
+
+def _can_continue_confirmed_nonstationary_mode_modeling(investigation) -> None:
+    if any(stage.status == "RUNNING" for stage in investigation.stages):
+        raise RuntimeError("Investigation contains a RUNNING stage. Use --resume first.")
+    if investigation.status not in {"COMPLETE", "HUMAN_REVIEW_REQUIRED"}:
+        raise RuntimeError("Confirmed nonstationary modeling requires a terminal investigation.")
+    if any(stage.handler_id.startswith("openstar.tess.nonstationary.")
+           for stage in investigation.stages):
+        raise RuntimeError("Investigation already contains nonstationary modeling stages.")
+    confirmation = next((stage for stage in reversed(investigation.stages)
+                         if stage.handler_id == LONG_BASELINE_FREQUENCY_CONFIRMATION_HANDLER_ID
+                         and stage.status == "COMPLETE" and isinstance(stage.result, dict)), None)
+    latest = investigation.stages[-1] if investigation.stages else None
+    if confirmation is None or not (
+        latest is not None and latest.handler_id == "openstar.tess.finalize"
+        and latest.status == "COMPLETE" and latest.stop is True
+        and latest.triggered_by_stage_id == confirmation.id
+        and latest.parameters.get("outputSuffix") == "v20.9.1-long-baseline-frequency-confirmation"
+        and (latest.result or {}).get("longBaselineFrequencyConfirmation") == confirmation.result
+    ):
+        raise RuntimeError("The exact finalized v20.9.1 confirmation boundary is required.")
+    index = investigation.stages.index(confirmation)
+    if tuple(investigation.stages[index + 1:]) != (latest,):
+        raise RuntimeError("Later stages already consume the confirmation boundary.")
+    contract = build_confirmed_nonstationary_method_contract(confirmation.result)
+    for path in (contract.get("evidenceBoundary") or {}).get("frozenDatasetPaths") or []:
+        if not isinstance(path, str) or not Path(path).is_file():
+            raise RuntimeError(f"Frozen confirmation dataset is missing: {path}")
 
 
 def _can_continue_residual_mode_localization(investigation) -> None:
@@ -2505,6 +2544,22 @@ def main():
             parameters={},
             triggered_by_stage_id=last_stage_id,
         )
+    elif args.continue_confirmed_nonstationary_mode_modeling:
+        investigation = store.load(args.investigation_id)
+        if investigation.workflow_id != WORKFLOW_ID:
+            raise RuntimeError("Cannot continue investigation with a different workflow.")
+        _can_continue_confirmed_nonstationary_mode_modeling(investigation)
+        confirmation = next(stage for stage in reversed(investigation.stages)
+                            if stage.handler_id == LONG_BASELINE_FREQUENCY_CONFIRMATION_HANDLER_ID
+                            and stage.status == "COMPLETE")
+        next_number = _next_stage_number(investigation)
+        investigation = store.set_status(investigation, "RUNNING")
+        initial_stage = StageRequest(
+            id=f"{next_number:03d}-prepare-confirmed-nonstationary",
+            handler_id="openstar.tess.nonstationary.prepare",
+            parameters={"evidenceLineage": CONFIRMED_NONSTATIONARY_EVIDENCE_LINEAGE},
+            triggered_by_stage_id=confirmation.id,
+        )
     elif args.continue_residual_mode_localization:
         investigation = store.load(args.investigation_id)
         if investigation.workflow_id != WORKFLOW_ID:
@@ -3307,6 +3362,12 @@ def main():
         print("   no archive query or new data download is performed")
         print("   frozen primary and independent-sector light curves are reused")
         print("   each independent sector is held out without frequency or phase leakage")
+    elif args.continue_confirmed_nonstationary_mode_modeling:
+        print("🌀 Continuing the confirmed v20.9.1 boundary with v20.9.2 nonstationary modeling")
+        print(f"   stage: {initial_stage.id}")
+        print(f"   handler: {initial_stage.handler_id}")
+        print("   coordinator and a compatible generic worker are required")
+        print("   frozen datasets are reused; no archive query or download is performed")
     elif args.continue_residual_mode_localization:
         print("🎯 Continuing terminal investigation with v20.10 distributed residual-mode pixel localization")
         print(f"   stage: {initial_stage.id}")

@@ -114,9 +114,14 @@ from .tess_time_frequency import (
     summarize_time_frequency_evolution,
 )
 from .tess_nonstationary import (
+    CONFIRMED_NONSTATIONARY_EVIDENCE_LINEAGE,
+    build_confirmed_nonstationary_method_contract,
     build_nonstationary_project,
+    confirmed_nonstationary_physical_period,
+    confirmed_nonstationary_method_contract_hash,
     interpret_nonstationary_project,
     summarize_nonstationary_modeling,
+    validate_confirmed_nonstationary_boundary,
 )
 from .tess_mode_identification import (
     MULTIMODE_MODE_EVIDENCE_LINEAGE,
@@ -328,7 +333,7 @@ from .tess_multisector import (
 WORKFLOW_ID = "openstar.workflow.tess-investigation.v1"
 WORKFLOW_VERSION = "20.2"
 SOFTWARE_ID = "openstar.tess-investigation-plugin"
-SOFTWARE_VERSION = "20.40"
+SOFTWARE_VERSION = "20.41"
 ADAPTIVE_BLIND_TRANSIT_ADDITIONAL_SECTORS = 8
 EXHAUSTED_RESIDUAL_RUN_HANDLER_ID = (
     "openstar.tess.blind-transit-distributed.run"
@@ -5678,14 +5683,43 @@ def build_engine(
             investigation,
             "openstar.tess.time-frequency.summarize",
         )
+        source_localization = _latest_result_for_handler(
+            investigation,
+            "openstar.tess.source-localization.analyze",
+        )
+        evidence_lineage = request.parameters.get("evidenceLineage")
         if independent_prepare is None:
             raise RuntimeError("v20.9 requires the frozen independent-sector preparation.")
-        if morphology is None or not morphology.get("physicalCycleResolved"):
-            raise RuntimeError("v20.9 requires a morphology-resolved physical period.")
-        if time_frequency is None or time_frequency.get("recommendedNextTest") != "LONG_BASELINE_NONSTATIONARY_MODE_MODELING":
-            raise RuntimeError("v20.9 requires v20.8 to recommend LONG_BASELINE_NONSTATIONARY_MODE_MODELING.")
+        confirmed_contract = None
+        confirmation = None
+        if evidence_lineage == CONFIRMED_NONSTATIONARY_EVIDENCE_LINEAGE:
+            confirmation_stage = next((
+                stage for stage in reversed(investigation.stages)
+                if stage.handler_id == LONG_BASELINE_FREQUENCY_CONFIRMATION_HANDLER_ID
+                and stage.status == "COMPLETE" and isinstance(stage.result, dict)
+            ), None)
+            if confirmation_stage is None or request.triggered_by_stage_id != confirmation_stage.id:
+                raise RuntimeError("Confirmed nonstationary modeling requires the triggering v20.9.1 confirmation stage.")
+            confirmation = confirmation_stage.result
+            boundary = validate_confirmed_nonstationary_boundary(confirmation)
+            confirmed_contract = build_confirmed_nonstationary_method_contract(confirmation)
+            cycle = (
+                source_localization.get("physicalCycleEvidence")
+                if isinstance(source_localization, dict) else None
+            )
+            physical_period = confirmed_nonstationary_physical_period(
+                confirmation, cycle
+            )
+        elif evidence_lineage is None:
+            if morphology is None or not morphology.get("physicalCycleResolved"):
+                raise RuntimeError("v20.9 requires a morphology-resolved physical period.")
+            if time_frequency is None or time_frequency.get("recommendedNextTest") != "LONG_BASELINE_NONSTATIONARY_MODE_MODELING":
+                raise RuntimeError("v20.9 requires v20.8 to recommend LONG_BASELINE_NONSTATIONARY_MODE_MODELING.")
+            boundary = None
+            physical_period = float(morphology["resolvedPhysicalPeriodDays"])
+        else:
+            raise RuntimeError("Unsupported nonstationary evidence lineage.")
 
-        physical_period = float(morphology["resolvedPhysicalPeriodDays"])
         artifact_root = store.directory_for(investigation.id) / "artifacts"
         print("🌀 Preparing generic long-baseline nonstationary work")
         print(f"   resolved physical period: {physical_period} days")
@@ -5698,7 +5732,8 @@ def build_engine(
             primary_sector=prepared.get("sector"),
             independent_spec=independent_prepare,
             physical_period_days=physical_period,
-            time_frequency_summary=time_frequency,
+            time_frequency_summary=time_frequency if confirmed_contract is None else None,
+            confirmed_method_contract=confirmed_contract,
             output_dir=artifact_root,
             investigation_id=investigation.id,
         )
@@ -5739,6 +5774,11 @@ def build_engine(
                 "morphology": sha256_json(morphology),
                 "timeFrequency": sha256_json(time_frequency),
                 "independentPreparation": sha256_json(independent_prepare),
+                **({
+                    "longBaselineFrequencyConfirmation": sha256_json(confirmation),
+                    "methodContract": confirmed_nonstationary_method_contract_hash(confirmed_contract),
+                    "sourceLocalization": sha256_json(source_localization),
+                } if confirmed_contract is not None else {}),
             },
             artifacts=tuple(artifacts),
         )
@@ -5837,16 +5877,22 @@ def build_engine(
         print(f"   physical mechanism resolved: {summary.get('physicalMechanismResolved')}")
         print(f"   recommended next test: {summary.get('recommendedNextTest')}")
 
+        confirmed = preparation.get("evidenceLineage") == CONFIRMED_NONSTATIONARY_EVIDENCE_LINEAGE
         artifact_path = (
             store.directory_for(investigation.id)
             / "artifacts"
             / "nonstationary"
-            / "nonstationary-v20.9.json"
+            / ("nonstationary-v20.9.2-confirmed-boundary.json" if confirmed else "nonstationary-v20.9.json")
         )
         _write_json(artifact_path, summary)
         return StageOutcome(
             result=summary,
-            next_stage=nonstationary_continuation(summary, request_id=request.id),
+            next_stage=(StageRequest(
+                id=_next_stage_id(request.id, "finalize"),
+                handler_id="openstar.tess.finalize",
+                parameters={"outputSuffix": "v20.9.2-confirmed-nonstationary"},
+                triggered_by_stage_id=request.id,
+            ) if confirmed else nonstationary_continuation(summary, request_id=request.id)),
             input_hashes={
                 "preparation": sha256_json(preparation),
                 "interpretation": sha256_json(interpreted),
