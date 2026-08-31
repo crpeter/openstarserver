@@ -424,3 +424,72 @@ physical parameters. Its window and admissions use only verified frozen
 geometry, coordinates, weights, and fixed coverage rules. This is generic
 residual localization, not planetary classification or a discovery claim;
 anomaly interpretation is a later, separate phase.
+
+## Validate localized residual structure across series
+
+After the residual-grid project has completed through the generic
+project-smoke workflow, validate every accepted localized component against
+all other admitted generic series:
+
+```bash
+python -m workflows.microlensing.validate_residual_grid \
+  --residual-root /path/to/microlensing-recovery-a-residuals \
+  --residual-grid-root /path/to/microlensing-recovery-a-residual-grid \
+  --residual-grid-investigation-record \
+    /path/to/investigations/generic-residual-grid-investigation/investigation.json \
+  --output-root /path/to/microlensing-recovery-a-cross-validation
+```
+
+The analyzer treats all paths as untrusted and reconstructs the residual
+preparation artifacts, residual-grid contract, build manifest, project, and
+every admitted dataset. It then verifies the complete three-stage
+`openstar.workflow.project-smoke.v1` investigation, immutable stage ledgers,
+project identity and hash, zero-failure work accounting, complete candidate
+coverage for each admitted dataset, agreement between aggregate and nested
+winners, and exact winner-to-grid mapping. For the three-series real project,
+this requires all 105 work units to be complete. Each accepted winner is also
+re-evaluated with the canonical CurveGrid
+`openstar.curve-family.symmetric-radial-amplification.v1` implementation and
+must agree within the workload's established deterministic floating-point
+tolerance.
+
+Validation order is fixed by the admitted generic series order. For each
+discovery series, the analyzer freezes the accepted center, log scale, log
+shape, and amplitude sign. On every other admitted series, it evaluates that
+same geometry and fits only an offset and unconstrained signed amplitude by
+deterministic weighted least squares. It records the offset-only null WRSS,
+frozen-template WRSS, their difference, the fitted amplitude and sign, and
+positive-weight support within one and two frozen effective widths. A
+discovery series is never allowed to validate itself, and every ordered
+discovery-to-validation pair is retained, including insufficient-support and
+fit-failure results.
+
+The decision thresholds are predeclared and are not CLI options:
+
+- the discovery must have complete grid coverage and `deltaWRSS >= 30.0`
+- a held-out series must have at least one positive-weight sample within two
+  frozen effective widths, the same nonzero amplitude sign, and
+  `deltaWRSS >= 9.0`
+- a searched-axis boundary is reported and limits width interpretation, but
+  does not automatically reject the discovery
+- a component is `CROSS_SERIES_CONFIRMED` only when the discovery gate passes
+  and at least one distinct held-out series passes; otherwise it is
+  `NOT_CROSS_SERIES_CONFIRMED`
+- the overall result is `REPRODUCIBLE_LOCALIZED_RESIDUAL_STRUCTURE` when at
+  least one component is confirmed, and
+  `NO_REPRODUCIBLE_LOCALIZED_RESIDUAL_STRUCTURE` otherwise
+
+The previously nonexistent output root is published atomically with:
+
+- `residual-cross-validation-contract.json`
+- `residual-cross-validation.json`
+
+The result always leaves `planetaryInterpretationResolved` and
+`discoveryClaim` false. Confirmed reproducible structure recommends
+`BLIND_MICROLENSING_ANOMALY_MORPHOLOGY_MODELING`; a negative result recommends
+`RESIDUAL_SYSTEMATICS_AND_ERROR_MODEL_REVIEW`. The former is a later blind
+morphology test and the latter is a review of residual systematics and the
+error model. Neither next test is a planetary classification or discovery
+claim. The analyzer never reads sealed identity, archive sources, source
+filenames, event names, catalog identifiers, publications, sky coordinates,
+or published physical parameters.
