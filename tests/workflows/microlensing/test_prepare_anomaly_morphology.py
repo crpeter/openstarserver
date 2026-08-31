@@ -115,6 +115,9 @@ class AnomalyMorphologyFixture(ResidualCrossValidationFixture):
         negative["discoveryWinner"]["bestCenter"] = (
             positive["discoveryWinner"]["bestCenter"] - center_step
         )
+        negative["discoveryWinner"]["bestLogScale"] = positive[
+            "discoveryWinner"
+        ]["bestLogScale"]
         negative["searchedAxisBoundaryReported"] = True
         negative["searchedBoundaryAxes"] = ["logScale"]
         negative["widthInterpretationLimitedByBoundary"] = True
