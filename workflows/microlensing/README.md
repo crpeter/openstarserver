@@ -265,3 +265,73 @@ identifiers, publications, sky coordinates, or published physical
 parameters. This remains a blind known-event benchmark and smooth-event
 convergence phase, not planetary-anomaly recovery, classification, or a
 discovery claim.
+
+## Prepare residuals after verified smooth-model convergence
+
+After the second recentered grid has completed through its own generic
+project-smoke investigation, freeze the converged nonlinear geometry and
+prepare identity-free residuals for every generic series:
+
+```bash
+python -m workflows.microlensing.prepare_residuals \
+  --prepared-root /path/to/microlensing-recovery-a-prepared \
+  --coarse-project-root /path/to/microlensing-recovery-a-coarse-grid \
+  --coarse-investigation-record \
+    /path/to/investigations/coarse-run/investigation.json \
+  --refinement-project-root \
+    /path/to/microlensing-recovery-a-refinement-grid \
+  --refinement-investigation-record \
+    /path/to/investigations/refinement-run/investigation.json \
+  --first-recenter-project-root \
+    /path/to/microlensing-recovery-a-recentered-grid \
+  --first-recenter-investigation-record \
+    /path/to/investigations/first-recenter-run/investigation.json \
+  --second-recenter-project-root \
+    /path/to/microlensing-recovery-a-second-recentered-grid \
+  --second-recenter-investigation-record \
+    /path/to/investigations/second-recenter-run/investigation.json \
+  --output-root /path/to/microlensing-recovery-a-residuals
+```
+
+The required immutable ancestry is blind preparation → coarse project and
+completed investigation → first-refinement project and completed
+investigation → first-recenter project and completed investigation →
+second-recenter project and completed investigation. The builder reconstructs
+the deterministic second-recenter project expected from the verified
+first-recenter winner instead of trusting its manifest, and re-verifies all
+project artifacts, hashes, stage ledgers, stage order and causality, project
+identities, zero-failure work accounting, all 95 completed work units, and
+coverage of all 6,069 candidates.
+
+Residual publication requires exact convergence. The verified second-recenter
+winner must be interior on the center, log-scale, and log-shape axes, and its
+`bestCenter`, `bestLogScale`, `bestLogShape`, and
+`bestWeightedResidualSumSquares` must exactly equal the verified accepted
+first-recenter values. A boundary winner or any change in geometry or objective
+is rejected.
+
+The shared frozen geometry is `center = bestCenter`,
+`scale = exp(bestLogScale)`, and `shape = exp(bestLogShape)`. For every
+prepared generic series in canonical `orderedSeriesIDs` order, the builder
+evaluates the exact
+`openstar.curve-family.symmetric-radial-amplification.v1` basis and fits only
+an unconstrained offset and amplitude by deterministic weighted linear least
+squares. It preserves coordinates and inverse variances, writes model values
+and `observed - model` residuals, and records fit diagnostics and provenance
+hashes independently for every series; it does not select only the strongest
+series.
+
+The previously nonexistent output root is published atomically with this
+layout:
+
+- `residual-preparation-contract.json`
+- `residual-manifest.json`
+- `series/residual-series-001.json`
+- one sequential residual-series file for every prepared generic series
+
+The builder never reads `sealed/`, archive sources, source filenames, event
+names, catalog identifiers, publications, sky coordinates, or published event
+parameters. This phase only prepares residuals after deterministic convergence
+of the smooth symmetric model. Searching those residuals for an anomaly is a
+later, separate phase; residual preparation does not detect, classify, or
+claim a planetary anomaly.
