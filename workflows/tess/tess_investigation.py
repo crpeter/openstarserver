@@ -158,6 +158,10 @@ from .tess_target_residual_astrophysical_mechanism import (
     HANDLER_ID as TARGET_RESIDUAL_ASTROPHYSICAL_MECHANISM_HANDLER_ID,
     analyze_target_residual_astrophysical_mechanism,
 )
+from .tess_neighbor_catalog_pixel_response_review import (
+    HANDLER_ID as NEIGHBOR_CATALOG_PIXEL_RESPONSE_REVIEW_HANDLER_ID,
+    analyze_neighbor_catalog_pixel_response_review,
+)
 from .tess_residual_localization_review import (
     build_residual_mode_localization_review_project,
     interpret_residual_mode_localization_review_project,
@@ -1963,6 +1967,39 @@ def _render_report(conclusion: dict[str, Any]) -> str:
                 f"peakPower={item.get('peakPower')}, "
                 f"powerContrast={item.get('powerContrast')}, "
                 f"classification={item.get('classification')}"
+            )
+
+    neighbor_review = conclusion.get("neighborCatalogPixelResponseReview")
+    if neighbor_review is not None:
+        decision = neighbor_review.get("aggregateDecision") or {}
+        lines.extend([
+            "",
+            "## Neighbor catalog and frozen pixel-response review",
+            "",
+            f"- Method contract: {neighbor_review.get('methodContractID')}",
+            f"- Method contract hash: {neighbor_review.get('methodContractHash')}",
+            f"- Classification: {neighbor_review.get('classification')}",
+            f"- Residual-mode origin: {neighbor_review.get('residualModeOrigin')}",
+            f"- Catalog query complete: {neighbor_review.get('catalogQueryComplete')}",
+            f"- Catalog query errors: {neighbor_review.get('catalogQueryErrors')}",
+            f"- Catalog candidates: {len(neighbor_review.get('catalogCandidates') or [])}",
+            f"- Target-supporting sectors: {decision.get('targetSupportingSectors')}",
+            f"- Best neighbor: {decision.get('bestNeighborSourceID')}",
+            f"- Best-neighbor supporting sectors: {decision.get('bestNeighborSupportingSectors')}",
+            f"- Physical mechanism resolved: {neighbor_review.get('physicalMechanismResolved')}",
+            f"- Claim level changed: {neighbor_review.get('claimLevelChanged')}",
+            f"- Recommended next test: {neighbor_review.get('recommendedNextTest')}",
+            "",
+            "### Independent-sector pixel-response evidence",
+            "",
+        ])
+        for item in neighbor_review.get("sectorEvidence") or []:
+            lines.append(
+                f"- Sector {item.get('sector')}: "
+                f"qualityWindows={item.get('qualityWindowCount')}, "
+                f"classification={item.get('classification')}, "
+                f"supportedSource={item.get('supportedSourceID')}, "
+                f"windowSupport={item.get('windowSupportCounts')}"
             )
 
     multisource = conclusion.get("multiSourceResidualDecomposition")
@@ -6347,6 +6384,74 @@ def build_engine(
             input_hashes={
                 "residualExternalEvidence": sha256_json(external),
                 "catalogIdentity": sha256_json(identity),
+            },
+            artifacts=(_artifact(artifact_path, "application/json"),),
+        )
+
+
+    def neighbor_catalog_pixel_response_review_stage(investigation, request):
+        prepared = _result(investigation, "001-prepare-target")
+        identity = _required_latest_result_for_handler(
+            investigation, "openstar.tess.catalog-identity"
+        )
+        mode = _required_latest_result_for_handler(
+            investigation, "openstar.tess.mode-identification.analyze"
+        )
+        review_preparation = _required_latest_result_for_handler(
+            investigation,
+            "openstar.tess.residual-mode-localization-review.prepare",
+        )
+        review = _required_latest_result_for_handler(
+            investigation,
+            "openstar.tess.residual-mode-localization-review.interpret",
+        )
+        result = analyze_neighbor_catalog_pixel_response_review(
+            preparation=review_preparation,
+            localization_review=review,
+            mode_identification=mode,
+            identity=identity,
+            expected_tic_id=int(prepared["ticID"]),
+        )
+        decision = result.get("aggregateDecision") or {}
+        print("🧭 Neighbor catalog and frozen pixel-response review")
+        print(f"   method contract: {result.get('methodContractID')}")
+        print(f"   method hash: {result.get('methodContractHash')}")
+        print(f"   catalog candidates: {len(result.get('catalogCandidates') or [])}")
+        print(f"   catalog query complete: {result.get('catalogQueryComplete')}")
+        print(f"   target-supporting sectors: {decision.get('targetSupportingSectors')}")
+        print(f"   best neighbor: {decision.get('bestNeighborSourceID')}")
+        print(
+            "   best-neighbor supporting sectors: "
+            f"{decision.get('bestNeighborSupportingSectors')}"
+        )
+        print(f"   classification: {result.get('classification')}")
+        print(f"   physical mechanism resolved: {result.get('physicalMechanismResolved')}")
+        print(f"   recommended next test: {result.get('recommendedNextTest')}")
+
+        artifact_path = (
+            store.directory_for(investigation.id)
+            / "artifacts"
+            / "neighbor-catalog-pixel-response-review"
+            / "neighbor-catalog-pixel-response-review-v20.11.1.json"
+        )
+        _write_json(artifact_path, result)
+        return StageOutcome(
+            result=result,
+            next_stage=StageRequest(
+                id=_next_stage_id(request.id, "finalize"),
+                handler_id="openstar.tess.finalize",
+                parameters={
+                    "outputSuffix": (
+                        "v20.11.1-neighbor-catalog-pixel-response-review"
+                    )
+                },
+                triggered_by_stage_id=request.id,
+            ),
+            input_hashes={
+                "catalogIdentity": sha256_json(identity),
+                "modeIdentification": sha256_json(mode),
+                "localizationReviewPreparation": sha256_json(review_preparation),
+                "localizationReview": sha256_json(review),
             },
             artifacts=(_artifact(artifact_path, "application/json"),),
         )
@@ -11164,6 +11269,10 @@ def build_engine(
             investigation,
             "openstar.tess.residual-mode-localization-review.interpret",
         )
+        neighbor_catalog_pixel_response_review = _latest_result_for_handler(
+            investigation,
+            NEIGHBOR_CATALOG_PIXEL_RESPONSE_REVIEW_HANDLER_ID,
+        )
         multisource_residual = _latest_result_for_handler(
             investigation,
             "openstar.tess.multi-source-residual.interpret",
@@ -11582,6 +11691,26 @@ def build_engine(
                 )
             existing_rationale.append(
                 f"Recommended next confirmation step: {residual_mode_localization_review.get('recommendedNextTest')}."
+            )
+            claim_decision = {
+                "claim": claim_decision["claim"],
+                "rationale": existing_rationale,
+            }
+
+        if neighbor_catalog_pixel_response_review is not None:
+            existing_rationale = list(claim_decision.get("rationale") or [])
+            existing_rationale.append(
+                "v20.11.1 projects a fixed TIC/Gaia neighborhood through the "
+                "persisted v20.11 per-window pixel-to-sky geometry and compares "
+                "only the already-frozen residual power maps, classifying the "
+                "source evidence as "
+                f"{neighbor_catalog_pixel_response_review.get('classification')}. "
+                "It neither rereads flux nor changes the claim or physical "
+                "mechanism status."
+            )
+            existing_rationale.append(
+                "Recommended next confirmation step: "
+                f"{neighbor_catalog_pixel_response_review.get('recommendedNextTest')}."
             )
             claim_decision = {
                 "claim": claim_decision["claim"],
@@ -12429,7 +12558,11 @@ def build_engine(
             and stage.handler_id != "openstar.tess.finalize" and not stage.handler_id.startswith(
                 "openstar.tess.target-residual-archival-baseline.")
             for index, stage in enumerate(investigation.stages))
-        if target_residual_astrophysical_mechanism is not None:
+        if neighbor_catalog_pixel_response_review is not None:
+            recommended_next_test = neighbor_catalog_pixel_response_review.get(
+                "recommendedNextTest"
+            )
+        elif target_residual_astrophysical_mechanism is not None:
             recommended_next_test = target_residual_astrophysical_mechanism.get(
                 "recommendedNextTest"
             )
@@ -12607,6 +12740,9 @@ def build_engine(
                 target_residual_astrophysical_mechanism
             ),
             "residualModeLocalizationReview": residual_mode_localization_review,
+            "neighborCatalogPixelResponseReview": (
+                neighbor_catalog_pixel_response_review
+            ),
             "multiSourceResidualDecomposition": multisource_residual,
             "targetResidualMechanismPredictiveValidation": (
                 target_residual_mechanism_predictive_validation
@@ -12847,6 +12983,32 @@ def build_engine(
             print(f"   source-switching sectors: {review_cross.get('sourceSwitchingSectors')}")
             if multisource_residual is None:
                 print(f"   recommended next test: {residual_mode_localization_review.get('recommendedNextTest')}")
+        if neighbor_catalog_pixel_response_review is not None:
+            neighbor_decision = (
+                neighbor_catalog_pixel_response_review.get("aggregateDecision")
+                or {}
+            )
+            print(
+                "   neighbor catalog/pixel-response review: "
+                f"{neighbor_catalog_pixel_response_review.get('classification')}"
+            )
+            print(
+                "   catalog-guided residual origin: "
+                f"{neighbor_catalog_pixel_response_review.get('residualModeOrigin')}"
+            )
+            print(
+                "   target-supporting sectors: "
+                f"{neighbor_decision.get('targetSupportingSectors')}"
+            )
+            print(
+                "   best neighbor/supporting sectors: "
+                f"{neighbor_decision.get('bestNeighborSourceID')} / "
+                f"{neighbor_decision.get('bestNeighborSupportingSectors')}"
+            )
+            print(
+                "   recommended next test: "
+                f"{neighbor_catalog_pixel_response_review.get('recommendedNextTest')}"
+            )
         if multisource_residual is not None:
             print(f"   multi-source residual decomposition: {multisource_residual.get('classification')}")
             print(f"   decomposed residual origin: {multisource_residual.get('residualModeOrigin')}")
@@ -13225,6 +13387,10 @@ def build_engine(
     engine.register_handler(
         TARGET_RESIDUAL_ASTROPHYSICAL_MECHANISM_HANDLER_ID,
         target_residual_astrophysical_mechanism_stage,
+    )
+    engine.register_handler(
+        NEIGHBOR_CATALOG_PIXEL_RESPONSE_REVIEW_HANDLER_ID,
+        neighbor_catalog_pixel_response_review_stage,
     )
     engine.register_handler(
         "openstar.tess.residual-mode-localization-review.prepare",

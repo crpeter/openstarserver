@@ -43,6 +43,10 @@ from .tess_target_residual_astrophysical_mechanism import (
     HANDLER_ID as TARGET_RESIDUAL_ASTROPHYSICAL_MECHANISM_HANDLER_ID,
     validate_mechanism_followup_boundary,
 )
+from .tess_neighbor_catalog_pixel_response_review import (
+    HANDLER_ID as NEIGHBOR_CATALOG_PIXEL_RESPONSE_REVIEW_HANDLER_ID,
+    validate_review_boundary as validate_neighbor_catalog_pixel_response_boundary,
+)
 from .tess_resolved_cycle import validated_cycle_period
 from .tess_source_pair_lineage import frozen_source_pair_evidence
 
@@ -1817,6 +1821,110 @@ def _repair_target_residual_astrophysical_mechanism_terminal(
     )
 
 
+def _repair_neighbor_catalog_pixel_response_review_terminal(
+    store: InvestigationStore, investigation: Investigation, control: dict
+) -> Investigation | None:
+    """Append v20.11.1 only at the verified finalized unresolved v20.11 boundary."""
+    if not (
+        investigation.status in {"COMPLETE", "HUMAN_REVIEW_REQUIRED"}
+        and control.get("schedulerAction") == "INVESTIGATION_COMPLETE"
+        and control.get("selectedExperiment") in (None, {})
+        and not any(stage.status == "RUNNING" for stage in investigation.stages)
+        and not any(
+            stage.handler_id == NEIGHBOR_CATALOG_PIXEL_RESPONSE_REVIEW_HANDLER_ID
+            for stage in investigation.stages
+        )
+    ):
+        return None
+    prepared = next((
+        stage for stage in investigation.stages
+        if stage.id == "001-prepare-target" and stage.status == "COMPLETE"
+        and isinstance(stage.result, dict)
+    ), None)
+    identity = _latest_complete(investigation, "openstar.tess.catalog-identity")
+    mode = _latest_complete(
+        investigation, "openstar.tess.mode-identification.analyze"
+    )
+    review_preparation = _latest_complete(
+        investigation, "openstar.tess.residual-mode-localization-review.prepare"
+    )
+    review = _latest_complete(
+        investigation, "openstar.tess.residual-mode-localization-review.interpret"
+    )
+    latest = investigation.stages[-1] if investigation.stages else None
+    if any(stage is None for stage in (
+        prepared, identity, mode, review_preparation, review, latest,
+    )):
+        return None
+    if not (
+        isinstance(identity.result, dict)
+        and isinstance(mode.result, dict)
+        and isinstance(review_preparation.result, dict)
+        and isinstance(review.result, dict)
+        and latest.handler_id == "openstar.tess.finalize"
+        and latest.status == "COMPLETE"
+        and latest.stop is True
+        and latest.triggered_by_stage_id == review.id
+        and latest.parameters == {"outputSuffix": "v20.11"}
+        and (latest.result or {}).get("residualModeLocalizationReview")
+        == review.result
+        and (latest.result or {}).get("recommendedNextTest")
+        == "NEIGHBOR_CATALOG_AND_PIXEL_RESPONSE_REVIEW"
+    ):
+        return None
+    index = investigation.stages.index(review)
+    if tuple(investigation.stages[index + 1:]) != (latest,):
+        return None
+    try:
+        validate_neighbor_catalog_pixel_response_boundary(
+            preparation=review_preparation.result,
+            localization_review=review.result,
+            mode_identification=mode.result,
+            identity=identity.result,
+            expected_tic_id=int(prepared.result["ticID"]),
+        )
+    except (KeyError, RuntimeError, TypeError, ValueError):
+        return None
+    review_hashes = review.provenance.input_hashes if review.provenance else {}
+    preparation_hashes = (
+        review_preparation.provenance.input_hashes
+        if review_preparation.provenance else {}
+    )
+    if not (
+        review_hashes.get("preparation") == sha256_json(review_preparation.result)
+        and preparation_hashes.get("modeIdentification") == sha256_json(mode.result)
+        and all(
+            store.verified_terminal_stage_ledger_hash(investigation.id, stage)
+            for stage in (
+                prepared, identity, mode, review_preparation, review, latest,
+            )
+        )
+        and _verified_stage_json(
+            review, "residual-mode-localization-review-v20.11.json"
+        )
+        and _verified_stage_json(latest, "conclusion-v20.11.json")
+    ):
+        return None
+    continuation = StageRequest(
+        id=_continuation_stage_id(
+            latest, "neighbor-catalog-pixel-response-review"
+        ),
+        handler_id=NEIGHBOR_CATALOG_PIXEL_RESPONSE_REVIEW_HANDLER_ID,
+        parameters={},
+        triggered_by_stage_id=review.id,
+    )
+    return store.set_control_state(
+        investigation,
+        status="RUNNING",
+        control_state={
+            "branchAssessments": [],
+            "selectedExperiment": asdict(continuation),
+            "schedulerAction": "RUN_EXPERIMENT",
+            "recovery": "TESS_NEIGHBOR_CATALOG_PIXEL_RESPONSE_REVIEW",
+        },
+    )
+
+
 def _repair_dynamic_harmonic_terminal(
     store: InvestigationStore, investigation: Investigation, control: dict
 ) -> Investigation | None:
@@ -3352,6 +3460,13 @@ def repair_obsolete_terminal_wait(
         )
     if residual_mechanism_repair is not None:
         return residual_mechanism_repair
+
+    neighbor_catalog_review_repair = \
+        _repair_neighbor_catalog_pixel_response_review_terminal(
+            store, investigation, control
+        )
+    if neighbor_catalog_review_repair is not None:
+        return neighbor_catalog_review_repair
 
     dynamic_repair = _repair_dynamic_harmonic_terminal(store, investigation, control)
     if dynamic_repair is not None:
