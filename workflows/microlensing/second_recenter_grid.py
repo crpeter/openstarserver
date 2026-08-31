@@ -57,8 +57,8 @@ from workflows.microlensing.recenter_grid import (
     _project as _expected_first_recenter_project,
     _provenance_chain as _expected_first_recenter_provenance,
     _read_json_file,
-    _regular_directory,
-    _reject_symlink_components,
+    _regular_directory as _first_recenter_regular_directory,
+    _reject_symlink_components as _first_recenter_reject_symlink_components,
     _safe_product as _first_recenter_safe_product,
     _sha256_bytes,
     _verify_exact_project_tree,
@@ -177,6 +177,20 @@ class _VerifiedFirstRecenterWinner:
 
 def _fail(message: str) -> SecondRecenterGridBuildError:
     return SecondRecenterGridBuildError(message)
+
+
+def _reject_symlink_components(path: Path, description: str) -> None:
+    try:
+        _first_recenter_reject_symlink_components(path, description)
+    except FirstRecenterGridBuildError as error:
+        raise _fail(str(error)) from error
+
+
+def _regular_directory(path: Path, description: str) -> Path:
+    try:
+        return _first_recenter_regular_directory(path, description)
+    except FirstRecenterGridBuildError as error:
+        raise _fail(str(error)) from error
 
 
 def _safe_product(left: int, right: int, field_name: str) -> int:
