@@ -324,6 +324,41 @@ def confirmed_nonstationary_physical_period(
     return period
 
 
+def validate_confirmed_nonstationary_localization_boundary(
+    nonstationary_summary: dict[str, Any],
+    confirmation: dict[str, Any],
+    physical_cycle_evidence: dict[str, Any] | None,
+) -> float:
+    """Validate the exact v20.9.2 boundary before pixel acquisition."""
+    if not isinstance(nonstationary_summary, dict):
+        raise RuntimeError("Confirmed residual localization requires v20.9.2 modeling.")
+    expected_contract = build_confirmed_nonstationary_method_contract(confirmation)
+    expected_hash = confirmed_nonstationary_method_contract_hash(expected_contract)
+    frequency = _float(nonstationary_summary.get("preferredFrequencyAtReference"))
+    period = _float(nonstationary_summary.get("preferredPeriodAtReferenceDays"))
+    if not (
+        nonstationary_summary.get("evidenceLineage")
+        == CONFIRMED_NONSTATIONARY_EVIDENCE_LINEAGE
+        and nonstationary_summary.get("methodContract") == expected_contract
+        and nonstationary_summary.get("methodContractID")
+        == CONFIRMED_NONSTATIONARY_METHOD_CONTRACT_ID
+        and nonstationary_summary.get("methodContractHash") == expected_hash
+        and nonstationary_summary.get("recommendedNextTest")
+        == "RESIDUAL_MODE_PIXEL_LOCALIZATION"
+        and nonstationary_summary.get("physicalMechanismResolved") is False
+        and nonstationary_summary.get("claimLevelChanged") is False
+        and frequency is not None and frequency > 0
+        and period is not None and period > 0
+    ):
+        raise RuntimeError(
+            "Confirmed residual localization requires the exact persisted "
+            "v20.9.2 nonstationary-modeling boundary."
+        )
+    return confirmed_nonstationary_physical_period(
+        confirmation, physical_cycle_evidence
+    )
+
+
 def confirmed_nonstationary_method_contract_hash(
     contract: dict[str, Any],
 ) -> str:
