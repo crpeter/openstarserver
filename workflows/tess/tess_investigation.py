@@ -154,6 +154,10 @@ from .tess_residual_external_evidence import (
     HANDLER_ID as RESIDUAL_EXTERNAL_EVIDENCE_HANDLER_ID,
     analyze_residual_external_evidence,
 )
+from .tess_target_residual_astrophysical_mechanism import (
+    HANDLER_ID as TARGET_RESIDUAL_ASTROPHYSICAL_MECHANISM_HANDLER_ID,
+    analyze_target_residual_astrophysical_mechanism,
+)
 from .tess_residual_localization_review import (
     build_residual_mode_localization_review_project,
     interpret_residual_mode_localization_review_project,
@@ -1890,6 +1894,42 @@ def _render_report(conclusion: dict[str, Any]) -> str:
                 f"targetAssociated={item.get('targetAssociated')}, "
                 f"catalogPeriodDays={item.get('catalogPeriodDays')}, "
                 f"periodComparisons={item.get('periodComparisons')}"
+            )
+
+    residual_mechanism = conclusion.get(
+        "targetResidualAstrophysicalMechanismFollowup"
+    )
+    if residual_mechanism is not None:
+        spatial = residual_mechanism.get("spatialEvidence") or {}
+        rotation = residual_mechanism.get("rotationConstraintAtResidualPeriod") or {}
+        lines.extend([
+            "",
+            "## Target-residual astrophysical mechanism follow-up",
+            "",
+            f"- Method contract: {residual_mechanism.get('methodContractID')}",
+            f"- Method contract hash: {residual_mechanism.get('methodContractHash')}",
+            f"- Classification: {residual_mechanism.get('classification')}",
+            f"- Residual period: {residual_mechanism.get('residualPeriodAtReferenceDays')} days",
+            f"- Established physical period: {residual_mechanism.get('establishedPhysicalPeriodDays')} days",
+            f"- Rotation sanity at residual period: {rotation.get('status')}",
+            f"- Retained off-target residual sectors: {spatial.get('offTargetSectors')}",
+            f"- Spatial cautions: {spatial.get('cautions')}",
+            f"- Insufficiency reasons: {residual_mechanism.get('insufficiencyReasons')}",
+            f"- Physical mechanism resolved: {residual_mechanism.get('physicalMechanismResolved')}",
+            f"- Claim level changed: {residual_mechanism.get('claimLevelChanged')}",
+            f"- Recommended next test: {residual_mechanism.get('recommendedNextTest')}",
+            "",
+            "### Adjudicated frozen catalog evidence",
+            "",
+        ])
+        for item in residual_mechanism.get("adjudicatedCatalogEvidence") or []:
+            lines.append(
+                f"- {item.get('source')} {item.get('stableObjectID')}: "
+                f"classification={item.get('classification')}, "
+                f"family={item.get('classificationFamily')}, "
+                f"adjudication={item.get('adjudication')}, "
+                f"supportsResidualPeriod={item.get('supportsResidualPeriod')}, "
+                f"supportsEstablishedFamily={item.get('supportsEstablishedFamily')}"
             )
 
 
@@ -6250,6 +6290,63 @@ def build_engine(
                 "physicalCycleEvidence": sha256_json(
                     source_localization.get("physicalCycleEvidence")
                 ),
+            },
+            artifacts=(_artifact(artifact_path, "application/json"),),
+        )
+
+
+    def target_residual_astrophysical_mechanism_stage(investigation, request):
+        prepared = _result(investigation, "001-prepare-target")
+        identity = _required_latest_result_for_handler(
+            investigation, "openstar.tess.catalog-identity"
+        )
+        external = _required_latest_result_for_handler(
+            investigation, RESIDUAL_EXTERNAL_EVIDENCE_HANDLER_ID
+        )
+        result = analyze_target_residual_astrophysical_mechanism(
+            external_evidence=external,
+            identity=identity,
+            expected_tic_id=int(prepared["ticID"]),
+        )
+        print("🔬 Target-residual astrophysical mechanism follow-up")
+        print(f"   method contract: {result.get('methodContractID')}")
+        print(f"   method hash: {result.get('methodContractHash')}")
+        print(f"   classification: {result.get('classification')}")
+        print(
+            "   residual-period rotation records: "
+            f"{len(result.get('residualRotationEvidence') or [])}"
+        )
+        print(
+            "   residual-period pulsation records: "
+            f"{len(result.get('residualPulsationEvidence') or [])}"
+        )
+        print(
+            "   retained off-target sectors: "
+            f"{(result.get('spatialEvidence') or {}).get('offTargetSectors')}"
+        )
+        print(f"   physical mechanism resolved: {result.get('physicalMechanismResolved')}")
+        print(f"   recommended next test: {result.get('recommendedNextTest')}")
+
+        artifact_path = (
+            store.directory_for(investigation.id)
+            / "artifacts"
+            / "target-residual-astrophysical-mechanism"
+            / "target-residual-astrophysical-mechanism-v20.10.2.json"
+        )
+        _write_json(artifact_path, result)
+        return StageOutcome(
+            result=result,
+            next_stage=StageRequest(
+                id=_next_stage_id(request.id, "finalize"),
+                handler_id="openstar.tess.finalize",
+                parameters={
+                    "outputSuffix": "v20.10.2-target-residual-astrophysical-mechanism"
+                },
+                triggered_by_stage_id=request.id,
+            ),
+            input_hashes={
+                "residualExternalEvidence": sha256_json(external),
+                "catalogIdentity": sha256_json(identity),
             },
             artifacts=(_artifact(artifact_path, "application/json"),),
         )
@@ -11060,6 +11157,9 @@ def build_engine(
         residual_external_evidence = _latest_result_for_handler(
             investigation, RESIDUAL_EXTERNAL_EVIDENCE_HANDLER_ID,
         )
+        target_residual_astrophysical_mechanism = _latest_result_for_handler(
+            investigation, TARGET_RESIDUAL_ASTROPHYSICAL_MECHANISM_HANDLER_ID,
+        )
         residual_mode_localization_review = _latest_result_for_handler(
             investigation,
             "openstar.tess.residual-mode-localization-review.interpret",
@@ -11433,6 +11533,26 @@ def build_engine(
             existing_rationale.append(
                 "Recommended next confirmation step: "
                 f"{residual_external_evidence.get('recommendedNextTest')}."
+            )
+            claim_decision = {
+                "claim": claim_decision["claim"],
+                "rationale": existing_rationale,
+            }
+
+        if target_residual_astrophysical_mechanism is not None:
+            existing_rationale = list(claim_decision.get("rationale") or [])
+            existing_rationale.append(
+                "v20.10.2 conservatively adjudicates whether the frozen, "
+                "target-associated nonbinary catalog evidence is specifically "
+                "consistent with the residual period, classifying the hypothesis "
+                "as "
+                f"{target_residual_astrophysical_mechanism.get('classification')}. "
+                "It retains discordant off-target evidence and neither resolves "
+                "the physical mechanism nor changes the claim level."
+            )
+            existing_rationale.append(
+                "Recommended next confirmation step: "
+                f"{target_residual_astrophysical_mechanism.get('recommendedNextTest')}."
             )
             claim_decision = {
                 "claim": claim_decision["claim"],
@@ -12309,7 +12429,11 @@ def build_engine(
             and stage.handler_id != "openstar.tess.finalize" and not stage.handler_id.startswith(
                 "openstar.tess.target-residual-archival-baseline.")
             for index, stage in enumerate(investigation.stages))
-        if residual_external_evidence is not None:
+        if target_residual_astrophysical_mechanism is not None:
+            recommended_next_test = target_residual_astrophysical_mechanism.get(
+                "recommendedNextTest"
+            )
+        elif residual_external_evidence is not None:
             recommended_next_test = residual_external_evidence.get(
                 "recommendedNextTest"
             )
@@ -12479,6 +12603,9 @@ def build_engine(
             "dynamicHarmonicFrequencyRefinement": dynamic_harmonic_frequency_refinement,
             "residualModeLocalization": residual_mode_localization,
             "residualExternalEvidence": residual_external_evidence,
+            "targetResidualAstrophysicalMechanismFollowup": (
+                target_residual_astrophysical_mechanism
+            ),
             "residualModeLocalizationReview": residual_mode_localization_review,
             "multiSourceResidualDecomposition": multisource_residual,
             "targetResidualMechanismPredictiveValidation": (
@@ -12695,9 +12822,23 @@ def build_engine(
                 "   retained off-target residual sectors: "
                 f"{(residual_external_evidence.get('spatialEvidence') or {}).get('offTargetSectors')}"
             )
+            if target_residual_astrophysical_mechanism is None:
+                print(
+                    "   recommended next test: "
+                    f"{residual_external_evidence.get('recommendedNextTest')}"
+                )
+        if target_residual_astrophysical_mechanism is not None:
+            print(
+                "   target-residual astrophysical mechanism: "
+                f"{target_residual_astrophysical_mechanism.get('classification')}"
+            )
+            print(
+                "   retained off-target residual sectors: "
+                f"{(target_residual_astrophysical_mechanism.get('spatialEvidence') or {}).get('offTargetSectors')}"
+            )
             print(
                 "   recommended next test: "
-                f"{residual_external_evidence.get('recommendedNextTest')}"
+                f"{target_residual_astrophysical_mechanism.get('recommendedNextTest')}"
             )
         if residual_mode_localization_review is not None:
             review_cross = residual_mode_localization_review.get("crossTime") or {}
@@ -13080,6 +13221,10 @@ def build_engine(
     engine.register_handler(
         RESIDUAL_EXTERNAL_EVIDENCE_HANDLER_ID,
         residual_external_evidence_stage,
+    )
+    engine.register_handler(
+        TARGET_RESIDUAL_ASTROPHYSICAL_MECHANISM_HANDLER_ID,
+        target_residual_astrophysical_mechanism_stage,
     )
     engine.register_handler(
         "openstar.tess.residual-mode-localization-review.prepare",

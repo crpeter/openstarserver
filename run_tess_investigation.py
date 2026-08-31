@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 
 from openstar_coordinator_client import OpenStarCoordinatorClient
-from openstar_investigation import InvestigationStore
+from openstar_investigation import InvestigationStore, sha256_json
 from openstar_workflow import StageRequest
 from workflows.tess.tess_investigation import (
     SOFTWARE_ID,
@@ -32,6 +32,10 @@ from workflows.tess.tess_nonstationary import (
 from workflows.tess.tess_residual_external_evidence import (
     HANDLER_ID as RESIDUAL_EXTERNAL_EVIDENCE_HANDLER_ID,
     validate_target_supported_boundary,
+)
+from workflows.tess.tess_target_residual_astrophysical_mechanism import (
+    HANDLER_ID as TARGET_RESIDUAL_ASTROPHYSICAL_MECHANISM_HANDLER_ID,
+    validate_mechanism_followup_boundary,
 )
 
 
@@ -169,6 +173,14 @@ def parse_args():
             "Append v20.10.1 network-free adjudication of the frozen external "
             "variability and binary classifications after target-supported v20.10 "
             "residual-mode localization."
+        ),
+    )
+    recovery.add_argument(
+        "--continue-target-residual-astrophysical-mechanism",
+        action="store_true",
+        help=(
+            "Append v20.10.2 network-free mechanism-hypothesis adjudication "
+            "from the exact target-associated nonbinary v20.10.1 boundary."
         ),
     )
     recovery.add_argument(
@@ -966,6 +978,68 @@ def _can_continue_residual_external_evidence(investigation) -> None:
         nonstationary=nonstationary.result,
         confirmation=confirmation.result,
         physical_cycle=source_localization.result.get("physicalCycleEvidence"),
+        identity=identity.result,
+        expected_tic_id=int(prepared.result["ticID"]),
+    )
+
+
+def _can_continue_target_residual_astrophysical_mechanism(investigation) -> None:
+    if any(stage.status == "RUNNING" for stage in investigation.stages):
+        raise RuntimeError(
+            "Investigation contains a RUNNING stage. Use --resume before "
+            "target-residual astrophysical-mechanism continuation."
+        )
+    if investigation.status not in {"COMPLETE", "HUMAN_REVIEW_REQUIRED"}:
+        raise RuntimeError(
+            "--continue-target-residual-astrophysical-mechanism requires a "
+            "terminal investigation."
+        )
+    if any(
+        stage.handler_id == TARGET_RESIDUAL_ASTROPHYSICAL_MECHANISM_HANDLER_ID
+        for stage in investigation.stages
+    ):
+        raise RuntimeError(
+            "Investigation already contains target-residual astrophysical-"
+            "mechanism follow-up."
+        )
+
+    def completed(handler_id):
+        return next((
+            stage for stage in reversed(investigation.stages)
+            if stage.handler_id == handler_id and stage.status == "COMPLETE"
+            and isinstance(stage.result, dict)
+        ), None)
+
+    external = completed(RESIDUAL_EXTERNAL_EVIDENCE_HANDLER_ID)
+    identity = completed("openstar.tess.catalog-identity")
+    prepared = next((
+        stage for stage in investigation.stages
+        if stage.id == "001-prepare-target" and stage.status == "COMPLETE"
+        and isinstance(stage.result, dict)
+    ), None)
+    latest = investigation.stages[-1] if investigation.stages else None
+    if any(stage is None for stage in (external, identity, prepared, latest)):
+        raise RuntimeError("The completed v20.10.1 evidence lineage is required.")
+    if not (
+        latest.handler_id == "openstar.tess.finalize"
+        and latest.status == "COMPLETE" and latest.stop is True
+        and latest.triggered_by_stage_id == external.id
+        and latest.parameters == {
+            "outputSuffix": "v20.10.1-residual-external-evidence"
+        }
+        and (latest.result or {}).get("residualExternalEvidence") == external.result
+        and (latest.result or {}).get("recommendedNextTest")
+        == "TARGET_RESIDUAL_ASTROPHYSICAL_MECHANISM_FOLLOWUP"
+    ):
+        raise RuntimeError("The exact finalized v20.10.1 boundary is required.")
+    index = investigation.stages.index(external)
+    if tuple(investigation.stages[index + 1:]) != (latest,):
+        raise RuntimeError("Later stages already consume the v20.10.1 boundary.")
+    hashes = external.provenance.input_hashes if external.provenance else {}
+    if hashes.get("catalogIdentity") != sha256_json(identity.result):
+        raise RuntimeError("The frozen catalog-identity lineage has changed.")
+    validate_mechanism_followup_boundary(
+        external_evidence=external.result,
         identity=identity.result,
         expected_tic_id=int(prepared.result["ticID"]),
     )
@@ -2708,6 +2782,27 @@ def main():
             parameters={},
             triggered_by_stage_id=localization_stage_id,
         )
+    elif args.continue_target_residual_astrophysical_mechanism:
+        investigation = store.load(args.investigation_id)
+        if investigation.workflow_id != WORKFLOW_ID:
+            raise RuntimeError(
+                "Cannot continue investigation with a different workflow: "
+                f"{investigation.workflow_id}"
+            )
+        _can_continue_target_residual_astrophysical_mechanism(investigation)
+        external_stage_id = next(
+            stage.id for stage in reversed(investigation.stages)
+            if stage.handler_id == RESIDUAL_EXTERNAL_EVIDENCE_HANDLER_ID
+            and stage.status == "COMPLETE"
+        )
+        next_number = _next_stage_number(investigation)
+        investigation = store.set_status(investigation, "RUNNING")
+        initial_stage = StageRequest(
+            id=f"{next_number:03d}-target-residual-astrophysical-mechanism",
+            handler_id=TARGET_RESIDUAL_ASTROPHYSICAL_MECHANISM_HANDLER_ID,
+            parameters={},
+            triggered_by_stage_id=external_stage_id,
+        )
     elif args.continue_residual_mode_localization_review:
         investigation = store.load(args.investigation_id)
         if investigation.workflow_id != WORKFLOW_ID:
@@ -3517,6 +3612,17 @@ def main():
         print("   no catalog query, archive query, or download is performed")
         print("   the completed TIC, SIMBAD, VSX, and Gaia evidence is reused")
         print("   discordant off-target residual sectors remain explicit cautions")
+    elif args.continue_target_residual_astrophysical_mechanism:
+        print(
+            "🔬 Continuing the target-associated nonbinary v20.10.1 boundary "
+            "with v20.10.2 mechanism-hypothesis adjudication"
+        )
+        print(f"   stage: {initial_stage.id}")
+        print(f"   handler: {initial_stage.handler_id}")
+        print("   coordinator and distributed workers are not required")
+        print("   no flux values, catalog queries, archive queries, or downloads are used")
+        print("   frozen catalog period comparisons and TIC stellar metadata are reused")
+        print("   physical mechanism and claim level remain unresolved")
     elif args.continue_residual_mode_localization_review:
         print("🧭 Continuing terminal investigation with v20.11 distributed time-resolved residual-mode source localization review")
         print(f"   stage: {initial_stage.id}")

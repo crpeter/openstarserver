@@ -39,6 +39,10 @@ from .tess_residual_external_evidence import (
     HANDLER_ID as RESIDUAL_EXTERNAL_EVIDENCE_HANDLER_ID,
     validate_target_supported_boundary,
 )
+from .tess_target_residual_astrophysical_mechanism import (
+    HANDLER_ID as TARGET_RESIDUAL_ASTROPHYSICAL_MECHANISM_HANDLER_ID,
+    validate_mechanism_followup_boundary,
+)
 from .tess_resolved_cycle import validated_cycle_period
 from .tess_source_pair_lineage import frozen_source_pair_evidence
 
@@ -1729,6 +1733,90 @@ def _repair_target_supported_residual_external_evidence_terminal(
     )
 
 
+def _repair_target_residual_astrophysical_mechanism_terminal(
+    store: InvestigationStore, investigation: Investigation, control: dict
+) -> Investigation | None:
+    """Append v20.10.2 only at the verified finalized v20.10.1 boundary."""
+    if not (
+        investigation.status in {"COMPLETE", "HUMAN_REVIEW_REQUIRED"}
+        and control.get("schedulerAction") == "INVESTIGATION_COMPLETE"
+        and control.get("selectedExperiment") in (None, {})
+        and not any(stage.status == "RUNNING" for stage in investigation.stages)
+        and not any(
+            stage.handler_id == TARGET_RESIDUAL_ASTROPHYSICAL_MECHANISM_HANDLER_ID
+            for stage in investigation.stages
+        )
+    ):
+        return None
+    external = _latest_complete(investigation, RESIDUAL_EXTERNAL_EVIDENCE_HANDLER_ID)
+    identity = _latest_complete(investigation, "openstar.tess.catalog-identity")
+    prepared = next((
+        stage for stage in investigation.stages
+        if stage.id == "001-prepare-target" and stage.status == "COMPLETE"
+        and isinstance(stage.result, dict)
+    ), None)
+    latest = investigation.stages[-1] if investigation.stages else None
+    if any(stage is None for stage in (external, identity, prepared, latest)):
+        return None
+    if not (
+        isinstance(external.result, dict)
+        and isinstance(identity.result, dict)
+        and latest.handler_id == "openstar.tess.finalize"
+        and latest.status == "COMPLETE" and latest.stop is True
+        and latest.triggered_by_stage_id == external.id
+        and latest.parameters == {
+            "outputSuffix": "v20.10.1-residual-external-evidence"
+        }
+        and (latest.result or {}).get("residualExternalEvidence") == external.result
+        and (latest.result or {}).get("recommendedNextTest")
+        == "TARGET_RESIDUAL_ASTROPHYSICAL_MECHANISM_FOLLOWUP"
+    ):
+        return None
+    index = investigation.stages.index(external)
+    if tuple(investigation.stages[index + 1:]) != (latest,):
+        return None
+    try:
+        validate_mechanism_followup_boundary(
+            external_evidence=external.result,
+            identity=identity.result,
+            expected_tic_id=int(prepared.result["ticID"]),
+        )
+    except (KeyError, RuntimeError, TypeError, ValueError):
+        return None
+    hashes = external.provenance.input_hashes if external.provenance else {}
+    if not (
+        hashes.get("catalogIdentity") == sha256_json(identity.result)
+        and all(
+            store.verified_terminal_stage_ledger_hash(investigation.id, stage)
+            for stage in (prepared, identity, external, latest)
+        )
+        and _verified_stage_json(
+            external, "residual-external-evidence-v20.10.1.json"
+        )
+        and _verified_stage_json(
+            latest, "conclusion-v20.10.1-residual-external-evidence.json"
+        )
+    ):
+        return None
+    continuation = StageRequest(
+        id=_continuation_stage_id(
+            latest, "target-residual-astrophysical-mechanism"
+        ),
+        handler_id=TARGET_RESIDUAL_ASTROPHYSICAL_MECHANISM_HANDLER_ID,
+        parameters={},
+        triggered_by_stage_id=external.id,
+    )
+    return store.set_control_state(
+        investigation, status="RUNNING",
+        control_state={
+            "branchAssessments": [],
+            "selectedExperiment": asdict(continuation),
+            "schedulerAction": "RUN_EXPERIMENT",
+            "recovery": "TESS_TARGET_RESIDUAL_ASTROPHYSICAL_MECHANISM",
+        },
+    )
+
+
 def _repair_dynamic_harmonic_terminal(
     store: InvestigationStore, investigation: Investigation, control: dict
 ) -> Investigation | None:
@@ -3257,6 +3345,13 @@ def repair_obsolete_terminal_wait(
         )
     if residual_external_repair is not None:
         return residual_external_repair
+
+    residual_mechanism_repair = \
+        _repair_target_residual_astrophysical_mechanism_terminal(
+            store, investigation, control
+        )
+    if residual_mechanism_repair is not None:
+        return residual_mechanism_repair
 
     dynamic_repair = _repair_dynamic_harmonic_terminal(store, investigation, control)
     if dynamic_repair is not None:
