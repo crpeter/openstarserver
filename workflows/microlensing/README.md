@@ -493,3 +493,88 @@ error model. Neither next test is a planetary classification or discovery
 claim. The analyzer never reads sealed identity, archive sources, source
 filenames, event names, catalog identifiers, publications, sky coordinates,
 or published physical parameters.
+
+## Prepare blind anomaly-morphology evidence
+
+After cross-series validation reports exactly one
+`CROSS_SERIES_CONFIRMED` positive component and recommends
+`BLIND_MICROLENSING_ANOMALY_MORPHOLOGY_MODELING`, prepare the identity-free
+evidence and the predeclared contract for the later distributed morphology
+grid:
+
+```bash
+python -m workflows.microlensing.prepare_anomaly_morphology \
+  --residual-root /path/to/microlensing-recovery-a-residuals \
+  --residual-grid-root /path/to/microlensing-recovery-a-residual-grid \
+  --residual-grid-investigation-record \
+    /path/to/investigations/generic-residual-grid-investigation/investigation.json \
+  --cross-validation-root \
+    /path/to/microlensing-recovery-a-cross-validation \
+  --output-root /path/to/microlensing-recovery-a-morphology-preparation
+```
+
+The preparer does not trust summary fields. It reconstructs the residual
+preparation, residual-grid project and datasets, completed three-stage
+project-smoke investigation, immutable ledgers, multi-dataset counter scopes,
+complete per-dataset and project coverage, and accepted winners. It then
+recomputes the complete cross-validation result from those verified parents
+and requires the supplied contract and result to match exactly, including
+their IDs and hashes. The required result is
+`REPRODUCIBLE_LOCALIZED_RESIDUAL_STRUCTURE` with exactly one confirmed
+component, at least one distinct passing held-out series, unresolved planetary
+interpretation, no discovery claim, and the morphology-modeling next test.
+
+Series selection is generic and deterministic: include the confirmed positive
+discovery series and every distinct held-out series that passed its frozen
+validation gate. The closest earlier, discovery-gated negative winner is the
+preceding component anchor. No series ID or coordinate is hardcoded. The
+shared coordinate window brackets two effective widths around both anchors,
+then expands until every selected series contributes at least three
+positive-weight baseline samples on each side. Every selected series must
+also have positive-weight support within two effective widths of both
+components. Complete source indices, coordinates, signed residuals, inverse
+variances, inclusion reasons, and source hashes are preserved.
+
+The contract predeclares three generic residual model classes without
+evaluating them:
+
+- `POSITIVE_PULSE_ONLY` fits one positive component with shared nonlinear
+  geometry and per-series offset and amplitude.
+- `ORDERED_NEGATIVE_POSITIVE_DOUBLET` requires a negative component followed
+  by a positive component, shared nonlinear timing and shape, and per-series
+  offsets and signed component amplitudes.
+- `INDEPENDENT_PULSES` allows each series independent ordered negative and
+  positive centers as the less-constrained comparison while retaining shared
+  width and shape axes.
+
+Axes, rightmost-fastest mixed-radix candidate ordering, global candidate
+offsets, invalid-candidate behavior, finite-value rules, parameter counts,
+WRSS, BIC, and AICc are fixed in the contract. Widths are strictly positive.
+The width grid extends at least sixteen-fold below the earlier minimum-width
+boundary and is capped at one quarter of the prepared coordinate span.
+Separation is strictly positive and bounded by the prepared center axis.
+
+The ordered doublet can be preferred over the positive pulse only with global
+delta WRSS at least 30, per-series delta WRSS at least 9, delta BIC at least
+10, and all cross-series timing and sign requirements. Independent pulses can
+reject the ordered doublet only with delta WRSS at least 18, delta BIC at
+least 10, valid signs, and center dispersion beyond the predeclared timing
+tolerance. Any winning width boundary remains unresolved and cannot be
+reported as a measured duration.
+
+The previously nonexistent output root is published atomically with:
+
+- `anomaly-morphology-preparation.json`
+- `morphology-contract.json`
+- `datasets/morphology-series-001.json` and one sequential file per selected
+  generic series
+- `artifact-manifest.json`
+
+This step only prepares blind numerical evidence and a later model contract.
+It never reads sealed identity, raw archives, source filenames, event names,
+catalog identifiers, citations, observatory identity, sky coordinates, or
+published physical parameters. It does not run the morphology grid, implement
+a binary-lens model, resolve a planetary interpretation, or make a discovery
+claim. The next separate step is
+`DISTRIBUTED_BLIND_MICROLENSING_ANOMALY_MORPHOLOGY_GRID`.
+
