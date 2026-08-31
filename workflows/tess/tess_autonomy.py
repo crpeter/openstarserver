@@ -33,6 +33,7 @@ from .tess_long_baseline_frequency_confirmation import (
 from .tess_nonstationary import (
     CONFIRMED_NONSTATIONARY_EVIDENCE_LINEAGE,
     build_confirmed_nonstationary_method_contract,
+    validate_confirmed_nonstationary_localization_boundary,
 )
 from .tess_resolved_cycle import validated_cycle_period
 from .tess_source_pair_lineage import frozen_source_pair_evidence
@@ -1559,6 +1560,69 @@ def _repair_confirmed_nonstationary_terminal(
     )
 
 
+def _repair_confirmed_residual_localization_terminal(
+    store: InvestigationStore, investigation: Investigation, control: dict
+) -> Investigation | None:
+    """Append v20.10 only at the exact finalized confirmed-model boundary."""
+    if not (
+        investigation.status in {"COMPLETE", "HUMAN_REVIEW_REQUIRED"}
+        and control.get("schedulerAction") == "INVESTIGATION_COMPLETE"
+        and not any(stage.status == "RUNNING" for stage in investigation.stages)
+        and not any(
+            stage.handler_id.startswith("openstar.tess.residual-mode-localization.")
+            for stage in investigation.stages
+        )
+    ):
+        return None
+    summary = _latest_complete(
+        investigation, "openstar.tess.nonstationary.summarize")
+    confirmation = _latest_complete(
+        investigation, LONG_BASELINE_FREQUENCY_CONFIRMATION_HANDLER_ID)
+    localization = _latest_complete(
+        investigation, "openstar.tess.source-localization.analyze")
+    latest = investigation.stages[-1] if investigation.stages else None
+    if any(stage is None for stage in (summary, confirmation, localization, latest)):
+        return None
+    if not (
+        isinstance(summary.result, dict)
+        and isinstance(confirmation.result, dict)
+        and isinstance(localization.result, dict)
+        and latest.handler_id == "openstar.tess.finalize"
+        and latest.status == "COMPLETE" and latest.stop is True
+        and latest.triggered_by_stage_id == summary.id
+        and latest.parameters.get("outputSuffix")
+        == "v20.9.2-confirmed-nonstationary"
+        and (latest.result or {}).get("nonstationaryModeling") == summary.result
+    ):
+        return None
+    summary_index = investigation.stages.index(summary)
+    if tuple(investigation.stages[summary_index + 1:]) != (latest,):
+        return None
+    try:
+        validate_confirmed_nonstationary_localization_boundary(
+            summary.result,
+            confirmation.result,
+            localization.result.get("physicalCycleEvidence"),
+        )
+    except (KeyError, RuntimeError, TypeError, ValueError):
+        return None
+    continuation = StageRequest(
+        id=_continuation_stage_id(latest, "prepare-residual-mode-localization"),
+        handler_id="openstar.tess.residual-mode-localization.prepare",
+        parameters={},
+        triggered_by_stage_id=summary.id,
+    )
+    return store.set_control_state(
+        investigation, status="RUNNING",
+        control_state={
+            "branchAssessments": [],
+            "selectedExperiment": asdict(continuation),
+            "schedulerAction": "RUN_EXPERIMENT",
+            "recovery": "TESS_CONFIRMED_RESIDUAL_MODE_PIXEL_LOCALIZATION",
+        },
+    )
+
+
 def _repair_dynamic_harmonic_terminal(
     store: InvestigationStore, investigation: Investigation, control: dict
 ) -> Investigation | None:
@@ -3073,6 +3137,13 @@ def repair_obsolete_terminal_wait(
     )
     if confirmed_nonstationary_repair is not None:
         return confirmed_nonstationary_repair
+
+    confirmed_localization_repair = \
+        _repair_confirmed_residual_localization_terminal(
+            store, investigation, control
+        )
+    if confirmed_localization_repair is not None:
+        return confirmed_localization_repair
 
     dynamic_repair = _repair_dynamic_harmonic_terminal(store, investigation, control)
     if dynamic_repair is not None:
