@@ -117,6 +117,7 @@ from .tess_nonstationary import (
     CONFIRMED_NONSTATIONARY_EVIDENCE_LINEAGE,
     build_confirmed_nonstationary_method_contract,
     build_nonstationary_project,
+    confirmed_nonstationary_physical_period,
     confirmed_nonstationary_method_contract_hash,
     interpret_nonstationary_project,
     summarize_nonstationary_modeling,
@@ -5682,11 +5683,13 @@ def build_engine(
             investigation,
             "openstar.tess.time-frequency.summarize",
         )
+        source_localization = _latest_result_for_handler(
+            investigation,
+            "openstar.tess.source-localization.analyze",
+        )
         evidence_lineage = request.parameters.get("evidenceLineage")
         if independent_prepare is None:
             raise RuntimeError("v20.9 requires the frozen independent-sector preparation.")
-        if morphology is None or not morphology.get("physicalCycleResolved"):
-            raise RuntimeError("v20.9 requires a morphology-resolved physical period.")
         confirmed_contract = None
         confirmation = None
         if evidence_lineage == CONFIRMED_NONSTATIONARY_EVIDENCE_LINEAGE:
@@ -5700,18 +5703,23 @@ def build_engine(
             confirmation = confirmation_stage.result
             boundary = validate_confirmed_nonstationary_boundary(confirmation)
             confirmed_contract = build_confirmed_nonstationary_method_contract(confirmation)
+            cycle = (
+                source_localization.get("physicalCycleEvidence")
+                if isinstance(source_localization, dict) else None
+            )
+            physical_period = confirmed_nonstationary_physical_period(
+                confirmation, cycle
+            )
         elif evidence_lineage is None:
+            if morphology is None or not morphology.get("physicalCycleResolved"):
+                raise RuntimeError("v20.9 requires a morphology-resolved physical period.")
             if time_frequency is None or time_frequency.get("recommendedNextTest") != "LONG_BASELINE_NONSTATIONARY_MODE_MODELING":
                 raise RuntimeError("v20.9 requires v20.8 to recommend LONG_BASELINE_NONSTATIONARY_MODE_MODELING.")
             boundary = None
+            physical_period = float(morphology["resolvedPhysicalPeriodDays"])
         else:
             raise RuntimeError("Unsupported nonstationary evidence lineage.")
 
-        physical_period = float(morphology["resolvedPhysicalPeriodDays"])
-        if boundary is not None and not math.isclose(
-            physical_period, boundary["establishedPeriodDays"], rel_tol=1e-9, abs_tol=1e-12
-        ):
-            raise RuntimeError("Confirmed nonstationary physical-period lineage is inconsistent.")
         artifact_root = store.directory_for(investigation.id) / "artifacts"
         print("🌀 Preparing generic long-baseline nonstationary work")
         print(f"   resolved physical period: {physical_period} days")
@@ -5769,6 +5777,7 @@ def build_engine(
                 **({
                     "longBaselineFrequencyConfirmation": sha256_json(confirmation),
                     "methodContract": confirmed_nonstationary_method_contract_hash(confirmed_contract),
+                    "sourceLocalization": sha256_json(source_localization),
                 } if confirmed_contract is not None else {}),
             },
             artifacts=tuple(artifacts),

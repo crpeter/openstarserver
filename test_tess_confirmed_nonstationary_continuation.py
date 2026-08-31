@@ -16,9 +16,11 @@ from workflows.tess.tess_nonstationary import (
     CONFIRMED_NONSTATIONARY_EVIDENCE_LINEAGE,
     CONFIRMED_NONSTATIONARY_METHOD_CONTRACT_ID,
     build_confirmed_nonstationary_method_contract,
+    confirmed_nonstationary_physical_period,
     confirmed_nonstationary_method_contract_hash,
     validate_confirmed_nonstationary_boundary,
 )
+from workflows.tess.tess_resolved_cycle import authoritative_resolved_cycle
 
 
 def _confirmation(paths):
@@ -59,6 +61,23 @@ def _confirmation(paths):
 
 
 class ConfirmedNonstationaryContractTests(unittest.TestCase):
+    def test_uses_authoritative_cycle_when_morphology_stage_is_unresolved(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = [Path(temporary) / f"sector-{sector}.json"
+                     for sector in (1, *INDEPENDENT_SECTORS)]
+            confirmation = _confirmation(paths)
+        cycle = authoritative_resolved_cycle(morphology={
+            "physicalCycleResolved": True,
+            "resolvedPhysicalPeriodDays": 10.0,
+            "morphologyClass": "DOUBLE_WAVE_PHYSICAL_CYCLE_SUPPORTED",
+        })
+        self.assertEqual(
+            10.0,
+            confirmed_nonstationary_physical_period(confirmation, cycle),
+        )
+        with self.assertRaisesRegex(RuntimeError, "authoritative"):
+            confirmed_nonstationary_physical_period(confirmation, None)
+
     def test_exact_boundary_builds_deterministic_versioned_contract(self):
         with tempfile.TemporaryDirectory() as temporary:
             paths = [Path(temporary) / f"sector-{sector}.json"

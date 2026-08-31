@@ -16,6 +16,7 @@ from .tess_long_baseline_frequency_confirmation import (
     classify_long_baseline_confirmation,
     method_contract_hash as long_baseline_confirmation_contract_hash,
 )
+from .tess_resolved_cycle import validated_cycle_period
 
 
 DRIFT_GRID_COUNT = 33
@@ -301,6 +302,26 @@ def build_confirmed_nonstationary_method_contract(
             "automaticDiscoveryClaim": False,
         },
     }
+
+
+def confirmed_nonstationary_physical_period(
+    confirmation: dict[str, Any],
+    physical_cycle_evidence: dict[str, Any] | None,
+) -> float:
+    """Resolve the confirmed path from the authoritative cycle, not morphology."""
+    boundary = validate_confirmed_nonstationary_boundary(confirmation)
+    period = validated_cycle_period(physical_cycle_evidence)
+    if period is None or not math.isclose(
+        period,
+        boundary["establishedPeriodDays"],
+        rel_tol=1e-9,
+        abs_tol=1e-12,
+    ):
+        raise RuntimeError(
+            "Confirmed nonstationary modeling requires the authoritative "
+            "resolved physical-cycle lineage."
+        )
+    return period
 
 
 def confirmed_nonstationary_method_contract_hash(
