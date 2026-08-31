@@ -37,6 +37,10 @@ from workflows.tess.tess_target_residual_astrophysical_mechanism import (
     HANDLER_ID as TARGET_RESIDUAL_ASTROPHYSICAL_MECHANISM_HANDLER_ID,
     validate_mechanism_followup_boundary,
 )
+from workflows.tess.tess_neighbor_catalog_pixel_response_review import (
+    HANDLER_ID as NEIGHBOR_CATALOG_PIXEL_RESPONSE_REVIEW_HANDLER_ID,
+    validate_review_boundary as validate_neighbor_catalog_pixel_response_boundary,
+)
 
 
 def parse_args():
@@ -190,6 +194,15 @@ def parse_args():
             "Append v20.11 distributed time-resolved source-localization review of the "
             "v20.9 drifting residual mode after unresolved v20.10 static localization. "
             "Each usable pixel-window remains an ordinary openstar.lomb-scargle.v1 dataset."
+        ),
+    )
+    recovery.add_argument(
+        "--continue-neighbor-catalog-pixel-response-review",
+        action="store_true",
+        help=(
+            "Append v20.11.1 catalog-guided review of the already-persisted "
+            "v20.11 residual pixel-response maps. This queries a fixed TIC/Gaia "
+            "neighborhood but performs no TESS download or distributed work."
         ),
     )
     recovery.add_argument(
@@ -1081,6 +1094,75 @@ def _can_continue_residual_mode_localization_review(investigation) -> None:
             "Use --resume only if one is actually interrupted."
         )
 
+
+
+def _can_continue_neighbor_catalog_pixel_response_review(investigation) -> None:
+    if any(stage.status == "RUNNING" for stage in investigation.stages):
+        raise RuntimeError(
+            "Investigation contains a RUNNING stage. Use --resume before "
+            "neighbor catalog/pixel-response continuation."
+        )
+    if investigation.status not in {"COMPLETE", "HUMAN_REVIEW_REQUIRED"}:
+        raise RuntimeError(
+            "--continue-neighbor-catalog-pixel-response-review requires a "
+            "terminal investigation."
+        )
+    if any(
+        stage.handler_id == NEIGHBOR_CATALOG_PIXEL_RESPONSE_REVIEW_HANDLER_ID
+        for stage in investigation.stages
+    ):
+        raise RuntimeError(
+            "Investigation already contains neighbor catalog/pixel-response review."
+        )
+
+    def completed(handler_id):
+        return next((
+            stage for stage in reversed(investigation.stages)
+            if stage.handler_id == handler_id and stage.status == "COMPLETE"
+            and isinstance(stage.result, dict)
+        ), None)
+
+    prepared = next((
+        stage for stage in investigation.stages
+        if stage.id == "001-prepare-target" and stage.status == "COMPLETE"
+        and isinstance(stage.result, dict)
+    ), None)
+    identity = completed("openstar.tess.catalog-identity")
+    mode = completed("openstar.tess.mode-identification.analyze")
+    review_preparation = completed(
+        "openstar.tess.residual-mode-localization-review.prepare"
+    )
+    review = completed("openstar.tess.residual-mode-localization-review.interpret")
+    latest = investigation.stages[-1] if investigation.stages else None
+    if any(stage is None for stage in (
+        prepared, identity, mode, review_preparation, review, latest,
+    )):
+        raise RuntimeError("The completed v20.11 evidence lineage is required.")
+    if not (
+        latest.handler_id == "openstar.tess.finalize"
+        and latest.status == "COMPLETE"
+        and latest.stop is True
+        and latest.triggered_by_stage_id == review.id
+        and latest.parameters == {"outputSuffix": "v20.11"}
+        and (latest.result or {}).get("residualModeLocalizationReview")
+        == review.result
+        and (latest.result or {}).get("recommendedNextTest")
+        == "NEIGHBOR_CATALOG_AND_PIXEL_RESPONSE_REVIEW"
+    ):
+        raise RuntimeError("The exact finalized unresolved v20.11 boundary is required.")
+    index = investigation.stages.index(review)
+    if tuple(investigation.stages[index + 1:]) != (latest,):
+        raise RuntimeError("Later stages already consume the v20.11 boundary.")
+    hashes = review.provenance.input_hashes if review.provenance else {}
+    if hashes.get("preparation") != sha256_json(review_preparation.result):
+        raise RuntimeError("The frozen v20.11 preparation lineage has changed.")
+    validate_neighbor_catalog_pixel_response_boundary(
+        preparation=review_preparation.result,
+        localization_review=review.result,
+        mode_identification=mode.result,
+        identity=identity.result,
+        expected_tic_id=int(prepared.result["ticID"]),
+    )
 
 
 def _can_continue_multi_source_residual(investigation) -> None:
@@ -2527,6 +2609,7 @@ def main():
         or args.continue_source_localization
         or args.continue_offset_source_identification
         or args.continue_long_baseline_frequency_confirmation
+        or args.continue_neighbor_catalog_pixel_response_review
     ):
         health = coordinator.health()
 
@@ -2819,6 +2902,28 @@ def main():
             handler_id="openstar.tess.residual-mode-localization-review.prepare",
             parameters={},
             triggered_by_stage_id=last_stage_id,
+        )
+    elif args.continue_neighbor_catalog_pixel_response_review:
+        investigation = store.load(args.investigation_id)
+        if investigation.workflow_id != WORKFLOW_ID:
+            raise RuntimeError(
+                "Cannot continue investigation with a different workflow: "
+                f"{investigation.workflow_id}"
+            )
+        _can_continue_neighbor_catalog_pixel_response_review(investigation)
+        review_stage_id = next(
+            stage.id for stage in reversed(investigation.stages)
+            if stage.handler_id
+            == "openstar.tess.residual-mode-localization-review.interpret"
+            and stage.status == "COMPLETE"
+        )
+        next_number = _next_stage_number(investigation)
+        investigation = store.set_status(investigation, "RUNNING")
+        initial_stage = StageRequest(
+            id=f"{next_number:03d}-neighbor-catalog-pixel-response-review",
+            handler_id=NEIGHBOR_CATALOG_PIXEL_RESPONSE_REVIEW_HANDLER_ID,
+            parameters={},
+            triggered_by_stage_id=review_stage_id,
         )
     elif args.continue_multi_source_residual:
         investigation = store.load(args.investigation_id)
@@ -3517,6 +3622,7 @@ def main():
         or args.continue_physical_interpretation
         or args.continue_source_localization
         or args.continue_long_baseline_frequency_confirmation
+        or args.continue_neighbor_catalog_pixel_response_review
     ):
         print("Coordinator: not required for local/network non-distributed continuation")
     else:
@@ -3630,6 +3736,17 @@ def main():
         print("   coordinator required")
         print("   one compatible generic worker is sufficient; concurrency is not required")
         print("   MAST pixel download occurs during preparation; each usable pixel-window runs as ordinary Lomb-Scargle work")
+    elif args.continue_neighbor_catalog_pixel_response_review:
+        print(
+            "🧭 Continuing the unresolved v20.11 boundary with v20.11.1 "
+            "neighbor catalog and frozen pixel-response review"
+        )
+        print(f"   stage: {initial_stage.id}")
+        print(f"   handler: {initial_stage.handler_id}")
+        print("   coordinator and distributed workers are not required")
+        print("   fixed-radius TIC and Gaia DR3 catalog access is required")
+        print("   no TESS download or flux read is performed")
+        print("   persisted v20.11 power maps and sky Jacobians are reused")
     elif args.continue_multi_source_residual:
         print("🧩 Continuing terminal investigation with v20.12 distributed multi-source residual decomposition")
         print(f"   stage: {initial_stage.id}")
