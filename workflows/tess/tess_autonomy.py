@@ -22,6 +22,10 @@ from openstar_workflow import StageRequest, WorkflowEngine
 from .tess_localization_evidence import frozen_residual_localization_family
 from .tess_mode_identification import (
     MULTIMODE_MODE_EVIDENCE_LINEAGE,
+    V20_8_CONFIRMED_COHERENT_MODE_EVIDENCE_LINEAGE,
+    build_confirmed_coherent_mode_method_contract,
+    validate_confirmed_coherent_mode_dataset_lineage,
+    validate_v20_8_confirmed_coherent_residual,
     validated_multimode_mode_evidence,
 )
 from .tess_long_baseline_frequency_confirmation import (
@@ -34,6 +38,7 @@ from .tess_v20_8_long_baseline_time_frequency_confirmation import (
     HANDLER_ID as V20_8_LONG_BASELINE_TIME_FREQUENCY_CONFIRMATION_HANDLER_ID,
     build_dataset_specs as build_v20_8_long_baseline_dataset_specs,
     build_method_contract as build_v20_8_long_baseline_method_contract,
+    method_contract_hash as v20_8_confirmation_method_contract_hash,
     validate_frozen_window_lineage as validate_v20_8_frozen_window_lineage,
 )
 from .tess_nonstationary import (
@@ -1455,6 +1460,247 @@ def _repair_v20_8_long_baseline_time_frequency_confirmation_terminal(
             "schedulerAction": "RUN_EXPERIMENT",
             "recovery": (
                 "TESS_V20_8_LONG_BASELINE_TIME_FREQUENCY_CONFIRMATION"
+            ),
+        },
+    )
+
+
+def _repair_v20_8_confirmed_coherent_mode_identification_terminal(
+    store: InvestigationStore,
+    investigation: Investigation,
+    control: dict,
+) -> Investigation | None:
+    """Append v20.8.2 only at the verified positive v20.8.1 boundary."""
+    if not (
+        investigation.status in {"COMPLETE", "HUMAN_REVIEW_REQUIRED"}
+        and control.get("schedulerAction") == "INVESTIGATION_COMPLETE"
+        and control.get("selectedExperiment") in (None, {})
+        and not any(
+            stage.status == "RUNNING" for stage in investigation.stages
+        )
+        and not any(
+            stage.handler_id == "openstar.tess.mode-identification.analyze"
+            for stage in investigation.stages
+        )
+    ):
+        return None
+
+    confirmation = _latest_complete(
+        investigation,
+        V20_8_LONG_BASELINE_TIME_FREQUENCY_CONFIRMATION_HANDLER_ID,
+    )
+    latest = investigation.stages[-1] if investigation.stages else None
+    if confirmation is None or latest is None or not (
+        isinstance(confirmation.result, dict)
+        and latest.handler_id == "openstar.tess.finalize"
+        and latest.status == "COMPLETE"
+        and latest.stop is True
+        and latest.triggered_by_stage_id == confirmation.id
+        and latest.parameters == {
+            "outputSuffix": (
+                "v20.8.1-long-baseline-time-frequency-confirmation"
+            )
+        }
+        and isinstance(latest.result, dict)
+        and latest.result.get("longBaselineTimeFrequencyConfirmation")
+        == confirmation.result
+        and latest.result.get("recommendedNextTest")
+        == "MODE_IDENTIFICATION_OR_PULSATION_MODELING"
+    ):
+        return None
+    confirmation_index = investigation.stages.index(confirmation)
+    if tuple(investigation.stages[confirmation_index + 1:]) != (latest,):
+        return None
+
+    summary = next((
+        stage for stage in investigation.stages
+        if stage.id == confirmation.triggered_by_stage_id
+        and stage.handler_id == "openstar.tess.time-frequency.summarize"
+        and stage.status == "COMPLETE"
+        and isinstance(stage.result, dict)
+    ), None)
+    interpretation = next((
+        stage for stage in investigation.stages
+        if summary is not None
+        and stage.id == summary.triggered_by_stage_id
+        and stage.handler_id == "openstar.tess.time-frequency.interpret"
+        and stage.status == "COMPLETE"
+        and isinstance(stage.result, dict)
+    ), None)
+    run = next((
+        stage for stage in investigation.stages
+        if interpretation is not None
+        and stage.id == interpretation.triggered_by_stage_id
+        and stage.handler_id == "openstar.tess.time-frequency.run"
+        and stage.status == "COMPLETE"
+        and isinstance(stage.result, dict)
+    ), None)
+    preparation = next((
+        stage for stage in investigation.stages
+        if run is not None
+        and stage.id == run.triggered_by_stage_id
+        and stage.handler_id == "openstar.tess.time-frequency.prepare"
+        and stage.status == "COMPLETE"
+        and isinstance(stage.result, dict)
+    ), None)
+    prepared = next((
+        stage for stage in investigation.stages
+        if stage.id == "001-prepare-target"
+        and stage.status == "COMPLETE"
+        and isinstance(stage.result, dict)
+    ), None)
+    morphology = next((
+        stage for stage in reversed(
+            investigation.stages[:confirmation_index]
+        )
+        if stage.handler_id == "openstar.tess.morphology.analyze"
+        and stage.status == "COMPLETE"
+        and isinstance(stage.result, dict)
+    ), None)
+    independent = next((
+        stage for stage in reversed(
+            investigation.stages[:confirmation_index]
+        )
+        if stage.handler_id == "openstar.tess.independent.prepare"
+        and stage.status == "COMPLETE"
+        and isinstance(stage.result, dict)
+    ), None)
+    if any(stage is None for stage in (
+        summary, interpretation, run, preparation, prepared, morphology,
+        independent,
+    )):
+        return None
+
+    hashes = (
+        confirmation.provenance.input_hashes
+        if confirmation.provenance else {}
+    )
+    try:
+        confirmation_contract = build_v20_8_long_baseline_method_contract(
+            preparation=preparation.result,
+            interpretation=interpretation.result,
+            summary=summary.result,
+        )
+        confirmation_contract_hash = (
+            v20_8_confirmation_method_contract_hash(confirmation_contract)
+        )
+        if not (
+            confirmation.result.get("methodContract")
+            == confirmation_contract
+            and confirmation.result.get("methodContractHash")
+            == confirmation_contract_hash
+            and hashes.get("methodContract")
+            == confirmation_contract_hash
+            and hashes.get("morphology")
+            == sha256_json(morphology.result)
+            and hashes.get("timeFrequencyPreparation")
+            == sha256_json(preparation.result)
+            and hashes.get("timeFrequencyProjectResult")
+            == sha256_json(run.result)
+            and hashes.get("timeFrequencyInterpretation")
+            == sha256_json(interpretation.result)
+            and hashes.get("timeFrequencySummary")
+            == sha256_json(summary.result)
+        ):
+            return None
+        evidence = validate_v20_8_confirmed_coherent_residual(
+            confirmation.result
+        )
+
+        prepared_by_sector = {}
+        for item in independent.result.get("preparedSectors") or []:
+            if not isinstance(item, dict) or item.get("sector") is None:
+                continue
+            sector = int(item["sector"])
+            if sector in prepared_by_sector:
+                return None
+            prepared_by_sector[sector] = item
+        support = evidence["independentSectors"]
+        if not set(support).issubset(prepared_by_sector):
+            return None
+        dataset_specs = [{
+            "datasetID": prepared.result["datasetID"],
+            "datasetPath": prepared.result["datasetPath"],
+            "ticID": prepared.result["ticID"],
+            "sector": prepared.result["sector"],
+            "role": "PRIMARY",
+        }]
+        dataset_specs.extend({
+            "datasetID": prepared_by_sector[sector]["datasetID"],
+            "datasetPath": prepared_by_sector[sector]["datasetPath"],
+            "ticID": prepared.result["ticID"],
+            "sector": sector,
+            "role": "INDEPENDENT",
+        } for sector in support)
+
+        # Freeze the next method before either lineage validator reads flux.
+        mode_contract = build_confirmed_coherent_mode_method_contract(
+            confirmation=confirmation.result,
+            dataset_specs=dataset_specs,
+        )
+        window_specs = build_v20_8_long_baseline_dataset_specs(
+            expected_tic_id=int(prepared.result["ticID"]),
+            preparation=preparation.result,
+        )
+        validate_v20_8_frozen_window_lineage(
+            method_contract=confirmation_contract,
+            dataset_specs=window_specs,
+        )
+        if any(
+            hashes.get(
+                "frozenWindowDataset:"
+                f"{spec['role']}:{spec['sector']}:{spec['windowIndex']}"
+            ) != sha256_file(spec["datasetPath"])
+            for spec in window_specs
+        ):
+            return None
+        validate_confirmed_coherent_mode_dataset_lineage(
+            method_contract=mode_contract,
+            dataset_specs=dataset_specs,
+        )
+    except (KeyError, OSError, RuntimeError, TypeError, ValueError):
+        return None
+
+    if not (
+        all(
+            store.verified_terminal_stage_ledger_hash(
+                investigation.id, stage
+            )
+            for stage in (
+                prepared, independent, morphology, preparation, run,
+                interpretation, summary, confirmation, latest,
+            )
+        )
+        and _verified_stage_json(
+            confirmation,
+            "long-baseline-time-frequency-confirmation-v20.8.1.json",
+        )
+        and _verified_stage_json(
+            latest,
+            "conclusion-v20.8.1-long-baseline-time-frequency-confirmation.json",
+        )
+    ):
+        return None
+
+    continuation = StageRequest(
+        id=_continuation_stage_id(latest, "mode-identification"),
+        handler_id="openstar.tess.mode-identification.analyze",
+        parameters={
+            "evidenceLineage": (
+                V20_8_CONFIRMED_COHERENT_MODE_EVIDENCE_LINEAGE
+            )
+        },
+        triggered_by_stage_id=confirmation.id,
+    )
+    return store.set_control_state(
+        investigation,
+        status="RUNNING",
+        control_state={
+            "branchAssessments": [],
+            "selectedExperiment": asdict(continuation),
+            "schedulerAction": "RUN_EXPERIMENT",
+            "recovery": (
+                "TESS_V20_8_CONFIRMED_COHERENT_MODE_IDENTIFICATION"
             ),
         },
     )
@@ -3595,6 +3841,14 @@ def repair_obsolete_terminal_wait(
     )
     if v20_8_long_baseline_repair is not None:
         return v20_8_long_baseline_repair
+
+    v20_8_mode_repair = (
+        _repair_v20_8_confirmed_coherent_mode_identification_terminal(
+            store, investigation, control
+        )
+    )
+    if v20_8_mode_repair is not None:
+        return v20_8_mode_repair
 
     long_baseline_repair = \
         _repair_long_baseline_frequency_confirmation_terminal(

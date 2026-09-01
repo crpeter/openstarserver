@@ -6,11 +6,19 @@ investigation and the linear fits are deterministic.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import math
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Iterable
 
+from .tess_long_baseline_frequency_confirmation import _load_frozen_dataset
+from .tess_v20_8_long_baseline_time_frequency_confirmation import (
+    COHERENT as V20_8_COHERENT_RESIDUAL_FREQUENCY_CONFIRMED,
+    METHOD_CONTRACT_ID as V20_8_CONFIRMATION_METHOD_CONTRACT_ID,
+    method_contract_hash as v20_8_confirmation_method_contract_hash,
+)
 
 
 MIN_BIC_IMPROVEMENT = 10.0
@@ -19,6 +27,250 @@ GENERIC_REFINEMENT_WORKLOAD_ID = "openstar.lomb-scargle.v1"
 MULTIMODE_MODE_EVIDENCE_LINEAGE = (
     "MULTIMODE_RECURRENT_SECONDARY_FREQUENCY"
 )
+V20_8_CONFIRMED_COHERENT_MODE_EVIDENCE_LINEAGE = (
+    "V20_8_LONG_BASELINE_COHERENT_RESIDUAL_FREQUENCY"
+)
+CONFIRMED_COHERENT_MODE_METHOD_CONTRACT_ID = (
+    "openstar.tess.mode-identification."
+    "confirmed-coherent-residual-full-sector-comparison.v1"
+)
+CONFIRMED_COHERENT_MODE_RESULT_VERSION = (
+    "openstar.tess-confirmed-coherent-mode-identification.v1"
+)
+
+
+def confirmed_coherent_mode_method_contract_hash(
+    contract: dict[str, Any],
+) -> str:
+    encoded = json.dumps(
+        contract,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def validate_v20_8_confirmed_coherent_residual(
+    confirmation: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Validate the exact positive v20.8.1 predictive boundary."""
+    value = confirmation or {}
+    contract = value.get("methodContract") or {}
+    boundary = contract.get("evidenceBoundary") or {}
+    period_reference = boundary.get("periodReference") or {}
+    stability = value.get("frequencyStability") or {}
+    aggregate = value.get("aggregateDecision") or {}
+    folds = value.get("perSectorEvidence") or []
+    data_reuse = value.get("dataReuse") or {}
+    if not isinstance(folds, list) or not folds:
+        raise RuntimeError(
+            "Confirmed coherent mode identification requires held-out-sector evidence."
+        )
+    try:
+        established_period = float(period_reference["periodDays"])
+        residual_frequency = float(
+            stability["medianFrequencyCyclesPerDay"]
+        )
+        resolution = float(
+            value["longBaselineFrequencyResolutionCyclesPerDay"]
+        )
+        maximum_range = float(
+            stability["maximumAllowedRangeCyclesPerDay"]
+        )
+        frequency_range = float(stability["rangeCyclesPerDay"])
+        accepted_sectors = sorted(
+            int(item) for item in boundary["acceptedIndependentSectors"]
+        )
+        learned_frequencies = [
+            float(item) for item in
+            stability["learnedFrequenciesCyclesPerDay"]
+        ]
+        held_out_sectors = sorted(
+            int(fold["heldOutSector"]) for fold in folds
+        )
+        fold_frequencies = [
+            float(fold["learnedCoherentFrequencyCyclesPerDay"])
+            for fold in folds
+        ]
+        sufficient_count = int(
+            aggregate["sufficientHeldOutSectorCount"]
+        )
+        coherent_count = int(
+            aggregate["coherentSupportingSectorCount"]
+        )
+        harmonic_count = int(
+            aggregate["harmonicSupportingSectorCount"]
+        )
+        coherent_over_null = float(
+            aggregate["bicImprovementCoherentOverNull"]
+        )
+        coherent_over_harmonic = float(
+            aggregate["bicImprovementCoherentOverHarmonic"]
+        )
+    except (KeyError, TypeError, ValueError):
+        raise RuntimeError(
+            "Confirmed coherent v20.8.1 evidence is incomplete."
+        ) from None
+    finite_positive = (
+        established_period,
+        residual_frequency,
+        resolution,
+        maximum_range,
+    )
+    frozen_paths = boundary.get("frozenWindowDatasetPaths") or []
+    observed_paths = data_reuse.get("frozenWindowDatasetPaths") or []
+    exact = (
+        value.get("methodContractID")
+        == V20_8_CONFIRMATION_METHOD_CONTRACT_ID
+        and contract.get("methodContractID")
+        == V20_8_CONFIRMATION_METHOD_CONTRACT_ID
+        and value.get("methodContractHash")
+        == v20_8_confirmation_method_contract_hash(contract)
+        and value.get("classification")
+        == V20_8_COHERENT_RESIDUAL_FREQUENCY_CONFIRMED
+        and value.get("recommendedNextTest")
+        == "MODE_IDENTIFICATION_OR_PULSATION_MODELING"
+        and value.get("physicalMechanismResolved") is False
+        and value.get("claimLevelChanged") is False
+        and value.get("automaticDiscoveryClaim") is False
+        and value.get("leaveOneIndependentSectorOut") is True
+        and period_reference.get("kind")
+        == "UNRESOLVED_FAMILY_ANALYSIS_REFERENCE"
+        and period_reference.get("physicalCycleResolved") is False
+        and all(math.isfinite(item) and item > 0 for item in finite_positive)
+        and math.isfinite(frequency_range)
+        and frequency_range >= 0.0
+        and math.isclose(
+            resolution, maximum_range, rel_tol=1e-12, abs_tol=1e-15
+        )
+        and frequency_range <= resolution
+        and stability.get("stableWithinLongBaselineResolution") is True
+        and len(accepted_sectors) >= MIN_INDEPENDENT_SECTOR_SUPPORT
+        and len(set(accepted_sectors)) == len(accepted_sectors)
+        and held_out_sectors == accepted_sectors
+        and len(set(held_out_sectors)) == len(held_out_sectors)
+        and all(fold.get("support") == "COHERENT" for fold in folds)
+        and learned_frequencies == fold_frequencies
+        and len(learned_frequencies) == len(accepted_sectors)
+        and all(
+            math.isfinite(item) and item > 0
+            for item in learned_frequencies
+        )
+        and min(learned_frequencies) <= residual_frequency
+        <= max(learned_frequencies)
+        and sufficient_count == len(accepted_sectors)
+        and coherent_count == len(accepted_sectors)
+        and harmonic_count == 0
+        and coherent_over_null >= MIN_BIC_IMPROVEMENT
+        and coherent_over_harmonic >= MIN_BIC_IMPROVEMENT
+        and isinstance(frozen_paths, list)
+        and len(frozen_paths) >= len(accepted_sectors) + 1
+        and observed_paths == frozen_paths
+        and data_reuse.get("downloadPerformed") is False
+        and data_reuse.get("originalSectorFluxRead") is False
+    )
+    if not exact:
+        raise RuntimeError(
+            "Mode identification requires the exact confirmed coherent "
+            "v20.8.1 residual-frequency boundary."
+        )
+    return {
+        "establishedPeriodDays": established_period,
+        "residualFrequencyCyclesPerDay": residual_frequency,
+        "residualPeriodDays": 1.0 / residual_frequency,
+        "independentSectors": accepted_sectors,
+        "confirmationMethodContractHash": value["methodContractHash"],
+        "frozenWindowDatasetPaths": list(frozen_paths),
+    }
+
+
+def build_confirmed_coherent_mode_method_contract(
+    *,
+    confirmation: dict[str, Any],
+    dataset_specs: Iterable[dict[str, Any]],
+) -> dict[str, Any]:
+    """Freeze the full-sector comparison before reading any flux."""
+    evidence = validate_v20_8_confirmed_coherent_residual(confirmation)
+    specs = tuple(deepcopy(item) for item in dataset_specs)
+    paths = [str(Path(str(item["datasetPath"])).expanduser().resolve())
+             for item in specs]
+    primary = [item for item in specs if item.get("role") == "PRIMARY"]
+    independent = [
+        item for item in specs if item.get("role") == "INDEPENDENT"
+    ]
+    sectors = sorted(int(item["sector"]) for item in independent)
+    if not (
+        len(primary) == 1
+        and sectors == evidence["independentSectors"]
+        and len(set(sectors)) == len(sectors)
+        and len(paths) == len(set(paths))
+    ):
+        raise RuntimeError(
+            "Confirmed coherent mode dataset specifications are inconsistent."
+        )
+    return {
+        "methodContractID": CONFIRMED_COHERENT_MODE_METHOD_CONTRACT_ID,
+        "resultVersion": CONFIRMED_COHERENT_MODE_RESULT_VERSION,
+        "execution": "PYTHON_SERVER",
+        "networkAccess": False,
+        "evidenceBoundary": {
+            "lineage": V20_8_CONFIRMED_COHERENT_MODE_EVIDENCE_LINEAGE,
+            "confirmationClassification": (
+                V20_8_COHERENT_RESIDUAL_FREQUENCY_CONFIRMED
+            ),
+            "confirmationMethodContractHash": evidence[
+                "confirmationMethodContractHash"
+            ],
+            "establishedPeriodDays": evidence["establishedPeriodDays"],
+            "residualFrequencyCyclesPerDay": evidence[
+                "residualFrequencyCyclesPerDay"
+            ],
+            "residualPeriodDays": evidence["residualPeriodDays"],
+            "independentSectorSupport": {
+                "sectors": sectors,
+                "count": len(sectors),
+                "requiredCount": MIN_INDEPENDENT_SECTOR_SUPPORT,
+            },
+            "frozenDatasetPaths": paths,
+        },
+        "modelComparison": {
+            "criterion": "BIC",
+            "minimumImprovement": MIN_BIC_IMPROVEMENT,
+            "thresholdIsInclusive": True,
+            "frequencyGridPointCount": 101,
+            "frequencyGridHalfWidth": "ONE_FULL_BASELINE_RAYLEIGH_RESOLUTION",
+            "frequencyGridCenter": "CONFIRMED_COHERENT_RESIDUAL_FREQUENCY",
+            "frequencyTieBreak": "LOWEST_FREQUENCY",
+            "perDatasetNuisanceParameters": [
+                "OFFSET",
+                "SIGNED_SINE_AMPLITUDE_PER_FREQUENCY",
+                "SIGNED_COSINE_AMPLITUDE_PER_FREQUENCY",
+            ],
+            "familyHarmonicOrders": [1, 2],
+            "testedHigherHarmonicOrder": (
+                "NEAREST_INTEGER_AT_OR_ABOVE_THREE"
+            ),
+            "models": [
+                "ESTABLISHED_FAMILY",
+                "ESTABLISHED_FAMILY_PLUS_EXACT_HIGHER_HARMONIC",
+                "ESTABLISHED_FAMILY_PLUS_REFINED_INDEPENDENT_FREQUENCY",
+            ],
+        },
+        "decisionPolicy": {
+            "photometricModeCanBeConfirmed": True,
+            "pulsationMechanismCanBeResolved": False,
+            "physicalMechanismCanBeResolved": False,
+            "claimCanBeUpgraded": False,
+            "ambiguousResultRoutesToHumanReview": True,
+        },
+        "dataPolicy": {
+            "reuseFrozenPrimaryAndIndependentSectorDatasets": True,
+            "downloadNewData": False,
+            "constructAndHashContractBeforeReadingFlux": True,
+        },
+    }
 
 
 def validated_multimode_mode_evidence(
@@ -167,10 +419,32 @@ def _load_dataset(path: str | Path) -> tuple[list[float], list[float]]:
              if math.isfinite(float(time)) and math.isfinite(float(value))]
     if len(pairs) < 16:
         raise RuntimeError("Frozen dataset has too few finite samples for mode identification.")
-    origin = (dataset.get("source") or {}).get("originalTimeOriginDays")
-    if origin is None:
-        origin = (dataset.get("source") or {}).get("timeOriginDays")
-    offset = float(origin) if origin is not None and math.isfinite(float(origin)) else 0.0
+    origins = []
+    for container in (
+        dataset.get("source") or {},
+        dataset.get("metadata") or {},
+    ):
+        origin = container.get("originalTimeOriginDays")
+        if origin is None:
+            origin = container.get("timeOriginDays")
+        if origin is not None:
+            try:
+                parsed = float(origin)
+            except (TypeError, ValueError):
+                raise RuntimeError(
+                    "Frozen dataset has an invalid time origin."
+                ) from None
+            if not math.isfinite(parsed):
+                raise RuntimeError(
+                    "Frozen dataset has an invalid time origin."
+                )
+            origins.append(parsed)
+    if origins and any(
+        not math.isclose(value, origins[0], rel_tol=1e-12, abs_tol=1e-12)
+        for value in origins[1:]
+    ):
+        raise RuntimeError("Frozen dataset time-origin lineage is inconsistent.")
+    offset = origins[0] if origins else 0.0
     return [item[0] + offset for item in pairs], [item[1] for item in pairs]
 
 
@@ -303,3 +577,144 @@ def identify_residual_mode(*, dataset_paths: Iterable[str | Path], established_p
         "dataReuse": {"frozenDatasetPaths": list(paths), "downloadPerformed": False},
         "frequencyRefinement": {"execution": "PYTHON_SERVER", "genericDistributedWorkloadIfNeeded": GENERIC_REFINEMENT_WORKLOAD_ID},
     }
+
+
+def validate_confirmed_coherent_mode_dataset_lineage(
+    *,
+    method_contract: dict[str, Any],
+    dataset_specs: Iterable[dict[str, Any]],
+) -> tuple[dict[str, Any], ...]:
+    """Validate frozen full sectors only after contract preregistration."""
+    if (
+        method_contract.get("methodContractID")
+        != CONFIRMED_COHERENT_MODE_METHOD_CONTRACT_ID
+    ):
+        raise RuntimeError(
+            "Unsupported confirmed coherent mode-identification contract."
+        )
+    boundary = method_contract.get("evidenceBoundary") or {}
+    support = (boundary.get("independentSectorSupport") or {}).get(
+        "sectors"
+    ) or []
+    specs = tuple(deepcopy(item) for item in dataset_specs)
+    expected_paths = [
+        str(Path(str(path)).expanduser().resolve())
+        for path in boundary.get("frozenDatasetPaths") or []
+    ]
+    observed_paths = [
+        str(Path(str(item.get("datasetPath"))).expanduser().resolve())
+        for item in specs
+    ]
+    if observed_paths != expected_paths:
+        raise RuntimeError(
+            "Confirmed coherent mode datasets do not match the method contract."
+        )
+    datasets = tuple(_load_frozen_dataset(item) for item in specs)
+    primary = [item for item in datasets if item["role"] == "PRIMARY"]
+    independent = [
+        item for item in datasets if item["role"] == "INDEPENDENT"
+    ]
+    if not (
+        len(primary) == 1
+        and sorted(item["sector"] for item in independent)
+        == sorted(int(item) for item in support)
+        and len({item["sector"] for item in datasets}) == len(datasets)
+    ):
+        raise RuntimeError(
+            "Confirmed coherent mode dataset lineage is inconsistent."
+        )
+    return datasets
+
+
+def analyze_confirmed_coherent_residual_mode(
+    *,
+    method_contract: dict[str, Any],
+    dataset_specs: Iterable[dict[str, Any]],
+) -> dict[str, Any]:
+    """Adjudicate the confirmed coherent residual on frozen full sectors."""
+    contract_hash = confirmed_coherent_mode_method_contract_hash(
+        method_contract
+    )
+    boundary = method_contract.get("evidenceBoundary") or {}
+    support = (boundary.get("independentSectorSupport") or {}).get(
+        "sectors"
+    ) or []
+    specs = tuple(deepcopy(item) for item in dataset_specs)
+    validate_confirmed_coherent_mode_dataset_lineage(
+        method_contract=method_contract,
+        dataset_specs=specs,
+    )
+    expected_paths = [
+        str(Path(str(path)).expanduser().resolve())
+        for path in boundary.get("frozenDatasetPaths") or []
+    ]
+    result = identify_residual_mode(
+        dataset_paths=expected_paths,
+        established_period_days=float(boundary["establishedPeriodDays"]),
+        residual_period_days=float(boundary["residualPeriodDays"]),
+        independent_sectors=support,
+    )
+    classification = result.get("classification")
+    comparison = result.get("modelComparison") or {}
+    sector_support = result.get("independentSectorSupport") or {}
+    if not (
+        classification in {
+            "INDEPENDENT_STABLE_MODE",
+            "HIGHER_ORDER_HARMONIC_STRUCTURE",
+            "NO_COMPELLING_RESIDUAL_MODE",
+            "AMBIGUOUS_HARMONIC_OR_MODE",
+        }
+        and comparison.get("criterion") == "BIC"
+        and comparison.get("conservativeThreshold")
+        == MIN_BIC_IMPROVEMENT
+        and sector_support.get("sectors") == sorted(int(item) for item in support)
+        and sector_support.get("requiredCount")
+        == MIN_INDEPENDENT_SECTOR_SUPPORT
+        and sector_support.get("sufficient") is True
+        and result.get("physicalMechanismResolved") is False
+    ):
+        raise RuntimeError(
+            "Confirmed coherent mode identification violated its frozen "
+            "model-comparison contract."
+        )
+    if classification == "INDEPENDENT_STABLE_MODE":
+        pulsation_interpretation = (
+            "PHOTOMETRIC_MODE_SUPPORTED_PULSATION_MECHANISM_UNRESOLVED"
+        )
+    elif classification == "HIGHER_ORDER_HARMONIC_STRUCTURE":
+        pulsation_interpretation = (
+            "PULSATION_NOT_ESTABLISHED_HARMONIC_STRUCTURE_SUPPORTED"
+        )
+    else:
+        pulsation_interpretation = (
+            "PULSATION_OR_MODE_IDENTIFICATION_INCONCLUSIVE"
+        )
+        result["recommendedNextTest"] = "HUMAN_SCIENTIFIC_REVIEW"
+    result["failureOrInsufficiencyReasons"] = (
+        []
+        if classification in {
+            "INDEPENDENT_STABLE_MODE",
+            "HIGHER_ORDER_HARMONIC_STRUCTURE",
+        }
+        else [
+            "FULL_SECTOR_MODE_COMPARISON_DID_NOT_SUPPORT_A_CONSERVATIVE_"
+            "POSITIVE_INTERPRETATION"
+        ]
+    )
+    result.update({
+        "version": CONFIRMED_COHERENT_MODE_RESULT_VERSION,
+        "methodContractID": CONFIRMED_COHERENT_MODE_METHOD_CONTRACT_ID,
+        "methodContractHash": contract_hash,
+        "methodContract": deepcopy(method_contract),
+        "evidenceLineage": V20_8_CONFIRMED_COHERENT_MODE_EVIDENCE_LINEAGE,
+        "pulsationInterpretation": pulsation_interpretation,
+        "pulsationMechanismResolved": False,
+        "physicalMechanismResolved": False,
+        "claimLevelChanged": False,
+        "automaticDiscoveryClaim": False,
+        "dataReuse": {
+            "frozenDatasetPaths": expected_paths,
+            "downloadPerformed": False,
+        },
+    })
+    return result
