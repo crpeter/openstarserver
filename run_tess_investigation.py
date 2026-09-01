@@ -25,6 +25,7 @@ from workflows.tess.tess_v20_8_long_baseline_time_frequency_confirmation import 
     HANDLER_ID as V20_8_LONG_BASELINE_TIME_FREQUENCY_CONFIRMATION_HANDLER_ID,
     build_dataset_specs as build_v20_8_long_baseline_dataset_specs,
     build_method_contract as build_v20_8_long_baseline_method_contract,
+    method_contract_hash as v20_8_confirmation_method_contract_hash,
     validate_frozen_window_lineage as validate_v20_8_frozen_window_lineage,
 )
 from workflows.tess.tess_mode_identification import (
