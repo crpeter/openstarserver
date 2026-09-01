@@ -58,6 +58,12 @@ from .tess_neighbor_catalog_pixel_response_review import (
     HANDLER_ID as NEIGHBOR_CATALOG_PIXEL_RESPONSE_REVIEW_HANDLER_ID,
     validate_review_boundary as validate_neighbor_catalog_pixel_response_boundary,
 )
+from .tess_binary_confirmation import (
+    MORPHOLOGY_EVENT_SCREEN_ENTRY,
+    _dataset_sector as binary_confirmation_dataset_sector,
+    _original_time_origin as binary_confirmation_time_origin,
+    morphology_event_screening_continuation,
+)
 from .tess_resolved_cycle import validated_cycle_period
 from .tess_source_pair_lineage import frozen_source_pair_evidence
 
@@ -3644,6 +3650,170 @@ def _repair_shifted_stage_lookup_independent_prepare(
     )
 
 
+def _repair_binary_confirmation_time_origin_failure(
+    store: InvestigationStore, investigation: Investigation, control: dict
+) -> Investigation | None:
+    """Append one retry for the exact primary time-origin schema failure."""
+    expected_ids = (
+        "001-prepare-target",
+        "002-primary-distributed-search",
+        "003-catalog-identity",
+        "004-hypotheses",
+        "005-planner",
+        "006-prepare-independent-sectors",
+        "007-run-independent-sectors",
+        "008-interpret-independent-sectors",
+        "009-prepare-broad-independent-search",
+        "010-run-broad-independent-search",
+        "011-interpret-broad-independent-search",
+        "012-characterize-variability",
+        "013-periodic-event-screen",
+    )
+    expected_handlers = (
+        "openstar.tess.prepare-target",
+        "openstar.tess.primary-project.run",
+        "openstar.tess.catalog-identity",
+        "openstar.tess.hypotheses",
+        "openstar.tess.planner",
+        "openstar.tess.independent.prepare",
+        "openstar.tess.independent.run",
+        "openstar.tess.independent.interpret",
+        "openstar.tess.independent.broad.prepare",
+        "openstar.tess.independent.broad.run",
+        "openstar.tess.independent.broad.interpret",
+        "openstar.tess.morphology.analyze",
+        "openstar.tess.binary-confirmation.analyze",
+    )
+    stages = investigation.stages
+    if not (
+        investigation.status == "FAILED"
+        and len(stages) == len(expected_ids)
+        and tuple(stage.id for stage in stages) == expected_ids
+        and tuple(stage.handler_id for stage in stages) == expected_handlers
+        and all(stage.status == "COMPLETE" for stage in stages[:-1])
+        and stages[-1].status == "FAILED"
+        and stages[0].triggered_by_stage_id is None
+        and all(
+            stages[index].triggered_by_stage_id == stages[index - 1].id
+            for index in range(1, len(stages))
+        )
+        and all(
+            store.verified_terminal_stage_ledger_hash(investigation.id, stage)
+            for stage in stages
+        )
+    ):
+        return None
+
+    failed = stages[-1]
+    if not (
+        failed.parameters == {"entryMode": MORPHOLOGY_EVENT_SCREEN_ENTRY}
+        and failed.result is None
+        and not failed.artifacts
+        and failed.error == "ValueError: frozen dataset lacks originalTimeOriginDays"
+        and failed.failure_classification == "NON_RETRYABLE"
+        and failed.stop is False
+    ):
+        return None
+
+    if control.get("schedulerAction") not in {
+        "RUN_EXPERIMENT",
+        "INVESTIGATION_FAILED",
+    }:
+        return None
+    selected = control.get("selectedExperiment")
+    if selected is not None and selected != {
+        "id": failed.id,
+        "handler_id": failed.handler_id,
+        "parameters": failed.parameters,
+        "triggered_by_stage_id": failed.triggered_by_stage_id,
+    }:
+        return None
+
+    prepared = stages[0].result or {}
+    independent = stages[5].result or {}
+    morphology = stages[11].result or {}
+    if not (
+        morphology_event_screening_continuation(morphology, independent)
+        and _verified_stage_json(stages[11], "morphology-v20.4.json")
+    ):
+        return None
+
+    try:
+        primary_path = Path(str(prepared["datasetPath"])).expanduser().resolve()
+        primary = json.loads(primary_path.read_text(encoding="utf-8"))
+        primary_hash = sha256_file(primary_path)
+        source = primary.get("source") or {}
+        metadata = primary.get("metadata") or {}
+        metadata["originalTimeOriginDays"]
+        binary_confirmation_time_origin(primary)
+        primary_sector = binary_confirmation_dataset_sector(primary)
+        if (
+            primary_sector != int(prepared["sector"])
+            or int(metadata["ticID"]) != int(prepared["ticID"])
+        ):
+            return None
+    except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if "originalTimeOriginDays" in source:
+        return None
+
+    prepare_hashes = stages[0].provenance.input_hashes if stages[0].provenance else {}
+    morphology_hashes = (
+        stages[11].provenance.input_hashes if stages[11].provenance else {}
+    )
+    if not (
+        prepare_hashes.get("sourceDataset") == primary_hash
+        and morphology_hashes.get("primaryDataset") == primary_hash
+    ):
+        return None
+
+    prepared_sectors = independent.get("preparedSectors") or []
+    sector_ids: set[int] = set()
+    if len(prepared_sectors) < 3:
+        return None
+    for item in prepared_sectors:
+        try:
+            sector = int(item["sector"])
+            path = Path(str(item["datasetPath"])).expanduser().resolve()
+            expected_hash = morphology_hashes[f"independentSector{sector}"]
+            dataset = json.loads(path.read_text(encoding="utf-8"))
+            binary_confirmation_time_origin(dataset)
+            dataset_sector = binary_confirmation_dataset_sector(dataset)
+            if (
+                sector <= 0
+                or sector in sector_ids
+                or dataset_sector != sector
+                or sha256_file(path) != expected_hash
+            ):
+                return None
+        except (
+            KeyError,
+            OSError,
+            TypeError,
+            ValueError,
+            json.JSONDecodeError,
+        ):
+            return None
+        sector_ids.add(sector)
+
+    retry = StageRequest(
+        id="014-periodic-event-screen-recovery",
+        handler_id=failed.handler_id,
+        parameters=dict(failed.parameters),
+        triggered_by_stage_id=failed.id,
+    )
+    return store.set_control_state(
+        investigation,
+        status="RUNNING",
+        control_state={
+            "branchAssessments": [],
+            "selectedExperiment": asdict(retry),
+            "schedulerAction": "RUN_EXPERIMENT",
+            "recovery": "TESS_BINARY_CONFIRMATION_TIME_ORIGIN_COMPATIBILITY_RETRY",
+        },
+    )
+
+
 def repair_obsolete_terminal_wait(
     store: InvestigationStore,
     investigation: Investigation,
@@ -3787,6 +3957,12 @@ def repair_obsolete_terminal_wait(
     independent_repair = _repair_closed_file_independent_prepare(store, investigation)
     if independent_repair is not None:
         return independent_repair
+
+    binary_confirmation_repair = _repair_binary_confirmation_time_origin_failure(
+        store, investigation, control
+    )
+    if binary_confirmation_repair is not None:
+        return binary_confirmation_repair
 
     catalog_repair = _repair_catalog_timeout_terminal(store, investigation, control)
     if catalog_repair is not None:

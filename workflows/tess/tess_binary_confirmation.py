@@ -73,6 +73,64 @@ def _load(path: str | Path) -> dict[str, Any]:
         return json.load(handle)
 
 
+def _original_time_origin(dataset: dict[str, Any]) -> float:
+    """Resolve the immutable relative-time origin across frozen TESS schemas."""
+    observed: list[tuple[str, float]] = []
+    for location in ("source", "metadata"):
+        container = dataset.get(location)
+        if not isinstance(container, dict) or "originalTimeOriginDays" not in container:
+            continue
+        raw = container["originalTimeOriginDays"]
+        if isinstance(raw, bool):
+            raise ValueError(
+                f"frozen dataset has invalid {location}.originalTimeOriginDays"
+            )
+        try:
+            value = float(raw)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                f"frozen dataset has invalid {location}.originalTimeOriginDays"
+            ) from error
+        if not math.isfinite(value):
+            raise ValueError(
+                f"frozen dataset has nonfinite {location}.originalTimeOriginDays"
+            )
+        observed.append((location, value))
+
+    if not observed:
+        raise ValueError("frozen dataset lacks originalTimeOriginDays")
+    if len(observed) == 2 and observed[0][1] != observed[1][1]:
+        raise ValueError(
+            "frozen dataset has conflicting source/metadata originalTimeOriginDays"
+        )
+    return observed[0][1]
+
+
+def _dataset_sector(dataset: dict[str, Any]) -> int | None:
+    """Resolve optional sector identity without silently accepting conflicts."""
+    observed: list[tuple[str, int]] = []
+    for location in ("source", "metadata"):
+        container = dataset.get(location)
+        if not isinstance(container, dict) or "sector" not in container:
+            continue
+        raw = container["sector"]
+        if isinstance(raw, bool):
+            raise ValueError(f"frozen dataset has invalid {location}.sector")
+        try:
+            value = int(raw)
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"frozen dataset has invalid {location}.sector") from error
+        if value <= 0 or str(value) != str(raw).strip():
+            raise ValueError(f"frozen dataset has invalid {location}.sector")
+        observed.append((location, value))
+
+    if not observed:
+        return None
+    if len(observed) == 2 and observed[0][1] != observed[1][1]:
+        raise ValueError("frozen dataset has conflicting source/metadata sector")
+    return observed[0][1]
+
+
 def _solve(a: list[list[float]], b: list[float]) -> list[float]:
     aug = [row[:] + [b[i]] for i, row in enumerate(a)]
     for column in range(len(b)):
@@ -184,12 +242,8 @@ def _box_search(times: list[float], residual: list[float], period: float,
 
 
 def _sector(dataset: dict[str, Any], period: float, role: str) -> dict[str, Any]:
-    try:
-        origin = float((dataset.get("source") or {})["originalTimeOriginDays"])
-    except (KeyError, TypeError, ValueError) as error:
-        raise ValueError("frozen dataset lacks originalTimeOriginDays") from error
-    if not math.isfinite(origin):
-        raise ValueError("frozen dataset has nonfinite originalTimeOriginDays")
+    origin = _original_time_origin(dataset)
+    sector = _dataset_sector(dataset)
     pairs = []
     for relative_raw, flux_raw in zip(dataset.get("times") or [], dataset.get("flux") or []):
         try:
@@ -198,7 +252,7 @@ def _sector(dataset: dict[str, Any], period: float, role: str) -> dict[str, Any]
             continue
         if math.isfinite(relative) and math.isfinite(flux):
             pairs.append((origin + relative, flux))
-    result = {"datasetID": dataset.get("id"), "sector": (dataset.get("source") or {}).get("sector"),
+    result = {"datasetID": dataset.get("id"), "sector": sector,
               "role": role, "sampleCount": len(pairs),
               "originalTimeOriginDays": origin,
               "timeReference": "BTJD_RECONSTRUCTED_FROM_FROZEN_RELATIVE_TIME"}
