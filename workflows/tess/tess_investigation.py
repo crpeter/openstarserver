@@ -125,8 +125,14 @@ from .tess_nonstationary import (
     validate_confirmed_nonstationary_localization_boundary,
 )
 from .tess_mode_identification import (
+    CONFIRMED_COHERENT_MODE_METHOD_CONTRACT_ID,
+    V20_8_CONFIRMED_COHERENT_MODE_EVIDENCE_LINEAGE,
     MULTIMODE_MODE_EVIDENCE_LINEAGE,
+    analyze_confirmed_coherent_residual_mode,
+    build_confirmed_coherent_mode_method_contract,
+    confirmed_coherent_mode_method_contract_hash,
     identify_residual_mode,
+    validate_v20_8_confirmed_coherent_residual,
     validated_multimode_mode_evidence,
 )
 from .tess_long_baseline_frequency_confirmation import (
@@ -902,6 +908,47 @@ def mode_identification_continuation(summary: dict[str, Any], *, request_id: str
         handler_id=("openstar.tess.dynamic-harmonic.analyze" if dynamic else
                     ("openstar.tess.residual-mode-localization.prepare" if localize else "openstar.tess.finalize")),
         parameters={} if (localize or dynamic) else {"outputSuffix": "v20.9-mode-identification"},
+        triggered_by_stage_id=request_id,
+    )
+
+
+def confirmed_coherent_mode_identification_continuation(
+    summary: dict[str, Any], *, request_id: str
+) -> StageRequest:
+    """Finalize the local v20.8.2 adjudication before any new data work."""
+    recommendations = {
+        "INDEPENDENT_STABLE_MODE": "RESIDUAL_MODE_PIXEL_LOCALIZATION",
+        "HIGHER_ORDER_HARMONIC_STRUCTURE": "DYNAMIC_HARMONIC_MODELING",
+        "NO_COMPELLING_RESIDUAL_MODE": "HUMAN_SCIENTIFIC_REVIEW",
+        "AMBIGUOUS_HARMONIC_OR_MODE": "HUMAN_SCIENTIFIC_REVIEW",
+    }
+    classification = summary.get("classification")
+    method_contract = summary.get("methodContract") or {}
+    if not (
+        summary.get("evidenceLineage")
+        == V20_8_CONFIRMED_COHERENT_MODE_EVIDENCE_LINEAGE
+        and classification in recommendations
+        and summary.get("recommendedNextTest")
+        == recommendations[classification]
+        and summary.get("methodContractID")
+        == CONFIRMED_COHERENT_MODE_METHOD_CONTRACT_ID
+        and summary.get("methodContractHash")
+        == confirmed_coherent_mode_method_contract_hash(method_contract)
+        and summary.get("physicalMechanismResolved") is False
+        and summary.get("pulsationMechanismResolved") is False
+        and summary.get("claimLevelChanged") is False
+        and summary.get("automaticDiscoveryClaim") is False
+    ):
+        raise RuntimeError(
+            "Confirmed coherent mode identification violated its "
+            "conservative result contract."
+        )
+    return StageRequest(
+        id=_next_stage_id(request_id, "finalize"),
+        handler_id="openstar.tess.finalize",
+        parameters={
+            "outputSuffix": "v20.8.2-confirmed-coherent-mode-identification"
+        },
         triggered_by_stage_id=request_id,
     )
 
@@ -1830,6 +1877,9 @@ def _render_report(conclusion: dict[str, Any]) -> str:
         candidate = mode_identification.get("residualCandidate") or {}
         lines.extend([
             "", "## Stable residual mode identification", "",
+            f"- Method contract: {mode_identification.get('methodContractID')}",
+            f"- Method contract hash: {mode_identification.get('methodContractHash')}",
+            f"- Evidence lineage: {mode_identification.get('evidenceLineage')}",
             f"- Established period family: {mode_identification.get('establishedPeriodFamily')}",
             f"- Residual candidate period/frequency: {candidate.get('refinedPeriodDays')} days / {candidate.get('refinedFrequencyCyclesPerDay')} cycles/day",
             f"- Tested harmonic relation: order {relation.get('testedOrder')}, commensurate within measured resolution={relation.get('commensurateWithinResolution')}",
@@ -1837,7 +1887,10 @@ def _render_report(conclusion: dict[str, Any]) -> str:
             f"- Independent-sector support: {mode_identification.get('independentSectorSupport')}",
             f"- Classification: {mode_identification.get('classification')}",
             f"- Independent-mode evidence survived: {mode_identification.get('independentModeEvidenceSurvived')}",
+            f"- Pulsation interpretation: {mode_identification.get('pulsationInterpretation')}",
+            f"- Pulsation mechanism resolved: {mode_identification.get('pulsationMechanismResolved')}",
             f"- Physical mechanism resolved: {mode_identification.get('physicalMechanismResolved')}",
+            f"- Claim level changed: {mode_identification.get('claimLevelChanged')}",
             f"- Recommended next test: {mode_identification.get('recommendedNextTest')}",
         ])
 
@@ -5522,6 +5575,8 @@ def build_engine(
         input_hashes = {
             "independentPreparation": sha256_json(independent),
         }
+        confirmed_contract = None
+        confirmed_dataset_specs = None
         if evidence_lineage == MULTIMODE_MODE_EVIDENCE_LINEAGE:
             multimode_stage = next((
                 stage for stage in reversed(investigation.stages)
@@ -5565,6 +5620,120 @@ def build_engine(
                 "physicalInterpretation": sha256_json(physical),
                 "sourceLocalization": sha256_json(localization),
             })
+        elif (
+            evidence_lineage
+            == V20_8_CONFIRMED_COHERENT_MODE_EVIDENCE_LINEAGE
+        ):
+            confirmation_stage = next((
+                stage for stage in reversed(investigation.stages)
+                if stage.handler_id
+                == V20_8_LONG_BASELINE_TIME_FREQUENCY_CONFIRMATION_HANDLER_ID
+                and stage.status == "COMPLETE"
+                and isinstance(stage.result, dict)
+            ), None)
+            current = investigation.stages[-1] if investigation.stages else None
+            terminal = (
+                investigation.stages[-2]
+                if len(investigation.stages) >= 2 else None
+            )
+            if not (
+                confirmation_stage is not None
+                and current is not None
+                and terminal is not None
+                and request.triggered_by_stage_id == confirmation_stage.id
+                and current.id == request.id
+                and current.handler_id
+                == "openstar.tess.mode-identification.analyze"
+                and current.status == "RUNNING"
+                and terminal.handler_id == "openstar.tess.finalize"
+                and terminal.status == "COMPLETE"
+                and terminal.stop is True
+                and terminal.triggered_by_stage_id == confirmation_stage.id
+                and terminal.parameters == {
+                    "outputSuffix": (
+                        "v20.8.1-long-baseline-time-frequency-confirmation"
+                    )
+                }
+                and (terminal.result or {}).get(
+                    "longBaselineTimeFrequencyConfirmation"
+                ) == confirmation_stage.result
+                and (terminal.result or {}).get("recommendedNextTest")
+                == "MODE_IDENTIFICATION_OR_PULSATION_MODELING"
+            ):
+                raise RuntimeError(
+                    "Confirmed coherent mode identification requires the "
+                    "exact finalized v20.8.1 boundary."
+                )
+            confirmation_index = investigation.stages.index(
+                confirmation_stage
+            )
+            if tuple(investigation.stages[confirmation_index + 1:]) != (
+                terminal,
+                current,
+            ):
+                raise RuntimeError(
+                    "Later stages already consume the confirmed coherent "
+                    "v20.8.1 boundary."
+                )
+            evidence = validate_v20_8_confirmed_coherent_residual(
+                confirmation_stage.result
+            )
+            prepared_by_sector = {}
+            for item in independent.get("preparedSectors") or []:
+                if not isinstance(item, dict) or item.get("sector") is None:
+                    continue
+                sector = int(item["sector"])
+                if sector in prepared_by_sector:
+                    raise RuntimeError(
+                        "Frozen independent-sector preparation is duplicated."
+                    )
+                prepared_by_sector[sector] = item
+            support = evidence["independentSectors"]
+            if not set(support).issubset(prepared_by_sector):
+                raise RuntimeError(
+                    "Confirmed coherent sectors do not match frozen "
+                    "independent-sector preparation."
+                )
+            confirmed_dataset_specs = [{
+                "datasetID": prepared["datasetID"],
+                "datasetPath": prepared["datasetPath"],
+                "ticID": prepared["ticID"],
+                "sector": prepared["sector"],
+                "role": "PRIMARY",
+            }]
+            confirmed_dataset_specs.extend({
+                "datasetID": prepared_by_sector[sector]["datasetID"],
+                "datasetPath": prepared_by_sector[sector]["datasetPath"],
+                "ticID": prepared["ticID"],
+                "sector": sector,
+                "role": "INDEPENDENT",
+            } for sector in support)
+            confirmed_contract = (
+                build_confirmed_coherent_mode_method_contract(
+                    confirmation=confirmation_stage.result,
+                    dataset_specs=confirmed_dataset_specs,
+                )
+            )
+            established_period = evidence["establishedPeriodDays"]
+            residual_period = evidence["residualPeriodDays"]
+            input_hashes.update({
+                "longBaselineTimeFrequencyConfirmation": sha256_json(
+                    confirmation_stage.result
+                ),
+                "confirmedCoherentModeMethodContract": (
+                    confirmed_coherent_mode_method_contract_hash(
+                        confirmed_contract
+                    )
+                ),
+                "primaryPreparation": sha256_json(prepared),
+                **{
+                    "frozenDataset:"
+                    f"{spec['role']}:{spec['sector']}": sha256_file(
+                        spec["datasetPath"]
+                    )
+                    for spec in confirmed_dataset_specs
+                },
+            })
         elif evidence_lineage is None:
             time_frequency = _latest_result_for_handler(
                 investigation, "openstar.tess.time-frequency.summarize")
@@ -5601,26 +5770,62 @@ def build_engine(
         else:
             raise RuntimeError(
                 "Mode identification evidence lineage is unsupported.")
-        paths = [prepared["datasetPath"]]
-        paths.extend(item["datasetPath"] for item in independent.get("preparedSectors") or []
-                     if item.get("datasetPath"))
-        result = identify_residual_mode(dataset_paths=paths,
-                                        established_period_days=float(established_period),
-                                        residual_period_days=float(residual_period),
-                                        independent_sectors=support)
+        if confirmed_contract is not None:
+            result = analyze_confirmed_coherent_residual_mode(
+                method_contract=confirmed_contract,
+                dataset_specs=confirmed_dataset_specs,
+            )
+        else:
+            paths = [prepared["datasetPath"]]
+            paths.extend(
+                item["datasetPath"]
+                for item in independent.get("preparedSectors") or []
+                if item.get("datasetPath")
+            )
+            result = identify_residual_mode(
+                dataset_paths=paths,
+                established_period_days=float(established_period),
+                residual_period_days=float(residual_period),
+                independent_sectors=support,
+            )
         print("🎼 Identifying the recurrent residual frequency")
-        print(f"   established physical period: {established_period} days")
+        if confirmed_contract is not None:
+            print(f"   method contract: {result.get('methodContractID')}")
+            print(f"   method hash: {result.get('methodContractHash')}")
+            print(
+                "   established unresolved family reference: "
+                f"{established_period} days"
+            )
+        else:
+            print(f"   established physical period: {established_period} days")
         print(f"   recurrent residual period: {residual_period} days")
         print(f"   classification: {result.get('classification')}")
         print("   independent mode evidence survived: "
               f"{result.get('independentModeEvidenceSurvived')}")
         print(f"   recommended next test: {result.get('recommendedNextTest')}")
-        artifact_path = (store.directory_for(investigation.id) / "artifacts" /
-                         "mode-identification" / "mode-identification-v20.9.json")
+        artifact_name = (
+            "mode-identification-v20.8.2-confirmed-coherent.json"
+            if confirmed_contract is not None
+            else "mode-identification-v20.9.json"
+        )
+        artifact_path = (
+            store.directory_for(investigation.id)
+            / "artifacts"
+            / "mode-identification"
+            / artifact_name
+        )
         _write_json(artifact_path, result)
         return StageOutcome(
             result=result,
-            next_stage=mode_identification_continuation(result, request_id=request.id),
+            next_stage=(
+                confirmed_coherent_mode_identification_continuation(
+                    result, request_id=request.id
+                )
+                if confirmed_contract is not None
+                else mode_identification_continuation(
+                    result, request_id=request.id
+                )
+            ),
             input_hashes=input_hashes,
             artifacts=(_artifact(artifact_path, "application/json"),),
         )
@@ -11869,6 +12074,30 @@ def build_engine(
                 "rationale": existing_rationale,
             }
 
+        if mode_identification is not None:
+            existing_rationale = list(claim_decision.get("rationale") or [])
+            version = (
+                "v20.8.2 confirmed-coherent full-sector"
+                if mode_identification.get("evidenceLineage")
+                == V20_8_CONFIRMED_COHERENT_MODE_EVIDENCE_LINEAGE
+                else "stable-residual"
+            )
+            existing_rationale.append(
+                f"The {version} mode-identification comparison classifies "
+                "the residual as "
+                f"{mode_identification.get('classification')}; it does not "
+                "upgrade the claim or resolve the pulsation or physical "
+                "mechanism."
+            )
+            existing_rationale.append(
+                "Recommended next confirmation step: "
+                f"{mode_identification.get('recommendedNextTest')}."
+            )
+            claim_decision = {
+                "claim": claim_decision["claim"],
+                "rationale": existing_rationale,
+            }
+
         if long_baseline_frequency_confirmation is not None:
             existing_rationale = list(claim_decision.get("rationale") or [])
             existing_rationale.append(
@@ -13164,6 +13393,21 @@ def build_engine(
             print(
                 "   recommended next test: "
                 f"{v20_8_long_baseline_time_frequency_confirmation.get('recommendedNextTest')}"
+            )
+        if mode_identification is not None:
+            print(
+                "   mode identification: "
+                f"{mode_identification.get('classification')}"
+            )
+            if mode_identification.get("pulsationInterpretation") is not None:
+                print(
+                    "   pulsation interpretation: "
+                    f"{mode_identification.get('pulsationInterpretation')}"
+                )
+                print("   pulsation mechanism resolved: False")
+            print(
+                "   recommended next test: "
+                f"{mode_identification.get('recommendedNextTest')}"
             )
         if nonstationary_modeling is not None:
             comparison = nonstationary_modeling.get("modelComparison") or {}

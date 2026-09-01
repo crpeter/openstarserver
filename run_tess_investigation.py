@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 
 from openstar_coordinator_client import OpenStarCoordinatorClient
-from openstar_investigation import InvestigationStore, sha256_json
+from openstar_investigation import InvestigationStore, sha256_file, sha256_json
 from openstar_workflow import StageRequest
 from workflows.tess.tess_investigation import (
     SOFTWARE_ID,
@@ -25,10 +25,15 @@ from workflows.tess.tess_v20_8_long_baseline_time_frequency_confirmation import 
     HANDLER_ID as V20_8_LONG_BASELINE_TIME_FREQUENCY_CONFIRMATION_HANDLER_ID,
     build_dataset_specs as build_v20_8_long_baseline_dataset_specs,
     build_method_contract as build_v20_8_long_baseline_method_contract,
+    method_contract_hash as v20_8_confirmation_method_contract_hash,
     validate_frozen_window_lineage as validate_v20_8_frozen_window_lineage,
 )
 from workflows.tess.tess_mode_identification import (
     MULTIMODE_MODE_EVIDENCE_LINEAGE,
+    V20_8_CONFIRMED_COHERENT_MODE_EVIDENCE_LINEAGE,
+    build_confirmed_coherent_mode_method_contract,
+    validate_confirmed_coherent_mode_dataset_lineage,
+    validate_v20_8_confirmed_coherent_residual,
 )
 from workflows.tess.tess_nonstationary import (
     CONFIRMED_NONSTATIONARY_EVIDENCE_LINEAGE,
@@ -170,6 +175,15 @@ def parse_args():
             "LONG_BASELINE_TIME_FREQUENCY_CONFIRMATION boundary. This is "
             "separate from --continue-long-baseline-frequency-confirmation "
             "and --continue-nonstationary."
+        ),
+    )
+    recovery.add_argument(
+        "--continue-confirmed-coherent-mode-identification",
+        action="store_true",
+        help=(
+            "Append local, network-free full-sector mode identification "
+            "from the exact finalized v20.8.1 "
+            "COHERENT_RESIDUAL_FREQUENCY_CONFIRMED boundary."
         ),
     )
     recovery.add_argument(
@@ -993,6 +1007,221 @@ def _can_continue_v20_8_long_baseline_time_frequency_confirmation(
         method_contract=contract,
         dataset_specs=dataset_specs,
     )
+
+
+def _confirmed_coherent_mode_inputs(investigation):
+    confirmation = next((
+        stage for stage in reversed(investigation.stages)
+        if stage.handler_id
+        == V20_8_LONG_BASELINE_TIME_FREQUENCY_CONFIRMATION_HANDLER_ID
+        and stage.status == "COMPLETE"
+        and isinstance(stage.result, dict)
+    ), None)
+    latest = investigation.stages[-1] if investigation.stages else None
+    if confirmation is None or not (
+        latest is not None
+        and latest.handler_id == "openstar.tess.finalize"
+        and latest.status == "COMPLETE"
+        and latest.stop is True
+        and latest.triggered_by_stage_id == confirmation.id
+        and latest.parameters == {
+            "outputSuffix": (
+                "v20.8.1-long-baseline-time-frequency-confirmation"
+            )
+        }
+        and isinstance(latest.result, dict)
+        and latest.result.get("longBaselineTimeFrequencyConfirmation")
+        == confirmation.result
+        and latest.result.get("recommendedNextTest")
+        == "MODE_IDENTIFICATION_OR_PULSATION_MODELING"
+    ):
+        raise RuntimeError(
+            "The exact finalized confirmed coherent v20.8.1 boundary is required."
+        )
+    confirmation_index = investigation.stages.index(confirmation)
+    if tuple(investigation.stages[confirmation_index + 1:]) != (latest,):
+        raise RuntimeError(
+            "Later stages already consume the confirmed coherent v20.8.1 boundary."
+        )
+
+    summary = next((
+        stage for stage in investigation.stages
+        if stage.id == confirmation.triggered_by_stage_id
+        and stage.handler_id == "openstar.tess.time-frequency.summarize"
+        and stage.status == "COMPLETE"
+        and isinstance(stage.result, dict)
+    ), None)
+    interpretation = next((
+        stage for stage in investigation.stages
+        if summary is not None
+        and stage.id == summary.triggered_by_stage_id
+        and stage.handler_id == "openstar.tess.time-frequency.interpret"
+        and stage.status == "COMPLETE"
+        and isinstance(stage.result, dict)
+    ), None)
+    run = next((
+        stage for stage in investigation.stages
+        if interpretation is not None
+        and stage.id == interpretation.triggered_by_stage_id
+        and stage.handler_id == "openstar.tess.time-frequency.run"
+        and stage.status == "COMPLETE"
+        and isinstance(stage.result, dict)
+    ), None)
+    preparation = next((
+        stage for stage in investigation.stages
+        if run is not None
+        and stage.id == run.triggered_by_stage_id
+        and stage.handler_id == "openstar.tess.time-frequency.prepare"
+        and stage.status == "COMPLETE"
+        and isinstance(stage.result, dict)
+    ), None)
+    morphology = next((
+        stage for stage in reversed(
+            investigation.stages[:confirmation_index]
+        )
+        if stage.handler_id == "openstar.tess.morphology.analyze"
+        and stage.status == "COMPLETE"
+        and isinstance(stage.result, dict)
+    ), None)
+    prepared = next((
+        stage for stage in investigation.stages
+        if stage.id == "001-prepare-target"
+        and stage.status == "COMPLETE"
+        and isinstance(stage.result, dict)
+    ), None)
+    independent = next((
+        stage for stage in reversed(investigation.stages)
+        if stage.handler_id == "openstar.tess.independent.prepare"
+        and stage.status == "COMPLETE"
+        and isinstance(stage.result, dict)
+    ), None)
+    if any(stage is None for stage in (
+        summary, interpretation, run, preparation, morphology,
+        prepared, independent,
+    )):
+        raise RuntimeError(
+            "Confirmed coherent mode identification requires the completed "
+            "v20.8 and frozen full-sector lineage."
+        )
+
+    confirmation_hashes = (
+        confirmation.provenance.input_hashes
+        if confirmation.provenance else {}
+    )
+    rebuilt_confirmation_contract = build_v20_8_long_baseline_method_contract(
+        preparation=preparation.result,
+        interpretation=interpretation.result,
+        summary=summary.result,
+    )
+    rebuilt_confirmation_hash = (
+        v20_8_confirmation_method_contract_hash(
+            rebuilt_confirmation_contract
+        )
+    )
+    if not (
+        confirmation.result.get("methodContract")
+        == rebuilt_confirmation_contract
+        and confirmation.result.get("methodContractHash")
+        == rebuilt_confirmation_hash
+        and confirmation_hashes.get("methodContract")
+        == rebuilt_confirmation_hash
+        and confirmation_hashes.get("morphology")
+        == sha256_json(morphology.result)
+        and confirmation_hashes.get("timeFrequencyPreparation")
+        == sha256_json(preparation.result)
+        and confirmation_hashes.get("timeFrequencyProjectResult")
+        == sha256_json(run.result)
+        and confirmation_hashes.get("timeFrequencyInterpretation")
+        == sha256_json(interpretation.result)
+        and confirmation_hashes.get("timeFrequencySummary")
+        == sha256_json(summary.result)
+    ):
+        raise RuntimeError(
+            "The confirmed coherent v20.8.1 provenance has changed."
+        )
+    evidence = validate_v20_8_confirmed_coherent_residual(
+        confirmation.result
+    )
+
+    prepared_by_sector = {}
+    for item in independent.result.get("preparedSectors") or []:
+        if not isinstance(item, dict) or item.get("sector") is None:
+            continue
+        sector = int(item["sector"])
+        if sector in prepared_by_sector:
+            raise RuntimeError(
+                "Frozen independent-sector preparation is duplicated."
+            )
+        prepared_by_sector[sector] = item
+    support = evidence["independentSectors"]
+    if not set(support).issubset(prepared_by_sector):
+        raise RuntimeError(
+            "Confirmed coherent sectors do not match frozen independent data."
+        )
+    dataset_specs = [{
+        "datasetID": prepared.result["datasetID"],
+        "datasetPath": prepared.result["datasetPath"],
+        "ticID": prepared.result["ticID"],
+        "sector": prepared.result["sector"],
+        "role": "PRIMARY",
+    }]
+    dataset_specs.extend({
+        "datasetID": prepared_by_sector[sector]["datasetID"],
+        "datasetPath": prepared_by_sector[sector]["datasetPath"],
+        "ticID": prepared.result["ticID"],
+        "sector": sector,
+        "role": "INDEPENDENT",
+    } for sector in support)
+    contract = build_confirmed_coherent_mode_method_contract(
+        confirmation=confirmation.result,
+        dataset_specs=dataset_specs,
+    )
+
+    window_specs = build_v20_8_long_baseline_dataset_specs(
+        expected_tic_id=int(prepared.result["ticID"]),
+        preparation=preparation.result,
+    )
+    validate_v20_8_frozen_window_lineage(
+        method_contract=rebuilt_confirmation_contract,
+        dataset_specs=window_specs,
+    )
+    for spec in window_specs:
+        key = (
+            "frozenWindowDataset:"
+            f"{spec['role']}:{spec['sector']}:{spec['windowIndex']}"
+        )
+        if confirmation_hashes.get(key) != sha256_file(spec["datasetPath"]):
+            raise RuntimeError(
+                "A frozen v20.8.1 confirmation window has changed."
+            )
+    validate_confirmed_coherent_mode_dataset_lineage(
+        method_contract=contract,
+        dataset_specs=dataset_specs,
+    )
+    return confirmation, contract, dataset_specs
+
+
+def _can_continue_confirmed_coherent_mode_identification(
+    investigation,
+) -> None:
+    if any(stage.status == "RUNNING" for stage in investigation.stages):
+        raise RuntimeError(
+            "Investigation contains a RUNNING stage. Use --resume before "
+            "confirmed coherent mode identification."
+        )
+    if investigation.status not in {"COMPLETE", "HUMAN_REVIEW_REQUIRED"}:
+        raise RuntimeError(
+            "--continue-confirmed-coherent-mode-identification requires "
+            "a terminal investigation."
+        )
+    if any(
+        stage.handler_id == "openstar.tess.mode-identification.analyze"
+        for stage in investigation.stages
+    ):
+        raise RuntimeError(
+            "Investigation already contains mode identification."
+        )
+    _confirmed_coherent_mode_inputs(investigation)
 
 
 def _can_continue_confirmed_nonstationary_mode_modeling(investigation) -> None:
@@ -2769,6 +2998,7 @@ def main():
         or args.continue_offset_source_identification
         or args.continue_long_baseline_frequency_confirmation
         or args.continue_v20_8_long_baseline_time_frequency_confirmation
+        or args.continue_confirmed_coherent_mode_identification
         or args.continue_neighbor_catalog_pixel_response_review
     ):
         health = coordinator.health()
@@ -2996,6 +3226,32 @@ def main():
             ),
             parameters={},
             triggered_by_stage_id=summary_stage.id,
+        )
+    elif args.continue_confirmed_coherent_mode_identification:
+        investigation = store.load(args.investigation_id)
+        if investigation.workflow_id != WORKFLOW_ID:
+            raise RuntimeError(
+                "Cannot continue investigation with a different workflow: "
+                f"{investigation.workflow_id}"
+            )
+        _can_continue_confirmed_coherent_mode_identification(investigation)
+        confirmation = next(
+            stage for stage in reversed(investigation.stages)
+            if stage.handler_id
+            == V20_8_LONG_BASELINE_TIME_FREQUENCY_CONFIRMATION_HANDLER_ID
+            and stage.status == "COMPLETE"
+        )
+        next_number = _next_stage_number(investigation)
+        investigation = store.set_status(investigation, "RUNNING")
+        initial_stage = StageRequest(
+            id=f"{next_number:03d}-mode-identification",
+            handler_id="openstar.tess.mode-identification.analyze",
+            parameters={
+                "evidenceLineage": (
+                    V20_8_CONFIRMED_COHERENT_MODE_EVIDENCE_LINEAGE
+                )
+            },
+            triggered_by_stage_id=confirmation.id,
         )
     elif args.continue_confirmed_nonstationary_mode_modeling:
         investigation = store.load(args.investigation_id)
@@ -3810,6 +4066,7 @@ def main():
         or args.continue_source_localization
         or args.continue_long_baseline_frequency_confirmation
         or args.continue_v20_8_long_baseline_time_frequency_confirmation
+        or args.continue_confirmed_coherent_mode_identification
         or args.continue_neighbor_catalog_pixel_response_review
     ):
         print("Coordinator: not required for local/network non-distributed continuation")
@@ -3894,6 +4151,17 @@ def main():
         print("   only frozen v20.8 residual-window datasets are reused")
         print("   original sector flux is not read")
         print("   each independent sector is held out without frequency or phase leakage")
+    elif args.continue_confirmed_coherent_mode_identification:
+        print(
+            "🎼 Continuing the confirmed coherent v20.8.1 boundary with "
+            "v20.8.2 mode identification"
+        )
+        print(f"   stage: {initial_stage.id}")
+        print(f"   handler: {initial_stage.handler_id}")
+        print("   coordinator and distributed workers are not required")
+        print("   no archive query or new data download is performed")
+        print("   frozen primary and confirmed independent sectors are reused")
+        print("   the deterministic method contract is frozen before flux is read")
     elif args.continue_confirmed_nonstationary_mode_modeling:
         print("🌀 Continuing the confirmed v20.9.1 boundary with v20.9.2 nonstationary modeling")
         print(f"   stage: {initial_stage.id}")
