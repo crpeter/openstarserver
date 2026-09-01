@@ -79,8 +79,9 @@ basis = numerator / denominator
 Per-series nuisance parameters use source-order weighted normal equations,
 fixed active-set ordering, and partial-pivot Gaussian elimination. The rank
 tolerance is `1e-12`; result recomputation and deterministic objective ties use
-`1e-9 * max(1, abs(left), abs(right))`. Candidate ties select the smaller
-global index. All counts and products remain within `(1 << 53) - 1`.
+`1e-9 * max(1, abs(left), abs(right))`. Candidates compare by WRSS, BIC,
+finite AICc, defined AICc before undefined AICc, and finally the smaller global
+index. All counts and products remain within `(1 << 53) - 1`.
 
 Positive fits use design columns `intercept, positiveComponent`. Doublet fits
 use `intercept, negativeComponent, positiveComponent`. Active states are
@@ -93,13 +94,49 @@ objective values invalidate the candidate.
 
 Shards are ascending, contiguous, non-overlapping, and include a deterministic
 partial final shard. Strict work payloads contain only the morphology family,
-model class, grid start, and grid count. The server recomputes the reported
-winner, reduces accepted shard winners, and derives accounting solely from the
-validated dataset and work payload.
+model class, grid start, and grid count. For every submitted shard, the server
+evaluates every index in the server-owned range. It reconstructs the evaluated
+count, exact invalid count, canonical winner, and complete winner payload. A
+valid but nonwinning worker candidate, forged null winner, forged invalid
+count, or incomplete evaluation count is rejected. Reduction counts coverage
+only from results that pass this full-shard recomputation and requires ordered,
+exact, nonduplicated shard coverage.
 
 Completed result payloads contain exactly the morphology family, model class,
 shard range, `bestCandidate`, evaluated count, and invalid count. A best
-candidate contains exactly its global index, strict model-specific parameters,
-canonical per-series nuisance fits, and total WRSS. A shard with no valid
-candidate uses a null best candidate, marks every candidate invalid, and is
-accepted only after the server recomputes that entire exceptional shard.
+candidate contains exactly:
+
+- `gridIndex`
+- strict model-specific `parameters`
+- canonical `seriesFits`
+- `positiveWeightSampleCount`
+- `weightedResidualSumSquares`
+- `nominalParameterCount`
+- `bayesianInformationCriterion`
+- nullable `correctedAkaikeInformationCriterion`
+- `correctedAkaikeInformationCriterionDefined`
+
+Positive-only series fits contain exactly the generic series ID, positive-weight
+sample count, offset, positive amplitude, its sign label, and series WRSS.
+Doublet fits additionally contain the negative amplitude and its sign label.
+The exact sign labels are `negative`, `zero`, and `positive`; exact zero remains
+feasible for either non-strict sign constraint and is labeled `zero`.
+
+With total positive-weight sample count `N`, nominal count `k`, and total WRSS,
+the metrics are:
+
+```text
+BIC = WRSS + k * ln(N)
+AICc = WRSS + 2*k + 2*k*(k+1)/(N-k-1)
+```
+
+Nominal counts are `2*S + 3` for `POSITIVE_PULSE_ONLY`, `3*S + 6` for
+`ORDERED_NEGATIVE_POSITIVE_DOUBLET`, and `9` for the single-series
+`INDEPENDENT_PULSES`; zero amplitudes never reduce `k`. When `N <= k + 1`,
+AICc is exactly null and its defined flag is false. Otherwise it is finite and
+the flag is true.
+
+A shard with no valid candidate uses a null best candidate if and only if the
+server recomputes every candidate as invalid. Reduction publishes the exact
+total invalid count and the winning N, WRSS, k, BIC, nullable AICc, AICc-defined
+state, parameters, and complete ordered series fits.

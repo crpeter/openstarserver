@@ -93,10 +93,17 @@ _RESULT_PAYLOAD_FIELDS = frozenset(
     )
 )
 _BEST_CANDIDATE_FIELDS = frozenset(
-    ("gridIndex", "parameters", "seriesFits", "weightedResidualSumSquares")
-)
-_FLATTENABLE_RESULT_FIELDS = frozenset(
-    (*_RESULT_PAYLOAD_FIELDS, *_BEST_CANDIDATE_FIELDS)
+    (
+        "gridIndex",
+        "parameters",
+        "seriesFits",
+        "positiveWeightSampleCount",
+        "weightedResidualSumSquares",
+        "nominalParameterCount",
+        "bayesianInformationCriterion",
+        "correctedAkaikeInformationCriterion",
+        "correctedAkaikeInformationCriterionDefined",
+    )
 )
 _POSITIVE_PARAMETER_FIELDS = frozenset(("center", "logScale", "logShape"))
 _DOUBLET_PARAMETER_FIELDS = frozenset(
@@ -120,15 +127,36 @@ _INDEPENDENT_PARAMETER_FIELDS = frozenset(
     )
 )
 _POSITIVE_FIT_FIELDS = frozenset(
-    ("genericSeriesID", "offset", "positiveAmplitude", "weightedResidualSumSquares")
+    (
+        "genericSeriesID",
+        "positiveWeightSampleCount",
+        "offset",
+        "positiveAmplitude",
+        "positiveAmplitudeSign",
+        "weightedResidualSumSquares",
+    )
 )
 _DOUBLET_FIT_FIELDS = frozenset(
     (
         "genericSeriesID",
+        "positiveWeightSampleCount",
         "offset",
         "negativeAmplitude",
+        "negativeAmplitudeSign",
         "positiveAmplitude",
+        "positiveAmplitudeSign",
         "weightedResidualSumSquares",
+    )
+)
+_FLATTENABLE_RESULT_FIELDS = frozenset(
+    (
+        *_RESULT_PAYLOAD_FIELDS,
+        *_BEST_CANDIDATE_FIELDS,
+        *_POSITIVE_PARAMETER_FIELDS,
+        *_DOUBLET_PARAMETER_FIELDS,
+        *_INDEPENDENT_PARAMETER_FIELDS,
+        *_POSITIVE_FIT_FIELDS,
+        *_DOUBLET_FIT_FIELDS,
     )
 )
 
@@ -179,6 +207,7 @@ class _ValidatedDataset:
 @dataclass(frozen=True, slots=True)
 class _SeriesFit:
     generic_series_id: str
+    positive_weight_sample_count: int
     offset: float
     negative_amplitude: float | None
     positive_amplitude: float
@@ -190,7 +219,12 @@ class _CandidateEvaluation:
     grid_index: int
     parameters: Mapping[str, float]
     series_fits: tuple[_SeriesFit, ...]
+    positive_weight_sample_count: int
     weighted_residual_sum_squares: float
+    nominal_parameter_count: int
+    bayesian_information_criterion: float
+    corrected_akaike_information_criterion: float | None
+    corrected_akaike_information_criterion_defined: bool
 
 
 def _runtime_error(message: str) -> RuntimeError:
@@ -778,6 +812,67 @@ def _objective_limit(left: float, right: float) -> float:
     return RESULT_RELATIVE_TOLERANCE * max(1.0, abs(left), abs(right))
 
 
+def _amplitude_sign(value: float) -> str:
+    if value < 0.0:
+        return "negative"
+    if value > 0.0:
+        return "positive"
+    return "zero"
+
+
+def _nominal_parameter_count(model_class_id: str, series_count: int) -> int:
+    if model_class_id == POSITIVE_PULSE_ONLY:
+        return 2 * series_count + 3
+    if model_class_id == ORDERED_NEGATIVE_POSITIVE_DOUBLET:
+        return 3 * series_count + 6
+    if model_class_id == INDEPENDENT_PULSES and series_count == 1:
+        return 9
+    raise ValueError("model class and series count are inconsistent")
+
+
+def _candidate_precedes(
+    left: _CandidateEvaluation,
+    right: _CandidateEvaluation,
+) -> bool:
+    comparisons = (
+        (
+            left.weighted_residual_sum_squares,
+            right.weighted_residual_sum_squares,
+        ),
+        (
+            left.bayesian_information_criterion,
+            right.bayesian_information_criterion,
+        ),
+    )
+    for left_value, right_value in comparisons:
+        limit = _objective_limit(left_value, right_value)
+        if left_value < right_value - limit:
+            return True
+        if right_value < left_value - limit:
+            return False
+
+    if (
+        left.corrected_akaike_information_criterion_defined
+        and right.corrected_akaike_information_criterion_defined
+    ):
+        left_aicc = left.corrected_akaike_information_criterion
+        right_aicc = right.corrected_akaike_information_criterion
+        if left_aicc is None or right_aicc is None:
+            raise ValueError("defined AICc must be finite")
+        limit = _objective_limit(left_aicc, right_aicc)
+        if left_aicc < right_aicc - limit:
+            return True
+        if right_aicc < left_aicc - limit:
+            return False
+    elif (
+        left.corrected_akaike_information_criterion_defined
+        != right.corrected_akaike_information_criterion_defined
+    ):
+        return left.corrected_akaike_information_criterion_defined
+
+    return left.grid_index < right.grid_index
+
+
 def _fit_series(
     series: _Series,
     component_bases: Sequence[Sequence[float]],
@@ -954,6 +1049,7 @@ def _evaluate_candidate(
         fits.append(
             _SeriesFit(
                 generic_series_id=series.generic_series_id,
+                positive_weight_sample_count=series.positive_weight_count,
                 offset=offset,
                 negative_amplitude=(
                     amplitudes[0] if len(amplitudes) == 2 else None
@@ -967,11 +1063,59 @@ def _evaluate_candidate(
         total_objective += objective
         if not math.isfinite(total_objective):
             return None
+
+    positive_weight_sample_count = sum(
+        fit.positive_weight_sample_count for fit in fits
+    )
+    nominal_parameter_count = _nominal_parameter_count(
+        grid.model_class_id,
+        len(fits),
+    )
+    try:
+        bayesian_information_criterion = (
+            total_objective
+            + nominal_parameter_count * math.log(positive_weight_sample_count)
+        )
+        if positive_weight_sample_count > nominal_parameter_count + 1:
+            corrected_akaike_information_criterion = (
+                total_objective
+                + 2.0 * nominal_parameter_count
+                + (
+                    2.0
+                    * nominal_parameter_count
+                    * (nominal_parameter_count + 1)
+                    / (
+                        positive_weight_sample_count
+                        - nominal_parameter_count
+                        - 1
+                    )
+                )
+            )
+            corrected_akaike_information_criterion_defined = True
+        else:
+            corrected_akaike_information_criterion = None
+            corrected_akaike_information_criterion_defined = False
+    except (OverflowError, ValueError, ZeroDivisionError):
+        return None
+    metric_values = (total_objective, bayesian_information_criterion)
+    if corrected_akaike_information_criterion is not None:
+        metric_values = (*metric_values, corrected_akaike_information_criterion)
+    if not _finite_calculation(*metric_values):
+        return None
     return _CandidateEvaluation(
         grid_index=grid_index,
         parameters=dict(parameters),
         series_fits=tuple(fits),
+        positive_weight_sample_count=positive_weight_sample_count,
         weighted_residual_sum_squares=total_objective,
+        nominal_parameter_count=nominal_parameter_count,
+        bayesian_information_criterion=bayesian_information_criterion,
+        corrected_akaike_information_criterion=(
+            corrected_akaike_information_criterion
+        ),
+        corrected_akaike_information_criterion_defined=(
+            corrected_akaike_information_criterion_defined
+        ),
     )
 
 
@@ -983,18 +1127,36 @@ def _candidate_payload(
     for fit in evaluation.series_fits:
         record = {
             "genericSeriesID": fit.generic_series_id,
+            "positiveWeightSampleCount": fit.positive_weight_sample_count,
             "offset": fit.offset,
             "positiveAmplitude": fit.positive_amplitude,
+            "positiveAmplitudeSign": _amplitude_sign(fit.positive_amplitude),
             "weightedResidualSumSquares": fit.weighted_residual_sum_squares,
         }
         if model_class_id != POSITIVE_PULSE_ONLY:
             record["negativeAmplitude"] = fit.negative_amplitude
+            if fit.negative_amplitude is None:
+                raise ValueError("doublet fit lacks a negative amplitude")
+            record["negativeAmplitudeSign"] = _amplitude_sign(
+                fit.negative_amplitude
+            )
         series_fits.append(record)
     return {
         "gridIndex": evaluation.grid_index,
         "parameters": dict(evaluation.parameters),
         "seriesFits": series_fits,
+        "positiveWeightSampleCount": evaluation.positive_weight_sample_count,
         "weightedResidualSumSquares": evaluation.weighted_residual_sum_squares,
+        "nominalParameterCount": evaluation.nominal_parameter_count,
+        "bayesianInformationCriterion": (
+            evaluation.bayesian_information_criterion
+        ),
+        "correctedAkaikeInformationCriterion": (
+            evaluation.corrected_akaike_information_criterion
+        ),
+        "correctedAkaikeInformationCriterionDefined": (
+            evaluation.corrected_akaike_information_criterion_defined
+        ),
     }
 
 
@@ -1055,6 +1217,164 @@ def _strict_candidate_payload(value: Any, model_class_id: str) -> Mapping[str, A
     ):
         raise ValueError("bestCandidate.seriesFits field set is invalid")
     return value
+
+
+def _candidate_payload_matches(
+    candidate: Mapping[str, Any],
+    expected: _CandidateEvaluation,
+    model_class_id: str,
+) -> bool:
+    grid_index = _nonnegative_integer(candidate["gridIndex"], "best gridIndex")
+    if grid_index != expected.grid_index:
+        return False
+
+    returned_parameters = {
+        key: _result_number(value, f"parameters.{key}")
+        for key, value in candidate["parameters"].items()
+    }
+    if returned_parameters != dict(expected.parameters):
+        return False
+
+    positive_weight_sample_count = _positive_integer(
+        candidate["positiveWeightSampleCount"],
+        "positiveWeightSampleCount",
+    )
+    nominal_parameter_count = _positive_integer(
+        candidate["nominalParameterCount"],
+        "nominalParameterCount",
+    )
+    returned_objective = _result_number(
+        candidate["weightedResidualSumSquares"],
+        "weightedResidualSumSquares",
+    )
+    returned_bic = _result_number(
+        candidate["bayesianInformationCriterion"],
+        "bayesianInformationCriterion",
+    )
+    returned_defined = candidate["correctedAkaikeInformationCriterionDefined"]
+    if type(returned_defined) is not bool:
+        return False
+    returned_aicc_value = candidate["correctedAkaikeInformationCriterion"]
+    if returned_defined:
+        returned_aicc = _result_number(
+            returned_aicc_value,
+            "correctedAkaikeInformationCriterion",
+        )
+    elif returned_aicc_value is None:
+        returned_aicc = None
+    else:
+        return False
+
+    if (
+        positive_weight_sample_count != expected.positive_weight_sample_count
+        or nominal_parameter_count != expected.nominal_parameter_count
+        or returned_objective < 0.0
+        or not _agrees(
+            returned_objective,
+            expected.weighted_residual_sum_squares,
+        )
+        or not _agrees(returned_bic, expected.bayesian_information_criterion)
+        or returned_defined
+        != expected.corrected_akaike_information_criterion_defined
+    ):
+        return False
+    if returned_defined:
+        expected_aicc = expected.corrected_akaike_information_criterion
+        if (
+            returned_aicc is None
+            or expected_aicc is None
+            or not _agrees(returned_aicc, expected_aicc)
+        ):
+            return False
+    elif (
+        returned_aicc is not None
+        or expected.corrected_akaike_information_criterion is not None
+    ):
+        return False
+
+    returned_fits = candidate["seriesFits"]
+    if len(returned_fits) != len(expected.series_fits):
+        return False
+    returned_sample_count = 0
+    returned_series_objective = 0.0
+    for returned, expected_fit in zip(returned_fits, expected.series_fits):
+        if returned["genericSeriesID"] != expected_fit.generic_series_id:
+            return False
+        fit_sample_count = _positive_integer(
+            returned["positiveWeightSampleCount"],
+            "series positiveWeightSampleCount",
+        )
+        if fit_sample_count != expected_fit.positive_weight_sample_count:
+            return False
+        returned_sample_count += fit_sample_count
+        offset = _result_number(returned["offset"], "offset")
+        positive_amplitude = _result_number(
+            returned["positiveAmplitude"],
+            "positiveAmplitude",
+        )
+        series_objective = _result_number(
+            returned["weightedResidualSumSquares"],
+            "series weightedResidualSumSquares",
+        )
+        if (
+            positive_amplitude < 0.0
+            or series_objective < 0.0
+            or returned["positiveAmplitudeSign"]
+            != _amplitude_sign(positive_amplitude)
+            or returned["positiveAmplitudeSign"]
+            != _amplitude_sign(expected_fit.positive_amplitude)
+            or not _agrees(offset, expected_fit.offset)
+            or not _agrees(
+                positive_amplitude,
+                expected_fit.positive_amplitude,
+            )
+            or not _agrees(
+                series_objective,
+                expected_fit.weighted_residual_sum_squares,
+            )
+        ):
+            return False
+        if model_class_id != POSITIVE_PULSE_ONLY:
+            negative_amplitude = _result_number(
+                returned["negativeAmplitude"],
+                "negativeAmplitude",
+            )
+            if (
+                expected_fit.negative_amplitude is None
+                or negative_amplitude > 0.0
+                or returned["negativeAmplitudeSign"]
+                != _amplitude_sign(negative_amplitude)
+                or returned["negativeAmplitudeSign"]
+                != _amplitude_sign(expected_fit.negative_amplitude)
+                or not _agrees(
+                    negative_amplitude,
+                    expected_fit.negative_amplitude,
+                )
+            ):
+                return False
+        returned_series_objective += series_objective
+        if not math.isfinite(returned_series_objective):
+            return False
+    return (
+        returned_sample_count == positive_weight_sample_count
+        and _agrees(returned_series_objective, returned_objective)
+    )
+
+
+def _recompute_shard(
+    dataset: Mapping[str, Any],
+    start_index: int,
+    candidate_count: int,
+) -> tuple[int, _CandidateEvaluation | None]:
+    invalid_count = 0
+    best = None
+    for grid_index in range(start_index, start_index + candidate_count):
+        evaluation = _evaluate_candidate(dataset, grid_index)
+        if evaluation is None:
+            invalid_count += 1
+        elif best is None or _candidate_precedes(evaluation, best):
+            best = evaluation
+    return invalid_count, best
 
 
 class MorphologyGridPlugin:
@@ -1148,23 +1468,6 @@ class MorphologyGridPlugin:
             invalid_count = _nonnegative_integer(
                 payload["invalidCandidateCount"], "invalidCandidateCount"
             )
-            raw_candidate = payload["bestCandidate"]
-            candidate = (
-                None
-                if raw_candidate is None
-                else _strict_candidate_payload(
-                    raw_candidate,
-                    grid.model_class_id,
-                )
-            )
-            best_index = (
-                None
-                if candidate is None
-                else _nonnegative_integer(
-                    candidate["gridIndex"],
-                    "best gridIndex",
-                )
-            )
         except (KeyError, RuntimeError, TypeError, ValueError, OverflowError):
             return _invalid_result("Result structure or shard counts are invalid.")
 
@@ -1185,107 +1488,58 @@ class MorphologyGridPlugin:
             return _invalid_result(
                 "Evaluated candidate count is inconsistent."
             )
-        if candidate is None:
-            if invalid_count != evaluated_count:
+        try:
+            expected_invalid_count, expected = _recompute_shard(
+                dataset,
+                server_start,
+                server_count,
+            )
+        except (KeyError, RuntimeError, TypeError, ValueError, OverflowError):
+            return _invalid_result("Shard recomputation failed.")
+        if invalid_count != expected_invalid_count:
+            return _invalid_result(
+                "Invalid candidate count failed full-shard recomputation."
+            )
+
+        raw_candidate = payload["bestCandidate"]
+        if expected is None:
+            if raw_candidate is not None:
                 return _invalid_result(
-                    "A result without a winner must mark every candidate invalid."
-                )
-            if any(
-                _evaluate_candidate(dataset, index) is not None
-                for index in range(server_start, server_start + server_count)
-            ):
-                return _invalid_result(
-                    "Result omitted a valid candidate from its shard."
+                    "An all-invalid shard must report a null winner."
                 )
             return ResultValidation(
                 True,
                 "All morphology-grid shard candidates were invalid.",
-                {"method": "morphology-grid-all-invalid-recomputation"},
+                {
+                    "method": "morphology-grid-full-shard-recomputation",
+                    "invalidCandidateCount": expected_invalid_count,
+                },
             )
-        if best_index is None or not (
-            server_start <= best_index < server_start + server_count
-        ):
-            return _invalid_result("Best grid index is outside the work unit.")
-        if invalid_count >= evaluated_count:
-            return _invalid_result("Invalid candidate count is inconsistent.")
-
+        if raw_candidate is None:
+            return _invalid_result("Result omitted the canonical shard winner.")
         try:
-            expected_parameters = _candidate_parameters(grid, best_index)
-            returned_parameters = {
-                key: _result_number(value, f"parameters.{key}")
-                for key, value in candidate["parameters"].items()
-            }
-            returned_objective = _result_number(
-                candidate["weightedResidualSumSquares"],
-                "weightedResidualSumSquares",
+            candidate = _strict_candidate_payload(
+                raw_candidate,
+                grid.model_class_id,
             )
-            returned_fits = candidate["seriesFits"]
-            expected = _evaluate_candidate(dataset, best_index)
+            if not _candidate_payload_matches(
+                candidate,
+                expected,
+                grid.model_class_id,
+            ):
+                return _invalid_result(
+                    "Returned winner failed full-shard recomputation."
+                )
         except (KeyError, RuntimeError, TypeError, ValueError, OverflowError):
-            return _invalid_result("Result contains invalid numerical fields.")
-        if returned_parameters != dict(expected_parameters):
-            return _invalid_result("Returned parameters do not match the grid index.")
-        if returned_objective < 0.0 or expected is None:
-            return _invalid_result("Reported best candidate is invalid.")
-        if not _agrees(returned_objective, expected.weighted_residual_sum_squares):
-            return _invalid_result("Returned objective failed recomputation.")
-        if len(returned_fits) != len(expected.series_fits):
-            return _invalid_result("Returned series-fit count is invalid.")
-        for returned, expected_fit in zip(returned_fits, expected.series_fits):
-            if returned.get("genericSeriesID") != expected_fit.generic_series_id:
-                return _invalid_result("Returned series-fit order is invalid.")
-            numerical = (
-                ("offset", expected_fit.offset),
-                ("positiveAmplitude", expected_fit.positive_amplitude),
-                (
-                    "weightedResidualSumSquares",
-                    expected_fit.weighted_residual_sum_squares,
-                ),
-            )
-            if grid.model_class_id != POSITIVE_PULSE_ONLY:
-                numerical = (
-                    *numerical,
-                    ("negativeAmplitude", expected_fit.negative_amplitude),
-                )
-            try:
-                positive_amplitude = _result_number(
-                    returned["positiveAmplitude"],
-                    "positiveAmplitude",
-                )
-                if positive_amplitude < 0.0:
-                    return _invalid_result(
-                        "Returned positive amplitude violates its constraint."
-                    )
-                if grid.model_class_id != POSITIVE_PULSE_ONLY:
-                    negative_amplitude = _result_number(
-                        returned["negativeAmplitude"],
-                        "negativeAmplitude",
-                    )
-                    if negative_amplitude > 0.0:
-                        return _invalid_result(
-                            "Returned negative amplitude violates its constraint."
-                        )
-                series_objective = _result_number(
-                    returned["weightedResidualSumSquares"],
-                    "weightedResidualSumSquares",
-                )
-                if series_objective < 0.0:
-                    return _invalid_result(
-                        "Returned series objective must be nonnegative."
-                    )
-                if any(
-                    not _agrees(_result_number(returned[field], field), expected_value)
-                    for field, expected_value in numerical
-                ):
-                    return _invalid_result(
-                        "Returned nuisance fit failed recomputation."
-                    )
-            except (KeyError, TypeError, ValueError, OverflowError):
-                return _invalid_result("Returned nuisance fit is invalid.")
+            return _invalid_result("Returned winner payload is invalid.")
         return ResultValidation(
             True,
             "Morphology-grid result accepted.",
-            {"method": "morphology-grid-recomputation", "bestGridIndex": best_index},
+            {
+                "method": "morphology-grid-full-shard-recomputation",
+                "bestGridIndex": expected.grid_index,
+                "invalidCandidateCount": expected_invalid_count,
+            },
         )
 
     def reduce_dataset(
@@ -1301,22 +1555,27 @@ class MorphologyGridPlugin:
             )
         grid = _validated_dataset(dataset).grid
         expected_payloads = list(self.build_work_payloads(dataset))
-        exact_work_coverage = len(work_units) == len(expected_payloads)
-        if exact_work_coverage:
-            for work_unit, expected_payload in zip(work_units, expected_payloads):
+        work_matches = []
+        for index, work_unit in enumerate(work_units):
+            matches = index < len(expected_payloads)
+            if matches:
                 try:
                     actual_payload = _strict_work_payload(work_unit)
-                except ValueError:
-                    exact_work_coverage = False
-                    break
-                if dict(actual_payload) != dict(expected_payload):
-                    exact_work_coverage = False
-                    break
-
+                    matches = dict(actual_payload) == dict(expected_payloads[index])
+                except (KeyError, RuntimeError, TypeError, ValueError):
+                    matches = False
+            work_matches.append(matches)
+        exact_work_coverage = (
+            len(work_units) == len(expected_payloads)
+            and all(work_matches)
+        )
         completed_candidate_count = 0
-        accepted_winners = []
-        for work_unit, result in zip(work_units, results):
-            if result is None:
+        total_invalid_candidate_count = 0
+        result_accepted = []
+        accepted_winners: list[_CandidateEvaluation] = []
+        for matches, work_unit, result in zip(work_matches, work_units, results):
+            if not matches or result is None:
+                result_accepted.append(False)
                 continue
             try:
                 work_payload = _strict_work_payload(work_unit)
@@ -1324,35 +1583,36 @@ class MorphologyGridPlugin:
                     work_payload["gridCount"],
                     "work gridCount",
                 )
-                result_payload = result["payload"]
-                if (
-                    not isinstance(result_payload, Mapping)
-                    or set(result_payload) != _RESULT_PAYLOAD_FIELDS
-                ):
+                validation = self.validate_result(work_unit, result, dataset)
+                if not validation.accepted:
+                    result_accepted.append(False)
                     continue
+                result_payload = result["payload"]
+                invalid_count = _nonnegative_integer(
+                    result_payload["invalidCandidateCount"],
+                    "invalidCandidateCount",
+                )
                 raw_candidate = result_payload["bestCandidate"]
-                candidate = (
-                    None
-                    if raw_candidate is None
-                    else _strict_candidate_payload(
+                winner = None
+                if raw_candidate is not None:
+                    candidate = _strict_candidate_payload(
                         raw_candidate,
                         grid.model_class_id,
-                    )
-                )
-                winner = None
-                if candidate is not None:
-                    objective = _result_number(
-                        candidate["weightedResidualSumSquares"],
-                        "weightedResidualSumSquares",
                     )
                     best_index = _nonnegative_integer(
                         candidate["gridIndex"],
                         "best gridIndex",
                     )
-                    winner = (best_index, objective, dict(candidate))
+                    winner = _evaluate_candidate(dataset, best_index)
+                    if winner is None:
+                        result_accepted.append(False)
+                        continue
             except (KeyError, RuntimeError, TypeError, ValueError, OverflowError):
+                result_accepted.append(False)
                 continue
+            result_accepted.append(True)
             completed_candidate_count += candidate_count
+            total_invalid_candidate_count += invalid_count
             if winner is not None:
                 accepted_winners.append(winner)
 
@@ -1360,7 +1620,8 @@ class MorphologyGridPlugin:
             terminal
             and exact_work_coverage
             and work_units
-            and all(result is not None for result in results)
+            and len(result_accepted) == len(expected_payloads)
+            and all(result_accepted)
             and completed_candidate_count == grid.total_candidates
         )
         status = (
@@ -1369,14 +1630,17 @@ class MorphologyGridPlugin:
             else "MORPHOLOGY_GRID_INCOMPLETE"
         )
         best = None
-        for item in sorted(accepted_winners, key=lambda value: value[0]):
-            if best is None:
+        for item in sorted(
+            accepted_winners,
+            key=lambda evaluation: evaluation.grid_index,
+        ):
+            if best is None or _candidate_precedes(item, best):
                 best = item
-                continue
-            limit = _objective_limit(item[1], best[1])
-            if item[1] < best[1] - limit:
-                best = item
-        best_candidate = best[2] if best is not None else None
+        best_candidate = (
+            _candidate_payload(best, grid.model_class_id)
+            if best is not None
+            else None
+        )
         return DatasetReduction(
             payload={"bestCandidate": dict(best_candidate) if best_candidate else None},
             status_fields={
@@ -1388,6 +1652,7 @@ class MorphologyGridPlugin:
                 "modelClassID": grid.model_class_id,
                 "totalCandidateCount": grid.total_candidates,
                 "completedCandidateCount": completed_candidate_count,
+                "totalInvalidCandidateCount": total_invalid_candidate_count,
                 "bestGridIndex": (
                     best_candidate["gridIndex"] if best_candidate else None
                 ),
@@ -1397,8 +1662,35 @@ class MorphologyGridPlugin:
                 "bestSeriesFits": (
                     best_candidate["seriesFits"] if best_candidate else None
                 ),
+                "bestPositiveWeightSampleCount": (
+                    best_candidate["positiveWeightSampleCount"]
+                    if best_candidate
+                    else None
+                ),
                 "bestWeightedResidualSumSquares": (
                     best_candidate["weightedResidualSumSquares"]
+                    if best_candidate
+                    else None
+                ),
+                "bestNominalParameterCount": (
+                    best_candidate["nominalParameterCount"]
+                    if best_candidate
+                    else None
+                ),
+                "bestBayesianInformationCriterion": (
+                    best_candidate["bayesianInformationCriterion"]
+                    if best_candidate
+                    else None
+                ),
+                "bestCorrectedAkaikeInformationCriterion": (
+                    best_candidate["correctedAkaikeInformationCriterion"]
+                    if best_candidate
+                    else None
+                ),
+                "bestCorrectedAkaikeInformationCriterionDefined": (
+                    best_candidate[
+                        "correctedAkaikeInformationCriterionDefined"
+                    ]
                     if best_candidate
                     else None
                 ),

@@ -156,6 +156,34 @@ def independent_dataset():
     return dataset
 
 
+def dense_positive_dataset():
+    dataset = positive_dataset(series_count=1)
+    coordinates = [-3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0, 4.0]
+    dataset["series"] = [
+        {
+            "genericSeriesID": "series-001",
+            "coordinates": coordinates,
+            "values": [
+                0.75 + 1.5 * canonical_basis(coordinate, 0.0, 0.0, 0.0)
+                for coordinate in coordinates
+            ],
+            "inverseVariances": [1.0] * len(coordinates),
+        }
+    ]
+    return dataset
+
+
+def mixed_validity_dataset():
+    dataset = positive_dataset(series_count=1)
+    dataset["morphologyGrid"] = {
+        "centerAxis": linear_axis(0.0, 1.0, 1),
+        "logScaleAxis": linear_axis(-700.0, 700.0, 2),
+        "logShapeAxis": explicit_axis(0.0),
+    }
+    dataset["candidatesPerWorkUnit"] = 2
+    return dataset
+
+
 def worker_payload(dataset, shard):
     evaluations = []
     invalid_count = 0
@@ -170,14 +198,7 @@ def worker_payload(dataset, shard):
         raise AssertionError("synthetic shard unexpectedly has no valid candidate")
     best = evaluations[0]
     for evaluation in evaluations[1:]:
-        limit = morphology_grid._objective_limit(
-            evaluation.weighted_residual_sum_squares,
-            best.weighted_residual_sum_squares,
-        )
-        if (
-            evaluation.weighted_residual_sum_squares
-            < best.weighted_residual_sum_squares - limit
-        ):
+        if morphology_grid._candidate_precedes(evaluation, best):
             best = evaluation
     return {
         "morphologyFamilyID": morphology_grid.MORPHOLOGY_FAMILY_ID,
@@ -601,6 +622,156 @@ class MorphologyGridNumericalTests(unittest.TestCase):
         )
         self.assertIsNone(morphology_grid._evaluate_candidate(dataset, 0))
 
+    def test_candidate_metrics_and_nominal_parameter_counts_are_exact(self):
+        cases = (
+            (positive_dataset(), 13, 8, 7),
+            (ordered_dataset(), 0, 8, 12),
+            (independent_dataset(), 5, 4, 9),
+        )
+        for dataset, grid_index, expected_n, expected_k in cases:
+            with self.subTest(model=dataset["modelClassID"]):
+                evaluation = morphology_grid._evaluate_candidate(
+                    dataset,
+                    grid_index,
+                )
+                self.assertIsNotNone(evaluation)
+                self.assertEqual(
+                    expected_n,
+                    evaluation.positive_weight_sample_count,
+                )
+                self.assertEqual(expected_k, evaluation.nominal_parameter_count)
+                self.assertEqual(
+                    expected_n,
+                    sum(
+                        fit.positive_weight_sample_count
+                        for fit in evaluation.series_fits
+                    ),
+                )
+                self.assertAlmostEqual(
+                    evaluation.weighted_residual_sum_squares
+                    + expected_k * math.log(expected_n),
+                    evaluation.bayesian_information_criterion,
+                    places=12,
+                )
+                self.assertFalse(
+                    evaluation.corrected_akaike_information_criterion_defined
+                )
+                self.assertIsNone(
+                    evaluation.corrected_akaike_information_criterion
+                )
+
+    def test_defined_aicc_uses_the_frozen_formula(self):
+        evaluation = morphology_grid._evaluate_candidate(
+            dense_positive_dataset(),
+            13,
+        )
+        self.assertIsNotNone(evaluation)
+        self.assertEqual(8, evaluation.positive_weight_sample_count)
+        self.assertEqual(5, evaluation.nominal_parameter_count)
+        expected = (
+            evaluation.weighted_residual_sum_squares
+            + 2.0 * 5
+            + 2.0 * 5 * 6 / (8 - 5 - 1)
+        )
+        self.assertTrue(
+            evaluation.corrected_akaike_information_criterion_defined
+        )
+        self.assertAlmostEqual(
+            expected,
+            evaluation.corrected_akaike_information_criterion,
+            places=12,
+        )
+
+    def test_amplitude_sign_labels_cover_negative_zero_and_positive(self):
+        positive = morphology_grid._candidate_payload(
+            morphology_grid._evaluate_candidate(positive_dataset(), 13),
+            morphology_grid.POSITIVE_PULSE_ONLY,
+        )
+        self.assertEqual(
+            morphology_grid._BEST_CANDIDATE_FIELDS,
+            set(positive),
+        )
+        self.assertTrue(all(
+            set(fit) == morphology_grid._POSITIVE_FIT_FIELDS
+            for fit in positive["seriesFits"]
+        ))
+        self.assertTrue(all(
+            fit["positiveAmplitudeSign"] == "positive"
+            for fit in positive["seriesFits"]
+        ))
+
+        zero_dataset = positive_dataset(series_count=1)
+        zero_dataset["series"][0]["values"] = [1.5] * 5
+        zero = morphology_grid._candidate_payload(
+            morphology_grid._evaluate_candidate(zero_dataset, 13),
+            morphology_grid.POSITIVE_PULSE_ONLY,
+        )
+        self.assertEqual("zero", zero["seriesFits"][0]["positiveAmplitudeSign"])
+        self.assertEqual(5, zero["nominalParameterCount"])
+
+        ordered = morphology_grid._candidate_payload(
+            morphology_grid._evaluate_candidate(ordered_dataset(), 0),
+            morphology_grid.ORDERED_NEGATIVE_POSITIVE_DOUBLET,
+        )
+        self.assertTrue(all(
+            set(fit) == morphology_grid._DOUBLET_FIT_FIELDS
+            for fit in ordered["seriesFits"]
+        ))
+        self.assertTrue(all(
+            fit["negativeAmplitudeSign"] == "negative"
+            and fit["positiveAmplitudeSign"] == "positive"
+            for fit in ordered["seriesFits"]
+        ))
+        self.assertEqual("zero", morphology_grid._amplitude_sign(-0.0))
+
+    def test_candidate_comparison_uses_the_complete_frozen_order(self):
+        def candidate(
+            grid_index,
+            *,
+            wrss=10.0,
+            bic=20.0,
+            aicc=30.0,
+            aicc_defined=True,
+        ):
+            return morphology_grid._CandidateEvaluation(
+                grid_index=grid_index,
+                parameters={},
+                series_fits=(),
+                positive_weight_sample_count=10,
+                weighted_residual_sum_squares=wrss,
+                nominal_parameter_count=1,
+                bayesian_information_criterion=bic,
+                corrected_akaike_information_criterion=(
+                    aicc if aicc_defined else None
+                ),
+                corrected_akaike_information_criterion_defined=aicc_defined,
+            )
+
+        self.assertTrue(morphology_grid._candidate_precedes(
+            candidate(9, wrss=9.0, bic=100.0, aicc=100.0),
+            candidate(1),
+        ))
+        self.assertTrue(morphology_grid._candidate_precedes(
+            candidate(9, wrss=10.0 + 1.0e-10, bic=19.0),
+            candidate(1),
+        ))
+        self.assertTrue(morphology_grid._candidate_precedes(
+            candidate(9, aicc=29.0),
+            candidate(1),
+        ))
+        self.assertTrue(morphology_grid._candidate_precedes(
+            candidate(9),
+            candidate(1, aicc_defined=False),
+        ))
+        self.assertTrue(morphology_grid._candidate_precedes(
+            candidate(1),
+            candidate(9),
+        ))
+        self.assertFalse(morphology_grid._candidate_precedes(
+            candidate(9),
+            candidate(1),
+        ))
+
 
 class MorphologyGridResultTests(unittest.TestCase):
     def setUp(self):
@@ -617,7 +788,7 @@ class MorphologyGridResultTests(unittest.TestCase):
             for payload in self.shards
         ]
 
-    def test_valid_result_recomputes_only_reported_winner(self):
+    def test_valid_result_recomputes_every_shard_candidate(self):
         original = morphology_grid._evaluate_candidate
         calls = []
 
@@ -637,13 +808,70 @@ class MorphologyGridResultTests(unittest.TestCase):
             )
         self.assertTrue(validation.accepted, validation.message)
         self.assertEqual(
-            [self.results[0]["payload"]["bestCandidate"]["gridIndex"]],
+            list(range(
+                self.shards[0]["gridStartIndex"],
+                self.shards[0]["gridStartIndex"]
+                + self.shards[0]["gridCount"],
+            )),
             calls,
         )
         self.assertEqual(
-            "morphology-grid-recomputation",
+            "morphology-grid-full-shard-recomputation",
             validation.details["method"],
         )
+
+    def test_valid_nonwinner_and_forged_null_winner_are_rejected(self):
+        canonical_index = self.results[0]["payload"]["bestCandidate"][
+            "gridIndex"
+        ]
+        nonwinner = next(
+            morphology_grid._evaluate_candidate(self.dataset, grid_index)
+            for grid_index in range(5)
+            if grid_index != canonical_index
+            and morphology_grid._evaluate_candidate(self.dataset, grid_index)
+            is not None
+        )
+        result = copy.deepcopy(self.results[0])
+        result["payload"]["bestCandidate"] = morphology_grid._candidate_payload(
+            nonwinner,
+            self.dataset["modelClassID"],
+        )
+        self.assertFalse(
+            morphology_grid.PLUGIN.validate_result(
+                self.work_units[0],
+                result,
+                self.dataset,
+            ).accepted
+        )
+
+        forged_null = copy.deepcopy(self.results[0])
+        forged_null["payload"]["bestCandidate"] = None
+        self.assertFalse(
+            morphology_grid.PLUGIN.validate_result(
+                self.work_units[0],
+                forged_null,
+                self.dataset,
+            ).accepted
+        )
+
+    def test_full_shard_ties_select_the_lowest_grid_index(self):
+        dataset = positive_dataset(series_count=1)
+        dataset["series"][0]["values"] = [1.5] * 5
+        dataset["morphologyGrid"] = {
+            "centerAxis": linear_axis(-0.5, 0.5, 3),
+            "logScaleAxis": linear_axis(0.0, 1.0, 1),
+            "logShapeAxis": explicit_axis(0.0),
+        }
+        dataset["candidatesPerWorkUnit"] = 3
+        shard = next(morphology_grid.PLUGIN.build_work_payloads(dataset))
+        result = result_for(dataset, shard)
+        self.assertEqual(0, result["payload"]["bestCandidate"]["gridIndex"])
+        validation = morphology_grid.PLUGIN.validate_result(
+            {"id": "tied", "payload": shard},
+            result,
+            dataset,
+        )
+        self.assertTrue(validation.accepted, validation.message)
 
     def test_result_identity_counts_parameters_and_numerics_fail_closed(self):
         mutations = (
@@ -698,6 +926,91 @@ class MorphologyGridResultTests(unittest.TestCase):
             ).accepted
         )
 
+    def test_forged_scientific_metrics_and_signs_are_rejected(self):
+        candidate_mutations = (
+            ("positiveWeightSampleCount", 9),
+            ("nominalParameterCount", 8),
+            ("bayesianInformationCriterion", 123.0),
+            ("correctedAkaikeInformationCriterion", 0.0),
+            ("correctedAkaikeInformationCriterionDefined", True),
+        )
+        for field_name, value in candidate_mutations:
+            with self.subTest(field_name=field_name):
+                result = copy.deepcopy(self.results[0])
+                result["payload"]["bestCandidate"][field_name] = value
+                self.assertFalse(
+                    morphology_grid.PLUGIN.validate_result(
+                        self.work_units[0],
+                        result,
+                        self.dataset,
+                    ).accepted
+                )
+
+        fit_mutations = (
+            ("positiveWeightSampleCount", 5),
+            ("positiveAmplitudeSign", "zero"),
+        )
+        for field_name, value in fit_mutations:
+            with self.subTest(field_name=field_name):
+                result = copy.deepcopy(self.results[0])
+                result["payload"]["bestCandidate"]["seriesFits"][0][
+                    field_name
+                ] = value
+                self.assertFalse(
+                    morphology_grid.PLUGIN.validate_result(
+                        self.work_units[0],
+                        result,
+                        self.dataset,
+                    ).accepted
+                )
+
+        reordered = copy.deepcopy(self.results[0])
+        reordered["payload"]["bestCandidate"]["seriesFits"].reverse()
+        self.assertFalse(
+            morphology_grid.PLUGIN.validate_result(
+                self.work_units[0],
+                reordered,
+                self.dataset,
+            ).accepted
+        )
+
+        ordered_dataset_value = ordered_dataset()
+        ordered_shard = next(
+            morphology_grid.PLUGIN.build_work_payloads(ordered_dataset_value)
+        )
+        ordered_result = result_for(ordered_dataset_value, ordered_shard)
+        ordered_result["payload"]["bestCandidate"]["seriesFits"][0][
+            "negativeAmplitudeSign"
+        ] = "zero"
+        self.assertFalse(
+            morphology_grid.PLUGIN.validate_result(
+                {"id": "ordered", "payload": ordered_shard},
+                ordered_result,
+                ordered_dataset_value,
+            ).accepted
+        )
+
+        defined_dataset = dense_positive_dataset()
+        defined_shard = list(
+            morphology_grid.PLUGIN.build_work_payloads(defined_dataset)
+        )[2]
+        defined_result = result_for(defined_dataset, defined_shard)
+        defined_work = {"id": "defined-aicc", "payload": defined_shard}
+        for field_name, value in (
+            ("correctedAkaikeInformationCriterion", None),
+            ("correctedAkaikeInformationCriterionDefined", False),
+        ):
+            with self.subTest(defined_field=field_name):
+                forged = copy.deepcopy(defined_result)
+                forged["payload"]["bestCandidate"][field_name] = value
+                self.assertFalse(
+                    morphology_grid.PLUGIN.validate_result(
+                        defined_work,
+                        forged,
+                        defined_dataset,
+                    ).accepted
+                )
+
     def test_all_invalid_shard_requires_exact_server_recomputation(self):
         dataset = positive_dataset(series_count=1)
         dataset["morphologyGrid"]["logScaleAxis"] = linear_axis(
@@ -720,14 +1033,27 @@ class MorphologyGridResultTests(unittest.TestCase):
                 "invalidCandidateCount": 9,
             },
         }
-        validation = morphology_grid.PLUGIN.validate_result(
-            work_unit,
-            result,
-            dataset,
-        )
+        original = morphology_grid._evaluate_candidate
+        calls = []
+
+        def recording_evaluator(candidate_dataset, grid_index):
+            calls.append(grid_index)
+            return original(candidate_dataset, grid_index)
+
+        with patch.object(
+            morphology_grid,
+            "_evaluate_candidate",
+            side_effect=recording_evaluator,
+        ):
+            validation = morphology_grid.PLUGIN.validate_result(
+                work_unit,
+                result,
+                dataset,
+            )
         self.assertTrue(validation.accepted, validation.message)
+        self.assertEqual(list(range(9)), calls)
         self.assertEqual(
-            "morphology-grid-all-invalid-recomputation",
+            "morphology-grid-full-shard-recomputation",
             validation.details["method"],
         )
 
@@ -769,6 +1095,9 @@ class MorphologyGridResultTests(unittest.TestCase):
         flattened = copy.deepcopy(self.results[0])
         flattened["gridStartIndex"] = 0
         cases.append(flattened)
+        flattened_fit = copy.deepcopy(self.results[0])
+        flattened_fit["offset"] = 0.0
+        cases.append(flattened_fit)
         for case in cases:
             self.assertFalse(
                 morphology_grid.PLUGIN.validate_result(
@@ -778,7 +1107,7 @@ class MorphologyGridResultTests(unittest.TestCase):
                 ).accepted
             )
 
-    def test_partial_terminal_reduction_and_ties_are_deterministic(self):
+    def test_partial_and_terminal_reduction_expose_complete_metrics(self):
         partial = morphology_grid.PLUGIN.reduce_dataset(
             self.dataset,
             self.work_units,
@@ -801,22 +1130,98 @@ class MorphologyGridResultTests(unittest.TestCase):
         )
         self.assertTrue(terminal.status_fields["coverageComplete"])
         self.assertEqual(27, terminal.status_fields["completedCandidateCount"])
+        expected = terminal.payload["bestCandidate"]
+        self.assertEqual(
+            sum(result["payload"]["invalidCandidateCount"] for result in self.results),
+            terminal.status_fields["totalInvalidCandidateCount"],
+        )
+        field_map = {
+            "bestGridIndex": "gridIndex",
+            "bestParameters": "parameters",
+            "bestSeriesFits": "seriesFits",
+            "bestPositiveWeightSampleCount": "positiveWeightSampleCount",
+            "bestWeightedResidualSumSquares": "weightedResidualSumSquares",
+            "bestNominalParameterCount": "nominalParameterCount",
+            "bestBayesianInformationCriterion": "bayesianInformationCriterion",
+            "bestCorrectedAkaikeInformationCriterion": (
+                "correctedAkaikeInformationCriterion"
+            ),
+            "bestCorrectedAkaikeInformationCriterionDefined": (
+                "correctedAkaikeInformationCriterionDefined"
+            ),
+        }
+        for status_field, candidate_field in field_map.items():
+            self.assertEqual(
+                expected[candidate_field],
+                terminal.status_fields[status_field],
+            )
 
-        tied = copy.deepcopy(self.results)
-        first = tied[0]["payload"]["bestCandidate"]
-        second = tied[1]["payload"]["bestCandidate"]
-        first["weightedResidualSumSquares"] = 1.0
-        second["weightedResidualSumSquares"] = 1.0
+    def test_total_invalid_count_and_malformed_coverage_fail_closed(self):
+        dataset = mixed_validity_dataset()
+        shards = list(morphology_grid.PLUGIN.build_work_payloads(dataset))
+        work_units = [{"id": "mixed", "payload": shards[0]}]
+        results = [result_for(dataset, shards[0])]
+        terminal = morphology_grid.PLUGIN.reduce_dataset(
+            dataset,
+            work_units,
+            results,
+            terminal=True,
+        )
+        self.assertTrue(terminal.status_fields["coverageComplete"])
+        self.assertEqual(1, terminal.status_fields["totalInvalidCandidateCount"])
+
+        malformed_result = copy.deepcopy(results)
+        malformed_result[0]["payload"]["evaluatedCandidateCount"] = 1
+        rejected = morphology_grid.PLUGIN.reduce_dataset(
+            dataset,
+            work_units,
+            malformed_result,
+            terminal=True,
+        )
+        self.assertFalse(rejected.status_fields["coverageComplete"])
+        self.assertEqual(0, rejected.status_fields["completedCandidateCount"])
+
+        cases = (
+            (list(reversed(self.work_units)), list(reversed(self.results))),
+            (
+                [self.work_units[0], self.work_units[0], *self.work_units[2:]],
+                [self.results[0], self.results[0], *self.results[2:]],
+            ),
+            (self.work_units[:-1], self.results[:-1]),
+        )
+        for case_work, case_results in cases:
+            reduced = morphology_grid.PLUGIN.reduce_dataset(
+                self.dataset,
+                case_work,
+                case_results,
+                terminal=True,
+            )
+            self.assertFalse(reduced.status_fields["coverageComplete"])
+
+        wrong_identity_work = copy.deepcopy(self.work_units)
+        wrong_identity_work[0]["payload"]["modelClassID"] = (
+            morphology_grid.INDEPENDENT_PULSES
+        )
         reduced = morphology_grid.PLUGIN.reduce_dataset(
             self.dataset,
-            self.work_units[:2],
-            tied[:2],
-            terminal=False,
+            wrong_identity_work,
+            self.results,
+            terminal=True,
         )
-        self.assertEqual(
-            min(first["gridIndex"], second["gridIndex"]),
-            reduced.status_fields["bestGridIndex"],
+        self.assertFalse(reduced.status_fields["coverageComplete"])
+
+        envelopes_only = [
+            {"status": "completed", "payload": {}}
+            for _ in self.results
+        ]
+        reduced = morphology_grid.PLUGIN.reduce_dataset(
+            self.dataset,
+            self.work_units,
+            envelopes_only,
+            terminal=True,
         )
+        self.assertFalse(reduced.status_fields["coverageComplete"])
+        self.assertEqual(0, reduced.status_fields["completedCandidateCount"])
 
     def test_accounting_uses_server_owned_dataset_and_payload(self):
         work_unit = {

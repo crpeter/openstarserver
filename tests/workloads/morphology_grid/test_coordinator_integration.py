@@ -1,4 +1,5 @@
 import json
+import math
 import tempfile
 import unittest
 from pathlib import Path
@@ -6,6 +7,8 @@ from pathlib import Path
 from coordinator_runtime import CoordinatorRuntime
 from openstar_workloads.plugins import morphology_grid
 from tests.workloads.morphology_grid.test_morphology_grid_plugin import (
+    explicit_axis,
+    linear_axis,
     positive_dataset,
     worker_payload,
 )
@@ -18,10 +21,21 @@ SCHEMA_TUPLE = {
 }
 
 
+def lifecycle_dataset():
+    dataset = positive_dataset(series_count=1)
+    dataset["morphologyGrid"] = {
+        "centerAxis": linear_axis(-0.5, 0.5, 2),
+        "logScaleAxis": linear_axis(0.0, 1.0, 1),
+        "logShapeAxis": explicit_axis(0.0),
+    }
+    dataset["candidatesPerWorkUnit"] = 1
+    return dataset
+
+
 def write_project(root):
     dataset_path = root / "morphology-grid-dataset.json"
     dataset_path.write_text(
-        json.dumps(positive_dataset()),
+        json.dumps(lifecycle_dataset()),
         encoding="utf-8",
     )
     project_path = root / "morphology-grid-project.json"
@@ -77,7 +91,7 @@ class MorphologyGridCoordinatorIntegrationTests(unittest.TestCase):
                 )
                 self.assertIsNone(runtime.claim_work(node_id))
 
-    def test_exact_schema_lifecycle_claims_accepts_reduces_and_completes(self):
+    def test_tiny_exact_schema_lifecycle_claims_submits_reduces_and_completes(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve(strict=True)
             runtime = CoordinatorRuntime()
@@ -99,7 +113,7 @@ class MorphologyGridCoordinatorIntegrationTests(unittest.TestCase):
                 }
             )
 
-            dataset = positive_dataset()
+            dataset = lifecycle_dataset()
             claimed_ranges = []
             while True:
                 work = runtime.claim_work("morphology-grid-node")
@@ -142,12 +156,12 @@ class MorphologyGridCoordinatorIntegrationTests(unittest.TestCase):
                 self.assertEqual(200, code)
 
             self.assertEqual(
-                [(0, 5), (5, 5), (10, 5), (15, 5), (20, 5), (25, 2)],
+                [(0, 1), (1, 1)],
                 claimed_ranges,
             )
             status = runtime.project_status()
             self.assertEqual("COMPLETE", status["status"])
-            self.assertEqual(6, status["projectCompletedWorkUnits"])
+            self.assertEqual(2, status["projectCompletedWorkUnits"])
             dataset_status = status["datasets"][0]
             self.assertEqual(
                 "MORPHOLOGY_GRID_COMPLETE",
@@ -158,14 +172,30 @@ class MorphologyGridCoordinatorIntegrationTests(unittest.TestCase):
                 dataset_status["workloadStatus"],
             )
             self.assertTrue(dataset_status["coverageComplete"])
-            self.assertEqual(27, dataset_status["totalCandidateCount"])
-            self.assertEqual(27, dataset_status["completedCandidateCount"])
+            self.assertEqual(2, dataset_status["totalCandidateCount"])
+            self.assertEqual(2, dataset_status["completedCandidateCount"])
+            self.assertEqual(0, dataset_status["totalInvalidCandidateCount"])
             self.assertIsInstance(dataset_status["bestGridIndex"], int)
             self.assertIsInstance(dataset_status["bestParameters"], dict)
-            self.assertEqual(2, len(dataset_status["bestSeriesFits"]))
+            self.assertEqual(1, len(dataset_status["bestSeriesFits"]))
+            self.assertEqual(4, dataset_status["bestPositiveWeightSampleCount"])
+            self.assertEqual(5, dataset_status["bestNominalParameterCount"])
             self.assertGreaterEqual(
                 dataset_status["bestWeightedResidualSumSquares"],
                 0.0,
+            )
+            self.assertTrue(
+                math.isfinite(
+                    dataset_status["bestBayesianInformationCriterion"]
+                )
+            )
+            self.assertIsNone(
+                dataset_status["bestCorrectedAkaikeInformationCriterion"]
+            )
+            self.assertFalse(
+                dataset_status[
+                    "bestCorrectedAkaikeInformationCriterionDefined"
+                ]
             )
 
 
