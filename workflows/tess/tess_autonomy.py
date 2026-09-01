@@ -30,6 +30,12 @@ from .tess_long_baseline_frequency_confirmation import (
     validate_ambiguous_mode_identification,
     validate_frozen_dataset_lineage,
 )
+from .tess_v20_8_long_baseline_time_frequency_confirmation import (
+    HANDLER_ID as V20_8_LONG_BASELINE_TIME_FREQUENCY_CONFIRMATION_HANDLER_ID,
+    build_dataset_specs as build_v20_8_long_baseline_dataset_specs,
+    build_method_contract as build_v20_8_long_baseline_method_contract,
+    validate_frozen_window_lineage as validate_v20_8_frozen_window_lineage,
+)
 from .tess_nonstationary import (
     CONFIRMED_NONSTATIONARY_EVIDENCE_LINEAGE,
     build_confirmed_nonstationary_method_contract,
@@ -1296,6 +1302,161 @@ def _repair_mode_identification_terminal(
         control_state={"branchAssessments": [], "selectedExperiment": asdict(continuation),
                        "schedulerAction": "RUN_EXPERIMENT",
                        "recovery": "TESS_MODE_IDENTIFICATION_COMPATIBILITY_CONTINUATION"},
+    )
+
+
+def _repair_v20_8_long_baseline_time_frequency_confirmation_terminal(
+    store: InvestigationStore,
+    investigation: Investigation,
+    control: dict,
+) -> Investigation | None:
+    """Append only at the exact finalized unresolved v20.8 boundary."""
+    if not (
+        investigation.status in {"COMPLETE", "HUMAN_REVIEW_REQUIRED"}
+        and control.get("schedulerAction") == "INVESTIGATION_COMPLETE"
+        and not any(stage.status == "RUNNING" for stage in investigation.stages)
+        and not any(
+            stage.handler_id
+            == V20_8_LONG_BASELINE_TIME_FREQUENCY_CONFIRMATION_HANDLER_ID
+            for stage in investigation.stages
+        )
+    ):
+        return None
+
+    summary = _latest_complete(
+        investigation, "openstar.tess.time-frequency.summarize"
+    )
+    latest = investigation.stages[-1] if investigation.stages else None
+    if summary is None or latest is None or not (
+        isinstance(summary.result, dict)
+        and latest.handler_id == "openstar.tess.finalize"
+        and latest.status == "COMPLETE"
+        and latest.stop is True
+        and latest.triggered_by_stage_id == summary.id
+        and latest.parameters.get("outputSuffix") == "v20.8"
+        and isinstance(latest.result, dict)
+        and latest.result.get("timeFrequencyEvolution") == summary.result
+        and latest.result.get("recommendedNextTest")
+        == "LONG_BASELINE_TIME_FREQUENCY_CONFIRMATION"
+    ):
+        return None
+    summary_index = investigation.stages.index(summary)
+    if tuple(investigation.stages[summary_index + 1:]) != (latest,):
+        return None
+
+    interpretation = next((
+        stage for stage in investigation.stages
+        if stage.id == summary.triggered_by_stage_id
+        and stage.handler_id == "openstar.tess.time-frequency.interpret"
+        and stage.status == "COMPLETE"
+        and isinstance(stage.result, dict)
+    ), None)
+    run = next((
+        stage for stage in investigation.stages
+        if interpretation is not None
+        and stage.id == interpretation.triggered_by_stage_id
+        and stage.handler_id == "openstar.tess.time-frequency.run"
+        and stage.status == "COMPLETE"
+        and isinstance(stage.result, dict)
+    ), None)
+    preparation = next((
+        stage for stage in investigation.stages
+        if run is not None
+        and stage.id == run.triggered_by_stage_id
+        and stage.handler_id == "openstar.tess.time-frequency.prepare"
+        and stage.status == "COMPLETE"
+        and isinstance(stage.result, dict)
+    ), None)
+    prepared = next((
+        stage for stage in investigation.stages
+        if stage.id == "001-prepare-target"
+        and stage.status == "COMPLETE"
+        and isinstance(stage.result, dict)
+    ), None)
+    morphology = next((
+        stage for stage in reversed(investigation.stages[:summary_index])
+        if stage.handler_id == "openstar.tess.morphology.analyze"
+        and stage.status == "COMPLETE"
+        and isinstance(stage.result, dict)
+    ), None)
+    if any(stage is None for stage in (
+        interpretation, run, preparation, prepared, morphology
+    )):
+        return None
+
+    interpretation_hashes = (
+        interpretation.provenance.input_hashes
+        if interpretation.provenance else {}
+    )
+    preparation_hashes = (
+        preparation.provenance.input_hashes if preparation.provenance else {}
+    )
+    summary_hashes = (
+        summary.provenance.input_hashes if summary.provenance else {}
+    )
+    if not (
+        interpretation_hashes.get("preparation")
+        == sha256_json(preparation.result)
+        and interpretation_hashes.get("projectResult")
+        == sha256_json(run.result)
+        and preparation_hashes.get("morphology")
+        == sha256_json(morphology.result)
+        and summary_hashes.get("morphology")
+        == sha256_json(morphology.result)
+        and summary_hashes.get("timeFrequencyInterpretation")
+        == sha256_json(interpretation.result)
+        and all(
+            store.verified_terminal_stage_ledger_hash(investigation.id, stage)
+            for stage in (
+                prepared, morphology, preparation, run,
+                interpretation, summary, latest,
+            )
+        )
+        and _verified_stage_json(summary, "time-frequency-v20.8.json")
+        and _verified_stage_json(latest, "conclusion-v20.8.json")
+    ):
+        return None
+
+    try:
+        # The method is frozen before the lineage validator opens residual
+        # window files containing flux values.
+        contract = build_v20_8_long_baseline_method_contract(
+            preparation=preparation.result,
+            interpretation=interpretation.result,
+            summary=summary.result,
+        )
+        dataset_specs = build_v20_8_long_baseline_dataset_specs(
+            expected_tic_id=int(prepared.result["ticID"]),
+            preparation=preparation.result,
+        )
+        validate_v20_8_frozen_window_lineage(
+            method_contract=contract,
+            dataset_specs=dataset_specs,
+        )
+    except (KeyError, OSError, RuntimeError, TypeError, ValueError):
+        return None
+
+    continuation = StageRequest(
+        id=_continuation_stage_id(
+            latest, "long-baseline-time-frequency-confirmation"
+        ),
+        handler_id=(
+            V20_8_LONG_BASELINE_TIME_FREQUENCY_CONFIRMATION_HANDLER_ID
+        ),
+        parameters={},
+        triggered_by_stage_id=summary.id,
+    )
+    return store.set_control_state(
+        investigation,
+        status="RUNNING",
+        control_state={
+            "branchAssessments": [],
+            "selectedExperiment": asdict(continuation),
+            "schedulerAction": "RUN_EXPERIMENT",
+            "recovery": (
+                "TESS_V20_8_LONG_BASELINE_TIME_FREQUENCY_CONFIRMATION"
+            ),
+        },
     )
 
 
@@ -3426,6 +3587,14 @@ def repair_obsolete_terminal_wait(
     mode_repair = _repair_mode_identification_terminal(store, investigation, control)
     if mode_repair is not None:
         return mode_repair
+
+    v20_8_long_baseline_repair = (
+        _repair_v20_8_long_baseline_time_frequency_confirmation_terminal(
+            store, investigation, control
+        )
+    )
+    if v20_8_long_baseline_repair is not None:
+        return v20_8_long_baseline_repair
 
     long_baseline_repair = \
         _repair_long_baseline_frequency_confirmation_terminal(
