@@ -69,18 +69,33 @@ def _write_window(
         for time in absolute_times
     ]
     center_dataset_days = window_start + 5.0
-    path.write_text(json.dumps({
-        "id": dataset_id,
-        "source": {
+    source = {
+        "ticID": TIC_ID,
+        "sector": sector,
+        "timeFrequencyWindowIndex": window_index,
+        "windowStartDatasetDays": window_start,
+        "windowCenterDatasetDays": center_dataset_days,
+    }
+    metadata = {}
+    if role == "primary-time-frequency-window":
+        # This is the exact encoding produced from the frozen shallow-scan
+        # dataset: the sector origin remains in metadata and v20.8 persisted
+        # no absolute center for the primary window.
+        metadata = {
             "ticID": TIC_ID,
             "sector": sector,
             "originalTimeOriginDays": origin,
-            "timeFrequencyWindowIndex": window_index,
-            "windowStartDatasetDays": window_start,
-            "windowCenterDatasetDays": center_dataset_days,
-            "absoluteWindowCenterDays": origin + center_dataset_days,
-        },
-        "metadata": {},
+        }
+        source["absoluteWindowCenterDays"] = None
+    else:
+        # Independent v20.8 windows persist the already-shifted absolute
+        # window origin in source.
+        source["originalTimeOriginDays"] = origin + window_start
+        source["absoluteWindowCenterDays"] = origin + center_dataset_days
+    path.write_text(json.dumps({
+        "id": dataset_id,
+        "source": source,
+        "metadata": metadata,
         "science": {
             "purpose": "sliding-window-time-frequency-evolution",
             "role": role,
@@ -186,6 +201,33 @@ def _fold(support, h_bic, s_bic, n_bic, frequency):
 
 
 class V208LongBaselineAnalysisTests(unittest.TestCase):
+    def test_real_v20_8_primary_and_independent_time_origins_are_restored(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            preparation, interpretation, summary = _evidence(temporary)
+            contract = build_method_contract(
+                preparation=preparation,
+                interpretation=interpretation,
+                summary=summary,
+            )
+            specs = build_dataset_specs(
+                expected_tic_id=TIC_ID,
+                preparation=preparation,
+            )
+            datasets = validate_frozen_window_lineage(
+                method_contract=contract,
+                dataset_specs=specs,
+            )
+        for dataset in datasets:
+            expected_start = (
+                float(dataset["sector"] * 100.0)
+                + float((dataset["windowIndex"] - 1) * 12.0)
+            )
+            self.assertAlmostEqual(expected_start, min(dataset["times"]))
+            self.assertAlmostEqual(
+                expected_start + 5.0,
+                dataset["absoluteWindowCenterDays"],
+            )
+
     def test_method_contract_hash_is_deterministic_and_precedes_flux(self):
         with tempfile.TemporaryDirectory() as temporary:
             preparation, interpretation, summary = _evidence(temporary)
