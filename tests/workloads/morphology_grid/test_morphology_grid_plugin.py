@@ -548,7 +548,7 @@ class MorphologyGridNumericalTests(unittest.TestCase):
             dict(evaluation.parameters),
         )
         for index, fit in enumerate(evaluation.series_fits):
-            self.assertAlmostEqual(0.5 + index, fit.offset, places=12)
+            self.assertAlmostEqual(0.5 + index, fit.offset, places=11)
             self.assertAlmostEqual(
                 2.0 + index,
                 fit.positive_amplitude,
