@@ -450,15 +450,41 @@ def validate_frozen_window_lineage(
                 f"Frozen v20.8 window is unreadable: {path}: {error}"
             ) from error
         source = frozen.get("source") or {}
+        metadata = frozen.get("metadata") or {}
         science = frozen.get("science") or {}
         try:
             source_window_index = int(source["timeFrequencyWindowIndex"])
             science_window_index = int(science["windowIndex"])
             window_start = float(source["windowStartDatasetDays"])
             window_center = float(source["windowCenterDatasetDays"])
-            absolute_center = float(source["absoluteWindowCenterDays"])
-            source_origin = float(source["originalTimeOriginDays"])
         except (KeyError, TypeError, ValueError):
+            raise RuntimeError(
+                f"Frozen v20.8 window time lineage is incomplete: {path}"
+            ) from None
+        source_origin_value = source.get("originalTimeOriginDays")
+        if source_origin_value is None:
+            source_origin_value = source.get("timeOriginDays")
+        metadata_origin_value = metadata.get("originalTimeOriginDays")
+        if metadata_origin_value is None:
+            metadata_origin_value = metadata.get("timeOriginDays")
+        absolute_center_value = source.get("absoluteWindowCenterDays")
+        try:
+            source_origin = (
+                None
+                if source_origin_value is None
+                else float(source_origin_value)
+            )
+            metadata_origin = (
+                None
+                if metadata_origin_value is None
+                else float(metadata_origin_value)
+            )
+            absolute_center = (
+                None
+                if absolute_center_value is None
+                else float(absolute_center_value)
+            )
+        except (TypeError, ValueError):
             raise RuntimeError(
                 f"Frozen v20.8 window time lineage is incomplete: {path}"
             ) from None
@@ -475,24 +501,78 @@ def validate_frozen_window_lineage(
             and science.get("role") == expected_role
             and math.isfinite(window_start)
             and math.isfinite(window_center)
-            and math.isfinite(absolute_center)
-            and math.isfinite(source_origin)
-            and math.isclose(
-                source_origin + window_center,
-                absolute_center,
-                rel_tol=1e-12,
-                abs_tol=1e-9,
-            )
+            and window_center >= window_start
         ):
             raise RuntimeError(
                 f"Frozen v20.8 window time/role lineage mismatch: {path}"
             )
-        # The generic loader restores the sector-level origin.  v20.8 window
-        # samples were additionally rebased to their own window start, so add
-        # that persisted offset to recover the absolute long-baseline phase.
-        dataset["times"] = [
-            float(value) + window_start for value in dataset["times"]
+
+        origins = [
+            value for value in (source_origin, metadata_origin)
+            if value is not None
         ]
+        if not origins or any(not math.isfinite(value) for value in origins):
+            raise RuntimeError(
+                f"Frozen v20.8 window time lineage is incomplete: {path}"
+            )
+        loaded_origin = origins[0]
+        relative_center = window_center - window_start
+        sector_origin_center = loaded_origin + window_center
+        window_origin_center = loaded_origin + relative_center
+
+        # The persisted v20.8 builder has two authoritative encodings.  The
+        # primary scan keeps the sector origin in metadata and rebases the
+        # window samples, while independent windows replace their source
+        # origin with the absolute window origin.  Select between those
+        # encodings only by checking the persisted absolute center.  Older
+        # primary windows legitimately have no absolute-center field, but
+        # their metadata sector origin and persisted window offset determine
+        # it exactly.
+        if absolute_center is None:
+            if not (
+                spec["role"] == "PRIMARY_WINDOW"
+                and source_origin is None
+                and metadata_origin is not None
+            ):
+                raise RuntimeError(
+                    f"Frozen v20.8 window time lineage is incomplete: {path}"
+                )
+            absolute_center = sector_origin_center
+            time_shift = window_start
+        elif not math.isfinite(absolute_center):
+            raise RuntimeError(
+                f"Frozen v20.8 window time lineage is incomplete: {path}"
+            )
+        elif math.isclose(
+            absolute_center,
+            window_origin_center,
+            rel_tol=1e-12,
+            abs_tol=1e-9,
+        ):
+            time_shift = 0.0
+        elif math.isclose(
+            absolute_center,
+            sector_origin_center,
+            rel_tol=1e-12,
+            abs_tol=1e-9,
+        ):
+            time_shift = window_start
+        else:
+            raise RuntimeError(
+                f"Frozen v20.8 window time/role lineage mismatch: {path}"
+            )
+
+        absolute_times = [
+            float(value) + time_shift for value in dataset["times"]
+        ]
+        if not (
+            absolute_times
+            and min(absolute_times) <= absolute_center <= max(absolute_times)
+        ):
+            raise RuntimeError(
+                f"Frozen v20.8 window time/role lineage mismatch: {path}"
+            )
+        dataset["times"] = absolute_times
         dataset["windowIndex"] = int(spec["windowIndex"])
         dataset["absoluteWindowCenterDays"] = absolute_center
         datasets.append(dataset)
