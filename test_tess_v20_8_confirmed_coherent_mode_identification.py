@@ -417,6 +417,22 @@ class ConfirmedCoherentModeContractTests(ConfirmedCoherentModeFixture):
                     method_contract=contract, dataset_specs=specs
                 )
 
+    def test_confirmation_window_path_membership_is_exact_not_ordered(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            _, investigation, _, _ = self._history(temporary)
+            confirmation = copy.deepcopy(investigation.stages[-2].result)
+            paths = confirmation["dataReuse"]["frozenWindowDatasetPaths"]
+            confirmation["dataReuse"]["frozenWindowDatasetPaths"] = list(
+                reversed(paths)
+            )
+            validate_v20_8_confirmed_coherent_residual(confirmation)
+
+            confirmation["dataReuse"]["frozenWindowDatasetPaths"][-1] = (
+                confirmation["dataReuse"]["frozenWindowDatasetPaths"][0]
+            )
+            with self.assertRaisesRegex(RuntimeError, "exact confirmed"):
+                validate_v20_8_confirmed_coherent_residual(confirmation)
+
     def test_insufficient_predictive_sector_support_fails_closed(self):
         with tempfile.TemporaryDirectory() as temporary:
             _, investigation, _, _ = self._history(temporary)

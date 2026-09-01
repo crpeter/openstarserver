@@ -166,8 +166,12 @@ def validate_v20_8_confirmed_coherent_residual(
         and coherent_over_null >= MIN_BIC_IMPROVEMENT
         and coherent_over_harmonic >= MIN_BIC_IMPROVEMENT
         and isinstance(frozen_paths, list)
+        and isinstance(observed_paths, list)
         and len(frozen_paths) >= len(accepted_sectors) + 1
-        and observed_paths == frozen_paths
+        and len(observed_paths) == len(frozen_paths)
+        and len(set(frozen_paths)) == len(frozen_paths)
+        and len(set(observed_paths)) == len(observed_paths)
+        and set(observed_paths) == set(frozen_paths)
         and data_reuse.get("downloadPerformed") is False
         and data_reuse.get("originalSectorFluxRead") is False
     )
