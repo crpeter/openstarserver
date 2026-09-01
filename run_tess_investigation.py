@@ -21,6 +21,12 @@ from workflows.tess.tess_long_baseline_frequency_confirmation import (
     validate_ambiguous_mode_identification,
     validate_frozen_dataset_lineage,
 )
+from workflows.tess.tess_v20_8_long_baseline_time_frequency_confirmation import (
+    HANDLER_ID as V20_8_LONG_BASELINE_TIME_FREQUENCY_CONFIRMATION_HANDLER_ID,
+    build_dataset_specs as build_v20_8_long_baseline_dataset_specs,
+    build_method_contract as build_v20_8_long_baseline_method_contract,
+    validate_frozen_window_lineage as validate_v20_8_frozen_window_lineage,
+)
 from workflows.tess.tess_mode_identification import (
     MULTIMODE_MODE_EVIDENCE_LINEAGE,
 )
@@ -153,6 +159,17 @@ def parse_args():
             "Append local, network-free leave-one-independent-sector-out "
             "confirmation of an exact AMBIGUOUS_HARMONIC_OR_MODE result. "
             "This is separate from --continue-nonstationary."
+        ),
+    )
+    recovery.add_argument(
+        "--continue-v20-8-long-baseline-time-frequency-confirmation",
+        action="store_true",
+        help=(
+            "Append local, network-free leave-one-independent-sector-out "
+            "confirmation of the exact terminal unresolved v20.8 "
+            "LONG_BASELINE_TIME_FREQUENCY_CONFIRMATION boundary. This is "
+            "separate from --continue-long-baseline-frequency-confirmation "
+            "and --continue-nonstationary."
         ),
     )
     recovery.add_argument(
@@ -831,6 +848,148 @@ def _can_continue_long_baseline_frequency_confirmation(investigation) -> None:
     except (KeyError, TypeError, ValueError):
         raise RuntimeError("Frozen dataset lineage is incomplete.") from None
     validate_frozen_dataset_lineage(
+        method_contract=contract,
+        dataset_specs=dataset_specs,
+    )
+
+
+def _can_continue_v20_8_long_baseline_time_frequency_confirmation(
+    investigation,
+) -> None:
+    """Validate the exact finalized unresolved v20.8 boundary."""
+    if any(stage.status == "RUNNING" for stage in investigation.stages):
+        raise RuntimeError(
+            "Investigation contains a RUNNING stage. Use --resume before "
+            "v20.8 long-baseline time-frequency confirmation."
+        )
+    if investigation.status not in {"COMPLETE", "HUMAN_REVIEW_REQUIRED"}:
+        raise RuntimeError(
+            "--continue-v20-8-long-baseline-time-frequency-confirmation "
+            "requires a terminal investigation."
+        )
+    if any(
+        stage.handler_id
+        == V20_8_LONG_BASELINE_TIME_FREQUENCY_CONFIRMATION_HANDLER_ID
+        for stage in investigation.stages
+    ):
+        raise RuntimeError(
+            "Investigation already contains v20.8 long-baseline "
+            "time-frequency confirmation."
+        )
+
+    summary_stage = next((
+        stage for stage in reversed(investigation.stages)
+        if stage.handler_id == "openstar.tess.time-frequency.summarize"
+        and stage.status == "COMPLETE"
+        and isinstance(stage.result, dict)
+    ), None)
+    latest = investigation.stages[-1] if investigation.stages else None
+    if summary_stage is None or not (
+        latest is not None
+        and latest.handler_id == "openstar.tess.finalize"
+        and latest.status == "COMPLETE"
+        and latest.stop is True
+        and latest.triggered_by_stage_id == summary_stage.id
+        and latest.parameters.get("outputSuffix") == "v20.8"
+        and isinstance(latest.result, dict)
+        and latest.result.get("timeFrequencyEvolution") == summary_stage.result
+        and latest.result.get("recommendedNextTest")
+        == "LONG_BASELINE_TIME_FREQUENCY_CONFIRMATION"
+    ):
+        raise RuntimeError(
+            "The exact finalized unresolved v20.8 boundary is required."
+        )
+    summary_index = investigation.stages.index(summary_stage)
+    if tuple(investigation.stages[summary_index + 1:]) != (latest,):
+        raise RuntimeError(
+            "Later stages already consume the v20.8 time-frequency boundary."
+        )
+
+    interpretation_stage = next((
+        stage for stage in investigation.stages
+        if stage.id == summary_stage.triggered_by_stage_id
+        and stage.handler_id == "openstar.tess.time-frequency.interpret"
+        and stage.status == "COMPLETE"
+        and isinstance(stage.result, dict)
+    ), None)
+    run_stage = next((
+        stage for stage in investigation.stages
+        if interpretation_stage is not None
+        and stage.id == interpretation_stage.triggered_by_stage_id
+        and stage.handler_id == "openstar.tess.time-frequency.run"
+        and stage.status == "COMPLETE"
+        and isinstance(stage.result, dict)
+    ), None)
+    preparation_stage = next((
+        stage for stage in investigation.stages
+        if run_stage is not None
+        and stage.id == run_stage.triggered_by_stage_id
+        and stage.handler_id == "openstar.tess.time-frequency.prepare"
+        and stage.status == "COMPLETE"
+        and isinstance(stage.result, dict)
+    ), None)
+    prepared_stage = next((
+        stage for stage in investigation.stages
+        if stage.id == "001-prepare-target"
+        and stage.status == "COMPLETE"
+        and isinstance(stage.result, dict)
+    ), None)
+    morphology_stage = next((
+        stage for stage in reversed(investigation.stages[:summary_index])
+        if stage.handler_id == "openstar.tess.morphology.analyze"
+        and stage.status == "COMPLETE"
+        and isinstance(stage.result, dict)
+    ), None)
+    if any(stage is None for stage in (
+        interpretation_stage, run_stage, preparation_stage,
+        prepared_stage, morphology_stage,
+    )):
+        raise RuntimeError(
+            "The completed v20.8 prepare/run/interpret/morphology lineage "
+            "is incomplete."
+        )
+
+    interpretation_hashes = (
+        interpretation_stage.provenance.input_hashes
+        if interpretation_stage.provenance else {}
+    )
+    preparation_hashes = (
+        preparation_stage.provenance.input_hashes
+        if preparation_stage.provenance else {}
+    )
+    summary_hashes = (
+        summary_stage.provenance.input_hashes
+        if summary_stage.provenance else {}
+    )
+    if not (
+        interpretation_hashes.get("preparation")
+        == sha256_json(preparation_stage.result)
+        and interpretation_hashes.get("projectResult")
+        == sha256_json(run_stage.result)
+        and preparation_hashes.get("morphology")
+        == sha256_json(morphology_stage.result)
+        and summary_hashes.get("morphology")
+        == sha256_json(morphology_stage.result)
+        and summary_hashes.get("timeFrequencyInterpretation")
+        == sha256_json(interpretation_stage.result)
+    ):
+        raise RuntimeError(
+            "v20.8 provenance does not match the authoritative completed "
+            "physical-period and window-analysis lineage."
+        )
+
+    # Preregister the deterministic contract before validation opens any
+    # frozen residual-window file containing flux values.
+    contract = build_v20_8_long_baseline_method_contract(
+        preparation=preparation_stage.result,
+        interpretation=interpretation_stage.result,
+        summary=summary_stage.result,
+    )
+    dataset_specs = build_v20_8_long_baseline_dataset_specs(
+        expected_tic_id=int(prepared_stage.result["ticID"]),
+        preparation=preparation_stage.result,
+    )
+    validate_v20_8_frozen_window_lineage(
         method_contract=contract,
         dataset_specs=dataset_specs,
     )
@@ -2609,6 +2768,7 @@ def main():
         or args.continue_source_localization
         or args.continue_offset_source_identification
         or args.continue_long_baseline_frequency_confirmation
+        or args.continue_v20_8_long_baseline_time_frequency_confirmation
         or args.continue_neighbor_catalog_pixel_response_review
     ):
         health = coordinator.health()
@@ -2809,6 +2969,33 @@ def main():
             handler_id=LONG_BASELINE_FREQUENCY_CONFIRMATION_HANDLER_ID,
             parameters={},
             triggered_by_stage_id=last_stage_id,
+        )
+    elif args.continue_v20_8_long_baseline_time_frequency_confirmation:
+        investigation = store.load(args.investigation_id)
+        if investigation.workflow_id != WORKFLOW_ID:
+            raise RuntimeError(
+                "Cannot continue investigation with a different workflow: "
+                f"{investigation.workflow_id}"
+            )
+        _can_continue_v20_8_long_baseline_time_frequency_confirmation(
+            investigation
+        )
+        summary_stage = next(
+            stage for stage in reversed(investigation.stages)
+            if stage.handler_id == "openstar.tess.time-frequency.summarize"
+            and stage.status == "COMPLETE"
+        )
+        next_number = _next_stage_number(investigation)
+        investigation = store.set_status(investigation, "RUNNING")
+        initial_stage = StageRequest(
+            id=(
+                f"{next_number:03d}-long-baseline-time-frequency-confirmation"
+            ),
+            handler_id=(
+                V20_8_LONG_BASELINE_TIME_FREQUENCY_CONFIRMATION_HANDLER_ID
+            ),
+            parameters={},
+            triggered_by_stage_id=summary_stage.id,
         )
     elif args.continue_confirmed_nonstationary_mode_modeling:
         investigation = store.load(args.investigation_id)
@@ -3622,6 +3809,7 @@ def main():
         or args.continue_physical_interpretation
         or args.continue_source_localization
         or args.continue_long_baseline_frequency_confirmation
+        or args.continue_v20_8_long_baseline_time_frequency_confirmation
         or args.continue_neighbor_catalog_pixel_response_review
     ):
         print("Coordinator: not required for local/network non-distributed continuation")
@@ -3693,6 +3881,18 @@ def main():
         print("   coordinator and distributed workers are not required")
         print("   no archive query or new data download is performed")
         print("   frozen primary and independent-sector light curves are reused")
+        print("   each independent sector is held out without frequency or phase leakage")
+    elif args.continue_v20_8_long_baseline_time_frequency_confirmation:
+        print(
+            "🔭 Continuing the terminal unresolved v20.8 boundary with "
+            "v20.8.1 long-baseline time-frequency confirmation"
+        )
+        print(f"   stage: {initial_stage.id}")
+        print(f"   handler: {initial_stage.handler_id}")
+        print("   coordinator and distributed workers are not required")
+        print("   no archive query or new data download is performed")
+        print("   only frozen v20.8 residual-window datasets are reused")
+        print("   original sector flux is not read")
         print("   each independent sector is held out without frequency or phase leakage")
     elif args.continue_confirmed_nonstationary_mode_modeling:
         print("🌀 Continuing the confirmed v20.9.1 boundary with v20.9.2 nonstationary modeling")

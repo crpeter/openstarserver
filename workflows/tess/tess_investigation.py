@@ -135,6 +135,13 @@ from .tess_long_baseline_frequency_confirmation import (
     build_method_contract as build_long_baseline_frequency_confirmation_contract,
     method_contract_hash as long_baseline_frequency_confirmation_contract_hash,
 )
+from .tess_v20_8_long_baseline_time_frequency_confirmation import (
+    HANDLER_ID as V20_8_LONG_BASELINE_TIME_FREQUENCY_CONFIRMATION_HANDLER_ID,
+    analyze_long_baseline_time_frequency_confirmation as analyze_v20_8_long_baseline_time_frequency_confirmation,
+    build_dataset_specs as build_v20_8_long_baseline_dataset_specs,
+    build_method_contract as build_v20_8_long_baseline_method_contract,
+    method_contract_hash as v20_8_long_baseline_method_contract_hash,
+)
 from .tess_dynamic_harmonic import (
     compare_unresolved_family_dynamic_harmonics,
     model_dynamic_harmonics,
@@ -925,6 +932,41 @@ def long_baseline_frequency_confirmation_continuation(
     )
 
 
+def v20_8_long_baseline_time_frequency_confirmation_continuation(
+    summary: dict[str, Any], *, request_id: str
+) -> StageRequest:
+    """Finalize this append-only v20.8 branch without auto-running advice."""
+    if summary.get("classification") not in {
+        "COHERENT_RESIDUAL_FREQUENCY_CONFIRMED",
+        "HARMONIC_LOCKED_RESIDUAL_CONFIRMED",
+        "NONSTATIONARY_RESIDUAL_STRUCTURE_CONFIRMED",
+        "INTERMITTENT_RESIDUAL_STRUCTURE_CONFIRMED",
+        "LONG_BASELINE_TIME_FREQUENCY_INCONCLUSIVE",
+    }:
+        raise RuntimeError(
+            "v20.8 long-baseline time-frequency classification is invalid."
+        )
+    if not (
+        summary.get("physicalMechanismResolved") is False
+        and summary.get("claimLevelChanged") is False
+        and summary.get("automaticDiscoveryClaim") is False
+    ):
+        raise RuntimeError(
+            "v20.8 long-baseline confirmation cannot resolve the mechanism "
+            "or upgrade the claim."
+        )
+    return StageRequest(
+        id=_next_stage_id(request_id, "finalize"),
+        handler_id="openstar.tess.finalize",
+        parameters={
+            "outputSuffix": (
+                "v20.8.1-long-baseline-time-frequency-confirmation"
+            )
+        },
+        triggered_by_stage_id=request_id,
+    )
+
+
 def target_residual_mechanism_continuation(summary: dict[str, Any], *,
         request_id: str) -> StageRequest:
     """Route a newly computed v20.14 result without target-specific evidence."""
@@ -1705,6 +1747,50 @@ def _render_report(conclusion: dict[str, Any]) -> str:
                 f"prominence={item.get('candidatePeakProminenceRatio')}, "
                 f"accepted={item.get('acceptedTimeFrequencyFeature')}, "
                 f"nearFamily={item.get('nearEstablishedFamily')}"
+            )
+
+    v20_8_confirmation = conclusion.get(
+        "longBaselineTimeFrequencyConfirmation"
+    )
+    if v20_8_confirmation is not None:
+        lines.extend([
+            "",
+            "## v20.8 long-baseline time-frequency confirmation",
+            "",
+            f"- Method contract: {v20_8_confirmation.get('methodContractID')}",
+            "- Method contract hash: "
+            f"{v20_8_confirmation.get('methodContractHash')}",
+            "- Leave-one-independent-sector-out validation: True",
+            "- Long-baseline frequency resolution: "
+            f"{v20_8_confirmation.get('longBaselineFrequencyResolutionCyclesPerDay')} "
+            "cycles/day",
+            "- Aggregate predictive decision: "
+            f"{v20_8_confirmation.get('aggregateDecision')}",
+            "- Frequency stability: "
+            f"{v20_8_confirmation.get('frequencyStability')}",
+            f"- Classification: {v20_8_confirmation.get('classification')}",
+            "- Physical mechanism resolved: "
+            f"{v20_8_confirmation.get('physicalMechanismResolved')}",
+            f"- Claim level changed: {v20_8_confirmation.get('claimLevelChanged')}",
+            "- Recommended next test: "
+            f"{v20_8_confirmation.get('recommendedNextTest')}",
+            "",
+            "### Held-out sector evidence",
+            "",
+        ])
+        for fold in v20_8_confirmation.get("perSectorEvidence") or []:
+            lines.append(
+                "- Held-out sector "
+                f"{fold.get('heldOutSector')}: training={fold.get('trainingSectors')}, "
+                "learnedCoherentFrequency="
+                f"{fold.get('learnedCoherentFrequencyCyclesPerDay')}, "
+                f"exactHarmonicFrequency={fold.get('exactHarmonicFrequencyCyclesPerDay')}, "
+                f"separation={fold.get('frequencySeparationCyclesPerDay')}, "
+                f"predictiveBIC={fold.get('predictiveBIC')}, "
+                f"deltas={fold.get('predictiveBICDeltas')}, "
+                f"support={fold.get('support')}, "
+                "failureOrInsufficiencyReasons="
+                f"{fold.get('failureOrInsufficiencyReasons')}"
             )
 
     nonstationary = conclusion.get("nonstationaryModeling")
@@ -5235,6 +5321,193 @@ def build_engine(
             input_hashes={
                 "morphology": sha256_json(morphology),
                 "timeFrequencyInterpretation": sha256_json(interpreted),
+            },
+            artifacts=(_artifact(artifact_path, "application/json"),),
+        )
+
+    def v20_8_long_baseline_time_frequency_confirmation_stage(
+        investigation, request
+    ):
+        """Confirm the exact unresolved terminal v20.8 residual boundary."""
+        prepared = _result(investigation, "001-prepare-target")
+        summary_stage = next((
+            stage for stage in investigation.stages
+            if stage.id == request.triggered_by_stage_id
+            and stage.handler_id == "openstar.tess.time-frequency.summarize"
+            and stage.status == "COMPLETE"
+            and isinstance(stage.result, dict)
+        ), None)
+        interpretation_stage = next((
+            stage for stage in investigation.stages
+            if summary_stage is not None
+            and stage.id == summary_stage.triggered_by_stage_id
+            and stage.handler_id == "openstar.tess.time-frequency.interpret"
+            and stage.status == "COMPLETE"
+            and isinstance(stage.result, dict)
+        ), None)
+        run_stage = next((
+            stage for stage in investigation.stages
+            if interpretation_stage is not None
+            and stage.id == interpretation_stage.triggered_by_stage_id
+            and stage.handler_id == "openstar.tess.time-frequency.run"
+            and stage.status == "COMPLETE"
+            and isinstance(stage.result, dict)
+        ), None)
+        preparation_stage = next((
+            stage for stage in investigation.stages
+            if run_stage is not None
+            and stage.id == run_stage.triggered_by_stage_id
+            and stage.handler_id == "openstar.tess.time-frequency.prepare"
+            and stage.status == "COMPLETE"
+            and isinstance(stage.result, dict)
+        ), None)
+        morphology_stage = None
+        if summary_stage is not None:
+            summary_position = investigation.stages.index(summary_stage)
+            morphology_stage = next((
+                stage for stage in reversed(
+                    investigation.stages[:summary_position]
+                )
+                if stage.handler_id == "openstar.tess.morphology.analyze"
+                and stage.status == "COMPLETE"
+                and isinstance(stage.result, dict)
+            ), None)
+        current = investigation.stages[-1] if investigation.stages else None
+        terminal = (
+            investigation.stages[-2]
+            if len(investigation.stages) >= 2 else None
+        )
+        if any(stage is None for stage in (
+            summary_stage, interpretation_stage, run_stage, preparation_stage,
+            morphology_stage, terminal, current,
+        )):
+            raise RuntimeError(
+                "v20.8 long-baseline confirmation requires the exact completed "
+                "prepare/run/interpret/summarize lineage."
+            )
+        summary_index = investigation.stages.index(summary_stage)
+        if not (
+            current.id == request.id
+            and current.handler_id
+            == V20_8_LONG_BASELINE_TIME_FREQUENCY_CONFIRMATION_HANDLER_ID
+            and current.status == "RUNNING"
+            and terminal.handler_id == "openstar.tess.finalize"
+            and terminal.status == "COMPLETE"
+            and terminal.stop is True
+            and terminal.triggered_by_stage_id == summary_stage.id
+            and terminal.parameters.get("outputSuffix") == "v20.8"
+            and isinstance(terminal.result, dict)
+            and terminal.result.get("timeFrequencyEvolution")
+            == summary_stage.result
+            and terminal.result.get("recommendedNextTest")
+            == "LONG_BASELINE_TIME_FREQUENCY_CONFIRMATION"
+            and tuple(investigation.stages[summary_index + 1:])
+            == (terminal, current)
+        ):
+            raise RuntimeError(
+                "v20.8 long-baseline confirmation requires the exact "
+                "terminal v20.8 finalization boundary."
+            )
+        interpretation_hashes = (
+            interpretation_stage.provenance.input_hashes
+            if interpretation_stage.provenance else {}
+        )
+        summary_hashes = (
+            summary_stage.provenance.input_hashes
+            if summary_stage.provenance else {}
+        )
+        preparation_hashes = (
+            preparation_stage.provenance.input_hashes
+            if preparation_stage.provenance else {}
+        )
+        if not (
+            interpretation_hashes.get("preparation")
+            == sha256_json(preparation_stage.result)
+            and interpretation_hashes.get("projectResult")
+            == sha256_json(run_stage.result)
+            and preparation_hashes.get("morphology")
+            == sha256_json(morphology_stage.result)
+            and summary_hashes.get("morphology")
+            == sha256_json(morphology_stage.result)
+            and summary_hashes.get("timeFrequencyInterpretation")
+            == sha256_json(interpretation_stage.result)
+        ):
+            raise RuntimeError(
+                "v20.8 time-frequency provenance no longer matches its "
+                "completed lineage."
+            )
+
+        # Freeze and hash every scientific/modeling choice before any frozen
+        # residual-window file (and therefore any flux value) is opened.
+        contract = build_v20_8_long_baseline_method_contract(
+            preparation=preparation_stage.result,
+            interpretation=interpretation_stage.result,
+            summary=summary_stage.result,
+        )
+        contract_hash = v20_8_long_baseline_method_contract_hash(contract)
+        dataset_specs = build_v20_8_long_baseline_dataset_specs(
+            expected_tic_id=int(prepared["ticID"]),
+            preparation=preparation_stage.result,
+        )
+        result = analyze_v20_8_long_baseline_time_frequency_confirmation(
+            method_contract=contract,
+            dataset_specs=dataset_specs,
+        )
+        if not (
+            result.get("methodContractHash") == contract_hash
+            and result.get("physicalMechanismResolved") is False
+            and result.get("claimLevelChanged") is False
+            and result.get("automaticDiscoveryClaim") is False
+        ):
+            raise RuntimeError(
+                "v20.8 long-baseline confirmation violated its frozen contract."
+            )
+
+        print("🔭 v20.8 long-baseline time-frequency confirmation")
+        print(f"   method contract: {result.get('methodContractID')}")
+        print(f"   method hash: {result.get('methodContractHash')}")
+        for fold in result.get("perSectorEvidence") or []:
+            print(
+                f"   held-out sector {fold.get('heldOutSector')}: "
+                f"support={fold.get('support')}, "
+                "learned frequency="
+                f"{fold.get('learnedCoherentFrequencyCyclesPerDay')}"
+            )
+        print(f"   classification: {result.get('classification')}")
+        print("   physical mechanism resolved: False")
+        print(f"   recommended next test: {result.get('recommendedNextTest')}")
+
+        artifact_path = (
+            store.directory_for(investigation.id)
+            / "artifacts"
+            / "long-baseline-time-frequency-confirmation"
+            / "long-baseline-time-frequency-confirmation-v20.8.1.json"
+        )
+        _write_json(artifact_path, result)
+        return StageOutcome(
+            result=result,
+            next_stage=(
+                v20_8_long_baseline_time_frequency_confirmation_continuation(
+                    result, request_id=request.id
+                )
+            ),
+            input_hashes={
+                "methodContract": contract_hash,
+                "morphology": sha256_json(morphology_stage.result),
+                "timeFrequencyPreparation": sha256_json(
+                    preparation_stage.result
+                ),
+                "timeFrequencyProjectResult": sha256_json(run_stage.result),
+                "timeFrequencyInterpretation": sha256_json(
+                    interpretation_stage.result
+                ),
+                "timeFrequencySummary": sha256_json(summary_stage.result),
+                **{
+                    "frozenWindowDataset:"
+                    f"{spec['role']}:{spec['sector']}:{spec['windowIndex']}":
+                    sha256_file(spec["datasetPath"])
+                    for spec in dataset_specs
+                },
             },
             artifacts=(_artifact(artifact_path, "application/json"),),
         )
@@ -11239,6 +11512,12 @@ def build_engine(
             investigation,
             "openstar.tess.time-frequency.summarize",
         )
+        v20_8_long_baseline_time_frequency_confirmation = (
+            _latest_result_for_handler(
+                investigation,
+                V20_8_LONG_BASELINE_TIME_FREQUENCY_CONFIRMATION_HANDLER_ID,
+            )
+        )
         nonstationary_modeling = _latest_result_for_handler(
             investigation,
             "openstar.tess.nonstationary.summarize",
@@ -11566,6 +11845,24 @@ def build_engine(
             )
             existing_rationale.append(
                 f"Recommended next confirmation step: {time_frequency_evolution.get('recommendedNextTest')}."
+            )
+            claim_decision = {
+                "claim": claim_decision["claim"],
+                "rationale": existing_rationale,
+            }
+
+        if v20_8_long_baseline_time_frequency_confirmation is not None:
+            existing_rationale = list(claim_decision.get("rationale") or [])
+            existing_rationale.append(
+                "v20.8.1 leave-one-independent-sector-out long-baseline "
+                "time-frequency confirmation classifies the unresolved "
+                "residual structure as "
+                f"{v20_8_long_baseline_time_frequency_confirmation.get('classification')}; "
+                "it does not upgrade the claim or resolve the physical mechanism."
+            )
+            existing_rationale.append(
+                "Recommended next confirmation step: "
+                f"{v20_8_long_baseline_time_frequency_confirmation.get('recommendedNextTest')}."
             )
             claim_decision = {
                 "claim": claim_decision["claim"],
@@ -12727,6 +13024,9 @@ def build_engine(
             "sourceLocalization": source_localization,
             "multiModeDecomposition": multimode_decomposition,
             "timeFrequencyEvolution": time_frequency_evolution,
+            "longBaselineTimeFrequencyConfirmation": (
+                v20_8_long_baseline_time_frequency_confirmation
+            ),
             "nonstationaryModeling": nonstationary_modeling,
             "modeIdentification": mode_identification,
             "longBaselineFrequencyConfirmation": (
@@ -12855,6 +13155,16 @@ def build_engine(
             cross = source_localization.get("crossSector") or {}
             print(f"   source localization: {cross.get('classification')}")
             print(f"   variable signal origin: {cross.get('variableSignalOrigin')}")
+        if v20_8_long_baseline_time_frequency_confirmation is not None:
+            print(
+                "   long-baseline time-frequency confirmation: "
+                f"{v20_8_long_baseline_time_frequency_confirmation.get('classification')}"
+            )
+            print("   physical mechanism resolved: False")
+            print(
+                "   recommended next test: "
+                f"{v20_8_long_baseline_time_frequency_confirmation.get('recommendedNextTest')}"
+            )
         if nonstationary_modeling is not None:
             comparison = nonstationary_modeling.get("modelComparison") or {}
             print(f"   long-baseline residual model: {nonstationary_modeling.get('classification')}")
@@ -12863,6 +13173,8 @@ def build_engine(
             print(f"   fractional frequency drift/day: {nonstationary_modeling.get('fractionalFrequencyDriftPerDay')}")
             if residual_mode_localization is None:
                 print(f"   recommended next test: {nonstationary_modeling.get('recommendedNextTest')}")
+        elif v20_8_long_baseline_time_frequency_confirmation is not None:
+            pass
         elif time_frequency_evolution is not None:
             residual = time_frequency_evolution.get("residualEvolution") or {}
             family = time_frequency_evolution.get("familyEvolution") or {}
@@ -13337,6 +13649,10 @@ def build_engine(
     engine.register_handler(
         "openstar.tess.time-frequency.summarize",
         time_frequency_summary_stage,
+    )
+    engine.register_handler(
+        V20_8_LONG_BASELINE_TIME_FREQUENCY_CONFIRMATION_HANDLER_ID,
+        v20_8_long_baseline_time_frequency_confirmation_stage,
     )
     engine.register_handler(
         "openstar.tess.nonstationary.prepare",
