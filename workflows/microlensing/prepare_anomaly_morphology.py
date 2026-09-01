@@ -61,6 +61,7 @@ MORPHOLOGY_CONTRACT_ID = (
     "openstar.microlensing-anomaly-morphology-contract.v1"
 )
 MORPHOLOGY_CONTRACT_VERSION = "1.0"
+MORPHOLOGY_FAMILY_ID = "openstar.microlensing-residual-morphology.v1"
 MORPHOLOGY_DATASET_SCHEMA_ID = (
     "openstar.microlensing-anomaly-morphology-dataset.v1"
 )
@@ -96,6 +97,11 @@ ORDERED_OVER_POSITIVE_MINIMUM_PER_SERIES_DELTA_WRSS = 9.0
 ORDERED_OVER_POSITIVE_MINIMUM_DELTA_BIC = 10.0
 INDEPENDENT_OVER_ORDERED_MINIMUM_DELTA_WRSS = 18.0
 INDEPENDENT_OVER_ORDERED_MINIMUM_DELTA_BIC = 10.0
+
+RANK_RELATIVE_TOLERANCE = 1.0e-12
+OBJECTIVE_RELATIVE_TOLERANCE = 1.0e-9
+CONSTRAINT_TOLERANCE = 0.0
+TIMING_COMPARISON_TOLERANCE = 0.0
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _FORBIDDEN_IDENTITY_KEYS = frozenset(
@@ -190,6 +196,105 @@ def _safe_product(values: Sequence[int], field_name: str) -> int:
             raise _fail(f"{field_name} exceeds the safe integer range")
         product *= count
     return product
+
+
+def _safe_sum(values: Sequence[int], field_name: str) -> int:
+    total = 0
+    for value in values:
+        count = _exact_count(value, field_name)
+        if total > MAX_SAFE_INTEGER - count:
+            raise _fail(f"{field_name} exceeds the safe integer range")
+        total += count
+    return total
+
+
+def _independent_candidate_layout(
+    *,
+    center_count: int,
+    log_scale_count: int,
+    log_shape_count: int,
+    admitted_ids: Sequence[str],
+    global_offset: int,
+) -> dict[str, Any]:
+    """Build concatenated per-series searches, never a cross-series product."""
+
+    center_count = _exact_count(center_count, "independent center count")
+    log_scale_count = _exact_count(
+        log_scale_count, "independent log-scale count"
+    )
+    log_shape_count = _exact_count(
+        log_shape_count, "independent log-shape count"
+    )
+    global_offset = _exact_count(global_offset, "independent global offset")
+    if center_count < 2 or log_scale_count < 1 or log_shape_count < 1:
+        raise _fail("independent search axes are empty")
+    if len(set(admitted_ids)) != len(admitted_ids) or not admitted_ids:
+        raise _fail("independent series order is invalid")
+
+    ordered_center_pair_count = _safe_product(
+        [center_count, center_count - 1], "ordered center-pair numerator"
+    ) // 2
+    per_series_count = _safe_product(
+        [
+            ordered_center_pair_count,
+            log_scale_count,
+            log_shape_count,
+            log_scale_count,
+            log_shape_count,
+        ],
+        "independent per-series candidate count",
+    )
+    total_count = _safe_product(
+        [per_series_count, len(admitted_ids)],
+        "independent total candidate count",
+    )
+    if global_offset > MAX_SAFE_INTEGER - total_count:
+        raise _fail("independent candidate offset exceeds the safe integer range")
+
+    searches: list[dict[str, Any]] = []
+    for ordinal, series_id in enumerate(admitted_ids):
+        relative_offset = _safe_product(
+            [ordinal, per_series_count], "series offset"
+        )
+        start = _safe_sum(
+            [global_offset, relative_offset],
+            "independent series offset",
+        )
+        end = _safe_sum([start, per_series_count], "independent series end")
+        searches.append(
+            {
+                "candidateCount": per_series_count,
+                "canonicalSeriesIndex": ordinal,
+                "genericSeriesID": _nonempty_string(
+                    series_id, "independent generic series ID"
+                ),
+                "globalEndExclusive": end,
+                "globalStartIndex": start,
+            }
+        )
+    return {
+        "centerPairIndexFormula": (
+            "pairIndex = negativeCenterIndex * "
+            "(2 * centerCount - negativeCenterIndex - 1) // 2 + "
+            "(positiveCenterIndex - negativeCenterIndex - 1)"
+        ),
+        "independentSeriesSearches": searches,
+        "localMixedRadixFormula": (
+            "localIndex = ((((pairIndex * logScaleCount + "
+            "negativeLogScaleIndex) * logShapeCount + "
+            "negativeLogShapeIndex) * logScaleCount + "
+            "positiveLogScaleIndex) * logShapeCount + "
+            "positiveLogShapeIndex)"
+        ),
+        "orderedCenterPairCount": ordered_center_pair_count,
+        "orderedCenterPairRule": (
+            "Enumerate negativeCenterIndex ascending, then positiveCenterIndex "
+            "ascending, retaining exactly 0 <= negativeCenterIndex < "
+            "positiveCenterIndex < centerCount."
+        ),
+        "perSeriesCandidateCount": per_series_count,
+        "totalCandidateCount": total_count,
+    }
 
 
 def _assert_identity_isolated(value: Any) -> None:
@@ -762,67 +867,62 @@ def _model_axes(
         "POSITIVE_LOG_SCALE",
         "POSITIVE_LOG_SHAPE",
     ]
-    independent_order: list[str] = []
-    for series_id in admitted_ids:
-        independent_order.extend(
-            [f"{series_id}:NEGATIVE_CENTER", f"{series_id}:POSITIVE_CENTER"]
-        )
-    independent_order.extend(
-        [
-            "NEGATIVE_LOG_SCALE",
-            "NEGATIVE_LOG_SHAPE",
-            "POSITIVE_LOG_SCALE",
-            "POSITIVE_LOG_SHAPE",
-        ]
-    )
+    independent_order = [
+        "NEGATIVE_CENTER_PAIR_POSITIVE_CENTER",
+        "NEGATIVE_LOG_SCALE",
+        "NEGATIVE_LOG_SHAPE",
+        "POSITIVE_LOG_SCALE",
+        "POSITIVE_LOG_SHAPE",
+    ]
     counts = {
         "CENTER": center_count,
         "LOG_SCALE": log_scale_count,
         "LOG_SHAPE": len(fixed_log_shapes),
         "SEPARATION": separation_count,
     }
+    positive_count = _safe_product(
+        [counts[item] for item in positive_order], "positive model candidates"
+    )
+    ordered_count = _safe_product(
+        [
+            center_count,
+            separation_count,
+            log_scale_count,
+            len(fixed_log_shapes),
+            log_scale_count,
+            len(fixed_log_shapes),
+        ],
+        "ordered-doublet candidates",
+    )
+    ordered_offset = positive_count
+    independent_offset = _safe_sum(
+        [positive_count, ordered_count], "independent class offset"
+    )
+    independent_layout = _independent_candidate_layout(
+        center_count=center_count,
+        log_scale_count=log_scale_count,
+        log_shape_count=len(fixed_log_shapes),
+        admitted_ids=admitted_ids,
+        global_offset=independent_offset,
+    )
     model_counts = {
-        POSITIVE_PULSE_ONLY: _safe_product(
-            [counts[item] for item in positive_order], "positive model candidates"
-        ),
-        ORDERED_NEGATIVE_POSITIVE_DOUBLET: _safe_product(
-            [
-                center_count,
-                separation_count,
-                log_scale_count,
-                len(fixed_log_shapes),
-                log_scale_count,
-                len(fixed_log_shapes),
-            ],
-            "ordered-doublet candidates",
-        ),
-        INDEPENDENT_PULSES: _safe_product(
-            [center_count] * (2 * len(admitted_ids))
-            + [
-                log_scale_count,
-                len(fixed_log_shapes),
-                log_scale_count,
-                len(fixed_log_shapes),
-            ],
-            "independent-pulse candidates",
-        ),
+        POSITIVE_PULSE_ONLY: positive_count,
+        ORDERED_NEGATIVE_POSITIVE_DOUBLET: ordered_count,
+        INDEPENDENT_PULSES: independent_layout["totalCandidateCount"],
     }
-    offsets: dict[str, int] = {}
-    next_offset = 0
-    for model_id in MODEL_CLASS_IDS:
-        offsets[model_id] = next_offset
-        candidate_count = model_counts[model_id]
-        if next_offset > MAX_SAFE_INTEGER - candidate_count:
-            raise _fail("global candidate index exceeds safe integer range")
-        next_offset += candidate_count
+    offsets = {
+        POSITIVE_PULSE_ONLY: 0,
+        ORDERED_NEGATIVE_POSITIVE_DOUBLET: ordered_offset,
+        INDEPENDENT_PULSES: independent_offset,
+    }
+    global_count = _safe_sum(
+        [positive_count, ordered_count, independent_layout["totalCandidateCount"]],
+        "global candidate count",
+    )
     mapping = {
         "axisSourceByModelClass": {
             INDEPENDENT_PULSES: {
-                **{
-                    f"{series_id}:{component}_CENTER": "CENTER"
-                    for series_id in admitted_ids
-                    for component in ("NEGATIVE", "POSITIVE")
-                },
+                "NEGATIVE_CENTER_PAIR_POSITIVE_CENTER": "CENTER",
                 "NEGATIVE_LOG_SCALE": "LOG_SCALE",
                 "NEGATIVE_LOG_SHAPE": "LOG_SHAPE",
                 "POSITIVE_LOG_SCALE": "LOG_SCALE",
@@ -849,12 +949,14 @@ def _model_axes(
         },
         "candidateCounts": model_counts,
         "globalCandidateOffsets": offsets,
-        "globalCandidateCount": next_offset,
+        "globalCandidateCount": global_count,
+        "independentPerSeriesMapping": independent_layout,
         "linearizationRule": (
-            "Model classes use the declared class order. Within a class, the "
-            "rightmost declared axis varies fastest. The local mixed-radix "
-            "index is added to that class's global candidate offset."
+            "Shared model classes use the declared class order and rightmost-"
+            "fastest mixed radix. INDEPENDENT_PULSES concatenates canonical "
+            "per-series searches; it never forms a product across series."
         ),
+        "maximumSafeInteger": MAX_SAFE_INTEGER,
     }
     return axes, mapping
 
@@ -900,8 +1002,8 @@ def _morphology_contract(
         },
         INDEPENDENT_PULSES: {
             "linear": 3 * series_count,
-            "nonlinear": 2 * series_count + 4,
-            "total": 5 * series_count + 4,
+            "nonlinear": 6 * series_count,
+            "total": 9 * series_count,
         },
     }
     return {
@@ -921,12 +1023,29 @@ def _morphology_contract(
         "benchmarkKind": "known-event-recovery",
         "candidateIndexMapping": candidate_mapping,
         "comparisonMetrics": {
-            "AICc": (
-                "WRSS + 2*k + 2*k*(k+1)/(N-k-1); invalid when N<=k+1"
+            "AICc": {
+                "formula": "WRSS + 2*k + 2*k*(k+1)/(N-k-1)",
+                "undefinedRule": (
+                    "When N <= k + 1, emit value null and defined false; an "
+                    "undefined AICc sorts after every finite AICc."
+                ),
+            },
+            "BIC": {
+                "formula": "WRSS + k*ln(N)",
+                "logarithm": "natural logarithm",
+                "invalidRule": "N <= 0 or a nonfinite result is invalid",
+            },
+            "N": (
+                "Integer sum, in canonical series order, of samples whose "
+                "inverse variance is strictly greater than zero."
             ),
-            "BIC": "WRSS + k*log(N)",
-            "N": "total positive-weight prepared samples across all series",
-            "WRSS": "sum of per-series weighted residual sums of squares",
+            "WRSS": (
+                "Binary64 sum of per-series WRSS in canonical series order; "
+                "each per-series WRSS uses source sample order."
+            ),
+            "zeroConstrainedAmplitudeParameterCountRule": (
+                "Nominal k is never reduced when a constrained amplitude is zero."
+            ),
             "parameterCounts": parameter_counts,
         },
         "contractHashRule": (
@@ -935,13 +1054,204 @@ def _morphology_contract(
         ),
         "contractID": MORPHOLOGY_CONTRACT_ID,
         "contractVersion": MORPHOLOGY_CONTRACT_VERSION,
+        "familyIdentities": {
+            "componentTemplateFamilyID": FAMILY_ID,
+            "componentTemplateScope": (
+                "Identifies only one unit symmetric radial component, not any "
+                "compound morphology model class."
+            ),
+            "morphologyFamilyID": MORPHOLOGY_FAMILY_ID,
+            "morphologyFamilyScope": (
+                "Identifies the three compound residual-morphology classes and "
+                "their deterministic execution contract."
+            ),
+        },
         "crossSeriesRequirements": {
             "independentTimingConsistencyTolerance": axes["CENTER"]["step"],
+            "timingComparisonTolerance": TIMING_COMPARISON_TOLERANCE,
             "orderedCentersAndShapesSharedAcrossSeries": True,
             "orderedPerSeriesSigns": ["negative", "positive"],
             "positivePulsePerSeriesSign": "positive",
             "positiveWeightSupportPerComponentPerSeries": (
                 MINIMUM_COMPONENT_POSITIVE_WEIGHT_SUPPORT
+            ),
+        },
+        "deterministicExecution": {
+            "arithmetic": {
+                "format": "IEEE-754 binary64",
+                "roundingMode": "roundTiesToEven",
+                "operationRules": (
+                    "Evaluate operations in the written order; do not use fused "
+                    "multiply-add, reassociate expressions, or parallelize reductions."
+                ),
+            },
+            "componentBasis": {
+                "equation": (
+                    "scale=exp(logScale); shape=exp(logShape); "
+                    "z=(coordinate-center)/scale; uSquared=shape*shape+z*z; "
+                    "basis=(uSquared+2)/(sqrt(uSquared)*sqrt(uSquared+4))"
+                ),
+                "evaluationOrder": [
+                    "scale = exp(logScale)",
+                    "shape = exp(logShape)",
+                    "difference = coordinate - center",
+                    "z = difference / scale",
+                    "shapeSquared = shape * shape",
+                    "zSquared = z * z",
+                    "uSquared = shapeSquared + zSquared",
+                    "u = sqrt(uSquared)",
+                    "numerator = uSquared + 2.0",
+                    "rooted = sqrt(uSquared + 4.0)",
+                    "denominator = u * rooted",
+                    "basis = numerator / denominator",
+                ],
+                "geometryRule": (
+                    "center is used directly; scale=exp(logScale) and "
+                    "shape=exp(logShape) must be positive and finite."
+                ),
+                "nonfiniteRule": (
+                    "Any nonfinite intermediate makes the candidate invalid."
+                ),
+            },
+            "designMatrices": {
+                POSITIVE_PULSE_ONLY: {
+                    "columnOrder": ["INTERCEPT", "POSITIVE_COMPONENT"],
+                    "rowOrder": "sourceSampleIndices order",
+                },
+                ORDERED_NEGATIVE_POSITIVE_DOUBLET: {
+                    "columnOrder": [
+                        "INTERCEPT",
+                        "NEGATIVE_COMPONENT",
+                        "POSITIVE_COMPONENT",
+                    ],
+                    "rowOrder": "sourceSampleIndices order",
+                },
+                INDEPENDENT_PULSES: {
+                    "columnOrder": [
+                        "INTERCEPT",
+                        "NEGATIVE_COMPONENT",
+                        "POSITIVE_COMPONENT",
+                    ],
+                    "rowOrder": "sourceSampleIndices order",
+                    "scope": "one independent design matrix per canonical series",
+                },
+            },
+            "weightRules": {
+                "negative": "INVALID_NEGATIVE_WEIGHT",
+                "positive": (
+                    "Contributes to normal equations, rank support, N, and WRSS."
+                ),
+                "zero": (
+                    "Retain the row and published value, but do not update normal "
+                    "equations or N; its WRSS contribution is exact +0.0."
+                ),
+            },
+            "amplitudeConstraints": {
+                "NEGATIVE_COMPONENT": "amplitude <= 0.0",
+                "POSITIVE_COMPONENT": "amplitude >= 0.0",
+                "constraintTolerance": CONSTRAINT_TOLERANCE,
+                "zeroRule": (
+                    "Exact zero satisfies either feasibility constraint, is labeled "
+                    "zero, and fails every strict sign-evidence decision requirement."
+                ),
+            },
+            "normalEquations": {
+                "accumulation": (
+                    "Initialize every Gram and right-hand-side entry to +0.0. "
+                    "For each positive-weight sample in source order, update the "
+                    "upper Gram triangle with j ascending from 0 and k ascending "
+                    "from j, then update the right-hand side with j ascending from "
+                    "0. Mirror Gram[j][k] into Gram[k][j] only after accumulation."
+                ),
+                "gramTerm": "weight * column[j] * column[k]",
+                "rightHandSideTerm": "weight * column[j] * residualValue",
+            },
+            "constrainedLinearFit": {
+                "activeSetOrder": {
+                    POSITIVE_PULSE_ONLY: ["FREE", "ZERO"],
+                    ORDERED_NEGATIVE_POSITIVE_DOUBLET: [
+                        "FREE_FREE",
+                        "ZERO_FREE",
+                        "FREE_ZERO",
+                        "ZERO_ZERO",
+                    ],
+                    INDEPENDENT_PULSES: [
+                        "FREE_FREE",
+                        "ZERO_FREE",
+                        "FREE_ZERO",
+                        "ZERO_ZERO",
+                    ],
+                },
+                "twoComponentStateOrder": [
+                    "NEGATIVE_COMPONENT",
+                    "POSITIVE_COMPONENT",
+                ],
+                "algorithm": (
+                    "Enumerate active states in the declared order. The offset is "
+                    "always free; ZERO amplitudes are exact +0.0. Solve remaining "
+                    "free columns, discard sign-infeasible states, and choose the "
+                    "lowest WRSS; tolerance ties choose the lower state ordinal."
+                ),
+                "activeSetTieBreak": "lower declared active-state ordinal",
+            },
+            "linearSolve": {
+                "algorithm": "Gaussian elimination with partial pivoting",
+                "eliminationOrder": (
+                    "Pivot columns ascend; elimination rows and columns ascend; "
+                    "back substitution uses descending row order."
+                ),
+                "pivotTieBreak": "largest absolute pivot, then lowest row index",
+                "operationSteps": (
+                    "For pivot p, swap the chosen row with p. For each row r>p "
+                    "ascending, factor=A[r][p]/A[p][p], set A[r][p] to exact "
+                    "+0.0, update A[r][c]=A[r][c]-factor*A[p][c] for c>p "
+                    "ascending, then b[r]=b[r]-factor*b[p]. Back-substitute rows "
+                    "descending, subtracting A[r][c]*beta[c] for c>r ascending, "
+                    "then divide by A[r][r]."
+                ),
+                "rankLimit": (
+                    "rankRelativeTolerance * max(1.0, maximum absolute entry of "
+                    "the original reduced Gram matrix for that active state)"
+                ),
+                "rankRelativeTolerance": RANK_RELATIVE_TOLERANCE,
+                "singularRule": (
+                    "A nonfinite pivot or abs(pivot) <= rankLimit is rank deficient "
+                    "and invalid for that active state."
+                ),
+            },
+            "objective": {
+                "prediction": (
+                    "Initialize prediction=offset, then for each amplitude-bearing "
+                    "design column ascending set prediction=prediction+amplitude*basis."
+                ),
+                "residualSign": "observed residual value - prediction",
+                "wrssAccumulation": (
+                    "Initialize +0.0 and add weight * residual * residual once per "
+                    "sample in source order; every intermediate must be finite."
+                ),
+            },
+            "comparisonTolerances": {
+                "objectiveRelativeTolerance": OBJECTIVE_RELATIVE_TOLERANCE,
+                "comparisonLimit": (
+                    "objectiveRelativeTolerance * max(1.0, abs(left), abs(right))"
+                ),
+                "constraintTolerance": CONSTRAINT_TOLERANCE,
+                "rankRelativeTolerance": RANK_RELATIVE_TOLERANCE,
+                "timingComparisonTolerance": TIMING_COMPARISON_TOLERANCE,
+            },
+            "decisionThresholdComparison": (
+                "Threshold gates use exact binary64 >= comparisons with no objective "
+                "tie tolerance; timing consistency uses its declared tolerance."
+            ),
+            "candidateWinnerOrdering": [
+                "finite WRSS ascending within relative tolerance",
+                "finite BIC ascending within relative tolerance",
+                "finite AICc ascending within relative tolerance; null after finite",
+                "global candidate index ascending",
+            ],
+            "modelWinnerOrdering": (
+                "Apply the same WRSS, BIC, and AICc ordering, then declared "
+                "modelClassOrder; null AICc sorts after finite and null equals null."
             ),
         },
         "decisionRules": {
@@ -966,9 +1276,8 @@ def _morphology_contract(
                 "signRequirementsMustPass": True,
             },
             "tieBreak": (
-                "Lowest finite WRSS, then lowest BIC, then lowest AICc, then "
-                "lowest global candidate index. Exact ties prefer the less "
-                "complex model in declared model-class order."
+                "Use deterministicExecution.candidateWinnerOrdering and its "
+                "declared relative tolerance. Model ties use modelClassOrder."
             ),
         },
         "effectiveWidthBounds": {
@@ -981,9 +1290,9 @@ def _morphology_contract(
             },
         },
         "finiteValueRules": (
-            "All inputs, bases, fitted parameters, objectives, penalties, and "
-            "derived values must be finite; inverse variances must be "
-            "nonnegative and every fitted series must have sufficient rank."
+            "All consumed inputs and all basis, solve, prediction, objective, "
+            "penalty, and aggregate intermediates must be finite. Negative "
+            "weights are invalid; zero weights follow deterministicExecution."
         ),
         "identityIsolationStatement": (
             "Only generic series identifiers and verified identity-free "
@@ -1002,19 +1311,73 @@ def _morphology_contract(
                 "interpretation or discovery."
             ),
         },
-        "invalidCandidateBehavior": (
-            "Retain the candidate index, emit deterministic INVALID status "
-            "with null objective fields, and never select it."
-        ),
+        "invalidCandidateBehavior": {
+            "reasonPriority": [
+                "NONFINITE_INPUT",
+                "NEGATIVE_WEIGHT",
+                "INVALID_GEOMETRY",
+                "INSUFFICIENT_POSITIVE_WEIGHT_SUPPORT",
+                "RANK_DEFICIENT",
+                "NONFINITE_FIT",
+                "NO_FEASIBLE_ACTIVE_SET",
+                "NONFINITE_OBJECTIVE",
+            ],
+            "resultRule": (
+                "Emit status INVALID and the first applicable reason in priority "
+                "order; retain model class, independent series ID when applicable, "
+                "and global and local indices; emit fitted parameters, WRSS, BIC, "
+                "and AICc as null; the result cannot win or aggregate."
+            ),
+        },
+        "independentAggregation": {
+            "acceptedWinnerIdentity": (
+                "Canonical ordered vector of one accepted per-series global "
+                "candidate index; it is not a cross-series Cartesian candidate."
+            ),
+            "requiredInputs": (
+                "Exactly one finite accepted independent winner for every admitted "
+                "series in canonical order; otherwise the aggregate is invalid."
+            ),
+            "WRSS": "sum per-series accepted WRSS in canonical series order",
+            "N": "sum per-series positive-weight N in canonical series order",
+            "parameterCount": 9 * series_count,
+            "informationCriteria": (
+                "Compute global BIC and AICc once from aggregate WRSS, aggregate N, "
+                "and nominal k using comparisonMetrics."
+            ),
+            "negativeCenterDispersion": "max(negative centers) - min(negative centers)",
+            "positiveCenterDispersion": "max(positive centers) - min(positive centers)",
+            "timingDispersion": (
+                "max(negativeCenterDispersion, positiveCenterDispersion); exact "
+                "+0.0 when one series is admitted"
+            ),
+            "timingConsistencyRule": (
+                "timingDispersion <= independentTimingConsistencyTolerance + "
+                "timingComparisonTolerance"
+            ),
+            "decisionRule": (
+                "Compare this aggregate with the ordered-doublet result only by "
+                "the predeclared rejectOrderedDoubletForIndependentPulses rule."
+            ),
+        },
         "modelClassOrder": list(MODEL_CLASS_IDS),
         "modelClasses": {
             INDEPENDENT_PULSES: {
                 "amplitudeConstraints": ["negative", "positive"],
                 "centersSharedAcrossSeries": False,
                 "description": (
-                    "Negative and positive centers vary independently per "
-                    "series; widths and shapes remain shared comparison axes."
+                    "Each series receives a separate six-axis negative-positive "
+                    "search. No nonlinear parameter and no candidate Cartesian "
+                    "product is shared between different series."
                 ),
+                "independentNonlinearParametersPerSeries": [
+                    "negativeCenter",
+                    "positiveCenter",
+                    "negativeLogScale",
+                    "negativeLogShape",
+                    "positiveLogScale",
+                    "positiveLogShape",
+                ],
                 "linearNuisancePerSeries": [
                     "offset",
                     "negativeAmplitude",
@@ -1064,7 +1427,6 @@ def _morphology_contract(
             "minimum": axes["SEPARATION"]["start"],
             "strictNegativeBeforePositive": True,
         },
-        "templateFamilyID": FAMILY_ID,
     }
 
 

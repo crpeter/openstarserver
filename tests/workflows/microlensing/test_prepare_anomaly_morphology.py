@@ -21,6 +21,7 @@ from workflows.microlensing.prepare_anomaly_morphology import (
     MINIMUM_BASELINE_POSITIVE_WEIGHT_SAMPLES_PER_SIDE,
     MORPHOLOGY_CONTRACT_ID,
     MORPHOLOGY_DATASET_SCHEMA_ID,
+    MORPHOLOGY_FAMILY_ID,
     MORPHOLOGY_PREPARATION_SCHEMA_ID,
     NEXT_TEST,
     ORDERED_NEGATIVE_POSITIVE_DOUBLET,
@@ -28,6 +29,7 @@ from workflows.microlensing.prepare_anomaly_morphology import (
     PREPARATION_RELATIVE_PATH,
     AnomalyMorphologyPreparationError,
     _assert_identity_isolated,
+    _independent_candidate_layout,
     _parser,
     _source_arrays,
     prepare_anomaly_morphology,
@@ -334,6 +336,32 @@ class AnomalyMorphologySuccessTests(AnomalyMorphologyFixture):
                 "centersSharedAcrossSeries"
             ]
         )
+        independent = mapping["independentPerSeriesMapping"]
+        center_count = axes["CENTER"]["count"]
+        expected_pairs = center_count * (center_count - 1) // 2
+        expected_per_series = (
+            expected_pairs
+            * axes["LOG_SCALE"]["count"]
+            * axes["LOG_SHAPE"]["count"]
+            * axes["LOG_SCALE"]["count"]
+            * axes["LOG_SHAPE"]["count"]
+        )
+        self.assertEqual(expected_pairs, independent["orderedCenterPairCount"])
+        self.assertEqual(expected_per_series, independent["perSeriesCandidateCount"])
+        self.assertEqual(
+            expected_per_series * len(contract["admittedGenericSeriesIDs"]),
+            counts[INDEPENDENT_PULSES],
+        )
+        for ordinal, search in enumerate(
+            independent["independentSeriesSearches"]
+        ):
+            expected_start = offsets[INDEPENDENT_PULSES] + ordinal * expected_per_series
+            self.assertEqual(ordinal, search["canonicalSeriesIndex"])
+            self.assertEqual(expected_start, search["globalStartIndex"])
+            self.assertEqual(
+                expected_start + expected_per_series,
+                search["globalEndExclusive"],
+            )
         self.assertIn("AICc", contract["comparisonMetrics"])
         self.assertIn("BIC", contract["comparisonMetrics"])
         self.assertEqual(
@@ -347,6 +375,134 @@ class AnomalyMorphologySuccessTests(AnomalyMorphologyFixture):
             contract["decisionRules"][
                 "rejectOrderedDoubletForIndependentPulses"
             ]["globalDeltaWRSSAtLeast"],
+        )
+
+    def test_independent_search_growth_is_linear_without_cross_series_product(self):
+        two = _independent_candidate_layout(
+            center_count=7,
+            log_scale_count=3,
+            log_shape_count=2,
+            admitted_ids=("series-001", "series-002"),
+            global_offset=11,
+        )
+        three = _independent_candidate_layout(
+            center_count=7,
+            log_scale_count=3,
+            log_shape_count=2,
+            admitted_ids=("series-001", "series-002", "series-003"),
+            global_offset=11,
+        )
+        per_series = 21 * 3 * 2 * 3 * 2
+        self.assertEqual(per_series, two["perSeriesCandidateCount"])
+        self.assertEqual(2 * per_series, two["totalCandidateCount"])
+        self.assertEqual(3 * per_series, three["totalCandidateCount"])
+        self.assertEqual(
+            per_series,
+            three["totalCandidateCount"] - two["totalCandidateCount"],
+        )
+        self.assertNotEqual(
+            two["totalCandidateCount"] * per_series,
+            three["totalCandidateCount"],
+        )
+        self.assertEqual(
+            [11, 11 + per_series, 11 + 2 * per_series],
+            [
+                record["globalStartIndex"]
+                for record in three["independentSeriesSearches"]
+            ],
+        )
+        self.assertIn(
+            "negativeCenterIndex < positiveCenterIndex",
+            three["orderedCenterPairRule"],
+        )
+        self.assertIn("pairIndex", three["localMixedRadixFormula"])
+
+    def test_independent_search_rejects_unsafe_counts_and_offsets(self):
+        for parameters in (
+            {
+                "center_count": 1 << 53,
+                "log_scale_count": 2,
+                "log_shape_count": 1,
+                "admitted_ids": ("series-001",),
+                "global_offset": 0,
+            },
+            {
+                "center_count": 2,
+                "log_scale_count": 1,
+                "log_shape_count": 1,
+                "admitted_ids": ("series-001",),
+                "global_offset": (1 << 53) - 1,
+            },
+        ):
+            with self.subTest(parameters=parameters):
+                with self.assertRaises(AnomalyMorphologyPreparationError):
+                    _independent_candidate_layout(**parameters)
+
+    def test_contract_freezes_cross_platform_execution_semantics(self):
+        output, _ = self.prepare()
+        contract = read_json(output / CONTRACT_RELATIVE_PATH)
+        families = contract["familyIdentities"]
+        self.assertEqual(
+            "openstar.curve-family.symmetric-radial-amplification.v1",
+            families["componentTemplateFamilyID"],
+        )
+        self.assertEqual(MORPHOLOGY_FAMILY_ID, families["morphologyFamilyID"])
+        self.assertNotEqual(
+            families["componentTemplateFamilyID"],
+            families["morphologyFamilyID"],
+        )
+        execution = contract["deterministicExecution"]
+        self.assertEqual("IEEE-754 binary64", execution["arithmetic"]["format"])
+        self.assertIn("uSquared", execution["componentBasis"]["equation"])
+        self.assertEqual(
+            ["INTERCEPT", "NEGATIVE_COMPONENT", "POSITIVE_COMPONENT"],
+            execution["designMatrices"][INDEPENDENT_PULSES]["columnOrder"],
+        )
+        self.assertEqual(
+            "INVALID_NEGATIVE_WEIGHT", execution["weightRules"]["negative"]
+        )
+        self.assertIn("do not update", execution["weightRules"]["zero"])
+        self.assertEqual(
+            0.0,
+            execution["amplitudeConstraints"]["constraintTolerance"],
+        )
+        self.assertIn("fails", execution["amplitudeConstraints"]["zeroRule"])
+        self.assertEqual(
+            "Gaussian elimination with partial pivoting",
+            execution["linearSolve"]["algorithm"],
+        )
+        self.assertIn("factor=A[r][p]", execution["linearSolve"]["operationSteps"])
+        self.assertIn("rank deficient", execution["linearSolve"]["singularRule"])
+        self.assertIn(
+            "source order", execution["objective"]["wrssAccumulation"]
+        )
+        self.assertEqual(
+            1.0e-9,
+            execution["comparisonTolerances"]["objectiveRelativeTolerance"],
+        )
+        self.assertIn(
+            "global candidate index ascending",
+            execution["candidateWinnerOrdering"],
+        )
+        metrics = contract["comparisonMetrics"]
+        self.assertIn("value null", metrics["AICc"]["undefinedRule"])
+        self.assertIn(
+            "never reduced", metrics["zeroConstrainedAmplitudeParameterCountRule"]
+        )
+        self.assertEqual(
+            9 * len(contract["admittedGenericSeriesIDs"]),
+            metrics["parameterCounts"][INDEPENDENT_PULSES]["total"],
+        )
+        invalid = contract["invalidCandidateBehavior"]
+        self.assertIn("NONFINITE_INPUT", invalid["reasonPriority"])
+        self.assertIn("RANK_DEFICIENT", invalid["reasonPriority"])
+        self.assertIn("null", invalid["resultRule"])
+        aggregation = contract["independentAggregation"]
+        self.assertIn("canonical series order", aggregation["WRSS"])
+        self.assertIn("max(", aggregation["timingDispersion"])
+        self.assertIn(
+            "not a cross-series Cartesian",
+            aggregation["acceptedWinnerIdentity"],
         )
 
     def test_previous_minimum_width_boundary_is_extended_and_unresolved(self):

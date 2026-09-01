@@ -543,16 +543,35 @@ evaluating them:
 - `ORDERED_NEGATIVE_POSITIVE_DOUBLET` requires a negative component followed
   by a positive component, shared nonlinear timing and shape, and per-series
   offsets and signed component amplitudes.
-- `INDEPENDENT_PULSES` allows each series independent ordered negative and
-  positive centers as the less-constrained comparison while retaining shared
-  width and shape axes.
+- `INDEPENDENT_PULSES` gives every admitted series its own independently
+  indexed six-axis search: negative center, positive center, and separate
+  log-scale and log-shape values for both components. Negative center must
+  strictly precede positive center. Per-series search ranges are concatenated
+  in canonical series order; no Cartesian product is formed between series,
+  so candidate growth is linear in admitted-series count.
 
-Axes, rightmost-fastest mixed-radix candidate ordering, global candidate
-offsets, invalid-candidate behavior, finite-value rules, parameter counts,
-WRSS, BIC, and AICc are fixed in the contract. Widths are strictly positive.
+Axes, rightmost-fastest mixed-radix candidate ordering, safe-integer class and
+per-series offsets, invalid-candidate behavior, finite-value rules, nominal
+parameter counts, WRSS, BIC, and AICc are fixed in the contract. Independent
+per-series winners are aggregated in canonical series order into global WRSS,
+AICc, BIC, timing dispersion, and the predeclared comparison decision. Widths
+are strictly positive.
 The width grid extends at least sixteen-fold below the earlier minimum-width
 boundary and is capped at one quarter of the prepared coordinate span.
 Separation is strictly positive and bounded by the prepared center axis.
+
+The contract distinguishes the canonical single-component template family
+`openstar.curve-family.symmetric-radial-amplification.v1` from the compound
+morphology family `openstar.microlensing-residual-morphology.v1`. It freezes
+the exact symmetric-radial basis equation and operation order, IEEE-754
+binary64 arithmetic, design-matrix column and sample ordering, zero- and
+negative-weight handling, amplitude sign constraints, active-set enumeration,
+partial-pivot Gaussian elimination and rank threshold, source-order WRSS
+accumulation, nominal parameter counts even for zero amplitudes, undefined
+AICc behavior, relative objective tolerance, exact tie ordering, invalid
+results, and independent-series aggregation. These rules are intended to make
+later Python and Swift implementations produce the same deterministic result;
+this preparer does not execute a fit.
 
 The ordered doublet can be preferred over the positive pulse only with global
 delta WRSS at least 30, per-series delta WRSS at least 9, delta BIC at least
@@ -577,4 +596,3 @@ published physical parameters. It does not run the morphology grid, implement
 a binary-lens model, resolve a planetary interpretation, or make a discovery
 claim. The next separate step is
 `DISTRIBUTED_BLIND_MICROLENSING_ANOMALY_MORPHOLOGY_GRID`.
-
