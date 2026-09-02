@@ -148,6 +148,7 @@ from .tess_long_baseline_frequency_confirmation import (
 )
 from .tess_v20_8_long_baseline_time_frequency_confirmation import (
     HANDLER_ID as V20_8_LONG_BASELINE_TIME_FREQUENCY_CONFIRMATION_HANDLER_ID,
+    METHOD_CONTRACT_ID as V20_8_LONG_BASELINE_METHOD_CONTRACT_ID,
     analyze_long_baseline_time_frequency_confirmation as analyze_v20_8_long_baseline_time_frequency_confirmation,
     build_dataset_specs as build_v20_8_long_baseline_dataset_specs,
     build_method_contract as build_v20_8_long_baseline_method_contract,
@@ -1024,10 +1025,7 @@ def v20_8_long_baseline_time_frequency_confirmation_continuation(
             "v20.8 long-baseline time-frequency classification is invalid."
         )
     method_contract_id = summary.get("methodContractID")
-    if method_contract_id == (
-        "openstar.tess.v20-8-long-baseline-time-frequency-confirmation."
-        "leave-one-independent-sector-out.v1"
-    ):
+    if method_contract_id == V20_8_LONG_BASELINE_METHOD_CONTRACT_ID:
         output_suffix = (
             "v20.8.1-long-baseline-time-frequency-confirmation"
         )
@@ -6299,9 +6297,18 @@ def build_engine(
         if confirmed_contract is not None:
             print(f"   method contract: {result.get('methodContractID')}")
             print(f"   method hash: {result.get('methodContractHash')}")
+            period_reference = (
+                (confirmation_stage.result.get("methodContract") or {})
+                .get("evidenceBoundary", {})
+                .get("periodReference", {})
+            )
+            period_label = (
+                "established physical period"
+                if period_reference.get("physicalCycleResolved") is True
+                else "established unresolved family reference"
+            )
             print(
-                "   established unresolved family reference: "
-                f"{established_period} days"
+                f"   {period_label}: {established_period} days"
             )
         else:
             print(f"   established physical period: {established_period} days")

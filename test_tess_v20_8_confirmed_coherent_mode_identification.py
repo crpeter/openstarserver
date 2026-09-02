@@ -28,6 +28,7 @@ from test_tess_v20_8_long_baseline_time_frequency_confirmation import (
 from workflows.tess.tess_autonomy import (
     WORKFLOW_ID,
     WORKFLOW_VERSION,
+    _repair_v20_8_confirmed_coherent_mode_localization_terminal,
     _repair_v20_8_confirmed_coherent_mode_identification_terminal,
 )
 from workflows.tess.tess_investigation import build_engine
@@ -181,10 +182,12 @@ def _mode_result(classification):
 
 
 class ConfirmedCoherentModeFixture(unittest.TestCase):
-    def _history(self, root, *, status="COMPLETE"):
+    def _history(self, root, *, status="COMPLETE", resolved_cycle=False):
         root = Path(root)
         store = InvestigationStore(root / "investigations")
-        preparation, interpretation, summary = _evidence(root)
+        preparation, interpretation, summary = _evidence(
+            root, resolved_cycle=resolved_cycle
+        )
         confirmation_contract = build_confirmation_method_contract(
             preparation=preparation,
             interpretation=interpretation,
@@ -217,8 +220,10 @@ class ConfirmedCoherentModeFixture(unittest.TestCase):
             } for sector in INDEPENDENT_SECTORS]
         }
         morphology = {
-            "physicalCycleResolved": False,
-            "resolvedPhysicalPeriodDays": None,
+            "physicalCycleResolved": resolved_cycle,
+            "resolvedPhysicalPeriodDays": (
+                FAMILY_PERIOD_DAYS if resolved_cycle else None
+            ),
             "continuationEvidence": {
                 "timeFrequencyEvolutionWarranted": True,
                 "analysisReferencePeriodDays": FAMILY_PERIOD_DAYS,
@@ -379,6 +384,78 @@ class ConfirmedCoherentModeFixture(unittest.TestCase):
         )
         return store, investigation, contract, specs
 
+    def _finalized_mode_history(self, root, *, resolved_cycle=False):
+        store, investigation, contract, specs = self._history(
+            root, resolved_cycle=resolved_cycle
+        )
+        with mock.patch(
+            "workflows.tess.tess_mode_identification.identify_residual_mode",
+            return_value=_mode_result("INDEPENDENT_STABLE_MODE"),
+        ):
+            result = analyze_confirmed_coherent_residual_mode(
+                method_contract=contract,
+                dataset_specs=specs,
+            )
+        confirmation = investigation.stages[-2]
+        prepared = investigation.stages[0]
+        input_hashes = {
+            "longBaselineTimeFrequencyConfirmation": sha256_json(
+                confirmation.result
+            ),
+            "confirmedCoherentModeMethodContract": result[
+                "methodContractHash"
+            ],
+            "primaryPreparation": sha256_json(prepared.result),
+        }
+        input_hashes.update({
+            f"frozenDataset:{spec['role']}:{spec['sector']}": sha256_file(
+                spec["datasetPath"]
+            )
+            for spec in specs
+        })
+        mode = InvestigationStage(
+            "020-mode-identification",
+            "openstar.tess.mode-identification.analyze",
+            "COMPLETE",
+            confirmation.id,
+            {
+                "evidenceLineage": (
+                    V20_8_CONFIRMED_COHERENT_MODE_EVIDENCE_LINEAGE
+                )
+            },
+            result=result,
+            provenance=StageProvenance(
+                software_id="fixture",
+                software_version="1",
+                input_hashes=input_hashes,
+            ),
+        )
+        conclusion = copy.deepcopy(investigation.stages[-1].result)
+        conclusion.update({
+            "modeIdentification": result,
+            "recommendedNextTest": "RESIDUAL_MODE_PIXEL_LOCALIZATION",
+        })
+        final = InvestigationStage(
+            "021-finalize",
+            "openstar.tess.finalize",
+            "COMPLETE",
+            mode.id,
+            {
+                "outputSuffix": (
+                    "v20.8.2-confirmed-coherent-mode-identification"
+                )
+            },
+            result=conclusion,
+            stop=True,
+        )
+        investigation = replace(
+            investigation,
+            status="COMPLETE",
+            stages=investigation.stages + (mode, final),
+        )
+        store.save(investigation)
+        return store, investigation
+
 
 class ConfirmedCoherentModeContractTests(ConfirmedCoherentModeFixture):
     def test_method_contract_hash_is_deterministic_before_flux(self):
@@ -429,6 +506,45 @@ class ConfirmedCoherentModeContractTests(ConfirmedCoherentModeFixture):
 
             confirmation["dataReuse"]["frozenWindowDatasetPaths"][-1] = (
                 confirmation["dataReuse"]["frozenWindowDatasetPaths"][0]
+            )
+            with self.assertRaisesRegex(RuntimeError, "exact confirmed"):
+                validate_v20_8_confirmed_coherent_residual(confirmation)
+
+    def test_resolved_physical_cycle_confirmation_is_preserved(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            _, investigation, contract, _ = self._history(
+                temporary, resolved_cycle=True
+            )
+            confirmation = investigation.stages[-2].result
+        self.assertEqual(
+            {
+                "periodDays": FAMILY_PERIOD_DAYS,
+                "kind": "MORPHOLOGY_RESOLVED_PHYSICAL_PERIOD",
+                "physicalCycleResolved": True,
+            },
+            confirmation["methodContract"]["evidenceBoundary"][
+                "periodReference"
+            ],
+        )
+        self.assertEqual(
+            confirmation["methodContractHash"],
+            contract["evidenceBoundary"]["confirmationMethodContractHash"],
+        )
+
+    def test_inconsistent_resolved_period_reference_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            _, investigation, _, _ = self._history(
+                temporary, resolved_cycle=True
+            )
+            confirmation = copy.deepcopy(investigation.stages[-2].result)
+            period_reference = confirmation["methodContract"][
+                "evidenceBoundary"
+            ]["periodReference"]
+            period_reference["physicalCycleResolved"] = False
+            confirmation["methodContractHash"] = (
+                confirmation_method_contract_hash(
+                    confirmation["methodContract"]
+                )
             )
             with self.assertRaisesRegex(RuntimeError, "exact confirmed"):
                 validate_v20_8_confirmed_coherent_residual(confirmation)
@@ -575,6 +691,118 @@ class ConfirmedCoherentModeContinuationTests(ConfirmedCoherentModeFixture):
                     stages=investigation.stages + (existing,),
                 ))
 
+    def test_resolved_physical_cycle_boundary_repairs_append_only(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store, investigation, _, _ = self._history(
+                temporary, resolved_cycle=True
+            )
+            immutable = tuple(
+                json.dumps(asdict(stage), sort_keys=True)
+                for stage in investigation.stages
+            )
+            with mock.patch.object(
+                store, "verified_terminal_stage_ledger_hash",
+                return_value=True,
+            ), mock.patch(
+                "workflows.tess.tess_autonomy._verified_stage_json",
+                return_value=True,
+            ):
+                repaired = (
+                    _repair_v20_8_confirmed_coherent_mode_identification_terminal(
+                        store,
+                        investigation,
+                        investigation.metadata["controlState"],
+                    )
+                )
+        self.assertEqual("RUNNING", repaired.status)
+        self.assertEqual(immutable, tuple(
+            json.dumps(asdict(stage), sort_keys=True)
+            for stage in repaired.stages
+        ))
+        selected = repaired.metadata["controlState"]["selectedExperiment"]
+        self.assertEqual(
+            V20_8_CONFIRMED_COHERENT_MODE_EVIDENCE_LINEAGE,
+            selected["parameters"]["evidenceLineage"],
+        )
+
+    def test_finalized_stable_mode_repairs_to_pixel_localization_once(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store, investigation = self._finalized_mode_history(
+                temporary, resolved_cycle=True
+            )
+            immutable = tuple(
+                json.dumps(asdict(stage), sort_keys=True)
+                for stage in investigation.stages
+            )
+            with mock.patch.object(
+                store,
+                "verified_terminal_stage_ledger_hash",
+                return_value=True,
+            ), mock.patch(
+                "workflows.tess.tess_autonomy._verified_stage_json",
+                return_value=True,
+            ):
+                repaired = (
+                    _repair_v20_8_confirmed_coherent_mode_localization_terminal(
+                        store,
+                        investigation,
+                        investigation.metadata["controlState"],
+                    )
+                )
+                repeated = (
+                    _repair_v20_8_confirmed_coherent_mode_localization_terminal(
+                        store,
+                        repaired,
+                        repaired.metadata["controlState"],
+                    )
+                )
+        self.assertEqual("RUNNING", repaired.status)
+        self.assertEqual(immutable, tuple(
+            json.dumps(asdict(stage), sort_keys=True)
+            for stage in repaired.stages
+        ))
+        selected = repaired.metadata["controlState"]["selectedExperiment"]
+        self.assertEqual(
+            "022-prepare-residual-mode-localization", selected["id"]
+        )
+        self.assertEqual(
+            "openstar.tess.residual-mode-localization.prepare",
+            selected["handler_id"],
+        )
+        self.assertEqual({}, selected["parameters"])
+        self.assertEqual(
+            "020-mode-identification", selected["triggered_by_stage_id"]
+        )
+        self.assertIsNone(repeated)
+
+    def test_mode_localization_repair_rejects_altered_result(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store, investigation = self._finalized_mode_history(temporary)
+            stages = list(investigation.stages)
+            result = copy.deepcopy(stages[-2].result)
+            result["independentModeEvidenceSurvived"] = False
+            stages[-2] = replace(stages[-2], result=result)
+            conclusion = copy.deepcopy(stages[-1].result)
+            conclusion["modeIdentification"] = result
+            stages[-1] = replace(stages[-1], result=conclusion)
+            altered = replace(investigation, stages=tuple(stages))
+            with mock.patch.object(
+                store,
+                "verified_terminal_stage_ledger_hash",
+                return_value=True,
+            ), mock.patch(
+                "workflows.tess.tess_autonomy._verified_stage_json",
+                return_value=True,
+            ):
+                repaired = (
+                    _repair_v20_8_confirmed_coherent_mode_localization_terminal(
+                        store,
+                        altered,
+                        altered.metadata["controlState"],
+                    )
+                )
+        self.assertIsNone(repaired)
+
     def test_rejects_altered_confirmation_and_wrong_recommendation(self):
         for change in ("classification", "recommendedNextTest"):
             with self.subTest(change=change), \
@@ -596,7 +824,9 @@ class ConfirmedCoherentModeContinuationTests(ConfirmedCoherentModeFixture):
 
     def test_handler_persists_v20_8_2_without_claim_or_mechanism_upgrade(self):
         with tempfile.TemporaryDirectory() as temporary:
-            store, investigation, _, _ = self._history(temporary)
+            store, investigation, _, _ = self._history(
+                temporary, resolved_cycle=True
+            )
             frozen_stages = copy.deepcopy(investigation.stages)
             investigation = store.set_status(investigation, "RUNNING")
             coordinator = mock.Mock()
@@ -604,17 +834,21 @@ class ConfirmedCoherentModeContinuationTests(ConfirmedCoherentModeFixture):
                 store, coordinator, poll_interval=0.0, timeout=None
             )
             engine.chain_stages = False
-            completed, finalize = engine.run_stage(
-                investigation,
-                StageRequest(
-                    "020-mode-identification",
-                    "openstar.tess.mode-identification.analyze",
-                    {"evidenceLineage": (
-                        V20_8_CONFIRMED_COHERENT_MODE_EVIDENCE_LINEAGE
-                    )},
-                    "018-long-baseline-time-frequency-confirmation",
-                ),
-                software_id="integration", software_version="1",
+            with mock.patch("builtins.print") as console:
+                completed, finalize = engine.run_stage(
+                    investigation,
+                    StageRequest(
+                        "020-mode-identification",
+                        "openstar.tess.mode-identification.analyze",
+                        {"evidenceLineage": (
+                            V20_8_CONFIRMED_COHERENT_MODE_EVIDENCE_LINEAGE
+                        )},
+                        "018-long-baseline-time-frequency-confirmation",
+                    ),
+                    software_id="integration", software_version="1",
+                )
+            console.assert_any_call(
+                f"   established physical period: {FAMILY_PERIOD_DAYS} days"
             )
             self.assertEqual(frozen_stages, completed.stages[:-1])
             self.assertEqual("openstar.tess.finalize", finalize.handler_id)

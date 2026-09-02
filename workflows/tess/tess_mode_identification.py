@@ -121,6 +121,10 @@ def validate_v20_8_confirmed_coherent_residual(
     )
     frozen_paths = boundary.get("frozenWindowDatasetPaths") or []
     observed_paths = data_reuse.get("frozenWindowDatasetPaths") or []
+    period_reference_identity = (
+        period_reference.get("kind"),
+        period_reference.get("physicalCycleResolved"),
+    )
     exact = (
         value.get("methodContractID")
         == V20_8_CONFIRMATION_METHOD_CONTRACT_ID
@@ -136,9 +140,10 @@ def validate_v20_8_confirmed_coherent_residual(
         and value.get("claimLevelChanged") is False
         and value.get("automaticDiscoveryClaim") is False
         and value.get("leaveOneIndependentSectorOut") is True
-        and period_reference.get("kind")
-        == "UNRESOLVED_FAMILY_ANALYSIS_REFERENCE"
-        and period_reference.get("physicalCycleResolved") is False
+        and period_reference_identity in {
+            ("UNRESOLVED_FAMILY_ANALYSIS_REFERENCE", False),
+            ("MORPHOLOGY_RESOLVED_PHYSICAL_PERIOD", True),
+        }
         and all(math.isfinite(item) and item > 0 for item in finite_positive)
         and math.isfinite(frequency_range)
         and frequency_range >= 0.0

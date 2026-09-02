@@ -22,7 +22,10 @@ from workflows.tess.tess_autonomy import (
     WORKFLOW_VERSION,
     _repair_v20_8_long_baseline_time_frequency_confirmation_terminal,
 )
-from workflows.tess.tess_investigation import build_engine
+from workflows.tess.tess_investigation import (
+    build_engine,
+    v20_8_long_baseline_time_frequency_confirmation_continuation,
+)
 from workflows.tess.tess_v20_8_long_baseline_time_frequency_confirmation import (
     COHERENT,
     HANDLER_ID,
@@ -106,7 +109,7 @@ def _write_window(
     }), encoding="utf-8")
 
 
-def _evidence(root, *, sectors=INDEPENDENT_SECTORS):
+def _evidence(root, *, sectors=INDEPENDENT_SECTORS, resolved_cycle=False):
     prepared_windows = []
     window_results = []
     entries = ((PRIMARY_SECTOR, "primary-time-frequency-window"), *(
@@ -179,8 +182,12 @@ def _evidence(root, *, sectors=INDEPENDENT_SECTORS):
         "familyEvolution": {"classification": "FAMILY_PHASE_EVOLUTION"},
         "periodReference": {
             "periodDays": FAMILY_PERIOD_DAYS,
-            "kind": "UNRESOLVED_FAMILY_ANALYSIS_REFERENCE",
-            "physicalCycleResolved": False,
+            "kind": (
+                "MORPHOLOGY_RESOLVED_PHYSICAL_PERIOD"
+                if resolved_cycle
+                else "UNRESOLVED_FAMILY_ANALYSIS_REFERENCE"
+            ),
+            "physicalCycleResolved": resolved_cycle,
         },
         "physicalMechanismResolved": False,
         "claimLevelChanged": False,
@@ -253,6 +260,59 @@ class V208LongBaselineAnalysisTests(unittest.TestCase):
         self.assertEqual(method_contract_hash(first), method_contract_hash(second))
         self.assertFalse(first["crossValidation"]["heldOutFrequencySelection"])
         self.assertFalse(first["crossValidation"]["heldOutPhaseSelection"])
+
+        continuation = v20_8_long_baseline_time_frequency_confirmation_continuation(
+            {
+                "classification": NONSTATIONARY,
+                "methodContractID": METHOD_CONTRACT_ID,
+                "methodContract": first,
+                "methodContractHash": method_contract_hash(first),
+                "physicalMechanismResolved": False,
+                "claimLevelChanged": False,
+                "automaticDiscoveryClaim": False,
+            },
+            request_id="010-long-baseline-time-frequency-confirmation",
+        )
+        self.assertEqual("openstar.tess.finalize", continuation.handler_id)
+        self.assertEqual(
+            "v20.8.1-long-baseline-time-frequency-confirmation",
+            continuation.parameters["outputSuffix"],
+        )
+
+    def test_method_contract_accepts_resolved_physical_cycle_reference(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            preparation, interpretation, summary = _evidence(
+                temporary, resolved_cycle=True
+            )
+            contract = build_method_contract(
+                preparation=preparation,
+                interpretation=interpretation,
+                summary=summary,
+            )
+        self.assertEqual(
+            {
+                "periodDays": FAMILY_PERIOD_DAYS,
+                "kind": "MORPHOLOGY_RESOLVED_PHYSICAL_PERIOD",
+                "physicalCycleResolved": True,
+            },
+            contract["evidenceBoundary"]["periodReference"],
+        )
+
+    def test_method_contract_rejects_inconsistent_period_reference_identity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            preparation, interpretation, summary = _evidence(
+                temporary, resolved_cycle=True
+            )
+            summary["periodReference"]["physicalCycleResolved"] = False
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "exact terminal v20.8 NONSTATIONARY_VARIABILITY boundary",
+            ):
+                build_method_contract(
+                    preparation=preparation,
+                    interpretation=interpretation,
+                    summary=summary,
+                )
 
     def test_leave_one_sector_out_selection_cannot_read_held_out_flux(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -368,14 +428,18 @@ class V208LongBaselineAnalysisTests(unittest.TestCase):
 
 
 class V208LongBaselineContinuationTests(unittest.TestCase):
-    def _history(self, root, *, status="COMPLETE"):
+    def _history(self, root, *, status="COMPLETE", resolved_cycle=False):
         root = Path(root)
         store = InvestigationStore(root / "investigations")
-        preparation, interpretation, summary = _evidence(root)
+        preparation, interpretation, summary = _evidence(
+            root, resolved_cycle=resolved_cycle
+        )
         run_result = {"datasets": []}
         morphology = {
-            "physicalCycleResolved": False,
-            "resolvedPhysicalPeriodDays": None,
+            "physicalCycleResolved": resolved_cycle,
+            "resolvedPhysicalPeriodDays": (
+                FAMILY_PERIOD_DAYS if resolved_cycle else None
+            ),
             "continuationEvidence": {
                 "timeFrequencyEvolutionWarranted": True,
                 "analysisReferencePeriodDays": FAMILY_PERIOD_DAYS,
@@ -614,6 +678,32 @@ class V208LongBaselineContinuationTests(unittest.TestCase):
             selected["triggered_by_stage_id"],
         )
         self.assertIsNone(repeated)
+
+    def test_automatic_repair_accepts_resolved_physical_cycle_boundary(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store, investigation = self._history(
+                temporary, resolved_cycle=True
+            )
+            control = investigation.metadata["controlState"]
+            with mock.patch.object(
+                store, "verified_terminal_stage_ledger_hash",
+                return_value=True,
+            ), mock.patch(
+                "workflows.tess.tess_autonomy._verified_stage_json",
+                return_value=True,
+            ):
+                repaired = (
+                    _repair_v20_8_long_baseline_time_frequency_confirmation_terminal(
+                        store, investigation, control
+                    )
+                )
+        self.assertEqual("RUNNING", repaired.status)
+        selected = repaired.metadata["controlState"]["selectedExperiment"]
+        self.assertEqual(HANDLER_ID, selected["handler_id"])
+        self.assertEqual(
+            "008-summarize-time-frequency",
+            selected["triggered_by_stage_id"],
+        )
 
     def test_handler_persists_report_without_claim_or_mechanism_upgrade(self):
         with tempfile.TemporaryDirectory() as temporary:
