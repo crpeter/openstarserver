@@ -58,6 +58,7 @@ from .tess_nonstationary import (
     build_recurrent_residual_nonstationary_method_contract,
     validate_confirmed_nonstationary_localization_boundary,
     validate_recurrent_residual_nonstationary_boundary,
+    validate_recurrent_residual_nonstationary_localization_boundary,
 )
 from .tess_residual_external_evidence import (
     HANDLER_ID as RESIDUAL_EXTERNAL_EVIDENCE_HANDLER_ID,
@@ -2468,6 +2469,121 @@ def _repair_confirmed_residual_localization_terminal(
     )
 
 
+def _repair_recurrent_residual_localization_terminal(
+    store: InvestigationStore,
+    investigation: Investigation,
+    control: dict,
+) -> Investigation | None:
+    """Append v20.10 only at the exact finalized v20.9.3 boundary."""
+    if not (
+        investigation.status in {"COMPLETE", "HUMAN_REVIEW_REQUIRED"}
+        and control.get("schedulerAction") == "INVESTIGATION_COMPLETE"
+        and control.get("selectedExperiment") in (None, {})
+        and not any(
+            stage.status == "RUNNING"
+            for stage in investigation.stages
+        )
+        and not any(
+            stage.handler_id.startswith(
+                "openstar.tess.residual-mode-localization."
+            )
+            for stage in investigation.stages
+        )
+    ):
+        return None
+
+    summary = _latest_complete(
+        investigation, "openstar.tess.nonstationary.summarize"
+    )
+    confirmation = _latest_complete(
+        investigation,
+        V20_8_LONG_BASELINE_TIME_FREQUENCY_CONFIRMATION_HANDLER_ID,
+    )
+    prepare = _latest_complete(
+        investigation, "openstar.tess.nonstationary.prepare"
+    )
+    run = _latest_complete(
+        investigation, "openstar.tess.nonstationary.run"
+    )
+    interpreted = _latest_complete(
+        investigation, "openstar.tess.nonstationary.interpret"
+    )
+    latest = investigation.stages[-1] if investigation.stages else None
+    if any(
+        stage is None
+        for stage in (
+            summary,
+            confirmation,
+            prepare,
+            run,
+            interpreted,
+            latest,
+        )
+    ):
+        return None
+    if not (
+        isinstance(summary.result, dict)
+        and isinstance(confirmation.result, dict)
+        and isinstance(prepare.result, dict)
+        and isinstance(run.result, dict)
+        and isinstance(interpreted.result, dict)
+        and prepare.parameters == {
+            "evidenceLineage": (
+                RECURRENT_RESIDUAL_NONSTATIONARY_EVIDENCE_LINEAGE
+            )
+        }
+        and prepare.triggered_by_stage_id == confirmation.id
+        and run.triggered_by_stage_id == prepare.id
+        and interpreted.triggered_by_stage_id == run.id
+        and summary.triggered_by_stage_id == interpreted.id
+        and latest.handler_id == "openstar.tess.finalize"
+        and latest.status == "COMPLETE"
+        and latest.stop is True
+        and latest.triggered_by_stage_id == summary.id
+        and latest.parameters.get("outputSuffix")
+        == "v20.9.3-recurrent-residual-nonstationary"
+        and isinstance(latest.result, dict)
+        and latest.result.get("nonstationaryModeling") == summary.result
+        and tuple(
+            investigation.stages[
+                investigation.stages.index(prepare):
+            ]
+        ) == (prepare, run, interpreted, summary, latest)
+    ):
+        return None
+    try:
+        validate_recurrent_residual_nonstationary_localization_boundary(
+            summary.result, confirmation.result
+        )
+    except (KeyError, RuntimeError, TypeError, ValueError):
+        return None
+
+    continuation = StageRequest(
+        id=_continuation_stage_id(
+            latest, "prepare-residual-mode-localization"
+        ),
+        handler_id="openstar.tess.residual-mode-localization.prepare",
+        parameters={
+            "evidenceLineage": (
+                RECURRENT_RESIDUAL_NONSTATIONARY_EVIDENCE_LINEAGE
+            )
+        },
+        triggered_by_stage_id=summary.id,
+    )
+    return store.set_control_state(
+        investigation,
+        status="RUNNING",
+        control_state={
+            "branchAssessments": [],
+            "selectedExperiment": asdict(continuation),
+            "schedulerAction": "RUN_EXPERIMENT",
+            "recovery": (
+                "TESS_RECURRENT_RESIDUAL_MODE_PIXEL_LOCALIZATION"
+            ),
+        },
+    )
+
+
 def _repair_target_supported_residual_external_evidence_terminal(
     store: InvestigationStore, investigation: Investigation, control: dict
 ) -> Investigation | None:
@@ -4566,6 +4682,14 @@ def repair_obsolete_terminal_wait(
     )
     if confirmed_nonstationary_repair is not None:
         return confirmed_nonstationary_repair
+
+    recurrent_localization_repair = (
+        _repair_recurrent_residual_localization_terminal(
+            store, investigation, control
+        )
+    )
+    if recurrent_localization_repair is not None:
+        return recurrent_localization_repair
 
     confirmed_localization_repair = \
         _repair_confirmed_residual_localization_terminal(

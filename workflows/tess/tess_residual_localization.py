@@ -268,6 +268,15 @@ def build_residual_mode_pixel_project(
     search = _frequency_search(reference_frequency)
     physical_frequency = 1.0 / float(physical_period_days)
     source_base_id = str(source_dataset_entry.get("id") or f"tic-{tic_id}")
+    boundary_metadata = {
+        key: nonstationary_summary[key]
+        for key in (
+            "evidenceLineage",
+            "methodContractID",
+            "methodContractHash",
+        )
+        if nonstationary_summary.get(key) is not None
+    }
 
     dataset_entries: list[dict[str, Any]] = []
     prepared_pixels: list[dict[str, Any]] = []
@@ -347,6 +356,7 @@ def build_residual_mode_pixel_project(
                             "pixelColumn": int(col),
                             "referenceFrequency": float(reference_frequency),
                             "fractionalFrequencyDriftPerDay": float(q),
+                            **boundary_metadata,
                         },
                         "source": {
                             "mission": "TESS",
@@ -427,6 +437,7 @@ def build_residual_mode_pixel_project(
             "fractionalFrequencyDriftPerDay": float(q),
             "signalSectors": signal_sectors,
             "subtractedHarmonicOrders": list(harmonic_orders),
+            **boundary_metadata,
         },
     }
     manifest_path = root / f"{_safe(project_id)}.json"
@@ -448,6 +459,7 @@ def build_residual_mode_pixel_project(
         "fractionalFrequencyDriftPerDay": float(q),
         "timeReferenceDays": float(time_reference),
         "signalSectors": signal_sectors,
+        **boundary_metadata,
         "frequencySearch": search,
         "sectorMetadata": sector_metadata,
         "preparedPixels": prepared_pixels,
@@ -738,6 +750,15 @@ def interpret_residual_mode_pixel_project(
         "fractionalFrequencyDriftPerDay": preparation.get("fractionalFrequencyDriftPerDay"),
         "timeReferenceDays": preparation.get("timeReferenceDays"),
         "signalSectors": preparation.get("signalSectors"),
+        **{
+            key: preparation[key]
+            for key in (
+                "evidenceLineage",
+                "methodContractID",
+                "methodContractHash",
+            )
+            if preparation.get(key) is not None
+        },
         "sectorResults": sector_results,
         "crossSector": cross,
         "errors": preparation.get("errors") or [],
@@ -745,7 +766,10 @@ def interpret_residual_mode_pixel_project(
         "physicalMechanismResolved": False,
         "recommendedNextTest": cross.get("recommendedNextTest"),
         "interpretationGuard": (
-            "This localizes the v20.9 drifting residual component after subtracting the established "
-            "13.72-day family. It does not alter the already-established localization of the main periodic family."
+            "This localizes the residual component selected by the persisted "
+            "nonstationary-modeling boundary after subtracting the established "
+            f"{preparation.get('physicalPeriodDays')}-day family. It does not "
+            "alter the already-established localization of the main periodic "
+            "family."
         ),
     }
