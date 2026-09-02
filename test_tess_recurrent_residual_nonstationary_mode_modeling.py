@@ -271,6 +271,10 @@ class RecurrentResidualNonstationaryContinuationTests(
                     investigation
                 ),
             )
+            project_exists = Path(spec["projectPath"]).is_file()
+            analysis_series_exists = Path(
+                spec["analysisSeriesPath"]
+            ).is_file()
 
         self.assertFalse(spec["originalSectorFluxRead"])
         self.assertEqual(
@@ -289,8 +293,8 @@ class RecurrentResidualNonstationaryContinuationTests(
         )
         self.assertEqual(66, len(spec["preparedDatasets"]))
         self.assertEqual(66, len(spec["groups"]) * 33)
-        self.assertTrue(Path(spec["projectPath"]).is_file())
-        self.assertTrue(Path(spec["analysisSeriesPath"]).is_file())
+        self.assertTrue(project_exists)
+        self.assertTrue(analysis_series_exists)
 
     def test_manual_boundary_rejects_mutated_confirmation(self):
         with tempfile.TemporaryDirectory() as temporary:
