@@ -462,18 +462,23 @@ def _verify_parent_mapping(
     field_name: str,
     *,
     hashes: bool,
-) -> dict[str, str]:
+) -> dict[str, Any]:
     if not isinstance(value, Mapping) or not value:
         raise _fail(f"{field_name} must be a nonempty mapping")
-    result: dict[str, str] = {}
-    for key in sorted(value):
-        name = _nonempty_string(key, f"{field_name} key")
-        item = (
-            _sha256_string(value[key], f"{field_name}.{name}")
-            if hashes
-            else _nonempty_string(value[key], f"{field_name}.{name}")
-        )
-        result[name] = item
+    names = [_nonempty_string(key, f"{field_name} key") for key in value]
+    result: dict[str, Any] = {}
+    for name in sorted(names):
+        item = value[name]
+        if isinstance(item, Mapping):
+            result[name] = _verify_parent_mapping(
+                item,
+                f"{field_name}.{name}",
+                hashes=hashes,
+            )
+        elif hashes:
+            result[name] = _sha256_string(item, f"{field_name}.{name}")
+        else:
+            result[name] = _nonempty_string(item, f"{field_name}.{name}")
     return result
 
 
@@ -1181,9 +1186,12 @@ def _verify_preparation(root: Path) -> _VerifiedPreparation:
         or manifest.get("totalSampleCount") != total_sample_count
     ):
         raise _fail("prepared sample-count accounting is inconsistent")
+    verified_preparation = dict(preparation)
+    verified_preparation["parentHashes"] = parent_hashes
+    verified_preparation["parentIDs"] = parent_ids
     return _VerifiedPreparation(
         contract=dict(contract),
-        preparation=dict(preparation),
+        preparation=verified_preparation,
         manifest=dict(manifest),
         series=tuple(dict(item) for item in series_documents),
         axes=dict(axes),

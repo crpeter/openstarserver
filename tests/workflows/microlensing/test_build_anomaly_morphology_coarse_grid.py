@@ -401,9 +401,31 @@ class CoarseMorphologyFixture(unittest.TestCase):
                 }
             )
         parent_hashes = {
-            "residualGridProjectSHA256": sha256_bytes(b"generic-grid-project")
+            "ancestryArtifactHashes": {
+                "coarseInvestigationSHA256": sha256_bytes(
+                    b"generic-coarse-investigation"
+                ),
+                "projectArtifacts": {
+                    "coarseProjectSHA256": sha256_bytes(
+                        b"generic-coarse-project"
+                    ),
+                    "residualPreparationSHA256": sha256_bytes(
+                        b"generic-residual-preparation"
+                    ),
+                },
+            },
+            "residualGridProjectSHA256": sha256_bytes(b"generic-grid-project"),
         }
-        parent_ids = {"residualGridProjectID": "generic-grid-project"}
+        parent_ids = {
+            "ancestryProjectIDs": {
+                "coarseInvestigationID": "generic-coarse-investigation",
+                "projects": {
+                    "coarseProjectID": "generic-coarse-project",
+                    "residualPreparationID": "generic-residual-preparation",
+                },
+            },
+            "residualGridProjectID": "generic-grid-project",
+        }
         preparation = {
             "admittedGenericSeriesIDs": list(self.series_ids),
             "confirmedComponentProvenance": {
@@ -463,6 +485,17 @@ class CoarseMorphologyFixture(unittest.TestCase):
         self.source_preparation = preparation
         self.source_manifest = manifest
         self.source_datasets = datasets
+
+    def _refresh_preparation_manifest(self):
+        preparation_path = self.morphology / PREPARATION_RELATIVE_PATH
+        write_json(preparation_path, self.source_preparation)
+        self.source_manifest["morphologyPreparationFileSHA256"] = sha256_bytes(
+            preparation_path.read_bytes()
+        )
+        write_json(
+            self.morphology / SOURCE_MANIFEST_RELATIVE_PATH,
+            self.source_manifest,
+        )
 
     def _refresh_contract_family(self):
         contract_path = self.morphology / SOURCE_CONTRACT_RELATIVE_PATH
@@ -698,6 +731,33 @@ class CoarseMorphologySuccessTests(CoarseMorphologyFixture):
                 record["outputSHA256"],
             )
 
+    def test_nested_parent_lineage_is_preserved_in_sorted_structure(self):
+        published = self.build()
+        manifest = published["buildManifest"]
+        self.assertEqual(
+            self.source_preparation["parentHashes"],
+            manifest["parentHashes"],
+        )
+        self.assertEqual(
+            self.source_preparation["parentIDs"],
+            manifest["parentIDs"],
+        )
+
+        def assert_sorted_mappings(value):
+            if not isinstance(value, dict):
+                return
+            self.assertEqual(sorted(value), list(value))
+            for item in value.values():
+                assert_sorted_mappings(item)
+
+        assert_sorted_mappings(manifest["parentHashes"])
+        assert_sorted_mappings(manifest["parentIDs"])
+        self.assertIn(
+            "ancestryArtifactHashes",
+            manifest["parentHashes"],
+        )
+        self.assertIn("ancestryProjectIDs", manifest["parentIDs"])
+
     def test_outputs_are_identity_free_and_contain_no_evaluation(self):
         published = self.build()
         forbidden_keys = {
@@ -755,6 +815,65 @@ class CoarseMorphologySuccessTests(CoarseMorphologyFixture):
 
 
 class CoarseMorphologyRejectionTests(CoarseMorphologyFixture):
+    def test_invalid_nested_parent_lineage_values_are_rejected(self):
+        cases = (
+            (
+                "nested-hash",
+                "parentHashes",
+                (
+                    "ancestryArtifactHashes",
+                    "projectArtifacts",
+                    "coarseProjectSHA256",
+                ),
+                "not-a-sha256",
+                "lowercase SHA-256",
+            ),
+            (
+                "nested-id",
+                "parentIDs",
+                ("ancestryProjectIDs", "projects", "coarseProjectID"),
+                17,
+                "nonempty string",
+            ),
+            (
+                "empty-mapping",
+                "parentHashes",
+                ("ancestryArtifactHashes", "projectArtifacts"),
+                {},
+                "nonempty mapping",
+            ),
+            (
+                "list-value",
+                "parentIDs",
+                ("ancestryProjectIDs",),
+                ["generic-project"],
+                "nonempty string",
+            ),
+        )
+        for name, root_key, path, invalid_value, pattern in cases:
+            with self.subTest(name=name):
+                self._publish_preparation()
+                target = self.source_preparation[root_key]
+                for key in path[:-1]:
+                    target = target[key]
+                target[path[-1]] = invalid_value
+                self._refresh_preparation_manifest()
+                self.assert_rejected(pattern, name=name)
+
+    def test_preparation_manifest_nested_lineage_disagreement_is_rejected(self):
+        manifest_hashes = json.loads(
+            json.dumps(self.source_manifest["parentHashes"])
+        )
+        manifest_hashes["ancestryArtifactHashes"]["projectArtifacts"][
+            "coarseProjectSHA256"
+        ] = "f" * 64
+        self.source_manifest["parentHashes"] = manifest_hashes
+        write_json(
+            self.morphology / SOURCE_MANIFEST_RELATIVE_PATH,
+            self.source_manifest,
+        )
+        self.assert_rejected("manifest", name="nested-disagreement")
+
     def test_mutated_dataset_and_parent_hash_mismatch_are_rejected(self):
         path = self.morphology / SOURCE_DATASET_PATHS[0]
         path.write_bytes(path.read_bytes() + b" ")
