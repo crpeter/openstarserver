@@ -773,7 +773,8 @@ def _recurrent_window_series(
         dataset_id = str(dataset["datasetID"])
         source_windows.setdefault(sector, set()).add(dataset_id)
         roles.setdefault(sector, set()).add(str(dataset["role"]))
-        templates.setdefault(sector, _load_json(dataset["datasetPath"]))
+        if sector not in templates:
+            templates[sector] = _load_json(dataset["datasetPath"])
         for time, flux in zip(
             dataset["times"], dataset["flux"], strict=True
         ):
