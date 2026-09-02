@@ -16,7 +16,17 @@ from .tess_long_baseline_frequency_confirmation import (
     classify_long_baseline_confirmation,
     method_contract_hash as long_baseline_confirmation_contract_hash,
 )
+from .tess_recurrent_residual_long_baseline_confirmation import (
+    METHOD_CONTRACT_ID as RECURRENT_RESIDUAL_CONFIRMATION_METHOD_CONTRACT_ID,
+    RESULT_VERSION as RECURRENT_RESIDUAL_CONFIRMATION_RESULT_VERSION,
+)
 from .tess_resolved_cycle import validated_cycle_period
+from .tess_v20_8_long_baseline_time_frequency_confirmation import (
+    NONSTATIONARY as RECURRENT_NONSTATIONARY_CLASSIFICATION,
+    classify_confirmation as classify_recurrent_residual_confirmation,
+    method_contract_hash as recurrent_confirmation_contract_hash,
+    validate_frozen_window_lineage,
+)
 
 
 DRIFT_GRID_COUNT = 33
@@ -40,6 +50,14 @@ CONFIRMED_NONSTATIONARY_METHOD_CONTRACT_ID = (
     "openstar.tess.confirmed-nonstationary-mode-modeling.v1"
 )
 CONFIRMED_NONSTATIONARY_METHOD_CONTRACT_VERSION = 1
+RECURRENT_RESIDUAL_NONSTATIONARY_EVIDENCE_LINEAGE = (
+    "RECURRENT_RESIDUAL_LONG_BASELINE_NONSTATIONARY"
+)
+RECURRENT_RESIDUAL_NONSTATIONARY_METHOD_CONTRACT_ID = (
+    "openstar.tess.recurrent-residual-nonstationary-mode-modeling."
+    "drift-grid.v1"
+)
+RECURRENT_RESIDUAL_NONSTATIONARY_METHOD_CONTRACT_VERSION = 1
 
 
 def _load_json(path: str | Path) -> dict[str, Any]:
@@ -304,6 +322,267 @@ def build_confirmed_nonstationary_method_contract(
     }
 
 
+def validate_recurrent_residual_nonstationary_boundary(
+    confirmation: dict[str, Any],
+) -> dict[str, Any]:
+    """Validate the exact v20.8.2 recurrent-residual confirmation result."""
+    if not isinstance(confirmation, dict):
+        raise RuntimeError(
+            "Recurrent-residual long-baseline confirmation is missing."
+        )
+    source_contract = confirmation.get("methodContract")
+    source_hash = confirmation.get("methodContractHash")
+    folds = confirmation.get("perSectorEvidence")
+    resolution = _float(
+        confirmation.get(
+            "longBaselineFrequencyResolutionCyclesPerDay"
+        )
+    )
+    if not (
+        confirmation.get("version")
+        == RECURRENT_RESIDUAL_CONFIRMATION_RESULT_VERSION
+        and confirmation.get("methodContractID")
+        == RECURRENT_RESIDUAL_CONFIRMATION_METHOD_CONTRACT_ID
+        and isinstance(source_contract, dict)
+        and source_contract.get("methodContractID")
+        == RECURRENT_RESIDUAL_CONFIRMATION_METHOD_CONTRACT_ID
+        and isinstance(source_hash, str)
+        and source_hash
+        == recurrent_confirmation_contract_hash(source_contract)
+        and confirmation.get("classification")
+        == RECURRENT_NONSTATIONARY_CLASSIFICATION
+        and confirmation.get("recommendedNextTest")
+        == "LONG_BASELINE_NONSTATIONARY_MODE_MODELING"
+        and confirmation.get("physicalMechanismResolved") is False
+        and confirmation.get("claimLevelChanged") is False
+        and confirmation.get("automaticDiscoveryClaim") is False
+        and confirmation.get("leaveOneIndependentSectorOut") is True
+        and isinstance(folds, list)
+        and resolution is not None
+        and resolution > 0.0
+    ):
+        raise RuntimeError(
+            "Recurrent-residual nonstationary modeling requires the exact "
+            "conservative v20.8.2 confirmation boundary."
+        )
+
+    boundary = source_contract.get("evidenceBoundary") or {}
+    expected_sectors = {
+        int(value)
+        for value in boundary.get("acceptedIndependentSectors") or []
+    }
+    held_out: list[int] = []
+    sufficient_sectors: list[int] = []
+    for fold in folds:
+        if not isinstance(fold, dict):
+            raise RuntimeError(
+                "Recurrent-residual confirmation fold evidence is malformed."
+            )
+        sector = _int(fold.get("heldOutSector"))
+        training = [_int(value) for value in fold.get("trainingSectors") or []]
+        if (
+            sector is None
+            or any(value is None for value in training)
+            or sector in training
+            or not (expected_sectors - {sector}).issubset(set(training))
+        ):
+            raise RuntimeError(
+                "Recurrent-residual confirmation contains held-out-sector "
+                "leakage or incomplete training lineage."
+            )
+        held_out.append(sector)
+        if fold.get("support") != "INSUFFICIENT":
+            sufficient_sectors.append(sector)
+    if (
+        len(held_out) != len(set(held_out))
+        or set(held_out) != expected_sectors
+        or len(sufficient_sectors) < 3
+    ):
+        raise RuntimeError(
+            "Recurrent-residual nonstationary modeling requires at least "
+            "three unique sufficient held-out independent sectors."
+        )
+
+    try:
+        recomputed = classify_recurrent_residual_confirmation(
+            folds,
+            long_baseline_frequency_resolution=resolution,
+            accepted_independent_window_count=int(
+                boundary["acceptedIndependentWindowCount"]
+            ),
+            independent_window_count=int(
+                boundary["independentWindowCount"]
+            ),
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise RuntimeError(
+            "Recurrent-residual confirmation cannot be reproduced."
+        ) from error
+    if any(
+        confirmation.get(key) != recomputed.get(key)
+        for key in (
+            "classification",
+            "recommendedNextTest",
+            "aggregateDecision",
+            "frequencyStability",
+        )
+    ):
+        raise RuntimeError(
+            "Recurrent-residual confirmation does not recompute exactly."
+        )
+
+    stability = confirmation.get("frequencyStability") or {}
+    center_frequency = _float(
+        stability.get("medianFrequencyCyclesPerDay")
+    )
+    period_reference = boundary.get("periodReference") or {}
+    established_period = _float(period_reference.get("periodDays"))
+    exact_harmonic = _float(
+        (source_contract.get("models") or {}).get(
+            "exactHarmonicFrequencyCyclesPerDay"
+        )
+    )
+    data_reuse = confirmation.get("dataReuse") or {}
+    frozen_paths = data_reuse.get("frozenWindowDatasetPaths")
+    source_paths = boundary.get("frozenWindowDatasetPaths")
+    long_baseline_days = _float(confirmation.get("longBaselineDays"))
+    if not (
+        center_frequency is not None
+        and center_frequency > 0.0
+        and established_period is not None
+        and established_period > 0.0
+        and period_reference.get("physicalCycleResolved") is True
+        and exact_harmonic is not None
+        and exact_harmonic > 0.0
+        and isinstance(frozen_paths, list)
+        and isinstance(source_paths, list)
+        and sorted(frozen_paths) == sorted(source_paths)
+        and len(frozen_paths) >= len(expected_sectors) + 1
+        and data_reuse.get("downloadPerformed") is False
+        and data_reuse.get("originalSectorFluxRead") is False
+        and long_baseline_days is not None
+        and long_baseline_days > 0.0
+    ):
+        raise RuntimeError(
+            "Recurrent-residual frozen-window or resolved-cycle lineage "
+            "is invalid."
+        )
+    return {
+        "sourceMethodContractHash": source_hash,
+        "establishedPeriodDays": established_period,
+        "residualCenterFrequencyCyclesPerDay": center_frequency,
+        "exactHarmonicFrequencyCyclesPerDay": exact_harmonic,
+        "sufficientHeldOutSectors": sorted(sufficient_sectors),
+        "independentSectors": sorted(expected_sectors),
+        "acceptedIndependentWindowCount": int(
+            boundary["acceptedIndependentWindowCount"]
+        ),
+        "independentWindowCount": int(
+            boundary["independentWindowCount"]
+        ),
+        "frozenWindowDatasetPaths": list(frozen_paths),
+        "longBaselineDays": long_baseline_days,
+        "longBaselineFrequencyResolutionCyclesPerDay": resolution,
+    }
+
+
+def build_recurrent_residual_nonstationary_method_contract(
+    confirmation: dict[str, Any],
+) -> dict[str, Any]:
+    """Freeze v20.9.3 choices before reading residual-window flux."""
+    evidence = validate_recurrent_residual_nonstationary_boundary(
+        confirmation
+    )
+    return {
+        "methodContractID": (
+            RECURRENT_RESIDUAL_NONSTATIONARY_METHOD_CONTRACT_ID
+        ),
+        "methodContractVersion": (
+            RECURRENT_RESIDUAL_NONSTATIONARY_METHOD_CONTRACT_VERSION
+        ),
+        "evidenceLineage": (
+            RECURRENT_RESIDUAL_NONSTATIONARY_EVIDENCE_LINEAGE
+        ),
+        "execution": "DISTRIBUTED_GENERIC_LOMB_SCARGLE",
+        "dataPolicy": {
+            "reuseFrozenV20_8FamilySubtractedResidualWindows": True,
+            "downloadNewData": False,
+            "readOriginalSectorFlux": False,
+            "contractCreatedBeforeReadingFlux": True,
+            "overlappingWindowSamples": (
+                "NEAREST_WINDOW_CENTER_PER_SECTOR_TIME_TIE_LOWEST_INDEX"
+            ),
+        },
+        "evidenceBoundary": {
+            "sourceClassification": confirmation["classification"],
+            "sourceRecommendation": confirmation["recommendedNextTest"],
+            "sourceMethodContractHash": evidence[
+                "sourceMethodContractHash"
+            ],
+            "physicalMechanismResolved": False,
+            "establishedPeriodDays": evidence["establishedPeriodDays"],
+            "residualCenterFrequencyCyclesPerDay": evidence[
+                "residualCenterFrequencyCyclesPerDay"
+            ],
+            "exactHarmonicFrequencyCyclesPerDay": evidence[
+                "exactHarmonicFrequencyCyclesPerDay"
+            ],
+            "sufficientHeldOutSectors": evidence[
+                "sufficientHeldOutSectors"
+            ],
+            "independentSectors": evidence["independentSectors"],
+            "acceptedIndependentSectors": evidence[
+                "independentSectors"
+            ],
+            "acceptedIndependentWindowCount": evidence[
+                "acceptedIndependentWindowCount"
+            ],
+            "independentWindowCount": evidence[
+                "independentWindowCount"
+            ],
+            "frozenWindowDatasetPaths": evidence[
+                "frozenWindowDatasetPaths"
+            ],
+            "longBaselineDays": evidence["longBaselineDays"],
+            "longBaselineFrequencyResolutionCyclesPerDay": evidence[
+                "longBaselineFrequencyResolutionCyclesPerDay"
+            ],
+        },
+        "modeling": {
+            "inputObservable": (
+                "FROZEN_V20_8_FAMILY_SUBTRACTED_RESIDUAL_FLUX"
+            ),
+            "establishedFamilySubtraction": "ALREADY_APPLIED",
+            "perSectorNormalization": "CENTER_AND_STANDARD_DEVIATION",
+            "driftGridCount": DRIFT_GRID_COUNT,
+            "maximumEdgeFractionalDrift": (
+                MAX_EDGE_FRACTIONAL_DRIFT
+            ),
+            "frequencyHalfWidthFraction": (
+                FREQUENCY_HALF_WIDTH_FRACTION
+            ),
+            "minimumFrequencyHard": MINIMUM_FREQUENCY_HARD,
+            "maximumFrequencyHard": MAXIMUM_FREQUENCY_HARD,
+            "totalFrequencies": TOTAL_FREQUENCIES,
+            "frequenciesPerWorkUnit": FREQUENCIES_PER_WORK_UNIT,
+            "minimumPeakProminence": MIN_PEAK_PROMINENCE,
+            "modelComparisonCriterion": "BIC",
+            "minimumBICImprovement": MIN_BIC_IMPROVEMENT,
+        },
+        "claimPolicy": {
+            "claimLevelChanged": False,
+            "physicalMechanismResolved": False,
+            "automaticDiscoveryClaim": False,
+        },
+    }
+
+
+def recurrent_residual_nonstationary_method_contract_hash(
+    contract: dict[str, Any],
+) -> str:
+    return sha256_json(contract)
+
+
 def confirmed_nonstationary_physical_period(
     confirmation: dict[str, Any],
     physical_cycle_evidence: dict[str, Any] | None,
@@ -470,6 +749,109 @@ def _time_warp(relative_times: np.ndarray, fractional_drift_per_day: float) -> n
     return warped
 
 
+def _recurrent_window_series(
+    *,
+    method_contract: dict[str, Any],
+    dataset_specs: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+) -> list[dict[str, Any]]:
+    """Create one non-overlapping residual series per sector."""
+    datasets = validate_frozen_window_lineage(
+        method_contract=method_contract,
+        dataset_specs=dataset_specs,
+    )
+    candidates: dict[
+        tuple[int, float],
+        tuple[tuple[float, int, str], float, float, dict[str, Any]],
+    ] = {}
+    source_windows: dict[int, set[str]] = {}
+    templates: dict[int, dict[str, Any]] = {}
+    roles: dict[int, set[str]] = {}
+    for dataset in datasets:
+        sector = int(dataset["sector"])
+        center = float(dataset["absoluteWindowCenterDays"])
+        window_index = int(dataset["windowIndex"])
+        dataset_id = str(dataset["datasetID"])
+        source_windows.setdefault(sector, set()).add(dataset_id)
+        roles.setdefault(sector, set()).add(str(dataset["role"]))
+        if sector not in templates:
+            templates[sector] = _load_json(dataset["datasetPath"])
+        for time, flux in zip(
+            dataset["times"], dataset["flux"], strict=True
+        ):
+            absolute_time = float(time)
+            key = (sector, round(absolute_time, 12))
+            priority = (
+                abs(absolute_time - center),
+                window_index,
+                dataset_id,
+            )
+            current = candidates.get(key)
+            if current is None or priority < current[0]:
+                candidates[key] = (
+                    priority,
+                    absolute_time,
+                    float(flux),
+                    dataset,
+                )
+
+    by_sector: dict[int, list[tuple[float, float]]] = {}
+    for (sector, _), (_, time, flux, _) in candidates.items():
+        by_sector.setdefault(sector, []).append((time, flux))
+
+    loaded: list[dict[str, Any]] = []
+    for sector in sorted(by_sector):
+        samples = sorted(by_sector[sector])
+        times = np.asarray(
+            [item[0] for item in samples], dtype=np.float64
+        )
+        flux = np.asarray(
+            [item[1] for item in samples], dtype=np.float64
+        )
+        if len(times) < 256 or float(np.max(times)) <= float(np.min(times)):
+            raise RuntimeError(
+                "Recurrent-residual sector has too few distinct frozen "
+                f"window samples: {sector}."
+            )
+        centered = flux - float(np.mean(flux))
+        scale = float(np.std(centered))
+        if not math.isfinite(scale) or scale <= 1e-12:
+            raise RuntimeError(
+                "Recurrent-residual sector has no finite residual variance: "
+                f"{sector}."
+            )
+        role_values = roles[sector]
+        role = (
+            "primary-frozen-residual-windows"
+            if "PRIMARY_WINDOW" in role_values
+            else "independent-frozen-residual-windows"
+        )
+        loaded.append({
+            "item": {
+                "sectorKey": str(sector),
+                "sector": sector,
+                "role": role,
+            },
+            "dataset": templates[sector],
+            "absoluteTimes": times,
+            "residual": centered / scale,
+            "residualMeta": {
+                "familySubtractionReused": True,
+                "normalization": "CENTER_AND_STANDARD_DEVIATION",
+                "residualStdDevBeforeNormalization": scale,
+                "sampleCount": int(len(times)),
+                "sourceWindowCount": len(source_windows[sector]),
+                "sourceWindowDatasetIDs": sorted(
+                    source_windows[sector]
+                ),
+                "overlapResolution": (
+                    "NEAREST_WINDOW_CENTER_PER_SECTOR_TIME_"
+                    "TIE_LOWEST_INDEX"
+                ),
+            },
+        })
+    return loaded
+
+
 def build_nonstationary_project(
     *,
     source_project_path: str | Path,
@@ -482,13 +864,27 @@ def build_nonstationary_project(
     output_dir: str | Path,
     investigation_id: str,
     confirmed_method_contract: dict[str, Any] | None = None,
+    recurrent_method_contract: dict[str, Any] | None = None,
+    recurrent_dataset_specs: (
+        list[dict[str, Any]] | tuple[dict[str, Any], ...] | None
+    ) = None,
 ) -> dict[str, Any]:
     if physical_period_days <= 0:
         raise ValueError("physical_period_days must be positive")
+    if (
+        confirmed_method_contract is not None
+        and recurrent_method_contract is not None
+    ):
+        raise RuntimeError(
+            "Nonstationary modeling accepts only one evidence contract."
+        )
 
     source_project = _load_json(source_project_path)
     source_workload_id = str(source_project.get("workloadID") or "")
-    if source_workload_id and source_workload_id not in LOMB_SCARGLE_WORKLOAD_ALIASES:
+    if (
+        source_workload_id
+        and source_workload_id not in LOMB_SCARGLE_WORKLOAD_ALIASES
+    ):
         raise RuntimeError(
             "v20.9 requires a Lomb-Scargle-compatible source project; "
             f"found workloadID={source_workload_id}."
@@ -496,7 +892,47 @@ def build_nonstationary_project(
     workload_id = GENERIC_LOMB_SCARGLE_WORKLOAD_ID
     physical_frequency = 1.0 / float(physical_period_days)
     confirmed = confirmed_method_contract is not None
-    if confirmed:
+    recurrent = recurrent_method_contract is not None
+    method_contract = (
+        recurrent_method_contract
+        if recurrent else confirmed_method_contract
+    )
+
+    if recurrent:
+        if not (
+            isinstance(recurrent_method_contract, dict)
+            and recurrent_method_contract.get("methodContractID")
+            == RECURRENT_RESIDUAL_NONSTATIONARY_METHOD_CONTRACT_ID
+            and recurrent_method_contract.get("evidenceLineage")
+            == RECURRENT_RESIDUAL_NONSTATIONARY_EVIDENCE_LINEAGE
+            and recurrent_dataset_specs is not None
+        ):
+            raise RuntimeError(
+                "Recurrent-residual nonstationary method contract is invalid."
+            )
+        boundary = recurrent_method_contract.get("evidenceBoundary") or {}
+        center_frequency = _float(
+            boundary.get("residualCenterFrequencyCyclesPerDay")
+        )
+        supporting_sectors = sorted({
+            int(value)
+            for value in boundary.get("sufficientHeldOutSectors") or []
+            if _int(value) is not None
+        })
+        support_group_id = "recurrent-sufficient-held-out-sectors"
+        support_group_label = (
+            "v20.8.2 sufficient held-out independent sectors"
+        )
+        evidence_lineage = (
+            RECURRENT_RESIDUAL_NONSTATIONARY_EVIDENCE_LINEAGE
+        )
+        project_suffix = (
+            "recurrent-residual-long-baseline-nonstationary-v1"
+        )
+        analysis_filename = (
+            "long-baseline-series-v20.9.3-recurrent-residual.json"
+        )
+    elif confirmed:
         if not (
             isinstance(confirmed_method_contract, dict)
             and confirmed_method_contract.get("methodContractID")
@@ -504,7 +940,9 @@ def build_nonstationary_project(
             and confirmed_method_contract.get("evidenceLineage")
             == CONFIRMED_NONSTATIONARY_EVIDENCE_LINEAGE
         ):
-            raise RuntimeError("Confirmed nonstationary method contract is invalid.")
+            raise RuntimeError(
+                "Confirmed nonstationary method contract is invalid."
+            )
         boundary = confirmed_method_contract.get("evidenceBoundary") or {}
         center_frequency = _float(
             boundary.get("residualCenterFrequencyCyclesPerDay")
@@ -514,17 +952,18 @@ def build_nonstationary_project(
             for value in boundary.get("sufficientHeldOutSectors") or []
             if _int(value) is not None
         })
-        if center_frequency is None or center_frequency <= 0:
-            raise RuntimeError(
-                "Confirmed nonstationary method contract has no center frequency."
-            )
         support_group_id = "confirmed-sufficient-held-out-sectors"
         support_group_label = (
             "v20.9.1 sufficient held-out independent sectors"
         )
+        evidence_lineage = CONFIRMED_NONSTATIONARY_EVIDENCE_LINEAGE
+        project_suffix = "confirmed-long-baseline-nonstationary-v1"
+        analysis_filename = "long-baseline-series-v20.9.2.json"
     else:
         if not isinstance(time_frequency_summary, dict):
-            raise RuntimeError("v20.9 requires a v20.8 time-frequency summary.")
+            raise RuntimeError(
+                "v20.9 requires a v20.8 time-frequency summary."
+            )
         best_cluster = (
             (time_frequency_summary.get("residualEvolution") or {})
             .get("bestCluster") or {}
@@ -533,7 +972,9 @@ def build_nonstationary_project(
         if center_frequency is None or center_frequency <= 0:
             center_period = _float(best_cluster.get("medianPeriodDays"))
             if center_period is None or center_period <= 0:
-                raise RuntimeError("v20.9 requires a v20.8 best residual cluster.")
+                raise RuntimeError(
+                    "v20.9 requires a v20.8 best residual cluster."
+                )
             center_frequency = 1.0 / center_period
         supporting_sectors = sorted({
             int(value)
@@ -542,38 +983,54 @@ def build_nonstationary_project(
         })
         support_group_id = "v20.8-support-sectors"
         support_group_label = "v20.8 best-cluster supporting sectors"
+        evidence_lineage = "V20.8_TIME_FREQUENCY_RECOMMENDATION"
+        project_suffix = "long-baseline-nonstationary-v1"
+        analysis_filename = "long-baseline-series-v20.9.json"
+
+    if center_frequency is None or center_frequency <= 0:
+        raise RuntimeError(
+            "Nonstationary method contract has no center frequency."
+        )
 
     root = Path(output_dir) / "nonstationary"
     root.mkdir(parents=True, exist_ok=True)
 
-    source_items = _source_items(
-        primary_dataset_path=primary_dataset_path,
-        primary_sector=primary_sector,
-        independent_spec=independent_spec,
+    if recurrent:
+        loaded = _recurrent_window_series(
+            method_contract=recurrent_method_contract,
+            dataset_specs=recurrent_dataset_specs,
+        )
+    else:
+        source_items = _source_items(
+            primary_dataset_path=primary_dataset_path,
+            primary_sector=primary_sector,
+            independent_spec=independent_spec,
+        )
+        loaded = []
+        for item in source_items:
+            dataset = _load_json(item["datasetPath"])
+            times, flux = _dataset_arrays(dataset)
+            origin = _source_time_origin(dataset)
+            if origin is None:
+                raise RuntimeError(
+                    "v20.9 long-baseline modeling requires "
+                    "originalTimeOriginDays/timeOriginDays for sector "
+                    f"{item.get('sectorKey')}."
+                )
+            loaded.append({
+                "item": item,
+                "dataset": dataset,
+                "times": times,
+                "flux": flux,
+                "absoluteTimes": times + float(origin),
+            })
+
+    all_absolute_times = [
+        entry["absoluteTimes"] for entry in loaded
+    ]
+    reference_time = float(
+        np.median(np.concatenate(all_absolute_times))
     )
-
-    loaded: list[dict[str, Any]] = []
-    all_absolute_times: list[np.ndarray] = []
-    for item in source_items:
-        dataset = _load_json(item["datasetPath"])
-        times, flux = _dataset_arrays(dataset)
-        origin = _source_time_origin(dataset)
-        if origin is None:
-            raise RuntimeError(
-                "v20.9 long-baseline modeling requires originalTimeOriginDays/timeOriginDays "
-                f"for sector {item.get('sectorKey')}."
-            )
-        absolute_times = times + float(origin)
-        all_absolute_times.append(absolute_times)
-        loaded.append({
-            "item": item,
-            "dataset": dataset,
-            "times": times,
-            "flux": flux,
-            "absoluteTimes": absolute_times,
-        })
-
-    reference_time = float(np.median(np.concatenate(all_absolute_times)))
     combined_time_parts: list[np.ndarray] = []
     combined_flux_parts: list[np.ndarray] = []
     combined_sector_parts: list[np.ndarray] = []
@@ -582,16 +1039,26 @@ def build_nonstationary_project(
     for entry in loaded:
         item = entry["item"]
         absolute_times = entry["absoluteTimes"]
-        residual, residual_meta = _fit_established_family(
-            phase_times=absolute_times - reference_time,
-            flux=entry["flux"],
-            physical_frequency=physical_frequency,
-        )
+        if recurrent:
+            residual = entry["residual"]
+            residual_meta = entry["residualMeta"]
+        else:
+            residual, residual_meta = _fit_established_family(
+                phase_times=absolute_times - reference_time,
+                flux=entry["flux"],
+                physical_frequency=physical_frequency,
+            )
         sector_value = item.get("sector")
-        sector_numeric = -1 if sector_value is None else int(sector_value)
+        sector_numeric = (
+            -1 if sector_value is None else int(sector_value)
+        )
         combined_time_parts.append(absolute_times)
         combined_flux_parts.append(residual)
-        combined_sector_parts.append(np.full(len(residual), sector_numeric, dtype=np.int32))
+        combined_sector_parts.append(
+            np.full(
+                len(residual), sector_numeric, dtype=np.int32
+            )
+        )
         sector_residuals.append({
             "sectorKey": item["sectorKey"],
             "sector": sector_value,
@@ -619,10 +1086,15 @@ def build_nonstationary_project(
         "groupID": "all-sectors",
         "label": "all frozen sectors",
         "mask": np.ones(len(relative_times), dtype=bool),
-        "sectors": sorted({int(value) for value in sector_ids if int(value) >= 0}),
+        "sectors": sorted({
+            int(value) for value in sector_ids if int(value) >= 0
+        }),
     }]
     if len(supporting_sectors) >= 2:
-        support_mask = np.isin(sector_ids, np.asarray(supporting_sectors, dtype=np.int32))
+        support_mask = np.isin(
+            sector_ids,
+            np.asarray(supporting_sectors, dtype=np.int32),
+        )
         if int(np.count_nonzero(support_mask)) >= 256:
             groups.append({
                 "groupID": support_group_id,
@@ -637,41 +1109,54 @@ def build_nonstationary_project(
         mask = group["mask"]
         group_times = relative_times[mask]
         group_flux = residual_flux[mask]
-        group_sector_ids = sector_ids[mask]
         for drift_index, q in enumerate(drift_values):
             warped = _time_warp(group_times, float(q))
             local_times = warped - float(np.min(warped))
             drift_tag = f"{drift_index:02d}"
             dataset_id = (
-                f"{source_base_id}-nonstationary-{group['groupID']}-drift-{drift_tag}-v1"
+                f"{source_base_id}-nonstationary-"
+                f"{group['groupID']}-drift-{drift_tag}-v1"
             )
             target_name = (
                 f"{source_dataset_entry.get('targetName') or source_base_id} "
-                f"long-baseline {group['groupID']} drift candidate {drift_index + 1}/{len(drift_values)}"
+                f"long-baseline {group['groupID']} drift candidate "
+                f"{drift_index + 1}/{len(drift_values)}"
             )
             output_path = root / f"{_safe(dataset_id)}.json"
 
             template_dataset = copy.deepcopy(loaded[0]["dataset"])
             template_dataset["id"] = dataset_id
             template_dataset["targetName"] = target_name
-            template_dataset["times"] = np.asarray(local_times, dtype=np.float32).tolist()
-            template_dataset["flux"] = np.asarray(group_flux, dtype=np.float32).tolist()
+            template_dataset["times"] = np.asarray(
+                local_times, dtype=np.float32
+            ).tolist()
+            template_dataset["flux"] = np.asarray(
+                group_flux, dtype=np.float32
+            ).tolist()
             template_dataset["frequencySearch"] = search
             template_dataset["reference"] = {}
             science = dict(template_dataset.get("science") or {})
             science.update({
                 "role": "long-baseline-nonstationary-drift-grid",
-                "purpose": "generic-lomb-scargle-on-time-warped-residuals",
+                "purpose": (
+                    "generic-lomb-scargle-on-time-warped-residuals"
+                ),
                 "groupID": group["groupID"],
                 "groupSectors": group["sectors"],
                 "fractionalFrequencyDriftPerDay": float(q),
                 "physicalFundamentalFrequency": physical_frequency,
                 "firstHarmonicFrequency": 2.0 * physical_frequency,
             })
+            if recurrent:
+                science["inputObservable"] = (
+                    "frozen-v20.8-family-subtracted-residual-windows"
+                )
             template_dataset["science"] = science
             template_dataset["source"] = {
                 "mission": "TESS",
-                "baselineDays": float(np.max(group_times) - np.min(group_times)),
+                "baselineDays": float(
+                    np.max(group_times) - np.min(group_times)
+                ),
                 "distributedSamples": int(len(group_times)),
                 "timeReferenceDays": reference_time,
                 "fractionalFrequencyDriftPerDay": float(q),
@@ -690,7 +1175,9 @@ def build_nonstationary_project(
                 "driftIndex": int(drift_index),
                 "fractionalFrequencyDriftPerDay": float(q),
                 "sampleCount": int(len(group_times)),
-                "baselineDays": float(np.max(group_times) - np.min(group_times)),
+                "baselineDays": float(
+                    np.max(group_times) - np.min(group_times)
+                ),
             }
             prepared_datasets.append(meta)
 
@@ -703,17 +1190,26 @@ def build_nonstationary_project(
             })
             dataset_entries.append(manifest_entry)
 
-    project_suffix = (
-        "confirmed-long-baseline-nonstationary-v1"
-        if confirmed else "long-baseline-nonstationary-v1"
-    )
     project_id = (
-        f"{source_project['id']}.investigation.{_safe(investigation_id)}."
-        f"{project_suffix}"
+        f"{source_project['id']}.investigation."
+        f"{_safe(investigation_id)}.{project_suffix}"
     )
+    method_metadata = {}
+    if method_contract is not None:
+        hash_function = (
+            recurrent_residual_nonstationary_method_contract_hash
+            if recurrent else confirmed_nonstationary_method_contract_hash
+        )
+        method_metadata = {
+            "methodContractID": method_contract["methodContractID"],
+            "methodContractHash": hash_function(method_contract),
+        }
     manifest = {
         "id": project_id,
-        "name": f"{source_project.get('name', source_project['id'])} — long-baseline nonstationary modeling",
+        "name": (
+            f"{source_project.get('name', source_project['id'])} "
+            "— long-baseline nonstationary modeling"
+        ),
         "workloadID": workload_id,
         "datasets": dataset_entries,
         "investigation": {
@@ -721,79 +1217,78 @@ def build_nonstationary_project(
             "sourceDatasetID": source_dataset_entry.get("id"),
             "purpose": "long-baseline-nonstationary-mode-modeling",
             "workerSemantics": (
-                "Each dataset is an ordinary Lomb-Scargle search on a deterministic time warp; "
-                "workers and coordinator do not interpret TESS or nonstationary astrophysics."
+                "Each dataset is an ordinary Lomb-Scargle search on a "
+                "deterministic time warp; workers and coordinator do not "
+                "interpret TESS or nonstationary astrophysics."
             ),
             "physicalPeriodDays": float(physical_period_days),
             "residualCenterFrequency": float(center_frequency),
             "supportingSectors": supporting_sectors,
-            "evidenceLineage": (
-                CONFIRMED_NONSTATIONARY_EVIDENCE_LINEAGE
-                if confirmed else "V20.8_TIME_FREQUENCY_RECOMMENDATION"
-            ),
-            **({
-                "methodContractID": confirmed_method_contract[
-                    "methodContractID"
-                ],
-                "methodContractHash": (
-                    confirmed_nonstationary_method_contract_hash(
-                        confirmed_method_contract
-                    )
-                ),
-            } if confirmed else {}),
+            "evidenceLineage": evidence_lineage,
+            **method_metadata,
         },
     }
     manifest_path = root / f"{_safe(project_id)}.json"
     _write_json(manifest_path, manifest)
 
-    analysis_series_path = root / (
-        "long-baseline-series-v20.9.2.json"
-        if confirmed else "long-baseline-series-v20.9.json"
-    )
+    analysis_series_path = root / analysis_filename
     _write_json(analysis_series_path, {
         "timeReferenceDays": reference_time,
         "physicalPeriodDays": float(physical_period_days),
         "centerFrequency": float(center_frequency),
         "supportingSectors": supporting_sectors,
-        "absoluteTimes": np.asarray(absolute_times, dtype=np.float64).tolist(),
-        "relativeTimes": np.asarray(relative_times, dtype=np.float64).tolist(),
-        "residualFlux": np.asarray(residual_flux, dtype=np.float64).tolist(),
-        "sectorIDs": np.asarray(sector_ids, dtype=np.int32).tolist(),
+        "absoluteTimes": np.asarray(
+            absolute_times, dtype=np.float64
+        ).tolist(),
+        "relativeTimes": np.asarray(
+            relative_times, dtype=np.float64
+        ).tolist(),
+        "residualFlux": np.asarray(
+            residual_flux, dtype=np.float64
+        ).tolist(),
+        "sectorIDs": np.asarray(
+            sector_ids, dtype=np.int32
+        ).tolist(),
         "sectorResiduals": sector_residuals,
+        **({
+            "inputObservable": (
+                "FROZEN_V20_8_FAMILY_SUBTRACTED_RESIDUAL_FLUX"
+            )
+        } if recurrent else {}),
     })
 
-    work_units_per_dataset = math.ceil(TOTAL_FREQUENCIES / FREQUENCIES_PER_WORK_UNIT)
-    return {
+    work_units_per_dataset = math.ceil(
+        TOTAL_FREQUENCIES / FREQUENCIES_PER_WORK_UNIT
+    )
+    result = {
         "available": True,
         "projectID": project_id,
         "projectPath": str(manifest_path.resolve()),
         "analysisSeriesPath": str(analysis_series_path.resolve()),
         "workloadID": workload_id,
-        "workerSemantics": "generic-lomb-scargle-on-time-warped-residuals",
+        "workerSemantics": (
+            "generic-lomb-scargle-on-time-warped-residuals"
+        ),
         "physicalPeriodDays": float(physical_period_days),
         "physicalFrequency": physical_frequency,
         "residualCenterFrequency": float(center_frequency),
         "residualCenterPeriodDays": 1.0 / float(center_frequency),
         "supportingSectors": supporting_sectors,
         "supportGroupID": support_group_id,
-        "evidenceLineage": (
-            CONFIRMED_NONSTATIONARY_EVIDENCE_LINEAGE
-            if confirmed else "V20.8_TIME_FREQUENCY_RECOMMENDATION"
-        ),
-        **({
-            "methodContractID": confirmed_method_contract["methodContractID"],
-            "methodContractHash": confirmed_nonstationary_method_contract_hash(
-                confirmed_method_contract
-            ),
-            "methodContract": copy.deepcopy(confirmed_method_contract),
-        } if confirmed else {}),
+        "evidenceLineage": evidence_lineage,
         "timeReferenceDays": reference_time,
-        "timeSpanDays": float(np.max(relative_times) - np.min(relative_times)),
+        "timeSpanDays": float(
+            np.max(relative_times) - np.min(relative_times)
+        ),
         "frequencySearch": search,
         "driftGrid": {
             "count": int(len(drift_values)),
-            "minimumFractionalFrequencyDriftPerDay": float(np.min(drift_values)),
-            "maximumFractionalFrequencyDriftPerDay": float(np.max(drift_values)),
+            "minimumFractionalFrequencyDriftPerDay": float(
+                np.min(drift_values)
+            ),
+            "maximumFractionalFrequencyDriftPerDay": float(
+                np.max(drift_values)
+            ),
             "values": [float(value) for value in drift_values],
         },
         "groups": [
@@ -801,15 +1296,26 @@ def build_nonstationary_project(
                 "groupID": group["groupID"],
                 "groupLabel": group["label"],
                 "groupSectors": group["sectors"],
-                "sampleCount": int(np.count_nonzero(group["mask"])),
+                "sampleCount": int(
+                    np.count_nonzero(group["mask"])
+                ),
             }
             for group in groups
         ],
         "preparedDatasets": prepared_datasets,
         "sectorResiduals": sector_residuals,
         "workUnitsPerDataset": work_units_per_dataset,
-        "totalWorkUnits": len(dataset_entries) * work_units_per_dataset,
+        "totalWorkUnits": (
+            len(dataset_entries) * work_units_per_dataset
+        ),
+        **({"originalSectorFluxRead": False} if recurrent else {}),
     }
+    if method_contract is not None:
+        result.update({
+            **method_metadata,
+            "methodContract": copy.deepcopy(method_contract),
+        })
+    return result
 
 
 def _boundary_hit(frequency: float | None, search: dict[str, Any]) -> bool:

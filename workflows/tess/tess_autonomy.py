@@ -53,8 +53,11 @@ from .tess_recurrent_residual_long_baseline_confirmation import (
 )
 from .tess_nonstationary import (
     CONFIRMED_NONSTATIONARY_EVIDENCE_LINEAGE,
+    RECURRENT_RESIDUAL_NONSTATIONARY_EVIDENCE_LINEAGE,
     build_confirmed_nonstationary_method_contract,
+    build_recurrent_residual_nonstationary_method_contract,
     validate_confirmed_nonstationary_localization_boundary,
+    validate_recurrent_residual_nonstationary_boundary,
 )
 from .tess_residual_external_evidence import (
     HANDLER_ID as RESIDUAL_EXTERNAL_EVIDENCE_HANDLER_ID,
@@ -2244,6 +2247,164 @@ def _repair_confirmed_nonstationary_terminal(
     )
 
 
+def _repair_recurrent_residual_nonstationary_terminal(
+    store: InvestigationStore,
+    investigation: Investigation,
+    control: dict,
+) -> Investigation | None:
+    """Append v20.9.3 only at the exact finalized v20.8.2 boundary."""
+    if not (
+        investigation.status in {"COMPLETE", "HUMAN_REVIEW_REQUIRED"}
+        and control.get("schedulerAction") == "INVESTIGATION_COMPLETE"
+        and control.get("selectedExperiment") in (None, {})
+        and not any(
+            stage.status == "RUNNING"
+            for stage in investigation.stages
+        )
+        and not any(
+            stage.handler_id.startswith("openstar.tess.nonstationary.")
+            for stage in investigation.stages
+        )
+    ):
+        return None
+
+    confirmation = _latest_complete(
+        investigation,
+        V20_8_LONG_BASELINE_TIME_FREQUENCY_CONFIRMATION_HANDLER_ID,
+    )
+    transient = _latest_complete(
+        investigation, TRANSIENT_MODE_VALIDATION_HANDLER_ID
+    )
+    latest = investigation.stages[-1] if investigation.stages else None
+    prepared = next((
+        stage for stage in investigation.stages
+        if stage.id == "001-prepare-target"
+        and stage.status == "COMPLETE"
+        and isinstance(stage.result, dict)
+    ), None)
+    preparation = _latest_complete(
+        investigation, "openstar.tess.time-frequency.prepare"
+    )
+    if any(
+        stage is None
+        for stage in (
+            confirmation,
+            transient,
+            latest,
+            prepared,
+            preparation,
+        )
+    ):
+        return None
+    if not (
+        isinstance(confirmation.result, dict)
+        and isinstance(transient.result, dict)
+        and isinstance(preparation.result, dict)
+        and confirmation.triggered_by_stage_id == transient.id
+        and latest.handler_id == "openstar.tess.finalize"
+        and latest.status == "COMPLETE"
+        and latest.stop is True
+        and latest.triggered_by_stage_id == confirmation.id
+        and latest.parameters.get("outputSuffix")
+        == "v20.8.2-recurrent-residual-long-baseline-confirmation"
+        and isinstance(latest.result, dict)
+        and latest.result.get("longBaselineTimeFrequencyConfirmation")
+        == confirmation.result
+        and latest.result.get("recommendedNextTest")
+        == "LONG_BASELINE_NONSTATIONARY_MODE_MODELING"
+    ):
+        return None
+    confirmation_index = investigation.stages.index(confirmation)
+    if tuple(
+        investigation.stages[confirmation_index + 1:]
+    ) != (latest,):
+        return None
+
+    try:
+        boundary = (
+            validate_recurrent_residual_nonstationary_boundary(
+                confirmation.result
+            )
+        )
+        contract = (
+            build_recurrent_residual_nonstationary_method_contract(
+                confirmation.result
+            )
+        )
+        specs = build_v20_8_long_baseline_dataset_specs(
+            expected_tic_id=int(prepared.result["ticID"]),
+            preparation=preparation.result,
+        )
+        confirmation_hashes = (
+            confirmation.provenance.input_hashes
+            if confirmation.provenance else {}
+        )
+        transient_hashes = (
+            transient.provenance.input_hashes
+            if transient.provenance else {}
+        )
+        if not (
+            confirmation_hashes.get("methodContract")
+            == confirmation.result.get("methodContractHash")
+            and confirmation_hashes.get("transientModeValidation")
+            == sha256_json(transient.result)
+            and transient_hashes.get("methodContract")
+            == transient.result.get("methodContractHash")
+            and sorted(boundary["frozenWindowDatasetPaths"])
+            == sorted(spec["datasetPath"] for spec in specs)
+        ):
+            return None
+        # The contract is built before validation opens frozen flux.
+        validate_v20_8_frozen_window_lineage(
+            method_contract=contract,
+            dataset_specs=specs,
+        )
+        for spec in specs:
+            key = (
+                "frozenWindowDataset:"
+                f"{spec['role']}:{spec['sector']}:"
+                f"{spec['windowIndex']}"
+            )
+            if (
+                confirmation_hashes.get(key)
+                != sha256_file(spec["datasetPath"])
+            ):
+                return None
+    except (
+        KeyError,
+        OSError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    ):
+        return None
+
+    continuation = StageRequest(
+        id=_continuation_stage_id(
+            latest, "prepare-recurrent-residual-nonstationary"
+        ),
+        handler_id="openstar.tess.nonstationary.prepare",
+        parameters={
+            "evidenceLineage": (
+                RECURRENT_RESIDUAL_NONSTATIONARY_EVIDENCE_LINEAGE
+            )
+        },
+        triggered_by_stage_id=confirmation.id,
+    )
+    return store.set_control_state(
+        investigation,
+        status="RUNNING",
+        control_state={
+            "branchAssessments": [],
+            "selectedExperiment": asdict(continuation),
+            "schedulerAction": "RUN_EXPERIMENT",
+            "recovery": (
+                "TESS_RECURRENT_RESIDUAL_NONSTATIONARY_MODE_MODELING"
+            ),
+        },
+    )
+
+
 def _repair_confirmed_residual_localization_terminal(
     store: InvestigationStore, investigation: Investigation, control: dict
 ) -> Investigation | None:
@@ -4391,6 +4552,14 @@ def repair_obsolete_terminal_wait(
         )
     if long_baseline_repair is not None:
         return long_baseline_repair
+
+    recurrent_nonstationary_repair = (
+        _repair_recurrent_residual_nonstationary_terminal(
+            store, investigation, control
+        )
+    )
+    if recurrent_nonstationary_repair is not None:
+        return recurrent_nonstationary_repair
 
     confirmed_nonstationary_repair = _repair_confirmed_nonstationary_terminal(
         store, investigation, control
