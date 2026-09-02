@@ -22,7 +22,10 @@ from workflows.tess.tess_autonomy import (
     WORKFLOW_VERSION,
     _repair_v20_8_long_baseline_time_frequency_confirmation_terminal,
 )
-from workflows.tess.tess_investigation import build_engine
+from workflows.tess.tess_investigation import (
+    build_engine,
+    v20_8_long_baseline_time_frequency_confirmation_continuation,
+)
 from workflows.tess.tess_v20_8_long_baseline_time_frequency_confirmation import (
     COHERENT,
     HANDLER_ID,
@@ -257,6 +260,24 @@ class V208LongBaselineAnalysisTests(unittest.TestCase):
         self.assertEqual(method_contract_hash(first), method_contract_hash(second))
         self.assertFalse(first["crossValidation"]["heldOutFrequencySelection"])
         self.assertFalse(first["crossValidation"]["heldOutPhaseSelection"])
+
+        continuation = v20_8_long_baseline_time_frequency_confirmation_continuation(
+            {
+                "classification": NONSTATIONARY,
+                "methodContractID": METHOD_CONTRACT_ID,
+                "methodContract": first,
+                "methodContractHash": method_contract_hash(first),
+                "physicalMechanismResolved": False,
+                "claimLevelChanged": False,
+                "automaticDiscoveryClaim": False,
+            },
+            request_id="010-long-baseline-time-frequency-confirmation",
+        )
+        self.assertEqual("openstar.tess.finalize", continuation.handler_id)
+        self.assertEqual(
+            "v20.8.1-long-baseline-time-frequency-confirmation",
+            continuation.parameters["outputSuffix"],
+        )
 
     def test_method_contract_accepts_resolved_physical_cycle_reference(self):
         with tempfile.TemporaryDirectory() as temporary:
