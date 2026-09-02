@@ -98,6 +98,12 @@ _MAIN_FAMILY_FREQUENCY_REASSESSMENT_HANDLER = (
     "openstar.tess.main-family-frequency-domain-reassessment.analyze")
 _DEEP_CATALOG_COUNTERPART_HANDLER = (
     "openstar.tess.deep-catalog-counterpart-identification.analyze")
+_DEEP_CATALOG_PRF_PREPARE_HANDLER = (
+    "openstar.tess.deep-catalog-guided-prf-localization.prepare")
+_DEEP_CATALOG_PRF_RUN_HANDLER = (
+    "openstar.tess.deep-catalog-guided-prf-localization.run")
+_DEEP_CATALOG_PRF_INTERPRET_HANDLER = (
+    "openstar.tess.deep-catalog-guided-prf-localization.interpret")
 
 _KNOWN_TARGET_BLIND_PREPARER = "openstar.tess-known-target-blind-benchmark-preparer"
 
@@ -1020,6 +1026,41 @@ def _persisted_archive_continuation(investigation: Investigation):
             ):
                 continue
         return stage, raw
+    return None
+
+
+def _persisted_deep_catalog_prf_continuation(investigation: Investigation):
+    """Return the exact unattempted continuation recorded by the PR183 stages."""
+    expected = {
+        _DEEP_CATALOG_PRF_PREPARE_HANDLER: (
+            _DEEP_CATALOG_PRF_RUN_HANDLER, {},
+        ),
+        _DEEP_CATALOG_PRF_RUN_HANDLER: (
+            _DEEP_CATALOG_PRF_INTERPRET_HANDLER, {},
+        ),
+        _DEEP_CATALOG_PRF_INTERPRET_HANDLER: (
+            "openstar.tess.finalize",
+            {"outputSuffix": "deep-catalog-guided-prf-localization"},
+        ),
+    }
+    attempted_ids = {stage.id for stage in investigation.stages}
+    for stage in reversed(investigation.stages):
+        if stage.handler_id not in expected or stage.status != "COMPLETE":
+            continue
+        raw = stage.next_stage
+        if not isinstance(raw, dict):
+            continue
+        handler_id, parameters = expected[stage.handler_id]
+        continuation_id = raw.get("id")
+        if (
+            isinstance(continuation_id, str)
+            and continuation_id
+            and continuation_id not in attempted_ids
+            and raw.get("handler_id") == handler_id
+            and raw.get("parameters") == parameters
+            and raw.get("triggered_by_stage_id") == stage.id
+        ):
+            return stage, raw
     return None
 
 
@@ -2541,6 +2582,83 @@ def _repair_deep_catalog_finalize_handoff(
             "selectedExperiment": asdict(request),
             "schedulerAction": "RUN_EXPERIMENT",
             "recovery": "TESS_DEEP_CATALOG_FINALIZE_HANDOFF",
+        },
+    )
+
+
+def _repair_deep_catalog_prf_localization_terminal(
+    store: InvestigationStore,
+    investigation: Investigation,
+    control: dict,
+) -> Investigation | None:
+    """Append the PR183 PRF experiment only after the exact finalized PR182 boundary."""
+    if not (
+        investigation.status in {"COMPLETE", "HUMAN_REVIEW_REQUIRED"}
+        and control.get("schedulerAction") == "INVESTIGATION_COMPLETE"
+        and control.get("selectedExperiment") in (None, {})
+        and not any(stage.status == "RUNNING" for stage in investigation.stages)
+        and not any(
+            stage.handler_id.startswith("openstar.tess.deep-catalog-guided-prf-localization.")
+            for stage in investigation.stages
+        )
+        and investigation.stages
+    ):
+        return None
+    deep = _latest_complete(investigation, _DEEP_CATALOG_COUNTERPART_HANDLER)
+    latest = investigation.stages[-1]
+    if deep is None or not isinstance(deep.result, dict) or not isinstance(latest.result, dict):
+        return None
+    result = deep.result
+    candidates = result.get("plausibleCatalogCandidates") or []
+    if not (
+        result.get("version")
+        == "openstar.tess-deep-catalog-counterpart-identification.v1"
+        and result.get("classification") == "AMBIGUOUS_DEEP_CATALOG_COUNTERPARTS"
+        and result.get("counterpartIdentified") is False
+        and result.get("preferredCandidate") is None
+        and 2 <= len(candidates) <= 5
+        and all(
+            isinstance(item, dict)
+            and item.get("isTarget") is False
+            and item.get("variabilityConfirmed") is False
+            and item.get("raDeg") is not None
+            and item.get("decDeg") is not None
+            for item in candidates
+        )
+        and result.get("variabilityConfirmed") is False
+        and result.get("physicalMechanismResolved") is False
+        and result.get("claimLevelChanged") is False
+        and result.get("externalDataState") == "AVAILABLE"
+        and not (result.get("queryErrors") or [])
+        and result.get("recommendedNextTest")
+        == "HIGH_RESOLUTION_RESIDUAL_SOURCE_LOCALIZATION"
+        and latest.handler_id == "openstar.tess.finalize"
+        and latest.status == "COMPLETE"
+        and latest.stop is True
+        and latest.triggered_by_stage_id == deep.id
+        and latest.parameters.get("outputSuffix") == "deep-catalog-counterpart"
+        and latest.result.get("deepCatalogCounterpartIdentification") == result
+        and latest.result.get("recommendedNextTest")
+        == "HIGH_RESOLUTION_RESIDUAL_SOURCE_LOCALIZATION"
+    ):
+        return None
+    deep_index = investigation.stages.index(deep)
+    if tuple(investigation.stages[deep_index + 1:]) != (latest,):
+        return None
+    continuation = StageRequest(
+        id=_continuation_stage_id(
+            latest, "prepare-deep-catalog-guided-prf-localization"),
+        handler_id=_DEEP_CATALOG_PRF_PREPARE_HANDLER,
+        parameters={}, triggered_by_stage_id=deep.id,
+    )
+    return store.set_control_state(
+        investigation,
+        status="RUNNING",
+        control_state={
+            "branchAssessments": [],
+            "selectedExperiment": asdict(continuation),
+            "schedulerAction": "RUN_EXPERIMENT",
+            "recovery": "TESS_DEEP_CATALOG_GUIDED_PRF_LOCALIZATION",
         },
     )
 
@@ -4743,6 +4861,12 @@ def repair_obsolete_terminal_wait(
     if deep_catalog_repair is not None:
         return deep_catalog_repair
 
+    deep_catalog_localization_repair = _repair_deep_catalog_prf_localization_terminal(
+        store, investigation, control
+    )
+    if deep_catalog_localization_repair is not None:
+        return deep_catalog_localization_repair
+
     deep_catalog_finalize_repair = _repair_deep_catalog_finalize_handoff(
         store, investigation, control
     )
@@ -4996,11 +5120,14 @@ def repair_obsolete_terminal_wait(
         repaired, _ = AutonomousInvestigationEngine(store).decide(investigation, ())
         return repaired
 
-    gaia_continuation = _persisted_archive_continuation(investigation)
+    persisted_continuation = (
+        _persisted_archive_continuation(investigation)
+        or _persisted_deep_catalog_prf_continuation(investigation)
+    )
     if (
         investigation.status == "COMPLETE"
         and control.get("schedulerAction") == "INVESTIGATION_COMPLETE"
-        and gaia_continuation is not None
+        and persisted_continuation is not None
     ):
         metadata = investigation.metadata or {}
         target = InvestigationTarget(
@@ -5101,6 +5228,9 @@ def plan_tess_branches(
     )
     deep_catalog_identification = _latest_complete(
         investigation, _DEEP_CATALOG_COUNTERPART_HANDLER
+    )
+    deep_catalog_prf_localization = _latest_complete(
+        investigation, _DEEP_CATALOG_PRF_INTERPRET_HANDLER
     )
     catalog_guided_localization = _latest_complete(
         investigation, "openstar.tess.catalog-guided-source-localization.interpret"
@@ -5250,6 +5380,18 @@ def plan_tess_branches(
             ),
         )
 
+    deep_catalog_prf_continuation = _persisted_deep_catalog_prf_continuation(
+        investigation
+    )
+    if deep_catalog_prf_continuation is not None:
+        completed, raw = deep_catalog_prf_continuation
+        return (
+            ScientificBranch(
+                id=f"continue-after-{completed.id}",
+                experiment=_request_from_persisted(raw),
+            ),
+        )
+
     skymapper_interpretation = _latest_complete(
         investigation, "openstar.tess.skymapper-resolved-counterpart-photometry.interpret"
     )
@@ -5340,6 +5482,45 @@ def plan_tess_branches(
                 handler_id=_DEEP_CATALOG_COUNTERPART_HANDLER,
                 parameters={},
                 triggered_by_stage_id=catalog_identification.id,
+            ),
+        ),)
+    deep_catalog_prf_started = any(
+        stage.handler_id.startswith("openstar.tess.deep-catalog-guided-prf-localization.")
+        and stage.status in {"RUNNING", "COMPLETE"}
+        for stage in investigation.stages
+    )
+    deep_result = (
+        (deep_catalog_identification.result or {})
+        if deep_catalog_identification is not None else {}
+    )
+    deep_candidates = deep_result.get("plausibleCatalogCandidates") or []
+    if (
+        deep_catalog_identification is not None
+        and deep_catalog_prf_localization is None
+        and not deep_catalog_prf_started
+        and deep_result.get("version")
+        == "openstar.tess-deep-catalog-counterpart-identification.v1"
+        and deep_result.get("classification") == "AMBIGUOUS_DEEP_CATALOG_COUNTERPARTS"
+        and deep_result.get("counterpartIdentified") is False
+        and deep_result.get("preferredCandidate") is None
+        and 2 <= len(deep_candidates) <= 5
+        and deep_result.get("variabilityConfirmed") is False
+        and deep_result.get("physicalMechanismResolved") is False
+        and deep_result.get("claimLevelChanged") is False
+        and deep_result.get("externalDataState") == "AVAILABLE"
+        and not (deep_result.get("queryErrors") or [])
+        and deep_result.get("recommendedNextTest")
+        == "HIGH_RESOLUTION_RESIDUAL_SOURCE_LOCALIZATION"
+    ):
+        return (ScientificBranch(
+            id=f"localize-deep-catalog-after-{deep_catalog_identification.id}",
+            experiment=StageRequest(
+                id=_continuation_stage_id(
+                    investigation.stages[-1],
+                    "prepare-deep-catalog-guided-prf-localization",
+                ),
+                handler_id=_DEEP_CATALOG_PRF_PREPARE_HANDLER,
+                parameters={}, triggered_by_stage_id=deep_catalog_identification.id,
             ),
         ),)
     if deep_catalog_identification is not None:
