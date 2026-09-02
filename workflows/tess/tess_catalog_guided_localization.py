@@ -431,8 +431,14 @@ def _production_sector_inputs(
         _skycoord(float(target_sky["raDeg"]), float(target_sky["decDeg"])),
         *[_skycoord(float(item["raDeg"]), float(item["decDeg"])) for item in candidates],
     ]
+    component_ids = tuple(preparation.get("componentIDs") or COMPONENT_IDS)
+    if len(component_ids) != len(coordinates) or len(set(component_ids)) != len(component_ids):
+        raise RuntimeError("Frozen component IDs must uniquely label target plus every candidate.")
     inputs = []
-    cache_root = Path(preparation["artifactRoot"]) / "official-prf-cache"
+    cache_root = Path(
+        preparation.get("officialPRFCacheRoot")
+        or (Path(preparation["artifactRoot"]) / "official-prf-cache")
+    )
     for sector in preparation["sectors"]:
         tpf, source = _download_tpf(
             tic_id=int(preparation["ticID"]), sector=int(sector),
@@ -452,7 +458,7 @@ def _production_sector_inputs(
             harmonic_orders=orders)
         rows, cols = valid.shape
         centers = []
-        for component_id, coordinate in zip(COMPONENT_IDS, coordinates):
+        for component_id, coordinate in zip(component_ids, coordinates):
             x, y = tpf.wcs.world_to_pixel(coordinate)
             if not (math.isfinite(float(x)) and math.isfinite(float(y))):
                 raise RuntimeError(f"{component_id} has no finite WCS position in sector {sector}.")

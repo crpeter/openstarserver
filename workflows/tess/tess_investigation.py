@@ -250,6 +250,14 @@ from .tess_catalog_guided_localization import (
     run_catalog_guided_localization,
     interpret_catalog_guided_localization,
 )
+from .tess_deep_catalog_guided_localization import (
+    PREPARE_HANDLER_ID as DEEP_CATALOG_PRF_PREPARE_HANDLER_ID,
+    RUN_HANDLER_ID as DEEP_CATALOG_PRF_RUN_HANDLER_ID,
+    INTERPRET_HANDLER_ID as DEEP_CATALOG_PRF_INTERPRET_HANDLER_ID,
+    prepare_deep_catalog_guided_localization,
+    run_deep_catalog_guided_localization,
+    interpret_deep_catalog_guided_localization,
+)
 from .tess_difference_image import (
     build_difference_image_project,
     interpret_difference_image_project,
@@ -381,7 +389,7 @@ from .tess_multisector import (
 WORKFLOW_ID = "openstar.workflow.tess-investigation.v1"
 WORKFLOW_VERSION = "20.2"
 SOFTWARE_ID = "openstar.tess-investigation-plugin"
-SOFTWARE_VERSION = "20.45"
+SOFTWARE_VERSION = "20.46"
 ADAPTIVE_BLIND_TRANSIT_ADDITIONAL_SECTORS = 8
 EXHAUSTED_RESIDUAL_RUN_HANDLER_ID = (
     "openstar.tess.blind-transit-distributed.run"
@@ -1435,11 +1443,40 @@ def catalog_counterpart_variability_continuation(
 def deep_catalog_counterpart_continuation(
     summary: dict[str, Any], *, request_id: str
 ) -> StageRequest:
-    """Finalize a deeper-catalog discovery result without overreaching."""
+    """Enter bounded multi-source PRF localization only at the ambiguous boundary."""
+    localize = (
+        summary.get("version")
+        == "openstar.tess-deep-catalog-counterpart-identification.v1"
+        and summary.get("classification") == "AMBIGUOUS_DEEP_CATALOG_COUNTERPARTS"
+        and summary.get("counterpartIdentified") is False
+        and summary.get("preferredCandidate") is None
+        and 2 <= len(summary.get("plausibleCatalogCandidates") or []) <= 5
+        and summary.get("variabilityConfirmed") is False
+        and summary.get("physicalMechanismResolved") is False
+        and summary.get("claimLevelChanged") is False
+        and summary.get("externalDataState") == "AVAILABLE"
+        and not (summary.get("queryErrors") or [])
+        and summary.get("recommendedNextTest")
+        == "HIGH_RESOLUTION_RESIDUAL_SOURCE_LOCALIZATION"
+    )
+    return StageRequest(
+        id=_next_stage_id(
+            request_id,
+            "prepare-deep-catalog-guided-prf-localization" if localize else "finalize",
+        ),
+        handler_id=(DEEP_CATALOG_PRF_PREPARE_HANDLER_ID if localize
+                    else "openstar.tess.finalize"),
+        parameters={} if localize else {"outputSuffix": "deep-catalog-counterpart"},
+        triggered_by_stage_id=request_id,
+    )
+
+
+def deep_catalog_prf_localization_continuation(*, request_id: str) -> StageRequest:
+    """Finalize the bounded localization result before another science step."""
     return StageRequest(
         id=_next_stage_id(request_id, "finalize"),
         handler_id="openstar.tess.finalize",
-        parameters={"outputSuffix": "deep-catalog-counterpart"},
+        parameters={"outputSuffix": "deep-catalog-guided-prf-localization"},
         triggered_by_stage_id=request_id,
     )
 
@@ -2612,6 +2649,26 @@ def _render_report(conclusion: dict[str, Any]) -> str:
             f"- Variability confirmed: {deep_catalog_counterpart.get('variabilityConfirmed')}",
             f"- Recommended next test: {deep_catalog_counterpart.get('recommendedNextTest')}",
             f"- Guard: {deep_catalog_counterpart.get('interpretationGuard')}",
+        ])
+
+    deep_catalog_prf = conclusion.get("deepCatalogGuidedPrfLocalization")
+    if deep_catalog_prf is not None:
+        preferred = deep_catalog_prf.get("preferredCandidate") or {}
+        catalog_ids = preferred.get("catalogIDs") or {}
+        lines.extend([
+            "",
+            "## Deep-catalog-guided multi-source PRF localization",
+            "",
+            f"- Classification: {deep_catalog_prf.get('classification')}",
+            f"- Method scope: {deep_catalog_prf.get('methodScope')}",
+            f"- Decisive sectors: {deep_catalog_prf.get('decisiveSectorCount')} / {deep_catalog_prf.get('sectorCount')}",
+            f"- Stable component: {deep_catalog_prf.get('stableComponentID')}",
+            f"- SkyMapper DR4 object: {catalog_ids.get('skyMapperDR4ObjectID')}",
+            f"- NSC DR2 object: {catalog_ids.get('nscDR2ObjectID')}",
+            f"- Source attribution resolved: {deep_catalog_prf.get('sourceAttributionResolved')}",
+            f"- Catalog queries repeated: {deep_catalog_prf.get('catalogQueriesRepeated')}",
+            f"- Recommended next test: {deep_catalog_prf.get('recommendedNextTest')}",
+            f"- Guard: {deep_catalog_prf.get('interpretationGuard')}",
         ])
 
     external_high_resolution = conclusion.get("externalHighResolutionVariabilityValidation")
@@ -8901,6 +8958,116 @@ def build_engine(
             artifacts=(_artifact(path, "application/json"),),
         )
 
+    def deep_catalog_prf_localization_prepare_stage(investigation, request):
+        deep_catalog = _latest_result_for_handler(
+            investigation, DEEP_CATALOG_COUNTERPART_HANDLER_ID)
+        official_prf = _latest_result_for_handler(
+            investigation, "openstar.tess.official-spoc-prf-forward-modeling.prepare")
+        prepared = _latest_result_for_handler(investigation, "openstar.tess.prepare-target")
+        identity = _latest_result_for_handler(investigation, "openstar.tess.catalog-identity")
+        morphology = _latest_result_for_handler(investigation, "openstar.tess.morphology.analyze")
+        nonstationary = _latest_result_for_handler(
+            investigation, "openstar.tess.nonstationary.summarize")
+        if any(item is None for item in (
+            deep_catalog, official_prf, prepared, identity, morphology, nonstationary
+        )):
+            raise RuntimeError(
+                "Deep-catalog PRF localization requires persisted target, identity, morphology, "
+                "nonstationary, deep-catalog, and official-PRF evidence."
+            )
+        target_meta = ((identity.get("tic") or {}).get("metadata") or {})
+        sectors = [
+            int(item["sector"])
+            for item in official_prf.get("calibrationDiagnostics") or []
+            if item.get("sector") is not None
+        ]
+        prf_bridge = {
+            "version": "openstar.tess-deep-catalog-prf-localization-bridge.v1",
+            "ticID": prepared.get("ticID", official_prf.get("targetTIC")),
+            "target": {"componentID": "target", "ticID": prepared.get("ticID")},
+            "targetSky": {"raDeg": target_meta.get("raDeg"),
+                          "decDeg": target_meta.get("decDeg")},
+            "sectors": sectors,
+            "referenceFamilyPeriodDays": morphology.get("resolvedPhysicalPeriodDays"),
+            "residualReferenceFrequency": official_prf.get(
+                "referenceFrequency", nonstationary.get("preferredFrequencyAtReference")),
+            "residualTimeReferenceDays": official_prf.get(
+                "timeReferenceDays", nonstationary.get("timeReferenceDays")),
+            "fractionalFrequencyDriftPerDay": official_prf.get(
+                "fractionalFrequencyDriftPerDay",
+                nonstationary.get("fractionalFrequencyDriftPerDay")),
+            "officialPRFCacheRoot": str(
+                Path(official_prf["projectPath"]).parent / "official-prf-cache"
+            ) if official_prf.get("projectPath") else None,
+            "officialSPOCPRFPreparation": official_prf,
+        }
+        preparation = prepare_deep_catalog_guided_localization(
+            deep_catalog_summary=deep_catalog, prf_preparation=prf_bridge,
+            output_dir=store.directory_for(investigation.id) / "artifacts",
+            investigation_id=investigation.id,
+        )
+        print("🔬 Preparing deep-catalog-guided multi-source PRF localization")
+        print(f"   frozen candidates: {len(preparation['catalogCandidates'])}")
+        print(f"   source-subset hypotheses: {preparation['modelHypothesisCount']}")
+        print("   catalog queries repeated: False")
+        return StageOutcome(
+            result=preparation,
+            next_stage=StageRequest(
+                _next_stage_id(request.id, "run-deep-catalog-guided-prf-localization"),
+                DEEP_CATALOG_PRF_RUN_HANDLER_ID, {}, request.id),
+            input_hashes={"deepCatalogCounterpart": sha256_json(deep_catalog),
+                          "officialSPOCPRFPreparation": sha256_json(official_prf),
+                          "target": sha256_json(prepared),
+                          "catalogIdentity": sha256_json(identity),
+                          "morphology": sha256_json(morphology),
+                          "nonstationaryModel": sha256_json(nonstationary)},
+            artifacts=(_artifact(Path(preparation["preparationPath"]), "application/json"),),
+        )
+
+    def deep_catalog_prf_localization_run_stage(investigation, request):
+        preparation = _latest_result_for_handler(
+            investigation, DEEP_CATALOG_PRF_PREPARE_HANDLER_ID)
+        if preparation is None:
+            raise RuntimeError("Deep-catalog PRF localization run requires completed preparation.")
+        result = run_deep_catalog_guided_localization(
+            preparation, sector_inputs=request.parameters.get("sectorInputs"))
+        path = Path(preparation["artifactRoot"]) / "run.json"
+        _write_json(path, result)
+        print("✅ Deep-catalog-guided multi-source PRF fit complete")
+        print(f"   sectors: {len(result.get('sectorResults') or [])}")
+        return StageOutcome(
+            result=result,
+            next_stage=StageRequest(
+                _next_stage_id(request.id, "interpret-deep-catalog-guided-prf-localization"),
+                DEEP_CATALOG_PRF_INTERPRET_HANDLER_ID, {}, request.id),
+            input_hashes={"preparation": sha256_json(preparation)},
+            artifacts=(_artifact(path, "application/json"),),
+        )
+
+    def deep_catalog_prf_localization_interpret_stage(investigation, request):
+        preparation = _latest_result_for_handler(
+            investigation, DEEP_CATALOG_PRF_PREPARE_HANDLER_ID)
+        run = _latest_result_for_handler(investigation, DEEP_CATALOG_PRF_RUN_HANDLER_ID)
+        if preparation is None or run is None:
+            raise RuntimeError(
+                "Deep-catalog PRF localization interpretation requires completed prepare and run."
+            )
+        result = interpret_deep_catalog_guided_localization(preparation, run)
+        path = Path(preparation["artifactRoot"]) / "interpretation.json"
+        _write_json(path, result)
+        print("🔬 Deep-catalog-guided residual-source localization")
+        print(f"   classification: {result.get('classification')}")
+        print(f"   decisive sectors: {result.get('decisiveSectorCount')} / {result.get('sectorCount')}")
+        print(f"   stable component: {result.get('stableComponentID')}")
+        print(f"   physical mechanism resolved: {result.get('physicalMechanismResolved')}")
+        print(f"   recommended next test: {result.get('recommendedNextTest')}")
+        return StageOutcome(
+            result=result,
+            next_stage=deep_catalog_prf_localization_continuation(request_id=request.id),
+            input_hashes={"preparation": sha256_json(preparation), "run": sha256_json(run)},
+            artifacts=(_artifact(path, "application/json"),),
+        )
+
     def catalog_guided_localization_prepare_stage(investigation, request):
         catalog = _latest_result_for_handler(
             investigation, "openstar.tess.catalog-counterpart-identification.analyze")
@@ -12510,6 +12677,10 @@ def build_engine(
             investigation,
             DEEP_CATALOG_COUNTERPART_HANDLER_ID,
         )
+        deep_catalog_prf_localization = _latest_result_for_handler(
+            investigation,
+            DEEP_CATALOG_PRF_INTERPRET_HANDLER_ID,
+        )
         external_high_resolution_validation = _latest_result_for_handler(
             investigation,
             "openstar.tess.external-high-resolution-variability-validation.interpret",
@@ -13863,6 +14034,10 @@ def build_engine(
             # This branch is appended after v20.16. Genuinely later unrelated
             # evidence remains above it when introduced in the precedence list.
             recommended_next_test = target_residual_archival_baseline_extension.get("recommendedNextTest")
+        elif deep_catalog_prf_localization is not None:
+            recommended_next_test = deep_catalog_prf_localization.get(
+                "recommendedNextTest"
+            )
         elif deep_catalog_counterpart_identification is not None:
             recommended_next_test = deep_catalog_counterpart_identification.get(
                 "recommendedNextTest"
@@ -14052,6 +14227,7 @@ def build_engine(
             "officialSpocPrfForwardModeling": official_spoc_prf_forward_modeling,
             "catalogCounterpartIdentification": catalog_counterpart_identification,
             "deepCatalogCounterpartIdentification": deep_catalog_counterpart_identification,
+            "deepCatalogGuidedPrfLocalization": deep_catalog_prf_localization,
             "externalHighResolutionVariabilityValidation": external_high_resolution_validation,
             "skyMapperResolvedPhotometryScreen": skymapper_resolved_photometry,
             "nscResolvedPhotometryScreen": nsc_resolved_photometry,
@@ -14160,6 +14336,28 @@ def build_engine(
             print(
                 "   recommended next test: "
                 f"{deep_catalog_counterpart_identification.get('recommendedNextTest')}"
+            )
+        if deep_catalog_prf_localization is not None:
+            preferred = deep_catalog_prf_localization.get("preferredCandidate") or {}
+            print(
+                "   deep-catalog-guided PRF localization: "
+                f"{deep_catalog_prf_localization.get('classification')}"
+            )
+            print(
+                "   localized catalog component: "
+                f"{deep_catalog_prf_localization.get('stableComponentID')}"
+            )
+            print(
+                "   localized SkyMapper DR4 object: "
+                f"{(preferred.get('catalogIDs') or {}).get('skyMapperDR4ObjectID')}"
+            )
+            print(
+                "   localized NSC DR2 object: "
+                f"{(preferred.get('catalogIDs') or {}).get('nscDR2ObjectID')}"
+            )
+            print(
+                "   recommended next test: "
+                f"{deep_catalog_prf_localization.get('recommendedNextTest')}"
             )
         if source_localization is not None:
             cross = source_localization.get("crossSector") or {}
@@ -14810,6 +15008,18 @@ def build_engine(
     engine.register_handler(
         DEEP_CATALOG_COUNTERPART_HANDLER_ID,
         deep_catalog_counterpart_identification_stage,
+    )
+    engine.register_handler(
+        DEEP_CATALOG_PRF_PREPARE_HANDLER_ID,
+        deep_catalog_prf_localization_prepare_stage,
+    )
+    engine.register_handler(
+        DEEP_CATALOG_PRF_RUN_HANDLER_ID,
+        deep_catalog_prf_localization_run_stage,
+    )
+    engine.register_handler(
+        DEEP_CATALOG_PRF_INTERPRET_HANDLER_ID,
+        deep_catalog_prf_localization_interpret_stage,
     )
     engine.register_handler(
         "openstar.tess.catalog-guided-source-localization.prepare",
