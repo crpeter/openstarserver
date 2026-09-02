@@ -6297,9 +6297,18 @@ def build_engine(
         if confirmed_contract is not None:
             print(f"   method contract: {result.get('methodContractID')}")
             print(f"   method hash: {result.get('methodContractHash')}")
+            period_reference = (
+                (confirmation_stage.result.get("methodContract") or {})
+                .get("evidenceBoundary", {})
+                .get("periodReference", {})
+            )
+            period_label = (
+                "established physical period"
+                if period_reference.get("physicalCycleResolved") is True
+                else "established unresolved family reference"
+            )
             print(
-                "   established unresolved family reference: "
-                f"{established_period} days"
+                f"   {period_label}: {established_period} days"
             )
         else:
             print(f"   established physical period: {established_period} days")

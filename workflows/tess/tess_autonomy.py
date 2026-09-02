@@ -21,9 +21,12 @@ from openstar_targets import InvestigationTarget
 from openstar_workflow import StageRequest, WorkflowEngine
 from .tess_localization_evidence import frozen_residual_localization_family
 from .tess_mode_identification import (
+    CONFIRMED_COHERENT_MODE_METHOD_CONTRACT_ID,
+    CONFIRMED_COHERENT_MODE_RESULT_VERSION,
     MULTIMODE_MODE_EVIDENCE_LINEAGE,
     V20_8_CONFIRMED_COHERENT_MODE_EVIDENCE_LINEAGE,
     build_confirmed_coherent_mode_method_contract,
+    confirmed_coherent_mode_method_contract_hash,
     validate_confirmed_coherent_mode_dataset_lineage,
     validate_v20_8_confirmed_coherent_residual,
     validated_multimode_mode_evidence,
@@ -2013,6 +2016,250 @@ def _repair_v20_8_confirmed_coherent_mode_identification_terminal(
             "schedulerAction": "RUN_EXPERIMENT",
             "recovery": (
                 "TESS_V20_8_CONFIRMED_COHERENT_MODE_IDENTIFICATION"
+            ),
+        },
+    )
+
+
+def _repair_v20_8_confirmed_coherent_mode_localization_terminal(
+    store: InvestigationStore,
+    investigation: Investigation,
+    control: dict,
+) -> Investigation | None:
+    """Append pixel localization only at the verified positive v20.8.2 boundary."""
+    if not (
+        investigation.status in {"COMPLETE", "HUMAN_REVIEW_REQUIRED"}
+        and control.get("schedulerAction") == "INVESTIGATION_COMPLETE"
+        and control.get("selectedExperiment") in (None, {})
+        and not any(
+            stage.status == "RUNNING" for stage in investigation.stages
+        )
+        and not any(
+            stage.handler_id.startswith(
+                "openstar.tess.residual-mode-localization."
+            )
+            for stage in investigation.stages
+        )
+    ):
+        return None
+
+    mode = _latest_complete(
+        investigation, "openstar.tess.mode-identification.analyze"
+    )
+    confirmation = _latest_complete(
+        investigation,
+        V20_8_LONG_BASELINE_TIME_FREQUENCY_CONFIRMATION_HANDLER_ID,
+    )
+    independent = _latest_complete(
+        investigation, "openstar.tess.independent.prepare"
+    )
+    prepared = next((
+        stage for stage in investigation.stages
+        if stage.id == "001-prepare-target"
+        and stage.status == "COMPLETE"
+        and isinstance(stage.result, dict)
+    ), None)
+    latest = investigation.stages[-1] if investigation.stages else None
+    if any(
+        stage is None
+        for stage in (mode, confirmation, independent, prepared, latest)
+    ) or not all(
+        isinstance(stage.result, dict)
+        for stage in (mode, confirmation, independent, prepared, latest)
+    ):
+        return None
+
+    result = mode.result or {}
+    final_result = latest.result or {}
+    if not (
+        mode.triggered_by_stage_id == confirmation.id
+        and mode.parameters == {
+            "evidenceLineage": (
+                V20_8_CONFIRMED_COHERENT_MODE_EVIDENCE_LINEAGE
+            )
+        }
+        and result.get("version")
+        == CONFIRMED_COHERENT_MODE_RESULT_VERSION
+        and result.get("evidenceLineage")
+        == V20_8_CONFIRMED_COHERENT_MODE_EVIDENCE_LINEAGE
+        and result.get("classification") == "INDEPENDENT_STABLE_MODE"
+        and result.get("independentModeEvidenceSurvived") is True
+        and isinstance(result.get("modeCandidate"), dict)
+        and result.get("physicalMechanismResolved") is False
+        and result.get("pulsationMechanismResolved") is False
+        and result.get("claimLevelChanged") is False
+        and result.get("automaticDiscoveryClaim") is False
+        and result.get("recommendedNextTest")
+        == "RESIDUAL_MODE_PIXEL_LOCALIZATION"
+        and result.get("methodContractID")
+        == CONFIRMED_COHERENT_MODE_METHOD_CONTRACT_ID
+        and result.get("methodContractHash")
+        == confirmed_coherent_mode_method_contract_hash(
+            result.get("methodContract") or {}
+        )
+        and latest.handler_id == "openstar.tess.finalize"
+        and latest.status == "COMPLETE"
+        and latest.stop is True
+        and latest.triggered_by_stage_id == mode.id
+        and latest.parameters == {
+            "outputSuffix": (
+                "v20.8.2-confirmed-coherent-mode-identification"
+            )
+        }
+        and final_result.get("modeIdentification") == result
+        and final_result.get("recommendedNextTest")
+        == "RESIDUAL_MODE_PIXEL_LOCALIZATION"
+    ):
+        return None
+    mode_index = investigation.stages.index(mode)
+    if tuple(investigation.stages[mode_index + 1:]) != (latest,):
+        return None
+
+    try:
+        evidence = validate_v20_8_confirmed_coherent_residual(
+            confirmation.result
+        )
+        prepared_by_sector = {}
+        for item in independent.result.get("preparedSectors") or []:
+            if not isinstance(item, dict) or item.get("sector") is None:
+                continue
+            sector = int(item["sector"])
+            if sector in prepared_by_sector:
+                return None
+            prepared_by_sector[sector] = item
+        if not set(evidence["independentSectors"]).issubset(
+            prepared_by_sector
+        ):
+            return None
+        dataset_specs = [{
+            "datasetID": prepared.result["datasetID"],
+            "datasetPath": prepared.result["datasetPath"],
+            "ticID": prepared.result["ticID"],
+            "sector": prepared.result["sector"],
+            "role": "PRIMARY",
+        }]
+        dataset_specs.extend({
+            "datasetID": prepared_by_sector[sector]["datasetID"],
+            "datasetPath": prepared_by_sector[sector]["datasetPath"],
+            "ticID": prepared.result["ticID"],
+            "sector": sector,
+            "role": "INDEPENDENT",
+        } for sector in evidence["independentSectors"])
+        expected_contract = build_confirmed_coherent_mode_method_contract(
+            confirmation=confirmation.result,
+            dataset_specs=dataset_specs,
+        )
+        if result.get("methodContract") != expected_contract:
+            return None
+        validate_confirmed_coherent_mode_dataset_lineage(
+            method_contract=expected_contract,
+            dataset_specs=dataset_specs,
+        )
+        candidate = result["modeCandidate"]
+        residual = result["residualCandidate"]
+        frequency = float(candidate["frequencyCyclesPerDay"])
+        period = float(candidate["periodDays"])
+        if not (
+            math.isfinite(frequency)
+            and frequency > 0.0
+            and math.isfinite(period)
+            and period > 0.0
+            and math.isclose(
+                frequency,
+                1.0 / period,
+                rel_tol=1e-12,
+                abs_tol=1e-15,
+            )
+            and math.isclose(
+                frequency,
+                float(residual["refinedFrequencyCyclesPerDay"]),
+                rel_tol=1e-12,
+                abs_tol=1e-15,
+            )
+            and math.isclose(
+                period,
+                float(residual["refinedPeriodDays"]),
+                rel_tol=1e-12,
+                abs_tol=1e-15,
+            )
+            and candidate.get("supportingSectors")
+            == evidence["independentSectors"]
+            and (result.get("independentSectorSupport") or {}).get(
+                "sectors"
+            ) == evidence["independentSectors"]
+            and math.isclose(
+                float(
+                    result["establishedPeriodFamily"][
+                        "referencePeriodDays"
+                    ]
+                ),
+                float(
+                    expected_contract["evidenceBoundary"][
+                        "establishedPeriodDays"
+                    ]
+                ),
+                rel_tol=1e-12,
+                abs_tol=1e-15,
+            )
+        ):
+            return None
+    except (KeyError, OSError, RuntimeError, TypeError, ValueError):
+        return None
+
+    hashes = mode.provenance.input_hashes if mode.provenance else {}
+    try:
+        verified = (
+            hashes.get("longBaselineTimeFrequencyConfirmation")
+            == sha256_json(confirmation.result)
+            and hashes.get("confirmedCoherentModeMethodContract")
+            == result["methodContractHash"]
+            and hashes.get("primaryPreparation")
+            == sha256_json(prepared.result)
+            and all(
+                hashes.get(
+                    f"frozenDataset:{spec['role']}:{spec['sector']}"
+                ) == sha256_file(spec["datasetPath"])
+                for spec in dataset_specs
+            )
+            and all(
+                store.verified_terminal_stage_ledger_hash(
+                    investigation.id, stage
+                )
+                for stage in (
+                    prepared, independent, confirmation, mode, latest
+                )
+            )
+            and _verified_stage_json(
+                mode,
+                "mode-identification-v20.8.2-confirmed-coherent.json",
+            )
+            and _verified_stage_json(
+                latest,
+                "conclusion-v20.8.2-confirmed-coherent-mode-identification.json",
+            )
+        )
+    except (KeyError, OSError, TypeError, ValueError):
+        return None
+    if not verified:
+        return None
+
+    continuation = StageRequest(
+        id=_continuation_stage_id(
+            latest, "prepare-residual-mode-localization"
+        ),
+        handler_id="openstar.tess.residual-mode-localization.prepare",
+        parameters={},
+        triggered_by_stage_id=mode.id,
+    )
+    return store.set_control_state(
+        investigation,
+        status="RUNNING",
+        control_state={
+            "branchAssessments": [],
+            "selectedExperiment": asdict(continuation),
+            "schedulerAction": "RUN_EXPERIMENT",
+            "recovery": (
+                "TESS_V20_8_CONFIRMED_COHERENT_MODE_PIXEL_LOCALIZATION"
             ),
         },
     )
@@ -4936,6 +5183,14 @@ def repair_obsolete_terminal_wait(
     )
     if v20_8_mode_repair is not None:
         return v20_8_mode_repair
+
+    v20_8_mode_localization_repair = (
+        _repair_v20_8_confirmed_coherent_mode_localization_terminal(
+            store, investigation, control
+        )
+    )
+    if v20_8_mode_localization_repair is not None:
+        return v20_8_mode_localization_repair
 
     long_baseline_repair = \
         _repair_long_baseline_frequency_confirmation_terminal(
