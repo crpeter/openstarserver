@@ -96,6 +96,8 @@ _ASTROPHYSICAL_INTERPRETATION_HANDLER = (
 _MAIN_FAMILY_RECURRENCE_HANDLER = "openstar.tess.main-family-time-domain-recurrence.analyze"
 _MAIN_FAMILY_FREQUENCY_REASSESSMENT_HANDLER = (
     "openstar.tess.main-family-frequency-domain-reassessment.analyze")
+_DEEP_CATALOG_COUNTERPART_HANDLER = (
+    "openstar.tess.deep-catalog-counterpart-identification.analyze")
 
 _KNOWN_TARGET_BLIND_PREPARER = "openstar.tess-known-target-blind-benchmark-preparer"
 
@@ -2406,6 +2408,143 @@ def _repair_recurrent_residual_nonstationary_terminal(
     )
 
 
+def _repair_deep_catalog_counterpart_terminal(
+    store: InvestigationStore,
+    investigation: Investigation,
+    control: dict,
+) -> Investigation | None:
+    """Append deeper catalog discovery only at the exact finalized no-candidate boundary."""
+    if not (
+        investigation.status in {"COMPLETE", "HUMAN_REVIEW_REQUIRED"}
+        and control.get("schedulerAction") == "INVESTIGATION_COMPLETE"
+        and control.get("selectedExperiment") in (None, {})
+        and not any(stage.status == "RUNNING" for stage in investigation.stages)
+        and not any(
+            stage.handler_id == _DEEP_CATALOG_COUNTERPART_HANDLER
+            for stage in investigation.stages
+        )
+    ):
+        return None
+
+    catalog = _latest_complete(
+        investigation, "openstar.tess.catalog-counterpart-identification.analyze")
+    latest = investigation.stages[-1] if investigation.stages else None
+    if catalog is None or latest is None or not isinstance(catalog.result, dict):
+        return None
+    result = catalog.result
+    if not (
+        result.get("version") == "openstar.tess-catalog-counterpart-identification.v1"
+        and result.get("classification") == "NO_USABLE_CATALOG_CANDIDATES"
+        and result.get("counterpartIdentified") is False
+        and result.get("preferredCandidate") is None
+        and not (result.get("plausibleCatalogCandidates") or [])
+        and result.get("physicalMechanismResolved") is False
+        and result.get("claimLevelChanged") is False
+        and result.get("recommendedNextTest")
+        == "DEEPER_CATALOG_OR_HIGH_RESOLUTION_IMAGING"
+        and latest.handler_id == "openstar.tess.finalize"
+        and latest.status == "COMPLETE"
+        and latest.stop is True
+        and latest.triggered_by_stage_id == catalog.id
+        and latest.parameters.get("outputSuffix") == "catalog-counterpart"
+        and isinstance(latest.result, dict)
+        and latest.result.get("catalogCounterpartIdentification") == result
+        and latest.result.get("recommendedNextTest")
+        == "DEEPER_CATALOG_OR_HIGH_RESOLUTION_IMAGING"
+    ):
+        return None
+    catalog_index = investigation.stages.index(catalog)
+    if tuple(investigation.stages[catalog_index + 1:]) != (latest,):
+        return None
+
+    position = result.get("searchPosition") or {}
+    try:
+        values = tuple(float(position[key]) for key in (
+            "raDeg", "decDeg", "targetRaDeg", "targetDecDeg"))
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not str(position.get("componentID") or "").strip() or not all(
+        math.isfinite(value) for value in values
+    ):
+        return None
+
+    continuation = StageRequest(
+        id=_continuation_stage_id(latest, "deep-catalog-counterpart"),
+        handler_id=_DEEP_CATALOG_COUNTERPART_HANDLER,
+        parameters={},
+        triggered_by_stage_id=catalog.id,
+    )
+    return store.set_control_state(
+        investigation,
+        status="RUNNING",
+        control_state={
+            "branchAssessments": [],
+            "selectedExperiment": asdict(continuation),
+            "schedulerAction": "RUN_EXPERIMENT",
+            "recovery": "TESS_DEEP_CATALOG_COUNTERPART_IDENTIFICATION",
+        },
+    )
+
+
+def _repair_deep_catalog_finalize_handoff(
+    store: InvestigationStore,
+    investigation: Investigation,
+    control: dict,
+) -> Investigation | None:
+    """Resume the exact deep-catalog analysis-to-finalize handoff."""
+    if not (
+        investigation.status in {"COMPLETE", "HUMAN_REVIEW_REQUIRED"}
+        and control.get("schedulerAction") == "INVESTIGATION_COMPLETE"
+        and control.get("selectedExperiment") in (None, {})
+        and investigation.stages
+    ):
+        return None
+    latest = investigation.stages[-1]
+    result = latest.result if isinstance(latest.result, dict) else {}
+    expected_recommendations = {
+        "DEEP_CATALOG_COUNTERPART_IDENTIFIED": (
+            "DEEP_CATALOG_GUIDED_SOURCE_LOCALIZATION"
+        ),
+        "AMBIGUOUS_DEEP_CATALOG_COUNTERPARTS": (
+            "HIGH_RESOLUTION_RESIDUAL_SOURCE_LOCALIZATION"
+        ),
+        "NO_DEEP_CATALOG_COUNTERPART": "DEDICATED_HIGH_RESOLUTION_IMAGING",
+    }
+    classification = result.get("classification")
+    expected_next = {
+        "id": _continuation_stage_id(latest, "finalize"),
+        "handler_id": "openstar.tess.finalize",
+        "parameters": {"outputSuffix": "deep-catalog-counterpart"},
+        "triggered_by_stage_id": latest.id,
+    }
+    if not (
+        latest.handler_id == _DEEP_CATALOG_COUNTERPART_HANDLER
+        and latest.status == "COMPLETE"
+        and latest.stop is False
+        and latest.next_stage == expected_next
+        and result.get("version")
+        == "openstar.tess-deep-catalog-counterpart-identification.v1"
+        and classification in expected_recommendations
+        and result.get("recommendedNextTest")
+        == expected_recommendations[classification]
+        and result.get("physicalMechanismResolved") is False
+        and result.get("claimLevelChanged") is False
+        and result.get("variabilityConfirmed") is False
+    ):
+        return None
+    request = _request_from_persisted(expected_next)
+    return store.set_control_state(
+        investigation,
+        status="RUNNING",
+        control_state={
+            "branchAssessments": [],
+            "selectedExperiment": asdict(request),
+            "schedulerAction": "RUN_EXPERIMENT",
+            "recovery": "TESS_DEEP_CATALOG_FINALIZE_HANDOFF",
+        },
+    )
+
+
 def _repair_confirmed_residual_localization_terminal(
     store: InvestigationStore, investigation: Investigation, control: dict
 ) -> Investigation | None:
@@ -4598,6 +4737,18 @@ def repair_obsolete_terminal_wait(
     if catalog_repair is not None:
         return catalog_repair
 
+    deep_catalog_repair = _repair_deep_catalog_counterpart_terminal(
+        store, investigation, control
+    )
+    if deep_catalog_repair is not None:
+        return deep_catalog_repair
+
+    deep_catalog_finalize_repair = _repair_deep_catalog_finalize_handoff(
+        store, investigation, control
+    )
+    if deep_catalog_finalize_repair is not None:
+        return deep_catalog_finalize_repair
+
     period_repair = _repair_promoted_period_characterization_terminal(
         store, investigation, control
     )
@@ -4948,6 +5099,9 @@ def plan_tess_branches(
     catalog_identification = _latest_complete(
         investigation, "openstar.tess.catalog-counterpart-identification.analyze"
     )
+    deep_catalog_identification = _latest_complete(
+        investigation, _DEEP_CATALOG_COUNTERPART_HANDLER
+    )
     catalog_guided_localization = _latest_complete(
         investigation, "openstar.tess.catalog-guided-source-localization.interpret"
     )
@@ -5157,6 +5311,52 @@ def plan_tess_branches(
         )
 
     catalog_result = (catalog_identification.result or {}) if catalog_identification else {}
+    deep_catalog_started = any(
+        stage.handler_id == _DEEP_CATALOG_COUNTERPART_HANDLER
+        and stage.status in {"RUNNING", "COMPLETE"}
+        for stage in investigation.stages
+    )
+    if (
+        deep_catalog_identification is None
+        and not deep_catalog_started
+        and catalog_identification is not None
+        and catalog_result.get("version")
+        == "openstar.tess-catalog-counterpart-identification.v1"
+        and catalog_result.get("classification") == "NO_USABLE_CATALOG_CANDIDATES"
+        and catalog_result.get("counterpartIdentified") is False
+        and catalog_result.get("preferredCandidate") is None
+        and not (catalog_result.get("plausibleCatalogCandidates") or [])
+        and catalog_result.get("physicalMechanismResolved") is False
+        and catalog_result.get("claimLevelChanged") is False
+        and catalog_result.get("recommendedNextTest")
+        == "DEEPER_CATALOG_OR_HIGH_RESOLUTION_IMAGING"
+    ):
+        return (ScientificBranch(
+            id=f"continue-deep-catalog-after-{catalog_identification.id}",
+            experiment=StageRequest(
+                id=_continuation_stage_id(
+                    investigation.stages[-1], "deep-catalog-counterpart"
+                ),
+                handler_id=_DEEP_CATALOG_COUNTERPART_HANDLER,
+                parameters={},
+                triggered_by_stage_id=catalog_identification.id,
+            ),
+        ),)
+    if deep_catalog_identification is not None:
+        raw = deep_catalog_identification.next_stage
+        attempted_ids = {stage.id for stage in investigation.stages}
+        expected = {
+            "id": _continuation_stage_id(deep_catalog_identification, "finalize"),
+            "handler_id": "openstar.tess.finalize",
+            "parameters": {"outputSuffix": "deep-catalog-counterpart"},
+            "triggered_by_stage_id": deep_catalog_identification.id,
+        }
+        if raw == expected and expected["id"] not in attempted_ids:
+            return (ScientificBranch(
+                id=f"finalize-after-{deep_catalog_identification.id}",
+                experiment=_request_from_persisted(raw),
+            ),)
+        return ()
     # A completed stage 056 is authoritative over the stage-053 continuation.
     # Recreate its direct candidate-validation request after restart, exactly once.
     if time_resolved_frequency is not None:

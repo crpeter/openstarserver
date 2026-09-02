@@ -313,6 +313,10 @@ from .tess_prf_refinement import (
     interpret_prf_deblending,
 )
 from .tess_catalog_counterpart import identify_catalog_counterparts
+from .tess_deep_catalog_counterpart import (
+    HANDLER_ID as DEEP_CATALOG_COUNTERPART_HANDLER_ID,
+    identify_deep_catalog_counterparts,
+)
 from .tess_external_highres import (
     build_external_high_resolution_project,
     interpret_external_high_resolution_project,
@@ -377,7 +381,7 @@ from .tess_multisector import (
 WORKFLOW_ID = "openstar.workflow.tess-investigation.v1"
 WORKFLOW_VERSION = "20.2"
 SOFTWARE_ID = "openstar.tess-investigation-plugin"
-SOFTWARE_VERSION = "20.44"
+SOFTWARE_VERSION = "20.45"
 ADAPTIVE_BLIND_TRANSIT_ADDITIONAL_SECTORS = 8
 EXHAUSTED_RESIDUAL_RUN_HANDLER_ID = (
     "openstar.tess.blind-transit-distributed.run"
@@ -1424,6 +1428,18 @@ def catalog_counterpart_variability_continuation(
         ),
         parameters={} if (run_validation or run_localization)
         else {"outputSuffix": "catalog-counterpart"},
+        triggered_by_stage_id=request_id,
+    )
+
+
+def deep_catalog_counterpart_continuation(
+    summary: dict[str, Any], *, request_id: str
+) -> StageRequest:
+    """Finalize a deeper-catalog discovery result without overreaching."""
+    return StageRequest(
+        id=_next_stage_id(request_id, "finalize"),
+        handler_id="openstar.tess.finalize",
+        parameters={"outputSuffix": "deep-catalog-counterpart"},
         triggered_by_stage_id=request_id,
     )
 
@@ -2575,6 +2591,27 @@ def _render_report(conclusion: dict[str, Any]) -> str:
             f"- Target-to-counterpart separation: {ranking.get('targetSeparationArcsec')} arcsec",
             f"- Variability confirmed: {catalog_counterpart.get('variabilityConfirmed')}",
             f"- Recommended next test: {catalog_counterpart.get('recommendedNextTest')}",
+        ])
+
+    deep_catalog_counterpart = conclusion.get("deepCatalogCounterpartIdentification")
+    if deep_catalog_counterpart is not None:
+        preferred = deep_catalog_counterpart.get("preferredCandidate") or {}
+        catalog_ids = preferred.get("catalogIDs") or {}
+        ranking = preferred.get("rankingEvidence") or {}
+        lines.extend([
+            "",
+            "## Deeper catalog counterpart identification",
+            "",
+            f"- Classification: {deep_catalog_counterpart.get('classification')}",
+            f"- SkyMapper DR4 object: {catalog_ids.get('skyMapperDR4ObjectID')}",
+            f"- NSC DR2 object: {catalog_ids.get('nscDR2ObjectID')}",
+            f"- Residual-position separation: {ranking.get('residualPositionSeparationArcsec')} arcsec",
+            f"- Target-to-counterpart separation: {ranking.get('targetSeparationArcsec')} arcsec",
+            f"- Plausible deeper-catalog candidates: {len(deep_catalog_counterpart.get('plausibleCatalogCandidates') or [])}",
+            f"- Catalog query errors: {deep_catalog_counterpart.get('queryErrors')}",
+            f"- Variability confirmed: {deep_catalog_counterpart.get('variabilityConfirmed')}",
+            f"- Recommended next test: {deep_catalog_counterpart.get('recommendedNextTest')}",
+            f"- Guard: {deep_catalog_counterpart.get('interpretationGuard')}",
         ])
 
     external_high_resolution = conclusion.get("externalHighResolutionVariabilityValidation")
@@ -8821,6 +8858,49 @@ def build_engine(
             artifacts=(_artifact(path, "application/json"),),
         )
 
+    def deep_catalog_counterpart_identification_stage(investigation, request):
+        catalog = _latest_result_for_handler(
+            investigation, "openstar.tess.catalog-counterpart-identification.analyze")
+        if catalog is None:
+            raise RuntimeError(
+                "Deep-catalog identification requires persisted TIC/Gaia catalog evidence."
+            )
+        summary = identify_deep_catalog_counterparts(catalog_summary=catalog)
+        print("🔎 Deeper catalog counterpart identification")
+        print(
+            "   SkyMapper DR4 master rows: "
+            f"{len((summary.get('catalogQueries') or {}).get('skyMapperDR4', {}).get('rows') or [])}"
+        )
+        print(
+            "   NSC DR2 object rows: "
+            f"{len((summary.get('catalogQueries') or {}).get('nscDR2', {}).get('rows') or [])}"
+        )
+        print(
+            "   plausible non-target candidates: "
+            f"{len(summary.get('plausibleCatalogCandidates') or [])}"
+        )
+        print(f"   classification: {summary.get('classification')}")
+        print(f"   physical mechanism resolved: {summary.get('physicalMechanismResolved')}")
+        print(f"   recommended next test: {summary.get('recommendedNextTest')}")
+        path = (
+            store.directory_for(investigation.id) / "artifacts"
+            / "deep-catalog-counterpart-identification"
+            / "deep-catalog-counterpart-identification.json"
+        )
+        _write_json(path, summary)
+        unavailable = (
+            summary["classification"] == "EXTERNAL_DEEP_CATALOG_DATA_UNAVAILABLE"
+        )
+        return StageOutcome(
+            result=summary,
+            next_stage=(None if unavailable else deep_catalog_counterpart_continuation(
+                summary, request_id=request.id)),
+            stop=unavailable,
+            final_status=("QUIESCENT_AWAITING_DATA" if unavailable else "COMPLETE"),
+            input_hashes={"catalogCounterpartIdentification": sha256_json(catalog)},
+            artifacts=(_artifact(path, "application/json"),),
+        )
+
     def catalog_guided_localization_prepare_stage(investigation, request):
         catalog = _latest_result_for_handler(
             investigation, "openstar.tess.catalog-counterpart-identification.analyze")
@@ -12426,6 +12506,10 @@ def build_engine(
             investigation,
             "openstar.tess.catalog-counterpart-identification.analyze",
         )
+        deep_catalog_counterpart_identification = _latest_result_for_handler(
+            investigation,
+            DEEP_CATALOG_COUNTERPART_HANDLER_ID,
+        )
         external_high_resolution_validation = _latest_result_for_handler(
             investigation,
             "openstar.tess.external-high-resolution-variability-validation.interpret",
@@ -13170,6 +13254,40 @@ def build_engine(
                 "rationale": existing_rationale,
             }
 
+        if deep_catalog_counterpart_identification is not None:
+            existing_rationale = list(claim_decision.get("rationale") or [])
+            classification = deep_catalog_counterpart_identification.get("classification")
+            if classification == "DEEP_CATALOG_COUNTERPART_IDENTIFIED":
+                existing_rationale.append(
+                    "A source in SkyMapper DR4 and/or NSC DR2 is positionally consistent "
+                    "with the frozen PRF residual location, but this deeper-catalog match "
+                    "does not establish which source carries the residual variability."
+                )
+            elif classification == "AMBIGUOUS_DEEP_CATALOG_COUNTERPARTS":
+                existing_rationale.append(
+                    "The deeper catalog search finds multiple plausible sources at the "
+                    "frozen PRF residual location, so source identity remains ambiguous."
+                )
+            elif classification == "NO_DEEP_CATALOG_COUNTERPART":
+                existing_rationale.append(
+                    "Successful SkyMapper DR4 and NSC DR2 searches find no usable non-target "
+                    "source at the frozen PRF residual location; dedicated high-resolution "
+                    "imaging is therefore required."
+                )
+            else:
+                existing_rationale.append(
+                    "The deeper catalog search is incomplete because an external catalog "
+                    "service was unavailable; absence of a counterpart is not inferred."
+                )
+            existing_rationale.append(
+                "Recommended next confirmation step: "
+                f"{deep_catalog_counterpart_identification.get('recommendedNextTest')}."
+            )
+            claim_decision = {
+                "claim": claim_decision["claim"],
+                "rationale": existing_rationale,
+            }
+
         if external_high_resolution_validation is not None:
             existing_rationale = list(claim_decision.get("rationale") or [])
             classification = external_high_resolution_validation.get("classification")
@@ -13745,6 +13863,10 @@ def build_engine(
             # This branch is appended after v20.16. Genuinely later unrelated
             # evidence remains above it when introduced in the precedence list.
             recommended_next_test = target_residual_archival_baseline_extension.get("recommendedNextTest")
+        elif deep_catalog_counterpart_identification is not None:
+            recommended_next_test = deep_catalog_counterpart_identification.get(
+                "recommendedNextTest"
+            )
         elif (catalog_counterpart_identification is not None
                 and offset_source_variability is not None):
             # This validation is appended after historical finalization, so
@@ -13929,6 +14051,7 @@ def build_engine(
             "frequencyLocalizedPixelResponse": frequency_localized_pixel_response,
             "officialSpocPrfForwardModeling": official_spoc_prf_forward_modeling,
             "catalogCounterpartIdentification": catalog_counterpart_identification,
+            "deepCatalogCounterpartIdentification": deep_catalog_counterpart_identification,
             "externalHighResolutionVariabilityValidation": external_high_resolution_validation,
             "skyMapperResolvedPhotometryScreen": skymapper_resolved_photometry,
             "nscResolvedPhotometryScreen": nsc_resolved_photometry,
@@ -14019,6 +14142,24 @@ def build_engine(
             print(
                 "   recommended next test: "
                 f"{catalog_counterpart_identification.get('recommendedNextTest')}"
+            )
+        if deep_catalog_counterpart_identification is not None:
+            preferred = deep_catalog_counterpart_identification.get("preferredCandidate") or {}
+            catalog_ids = preferred.get("catalogIDs") or {}
+            ranking = preferred.get("rankingEvidence") or {}
+            print(
+                "   deep catalog counterpart classification: "
+                f"{deep_catalog_counterpart_identification.get('classification')}"
+            )
+            print(f"   SkyMapper DR4 object: {catalog_ids.get('skyMapperDR4ObjectID')}")
+            print(f"   NSC DR2 object: {catalog_ids.get('nscDR2ObjectID')}")
+            print(
+                "   residual-position separation: "
+                f"{ranking.get('residualPositionSeparationArcsec')} arcsec"
+            )
+            print(
+                "   recommended next test: "
+                f"{deep_catalog_counterpart_identification.get('recommendedNextTest')}"
             )
         if source_localization is not None:
             cross = source_localization.get("crossSector") or {}
@@ -14665,6 +14806,10 @@ def build_engine(
     engine.register_handler(
         "openstar.tess.catalog-counterpart-identification.analyze",
         catalog_counterpart_identification_stage,
+    )
+    engine.register_handler(
+        DEEP_CATALOG_COUNTERPART_HANDLER_ID,
+        deep_catalog_counterpart_identification_stage,
     )
     engine.register_handler(
         "openstar.tess.catalog-guided-source-localization.prepare",
