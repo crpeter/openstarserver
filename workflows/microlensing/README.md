@@ -596,3 +596,77 @@ published physical parameters. It does not run the morphology grid, implement
 a binary-lens model, resolve a planetary interpretation, or make a discovery
 claim. The next separate step is
 `DISTRIBUTED_BLIND_MICROLENSING_ANOMALY_MORPHOLOGY_GRID`.
+
+## Build the bounded blind morphology coarse grid
+
+Convert a verified anomaly-morphology preparation into an ordinary
+`openstar.morphology-grid.v1` project without evaluating the approximately
+65-million-candidate full grid:
+
+```bash
+python -m workflows.microlensing.build_anomaly_morphology_coarse_grid \
+  --morphology-root \
+    /path/to/microlensing-recovery-a-morphology-preparation \
+  --project-id generic-morphology-coarse \
+  --output-root /path/to/microlensing-recovery-a-morphology-coarse
+```
+
+The input root must be the complete, immutable output of
+`prepare_anomaly_morphology.py`: its preparation result, morphology contract,
+artifact manifest, and both ordered generic-series files. The builder verifies
+their schemas, canonical bytes, hashes, series ordering, source sample arrays,
+full candidate mapping, family identities, deterministic execution semantics,
+parent provenance, identity-isolation statement, and recommended next test.
+Symlinks, path traversal, unexpected files, nonfinite values, negative weights,
+and an existing output root are rejected.
+
+The per-search candidate ceiling defaults to 8,192 and can be lowered with
+`--maximum-candidates-per-search`. For each search independently, one integer
+stride starts at one and increases by one until the first admissible grid is at
+or below the frozen limit. A linear axis retains its start, multiplies its step
+by the stride, and uses `floor((sourceCount - 1) / stride) + 1` values. An
+explicit axis retains source indices `0, stride, 2*stride, ...`. No irregular
+endpoint is appended. Independent-pulse searches stride their center axis
+before counting strict negative-center-before-positive-center pairs and must
+retain at least two centers. Thus every coarse value maps to an original full
+axis index; no sample value, residual magnitude, candidate fit, or identity is
+consulted when choosing a stride.
+
+The project always contains four searches in this order:
+
+1. one shared `POSITIVE_PULSE_ONLY` dataset containing both generic series;
+2. one shared `ORDERED_NEGATIVE_POSITIVE_DOUBLET` dataset containing both;
+3. one single-series `INDEPENDENT_PULSES` dataset for the first series; and
+4. one single-series `INDEPENDENT_PULSES` dataset for the second series.
+
+The independent searches are separate workload datasets, never a cross-series
+Cartesian product. Every dataset preserves complete source coordinates, signed
+residual values, inverse variances, generic series order, and identity-free
+hash provenance. It uses 64 candidates per work unit, with candidate,
+work-unit, and sample-candidate evaluation totals derived from the emitted
+axes.
+
+The previously nonexistent output root is published atomically with:
+
+- `coarse-grid-contract.json`
+- `datasets/positive-pulse-only.json`
+- `datasets/ordered-negative-positive-doublet.json`
+- `datasets/independent-pulses-series-001.json`
+- `datasets/independent-pulses-series-002.json`
+- `project.json`
+- `build-manifest.json`
+
+The builder does not evaluate a basis, fit nuisance parameters, rank a
+candidate, classify morphology, or interpret the result. This bounded project
+remains a blind generic morphology comparison and makes no discovery claim.
+Only after a completed distributed run should a separate verifier perform
+fitting-result validation and interpretation. Run that separate investigation
+through the ordinary project runner:
+
+```bash
+python run_investigation.py \
+  --project /path/to/microlensing-recovery-a-morphology-coarse/project.json \
+  --investigation-id generic-morphology-coarse-investigation \
+  --coordinator http://127.0.0.1:8080 \
+  --store /path/to/investigations
+```
