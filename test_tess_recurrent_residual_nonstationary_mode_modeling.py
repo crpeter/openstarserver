@@ -20,6 +20,7 @@ from workflows.tess.tess_nonstationary import (
     RECURRENT_RESIDUAL_NONSTATIONARY_EVIDENCE_LINEAGE,
     RECURRENT_RESIDUAL_NONSTATIONARY_METHOD_CONTRACT_ID,
     _recurrent_window_series,
+    build_nonstationary_project,
     build_recurrent_residual_nonstationary_method_contract,
     recurrent_residual_nonstationary_method_contract_hash,
     validate_recurrent_residual_nonstationary_boundary,
@@ -163,6 +164,71 @@ class RecurrentResidualNonstationaryContinuationTests(
                 "NEAREST_WINDOW_CENTER_PER_SECTOR_TIME_TIE_LOWEST_INDEX",
                 item["residualMeta"]["overlapResolution"],
             )
+
+    def test_project_builder_never_reads_original_sector_flux(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _, investigation = self._confirmation_terminal(temporary)
+            confirmation = investigation.stages[-2].result
+            evidence = (
+                validate_recurrent_residual_nonstationary_boundary(
+                    confirmation
+                )
+            )
+            contract = (
+                build_recurrent_residual_nonstationary_method_contract(
+                    confirmation
+                )
+            )
+            source_project = root / "source-project.json"
+            source_project.write_text(json.dumps({
+                "id": "synthetic-source",
+                "name": "Synthetic source",
+                "workloadID": "openstar.lomb-scargle.v1",
+                "datasets": [],
+            }), encoding="utf-8")
+            spec = build_nonstationary_project(
+                source_project_path=source_project,
+                source_dataset_entry={
+                    "id": "primary-sector-1",
+                    "targetName": "Synthetic recurrent residual",
+                },
+                primary_dataset_path=(
+                    root / "original-flux-must-not-be-read.json"
+                ),
+                primary_sector=1,
+                independent_spec={"preparedSectors": []},
+                physical_period_days=evidence[
+                    "establishedPeriodDays"
+                ],
+                time_frequency_summary=None,
+                output_dir=root / "artifacts",
+                investigation_id="recurrent-v20-9-3",
+                recurrent_method_contract=contract,
+                recurrent_dataset_specs=self._window_specs(
+                    investigation
+                ),
+            )
+
+        self.assertFalse(spec["originalSectorFluxRead"])
+        self.assertEqual(
+            RECURRENT_RESIDUAL_NONSTATIONARY_EVIDENCE_LINEAGE,
+            spec["evidenceLineage"],
+        )
+        self.assertEqual(
+            RECURRENT_RESIDUAL_NONSTATIONARY_METHOD_CONTRACT_ID,
+            spec["methodContractID"],
+        )
+        self.assertEqual(
+            recurrent_residual_nonstationary_method_contract_hash(
+                contract
+            ),
+            spec["methodContractHash"],
+        )
+        self.assertEqual(66, len(spec["preparedDatasets"]))
+        self.assertEqual(66, len(spec["groups"]) * 33)
+        self.assertTrue(Path(spec["projectPath"]).is_file())
+        self.assertTrue(Path(spec["analysisSeriesPath"]).is_file())
 
     def test_manual_boundary_rejects_mutated_confirmation(self):
         with tempfile.TemporaryDirectory() as temporary:
