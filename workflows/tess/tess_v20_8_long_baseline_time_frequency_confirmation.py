@@ -799,9 +799,19 @@ def analyze_long_baseline_time_frequency_confirmation(
     *,
     method_contract: dict[str, Any],
     dataset_specs: Iterable[dict[str, Any]],
+    expected_method_contract_id: str = METHOD_CONTRACT_ID,
+    result_version: str = RESULT_VERSION,
 ) -> dict[str, Any]:
     """Run leave-one-independent-sector-out fixed-phase prediction."""
-    if method_contract.get("methodContractID") != METHOD_CONTRACT_ID:
+    if (
+        not isinstance(expected_method_contract_id, str)
+        or not expected_method_contract_id
+        or not isinstance(result_version, str)
+        or not result_version
+        or method_contract.get("methodContractID")
+        != expected_method_contract_id
+        or method_contract.get("resultVersion") != result_version
+    ):
         raise RuntimeError("Unsupported v20.8 confirmation method contract.")
     contract_hash = method_contract_hash(method_contract)
     datasets = validate_frozen_window_lineage(
@@ -945,8 +955,8 @@ def analyze_long_baseline_time_frequency_confirmation(
         independent_window_count=int(boundary["independentWindowCount"]),
     )
     return {
-        "version": RESULT_VERSION,
-        "methodContractID": METHOD_CONTRACT_ID,
+        "version": result_version,
+        "methodContractID": expected_method_contract_id,
         "methodContractHash": contract_hash,
         "methodContract": deepcopy(method_contract),
         "leaveOneIndependentSectorOut": True,

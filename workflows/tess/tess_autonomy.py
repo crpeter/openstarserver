@@ -47,6 +47,10 @@ from .tess_transient_mode_validation import (
     build_method_contract as build_transient_mode_method_contract,
     validate_frozen_dataset_lineage as validate_transient_mode_frozen_lineage,
 )
+from .tess_recurrent_residual_long_baseline_confirmation import (
+    build_dataset_specs as build_recurrent_residual_dataset_specs,
+    build_method_contract as build_recurrent_residual_method_contract,
+)
 from .tess_nonstationary import (
     CONFIRMED_NONSTATIONARY_EVIDENCE_LINEAGE,
     build_confirmed_nonstationary_method_contract,
@@ -1327,10 +1331,11 @@ def _repair_v20_8_long_baseline_time_frequency_confirmation_terminal(
     investigation: Investigation,
     control: dict,
 ) -> Investigation | None:
-    """Append only at the exact finalized unresolved v20.8 boundary."""
+    """Append only at one exact terminal v20.8 residual boundary."""
     if not (
         investigation.status in {"COMPLETE", "HUMAN_REVIEW_REQUIRED"}
         and control.get("schedulerAction") == "INVESTIGATION_COMPLETE"
+        and control.get("selectedExperiment") in (None, {})
         and not any(stage.status == "RUNNING" for stage in investigation.stages)
         and not any(
             stage.handler_id
@@ -1344,8 +1349,15 @@ def _repair_v20_8_long_baseline_time_frequency_confirmation_terminal(
         investigation, "openstar.tess.time-frequency.summarize"
     )
     latest = investigation.stages[-1] if investigation.stages else None
-    if summary is None or latest is None or not (
-        isinstance(summary.result, dict)
+    transient = _latest_complete(
+        investigation, TRANSIENT_MODE_VALIDATION_HANDLER_ID
+    )
+    if summary is None or latest is None or not isinstance(summary.result, dict):
+        return None
+
+    summary_index = investigation.stages.index(summary)
+    direct_boundary = (
+        transient is None
         and latest.handler_id == "openstar.tess.finalize"
         and latest.status == "COMPLETE"
         and latest.stop is True
@@ -1355,10 +1367,51 @@ def _repair_v20_8_long_baseline_time_frequency_confirmation_terminal(
         and latest.result.get("timeFrequencyEvolution") == summary.result
         and latest.result.get("recommendedNextTest")
         == "LONG_BASELINE_TIME_FREQUENCY_CONFIRMATION"
-    ):
-        return None
-    summary_index = investigation.stages.index(summary)
-    if tuple(investigation.stages[summary_index + 1:]) != (latest,):
+        and tuple(investigation.stages[summary_index + 1:]) == (latest,)
+    )
+
+    prior_terminal = None
+    recurrent_boundary = False
+    if transient is not None:
+        transient_index = investigation.stages.index(transient)
+        if transient_index > 0:
+            prior_terminal = investigation.stages[transient_index - 1]
+        transient_hashes = (
+            transient.provenance.input_hashes if transient.provenance else {}
+        )
+        recurrent_boundary = (
+            prior_terminal is not None
+            and prior_terminal.handler_id == "openstar.tess.finalize"
+            and prior_terminal.status == "COMPLETE"
+            and prior_terminal.stop is True
+            and prior_terminal.triggered_by_stage_id == summary.id
+            and prior_terminal.parameters.get("outputSuffix") == "v20.8"
+            and isinstance(prior_terminal.result, dict)
+            and prior_terminal.result.get("timeFrequencyEvolution")
+            == summary.result
+            and prior_terminal.result.get("recommendedNextTest")
+            == "TRANSIENT_MODE_VALIDATION"
+            and transient.triggered_by_stage_id == summary.id
+            and isinstance(transient.result, dict)
+            and transient_hashes.get("timeFrequencySummary")
+            == sha256_json(summary.result)
+            and transient_hashes.get("methodContract")
+            == transient.result.get("methodContractHash")
+            and latest.handler_id == "openstar.tess.finalize"
+            and latest.status == "COMPLETE"
+            and latest.stop is True
+            and latest.triggered_by_stage_id == transient.id
+            and latest.parameters.get("outputSuffix")
+            == "v20.8.1-transient-mode-validation"
+            and isinstance(latest.result, dict)
+            and latest.result.get("transientModeValidation")
+            == transient.result
+            and latest.result.get("recommendedNextTest")
+            == "LONG_BASELINE_TIME_FREQUENCY_CONFIRMATION"
+            and tuple(investigation.stages[summary_index + 1:])
+            == (prior_terminal, transient, latest)
+        )
+    if not (direct_boundary or recurrent_boundary):
         return None
 
     interpretation = next((
@@ -1411,6 +1464,28 @@ def _repair_v20_8_long_baseline_time_frequency_confirmation_terminal(
     summary_hashes = (
         summary.provenance.input_hashes if summary.provenance else {}
     )
+    terminal_lineage = (
+        (prior_terminal, transient, latest)
+        if recurrent_boundary else (latest,)
+    )
+    artifact_checks = [
+        _verified_stage_json(summary, "time-frequency-v20.8.json"),
+    ]
+    if recurrent_boundary:
+        artifact_checks.extend([
+            _verified_stage_json(prior_terminal, "conclusion-v20.8.json"),
+            _verified_stage_json(
+                transient, "transient-mode-validation-v20.8.1.json"
+            ),
+            _verified_stage_json(
+                latest,
+                "conclusion-v20.8.1-transient-mode-validation.json",
+            ),
+        ])
+    else:
+        artifact_checks.append(
+            _verified_stage_json(latest, "conclusion-v20.8.json")
+        )
     if not (
         interpretation_hashes.get("preparation")
         == sha256_json(preparation.result)
@@ -1425,27 +1500,38 @@ def _repair_v20_8_long_baseline_time_frequency_confirmation_terminal(
         and all(
             store.verified_terminal_stage_ledger_hash(investigation.id, stage)
             for stage in (
-                prepared, morphology, preparation, run,
-                interpretation, summary, latest,
+                prepared,
+                morphology,
+                preparation,
+                run,
+                interpretation,
+                summary,
+                *terminal_lineage,
             )
         )
-        and _verified_stage_json(summary, "time-frequency-v20.8.json")
-        and _verified_stage_json(latest, "conclusion-v20.8.json")
+        and all(artifact_checks)
     ):
         return None
 
     try:
-        # The method is frozen before the lineage validator opens residual
-        # window files containing flux values.
-        contract = build_v20_8_long_baseline_method_contract(
-            preparation=preparation.result,
-            interpretation=interpretation.result,
-            summary=summary.result,
-        )
-        dataset_specs = build_v20_8_long_baseline_dataset_specs(
-            expected_tic_id=int(prepared.result["ticID"]),
-            preparation=preparation.result,
-        )
+        if recurrent_boundary:
+            contract = build_recurrent_residual_method_contract(
+                transient_validation=transient.result,
+            )
+            dataset_specs = build_recurrent_residual_dataset_specs(
+                expected_tic_id=int(prepared.result["ticID"]),
+                preparation=preparation.result,
+            )
+        else:
+            contract = build_v20_8_long_baseline_method_contract(
+                preparation=preparation.result,
+                interpretation=interpretation.result,
+                summary=summary.result,
+            )
+            dataset_specs = build_v20_8_long_baseline_dataset_specs(
+                expected_tic_id=int(prepared.result["ticID"]),
+                preparation=preparation.result,
+            )
         validate_v20_8_frozen_window_lineage(
             method_contract=contract,
             dataset_specs=dataset_specs,
@@ -1453,6 +1539,7 @@ def _repair_v20_8_long_baseline_time_frequency_confirmation_terminal(
     except (KeyError, OSError, RuntimeError, TypeError, ValueError):
         return None
 
+    trigger = transient if recurrent_boundary else summary
     continuation = StageRequest(
         id=_continuation_stage_id(
             latest, "long-baseline-time-frequency-confirmation"
@@ -1461,7 +1548,12 @@ def _repair_v20_8_long_baseline_time_frequency_confirmation_terminal(
             V20_8_LONG_BASELINE_TIME_FREQUENCY_CONFIRMATION_HANDLER_ID
         ),
         parameters={},
-        triggered_by_stage_id=summary.id,
+        triggered_by_stage_id=trigger.id,
+    )
+    recovery = (
+        "TESS_RECURRENT_RESIDUAL_LONG_BASELINE_CONFIRMATION"
+        if recurrent_boundary
+        else "TESS_V20_8_LONG_BASELINE_TIME_FREQUENCY_CONFIRMATION"
     )
     return store.set_control_state(
         investigation,
@@ -1470,12 +1562,9 @@ def _repair_v20_8_long_baseline_time_frequency_confirmation_terminal(
             "branchAssessments": [],
             "selectedExperiment": asdict(continuation),
             "schedulerAction": "RUN_EXPERIMENT",
-            "recovery": (
-                "TESS_V20_8_LONG_BASELINE_TIME_FREQUENCY_CONFIRMATION"
-            ),
+            "recovery": recovery,
         },
     )
-
 
 def _repair_transient_mode_validation_terminal(
     store: InvestigationStore,
