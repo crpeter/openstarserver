@@ -1,0 +1,3 @@
+# Optional coordinator-only ASAS-SN Sky Patrol client.
+# Never install this dependency on generic compute workers.
+skypatrol==0.6.21

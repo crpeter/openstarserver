@@ -268,6 +268,21 @@ from .tess_period_family_difference_image import (
     run_period_family_difference_imaging,
     interpret_period_family_difference_imaging,
 )
+from .external_long_baseline import (
+    ASASSNSkyPatrolProvider, ProviderConfigurationUnavailable,
+    ProviderTransientError, external_method_contract_sha256,
+    freeze_external_method_contract, run_external_experiment,
+    validate_external_method_contract,
+)
+from .period_family_followup import (
+    DIFFERENCE_TRIGGER,
+    build_period_family_followup_recommendation,
+    extract_gaia_context,
+    freeze_period_family_contract,
+    select_untouched_sectors,
+    verified_contract,
+    verify_semantic_boundary,
+)
 from .tess_period_family_time_domain_evolution import (
     PREPARE_HANDLER as PERIOD_FAMILY_TIME_DOMAIN_PREPARE_HANDLER,
     RUN_HANDLER as PERIOD_FAMILY_TIME_DOMAIN_RUN_HANDLER,
@@ -723,6 +738,15 @@ def _write_json(path: Path, value: dict[str, Any]) -> None:
     with path.open("w", encoding="utf-8") as handle:
         json.dump(value, handle, indent=2, allow_nan=False)
         handle.write("\n")
+
+
+def _write_immutable_json(path: Path, value: dict[str, Any]) -> None:
+    """Write a new JSON artifact or verify an identical recovery artifact."""
+    if path.exists():
+        if sha256_json(_load_json(path)) != sha256_json(value):
+            raise RuntimeError(f"Immutable artifact differs on recovery: {path.name}")
+        return
+    _write_json(path, value)
 
 
 def _load_json(path: str | Path) -> dict[str, Any]:
@@ -3617,6 +3641,13 @@ def build_engine(
                 (followup_interpretation or {}).get("selectedPeriodDays")
             ),
         )
+        followup = build_period_family_followup_recommendation(
+            investigation,
+            interpreted,
+            origin_stage_id=request.id,
+        )
+        if followup is not None:
+            interpreted.update(followup)
         cluster = interpreted.get("bestCluster") or {}
         print("🧩 Independent-sector period clustering")
         print(f"   eligible sectors: {interpreted.get('eligibleSectorCount')}")
@@ -3645,6 +3676,13 @@ def build_engine(
         elif spec.get("continuation"):
             finalize_parameters["outputSuffix"] = "v20.3.1"
 
+        if interpreted.get("recommendedNextTest") == DIFFERENCE_TRIGGER:
+            return StageOutcome(
+                result=interpreted,
+                stop=True,
+                final_status="QUIESCENT_AWAITING_DATA",
+                input_hashes={"broadIndependentProjectResult": sha256_json(run)},
+            )
         return StageOutcome(
             result=interpreted,
             next_stage=broad_independent_continuation(
@@ -9161,6 +9199,232 @@ def build_engine(
             },
             artifacts=(_artifact(path, "application/json"),),
         )
+
+
+    def generic_period_family_difference_prepare_stage(investigation, request):
+        boundary=verify_semantic_boundary(store,investigation); evidence=boundary["result"]
+        family=evidence.get("frozenPeriodFamily") or {}
+        required=("ticID","targetSky","primaryDetection","independentSectorDetections")
+        if not all(key in family for key in required):
+            raise RuntimeError("Generic localization requires a complete frozenPeriodFamily contract.")
+        preparation=prepare_period_family_difference_imaging(
+            frozen_boundary={**family,"claim":"HUMAN_REVIEW_REQUIRED","periodFamilyResolved":False,
+                "physicalCycleResolved":False,"physicalMechanismResolved":False},
+            ledger_hashes=boundary["ledgerSHA256"],
+            output_dir=store.directory_for(investigation.id)/"artifacts",investigation_id=investigation.id)
+        preparation["semanticPolicyVersion"]=boundary["policyVersion"]
+        contract=(verified_contract(evidence) if evidence.get("periodFamilyContract")
+                  else freeze_period_family_contract(evidence,boundary["triggerStageID"]))
+        preparation["periodFamilyContract"]=contract
+        preparation["periodFamilyContractSHA256"]=sha256_json(contract)
+        contract_path=Path(preparation["artifactRoot"])/"period-family-contract.json"
+        _write_immutable_json(contract_path,contract)
+        return StageOutcome(result=preparation,next_stage=StageRequest(
+            _next_stage_id(request.id,"run-generic-period-family-difference-imaging"),
+            "openstar.tess.generic-period-family-difference-imaging.run",{},request.id),
+            input_hashes={"semanticBoundary":sha256_json(boundary)},
+            artifacts=(_artifact(Path(preparation["preparationPath"]),"application/json"),
+                       _artifact(contract_path,"application/json")))
+
+    def generic_period_family_difference_run_stage(investigation,request):
+        preparation=_latest_result_for_handler(investigation,"openstar.tess.generic-period-family-difference-imaging.prepare")
+        result=run_period_family_difference_imaging(preparation,sector_inputs=request.parameters.get("sectorInputs"))
+        path=Path(preparation["artifactRoot"])/"generic-run.json"; _write_immutable_json(path,result)
+        return StageOutcome(result=result,next_stage=StageRequest(
+            _next_stage_id(request.id,"interpret-generic-period-family-difference-imaging"),
+            "openstar.tess.generic-period-family-difference-imaging.interpret",{},request.id),
+            input_hashes={"preparation":sha256_json(preparation)},artifacts=(_artifact(path,"application/json"),))
+
+    def generic_period_family_difference_interpret_stage(investigation,request):
+        preparation=_latest_result_for_handler(investigation,"openstar.tess.generic-period-family-difference-imaging.prepare")
+        run=_latest_result_for_handler(investigation,"openstar.tess.generic-period-family-difference-imaging.run")
+        result=interpret_period_family_difference_imaging(preparation,run)
+        contract=verified_contract(preparation)
+        result["periodFamilyContract"]=contract
+        result["periodFamilyContractSHA256"]=sha256_json(contract)
+        result["autonomousContinuationEligible"]=result.get("recommendedNextTest")=="UNTOUCHED_SECTOR_TIME_DOMAIN_EVOLUTION"
+        path=Path(preparation["artifactRoot"])/"generic-interpretation.json"; _write_immutable_json(path,result)
+        return StageOutcome(result=result,stop=True,final_status="QUIESCENT_AWAITING_DATA",
+            input_hashes={"preparation":sha256_json(preparation),"run":sha256_json(run)},artifacts=(_artifact(path,"application/json"),))
+
+    def generic_period_family_time_prepare_stage(investigation,request):
+        boundary=verify_semantic_boundary(store,investigation); evidence=boundary["result"]
+        identity=_latest_result_for_handler(investigation,"openstar.tess.catalog-identity") or {}
+        products=list((identity.get("tess") or {}).get("officialProducts") or (identity.get("tess") or {}).get("products") or [])
+        contract=verified_contract(evidence)
+        consumed=list(contract["consumedSectors"])
+        selection=select_untouched_sectors(products,consumed)
+        if selection.get("status") != "SELECTED":
+            result={"version":"openstar.period-family-time-domain-preparation.v2",
+                    "classification":"NO_STABLE_UNTOUCHED_SECTOR_EPOCHS",
+                    "sectorSelection":selection,
+                    "periodFamilyContract":contract,
+                    "periodFamilyContractSHA256":sha256_json(contract),
+                    "autonomousContinuationEligible":False,
+                    "claimDecision":{"claim":"HUMAN_REVIEW_REQUIRED"},
+                    "recommendedNextTest":"MANUAL_ARCHIVE_METADATA_REVIEW"}
+            failure_path=(store.directory_for(investigation.id)/"artifacts"/
+                          "period-family-time-domain-evolution"/"selection-failure.json")
+            _write_immutable_json(failure_path,result)
+            return StageOutcome(result=result,stop=True,
+                final_status="QUIESCENT_AWAITING_DATA",
+                input_hashes={"semanticBoundary":sha256_json(boundary),
+                              "sectorSelection":sha256_json(selection)},
+                artifacts=(_artifact(failure_path,"application/json"),))
+        family=list(contract["periodFamilyMembersDays"])
+        window=contract["acceptanceWindowDays"]
+        frozen={"ticID":identity.get("ticID"),"primaryPeriodDays":contract["primaryPeriodDays"],
+            "persistedPeriodFamilyDays":family,"familyCenterDays":contract["familyCenterDays"],
+            "familyAcceptanceWindowDays":window,"previouslyConsumedSectors":consumed,
+            "untouchedSectors":selection["selectedSectors"],
+            "campaigns":{epoch:[s for s in selection["selectedSectors"] if selection.get("selectedSectorEpochs",{}).get(str(s))==epoch] for epoch in selection.get("selectedEpochs",[])},
+            "archiveContract":{"mission":"TESS","author":"SPOC",
+                               "cadenceSeconds":120,"exptimeSeconds":120,
+                               "fluxProducts":["SAP","PDCSAP"],
+                               "allowCadenceFallback":False},}
+        preparation=prepare_period_family_time_domain_evolution(frozen_boundary=frozen,
+            ledger_hashes=boundary["ledgerSHA256"],output_dir=store.directory_for(investigation.id)/"artifacts",
+            investigation_id=investigation.id)
+        preparation["sectorSelection"]=selection
+        preparation["periodFamilyContract"]=contract
+        preparation["periodFamilyContractSHA256"]=sha256_json(contract)
+        contract_path=Path(preparation["artifactRoot"])/"period-family-contract.json"
+        _write_immutable_json(contract_path,contract)
+        return StageOutcome(result=preparation,next_stage=StageRequest(
+            _next_stage_id(request.id,"run-generic-period-family-time-domain-evolution"),
+            "openstar.tess.generic-period-family-time-domain-evolution.run",{},request.id),
+            input_hashes={"semanticBoundary":sha256_json(boundary),"sectorSelection":sha256_json(selection)},
+            artifacts=(_artifact(Path(preparation["preparationPath"]),"application/json"),
+                       _artifact(contract_path,"application/json")))
+
+    def generic_period_family_time_run_stage(investigation,request):
+        preparation=_latest_result_for_handler(investigation,"openstar.tess.generic-period-family-time-domain-evolution.prepare")
+        result=run_period_family_time_domain_evolution(preparation,sector_inputs=request.parameters.get("sectorInputs"))
+        path=Path(preparation["artifactRoot"])/"generic-run.json"; _write_immutable_json(path,result)
+        return StageOutcome(result=result,next_stage=StageRequest(
+            _next_stage_id(request.id,"interpret-generic-period-family-time-domain-evolution"),
+            "openstar.tess.generic-period-family-time-domain-evolution.interpret",{},request.id),
+            input_hashes={"preparation":sha256_json(preparation)},artifacts=(_artifact(path,"application/json"),))
+
+    def generic_period_family_time_interpret_stage(investigation,request):
+        preparation=_latest_result_for_handler(investigation,"openstar.tess.generic-period-family-time-domain-evolution.prepare")
+        run=_latest_result_for_handler(investigation,"openstar.tess.generic-period-family-time-domain-evolution.run")
+        result=interpret_period_family_time_domain_evolution(preparation,run)
+        contract=verified_contract(preparation)
+        result["periodFamilyContract"]=contract
+        result["periodFamilyContractSHA256"]=sha256_json(contract)
+        result["autonomousContinuationEligible"]=result.get("recommendedNextTest")=="ADDITIONAL_LONG_BASELINE_TIME_DOMAIN_DATA"
+        path=Path(preparation["artifactRoot"])/"generic-interpretation.json"; _write_immutable_json(path,result)
+        return StageOutcome(result=result,stop=True,final_status="QUIESCENT_AWAITING_DATA",
+            input_hashes={"preparation":sha256_json(preparation),"run":sha256_json(run)},artifacts=(_artifact(path,"application/json"),))
+
+    def external_long_baseline_prepare_stage(investigation, request):
+        boundary = verify_semantic_boundary(store, investigation)
+        evidence = boundary["result"]
+        contract = verified_contract(evidence)
+        window = contract["acceptanceWindowDays"]
+        identity = _latest_result_for_handler(investigation, "openstar.tess.catalog-identity") or {}
+        metadata = ((identity.get("tic") or {}).get("metadata") or {})
+        gaia_context = extract_gaia_context(identity)
+        method_contract = freeze_external_method_contract(window)
+        method_contract_sha256 = external_method_contract_sha256(method_contract)
+        result = {"version":"openstar.external-long-baseline-preparation.v2",
+            "semanticBoundary":boundary, "familyWindowDays":window,
+            "periodFamilyContract":contract,"periodFamilyContractSHA256":sha256_json(contract),
+            "methodContract":method_contract,
+            "methodContractSHA256":method_contract_sha256,
+            "target":{"ticID":identity.get("ticID"),"gaiaDR3SourceID":gaia_context.get("targetGaiaDR3SourceID"),
+                      "raDeg":metadata.get("raDeg"),"decDeg":metadata.get("decDeg")},
+            "gaiaContext":gaia_context, "catalogNeighbors":gaia_context.get("neighbors"),
+            "providerPriority":["ASAS-SN_SKY_PATROL"],
+            "credentialsPersisted":False}
+        path = store.directory_for(investigation.id) / "artifacts" / "external-long-baseline" / "preregistration.json"
+        _write_immutable_json(path, result)
+        return StageOutcome(result=result,next_stage=StageRequest(
+            _next_stage_id(request.id,"run-external-long-baseline"),
+            "openstar.tess.external-long-baseline.run",{},request.id),
+            input_hashes={"semanticBoundary": sha256_json(boundary)},
+            artifacts=(_artifact(path, "application/json"),))
+
+    def external_long_baseline_run_stage(investigation, request):
+        preparation = _latest_result_for_handler(investigation,
+            "openstar.tess.external-long-baseline.prepare")
+        if preparation is None: raise RuntimeError("External run requires preregistration.")
+        window=preparation.get("familyWindowDays")
+        method_contract=preparation.get("methodContract")
+        try:
+            validate_external_method_contract(method_contract)
+            method_hash=external_method_contract_sha256(method_contract)
+            if preparation.get("methodContractSHA256") != method_hash:
+                raise RuntimeError("External method contract hash mismatch.")
+            expected=freeze_external_method_contract(window,method_contract)
+            if expected != method_contract:
+                raise RuntimeError("External method contract does not match the frozen family window.")
+        except (RuntimeError, TypeError, ValueError) as exc:
+            result={"operationalOutcome":"MALFORMED_PREREGISTRATION",
+                    "analysisAvailable":False,"reason":str(exc)}
+        else:
+            try: providers=[ASASSNSkyPatrolProvider.from_environment()]
+            except ProviderConfigurationUnavailable as exc:
+                result={"operationalOutcome":"PROVIDER_CONFIGURATION_UNAVAILABLE",
+                        "analysisAvailable":False,"reason":str(exc),"credentialsPersisted":False,
+                        "methodContract":method_contract,
+                        "methodContractSHA256":method_hash}
+            except ProviderTransientError as exc:
+                raise RetryableExecutionError(str(exc)) from exc
+            else:
+                try:
+                    result=run_external_experiment(target=preparation["target"],family_window=window,
+                        neighbors=preparation.get("catalogNeighbors"),providers=providers,
+                        artifact_root=store.directory_for(investigation.id)/"artifacts"/"external-long-baseline",
+                        contract=method_contract)
+                except ProviderTransientError as exc:
+                    raise RetryableExecutionError(str(exc)) from exc
+        path=store.directory_for(investigation.id)/"artifacts"/"external-long-baseline"/"analysis.json"
+        _write_immutable_json(path,result)
+        evidence_artifacts=tuple(
+            _artifact(Path(item["path"]),"application/json")
+            for item in result.get("artifactManifest") or []
+        )
+        evidence_hashes={f"externalArtifact:{index}:{item['role']}":item["sha256"]
+                         for index,item in enumerate(result.get("artifactManifest") or [])}
+        return StageOutcome(result=result,next_stage=StageRequest(
+            _next_stage_id(request.id,"interpret-external-long-baseline"),
+            "openstar.tess.external-long-baseline.interpret",{},request.id),
+            input_hashes={"preparation":sha256_json(preparation),**evidence_hashes},
+            artifacts=(_artifact(path,"application/json"),)+evidence_artifacts)
+
+    def external_long_baseline_interpret_stage(investigation, request):
+        preparation=_latest_result_for_handler(investigation,"openstar.tess.external-long-baseline.prepare")
+        analysis=_latest_result_for_handler(investigation,"openstar.tess.external-long-baseline.run")
+        if preparation is None or analysis is None: raise RuntimeError("External interpretation requires prepare and run.")
+        result=dict(analysis)
+        operational=analysis.get("operationalOutcome")
+        if operational == "PROVIDER_CONFIGURATION_UNAVAILABLE":
+            result.update({"classification":"EXTERNAL_OPERATIONALLY_UNAVAILABLE",
+                "externalRecurrenceReplicated":False,"stableClockSupported":False,
+                "waveformEvolutionSupported":False,"sourceAttributionReliableAtExternalResolution":False,
+                "periodFamilyResolved":False,"physicalCycleResolved":False,"physicalMechanismResolved":False,
+                "claimDecision":{"claim":"HUMAN_REVIEW_REQUIRED"},
+                "recommendedNextTest":"INSTALL_OPTIONAL_COORDINATOR_DEPENDENCY"})
+        elif operational == "MALFORMED_PREREGISTRATION":
+            result.update({"classification":"EXTERNAL_PREREGISTRATION_INVALID",
+                "externalRecurrenceReplicated":False,"stableClockSupported":False,
+                "waveformEvolutionSupported":False,
+                "sourceAttributionReliableAtExternalResolution":False,
+                "periodFamilyResolved":False,"physicalCycleResolved":False,
+                "physicalMechanismResolved":False,
+                "claimDecision":{"claim":"HUMAN_REVIEW_REQUIRED"},
+                "recommendedNextTest":"MANUAL_WORKFLOW_CONTRACT_REVIEW"})
+        else:
+            result.update({"periodFamilyResolved":False,"physicalCycleResolved":False,
+                           "physicalMechanismResolved":False,
+                           "claimDecision":{"claim":"HUMAN_REVIEW_REQUIRED"}})
+        path=store.directory_for(investigation.id)/"artifacts"/"external-long-baseline"/"interpretation.json"
+        _write_immutable_json(path,result)
+        return StageOutcome(result=result,stop=True,final_status="QUIESCENT_AWAITING_DATA",
+            input_hashes={"preparation":sha256_json(preparation),"analysis":sha256_json(analysis)},
+            artifacts=(_artifact(path,"application/json"),))
 
     def residual_phase_difference_image_interpret_stage(investigation, request):
         preparation = _latest_result_for_handler(
@@ -14835,6 +15099,15 @@ def build_engine(
         "openstar.tess.residual-phase-difference-imaging.interpret",
         residual_phase_difference_image_interpret_stage,
     )
+    engine.register_handler("openstar.tess.external-long-baseline.prepare", external_long_baseline_prepare_stage)
+    engine.register_handler("openstar.tess.external-long-baseline.run", external_long_baseline_run_stage)
+    engine.register_handler("openstar.tess.external-long-baseline.interpret", external_long_baseline_interpret_stage)
+    engine.register_handler("openstar.tess.generic-period-family-difference-imaging.prepare", generic_period_family_difference_prepare_stage)
+    engine.register_handler("openstar.tess.generic-period-family-difference-imaging.run", generic_period_family_difference_run_stage)
+    engine.register_handler("openstar.tess.generic-period-family-difference-imaging.interpret", generic_period_family_difference_interpret_stage)
+    engine.register_handler("openstar.tess.generic-period-family-time-domain-evolution.prepare", generic_period_family_time_prepare_stage)
+    engine.register_handler("openstar.tess.generic-period-family-time-domain-evolution.run", generic_period_family_time_run_stage)
+    engine.register_handler("openstar.tess.generic-period-family-time-domain-evolution.interpret", generic_period_family_time_interpret_stage)
     engine.register_handler(
         PERIOD_FAMILY_DIFFERENCE_PREPARE_HANDLER,
         period_family_difference_image_prepare_stage,

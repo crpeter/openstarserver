@@ -5071,6 +5071,39 @@ def plan_tess_branches(
 ) -> tuple[ScientificBranch, ...]:
     """Translate persisted TESS evidence into domain-neutral branch declarations."""
 
+    # Only actively running investigations cross new semantic capability
+    # boundaries.  COMPLETE/QUIESCENT historical investigations remain closed
+    # until the existing explicit manual-admission path reopens them.
+    if (investigation.status == "RUNNING" or (investigation.status == "QUIESCENT_AWAITING_DATA"
+            and investigation.stages and (investigation.stages[-1].result or {}).get("autonomousContinuationEligible") is True)):
+        from .period_family_followup import latest_semantic_result
+        semantic = latest_semantic_result(investigation)
+        if semantic is not None:
+            predecessor, result = semantic
+            trigger = result.get("recommendedNextTest")
+            routes = {
+                "PERIOD_FAMILY_DIFFERENCE_IMAGE_LOCALIZATION": (
+                    "prepare-period-family-difference-imaging",
+                    "openstar.tess.generic-period-family-difference-imaging.prepare"),
+                "UNTOUCHED_SECTOR_TIME_DOMAIN_EVOLUTION": (
+                    "prepare-period-family-time-domain-evolution",
+                    "openstar.tess.generic-period-family-time-domain-evolution.prepare"),
+                "ADDITIONAL_LONG_BASELINE_TIME_DOMAIN_DATA": (
+                    "external-long-baseline-photometry",
+                    "openstar.tess.external-long-baseline.prepare"),
+            }
+            route = routes.get(trigger)
+            already_started = route and any(s.handler_id == route[1] for s in investigation.stages)
+            if route and not already_started:
+                suffix, handler = route
+                return (ScientificBranch(
+                    id=f"{suffix}-after-{predecessor.id}",
+                    experiment=StageRequest(
+                        id=_continuation_stage_id(predecessor, suffix),
+                        handler_id=handler, parameters={},
+                        triggered_by_stage_id=predecessor.id),
+                ),)
+
     mechanism = _target_residual_mechanism_boundary(investigation)
     if mechanism is not None:
         return (ScientificBranch(
