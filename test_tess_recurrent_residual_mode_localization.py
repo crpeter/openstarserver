@@ -11,9 +11,7 @@ from openstar_workflow import StageRequest
 from run_tess_investigation import (
     _can_continue_residual_mode_localization,
 )
-from test_tess_recurrent_residual_nonstationary_mode_modeling import (
-    RecurrentResidualNonstationaryContinuationTests,
-)
+import test_tess_recurrent_residual_nonstationary_mode_modeling as nonstationary_fixture
 from workflows.tess.tess_autonomy import (
     _repair_recurrent_residual_localization_terminal,
 )
@@ -31,7 +29,7 @@ from workflows.tess.tess_v20_8_long_baseline_time_frequency_confirmation import 
 
 class RecurrentResidualLocalizationContinuationTests(unittest.TestCase):
     def _terminal(self, root):
-        fixture = RecurrentResidualNonstationaryContinuationTests()
+        fixture = nonstationary_fixture.RecurrentResidualNonstationaryContinuationTests()
         store, investigation = fixture._confirmation_terminal(root)
         confirmation = next(
             stage.result
