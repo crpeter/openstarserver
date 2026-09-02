@@ -7,12 +7,14 @@ from unittest import mock
 import numpy as np
 
 from openstar_investigation import InvestigationStage, InvestigationStore
-from workflows.tess.tess_autonomy import repair_obsolete_terminal_wait
+from openstar_targets import InvestigationTarget
+from workflows.tess.tess_autonomy import plan_tess_branches, repair_obsolete_terminal_wait
 from workflows.tess.tess_deep_catalog_counterpart import HANDLER_ID as DEEP_HANDLER_ID
 from workflows.tess.tess_deep_catalog_guided_localization import (
     INTERPRET_HANDLER_ID,
     METHOD_VERSION,
     PREPARE_HANDLER_ID,
+    RUN_HANDLER_ID,
     interpret_deep_catalog_guided_localization,
     prepare_deep_catalog_guided_localization,
     run_deep_catalog_guided_localization,
@@ -209,6 +211,74 @@ class DeepCatalogGuidedLocalizationTests(unittest.TestCase):
             self.assertEqual("024-prepare-deep-catalog-guided-prf-localization", selected["id"])
             self.assertEqual(deep.id, selected["triggered_by_stage_id"])
             self.assertEqual(repaired, repair_obsolete_terminal_wait(store, repaired))
+
+    def test_persisted_prepare_run_interpret_handoffs_resume_exactly_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            investigation = InvestigationStore(Path(directory)).create(
+                "deep-prf-handoffs", "openstar.workflow.tess-investigation.v1", "20.2")
+            deep = InvestigationStage(
+                "042-deep-catalog-counterpart", DEEP_HANDLER_ID, "COMPLETE", None, {},
+                result=self.deep)
+            prepare = InvestigationStage(
+                "044-prepare-deep-catalog-guided-prf-localization", PREPARE_HANDLER_ID,
+                "COMPLETE", deep.id, {}, result={"version": METHOD_VERSION},
+                next_stage={
+                    "id": "045-run-deep-catalog-guided-prf-localization",
+                    "handler_id": RUN_HANDLER_ID, "parameters": {},
+                    "triggered_by_stage_id": "044-prepare-deep-catalog-guided-prf-localization",
+                })
+            investigation = replace(investigation, stages=(deep, prepare))
+            target = InvestigationTarget(
+                "synthetic", investigation.id, investigation.workflow_id,
+                investigation.workflow_version)
+
+            metadata = dict(investigation.metadata)
+            metadata["controlState"] = {
+                "schedulerAction": "INVESTIGATION_COMPLETE",
+                "selectedExperiment": None,
+            }
+            complete = replace(investigation, status="COMPLETE", metadata=metadata)
+            repaired = repair_obsolete_terminal_wait(
+                InvestigationStore(Path(directory)), complete)
+            selected = repaired.metadata["controlState"]["selectedExperiment"]
+            self.assertEqual("RUNNING", repaired.status)
+            self.assertEqual(RUN_HANDLER_ID, selected["handler_id"])
+            self.assertEqual(prepare.next_stage["id"], selected["id"])
+
+            branches = plan_tess_branches(investigation, target)
+            self.assertEqual(RUN_HANDLER_ID, branches[0].experiment.handler_id)
+
+            run = InvestigationStage(
+                "045-run-deep-catalog-guided-prf-localization", RUN_HANDLER_ID,
+                "COMPLETE", prepare.id, {}, result={}, next_stage={
+                    "id": "046-interpret-deep-catalog-guided-prf-localization",
+                    "handler_id": INTERPRET_HANDLER_ID, "parameters": {},
+                    "triggered_by_stage_id": "045-run-deep-catalog-guided-prf-localization",
+                })
+            investigation = replace(investigation, stages=(deep, prepare, run))
+            branches = plan_tess_branches(investigation, target)
+            self.assertEqual(INTERPRET_HANDLER_ID, branches[0].experiment.handler_id)
+
+            interpret = InvestigationStage(
+                "046-interpret-deep-catalog-guided-prf-localization",
+                INTERPRET_HANDLER_ID, "COMPLETE", run.id, {}, result={}, next_stage={
+                    "id": "047-finalize", "handler_id": "openstar.tess.finalize",
+                    "parameters": {"outputSuffix": "deep-catalog-guided-prf-localization"},
+                    "triggered_by_stage_id":
+                        "046-interpret-deep-catalog-guided-prf-localization",
+                })
+            investigation = replace(
+                investigation, stages=(deep, prepare, run, interpret))
+            branches = plan_tess_branches(investigation, target)
+            self.assertEqual("openstar.tess.finalize", branches[0].experiment.handler_id)
+
+            final = InvestigationStage(
+                "047-finalize", "openstar.tess.finalize", "COMPLETE", interpret.id,
+                {"outputSuffix": "deep-catalog-guided-prf-localization"},
+                result={}, stop=True)
+            investigation = replace(
+                investigation, stages=(deep, prepare, run, interpret, final))
+            self.assertEqual((), plan_tess_branches(investigation, target))
 
 
 if __name__ == "__main__":

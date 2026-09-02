@@ -100,6 +100,8 @@ _DEEP_CATALOG_COUNTERPART_HANDLER = (
     "openstar.tess.deep-catalog-counterpart-identification.analyze")
 _DEEP_CATALOG_PRF_PREPARE_HANDLER = (
     "openstar.tess.deep-catalog-guided-prf-localization.prepare")
+_DEEP_CATALOG_PRF_RUN_HANDLER = (
+    "openstar.tess.deep-catalog-guided-prf-localization.run")
 _DEEP_CATALOG_PRF_INTERPRET_HANDLER = (
     "openstar.tess.deep-catalog-guided-prf-localization.interpret")
 
@@ -1024,6 +1026,41 @@ def _persisted_archive_continuation(investigation: Investigation):
             ):
                 continue
         return stage, raw
+    return None
+
+
+def _persisted_deep_catalog_prf_continuation(investigation: Investigation):
+    """Return the exact unattempted continuation recorded by the PR183 stages."""
+    expected = {
+        _DEEP_CATALOG_PRF_PREPARE_HANDLER: (
+            _DEEP_CATALOG_PRF_RUN_HANDLER, {},
+        ),
+        _DEEP_CATALOG_PRF_RUN_HANDLER: (
+            _DEEP_CATALOG_PRF_INTERPRET_HANDLER, {},
+        ),
+        _DEEP_CATALOG_PRF_INTERPRET_HANDLER: (
+            "openstar.tess.finalize",
+            {"outputSuffix": "deep-catalog-guided-prf-localization"},
+        ),
+    }
+    attempted_ids = {stage.id for stage in investigation.stages}
+    for stage in reversed(investigation.stages):
+        if stage.handler_id not in expected or stage.status != "COMPLETE":
+            continue
+        raw = stage.next_stage
+        if not isinstance(raw, dict):
+            continue
+        handler_id, parameters = expected[stage.handler_id]
+        continuation_id = raw.get("id")
+        if (
+            isinstance(continuation_id, str)
+            and continuation_id
+            and continuation_id not in attempted_ids
+            and raw.get("handler_id") == handler_id
+            and raw.get("parameters") == parameters
+            and raw.get("triggered_by_stage_id") == stage.id
+        ):
+            return stage, raw
     return None
 
 
@@ -5083,11 +5120,14 @@ def repair_obsolete_terminal_wait(
         repaired, _ = AutonomousInvestigationEngine(store).decide(investigation, ())
         return repaired
 
-    gaia_continuation = _persisted_archive_continuation(investigation)
+    persisted_continuation = (
+        _persisted_archive_continuation(investigation)
+        or _persisted_deep_catalog_prf_continuation(investigation)
+    )
     if (
         investigation.status == "COMPLETE"
         and control.get("schedulerAction") == "INVESTIGATION_COMPLETE"
-        and gaia_continuation is not None
+        and persisted_continuation is not None
     ):
         metadata = investigation.metadata or {}
         target = InvestigationTarget(
@@ -5333,6 +5373,18 @@ def plan_tess_branches(
     archive_continuation = _persisted_archive_continuation(investigation)
     if archive_continuation is not None:
         completed, raw = archive_continuation
+        return (
+            ScientificBranch(
+                id=f"continue-after-{completed.id}",
+                experiment=_request_from_persisted(raw),
+            ),
+        )
+
+    deep_catalog_prf_continuation = _persisted_deep_catalog_prf_continuation(
+        investigation
+    )
+    if deep_catalog_prf_continuation is not None:
+        completed, raw = deep_catalog_prf_continuation
         return (
             ScientificBranch(
                 id=f"continue-after-{completed.id}",
