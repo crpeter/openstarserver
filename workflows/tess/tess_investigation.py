@@ -8961,48 +8961,14 @@ def build_engine(
     def deep_catalog_prf_localization_prepare_stage(investigation, request):
         deep_catalog = _latest_result_for_handler(
             investigation, DEEP_CATALOG_COUNTERPART_HANDLER_ID)
-        official_prf = _latest_result_for_handler(
+        prf = _latest_result_for_handler(
             investigation, "openstar.tess.official-spoc-prf-forward-modeling.prepare")
-        prepared = _latest_result_for_handler(investigation, "openstar.tess.prepare-target")
-        identity = _latest_result_for_handler(investigation, "openstar.tess.catalog-identity")
-        morphology = _latest_result_for_handler(investigation, "openstar.tess.morphology.analyze")
-        nonstationary = _latest_result_for_handler(
-            investigation, "openstar.tess.nonstationary.summarize")
-        if any(item is None for item in (
-            deep_catalog, official_prf, prepared, identity, morphology, nonstationary
-        )):
+        if deep_catalog is None or prf is None:
             raise RuntimeError(
-                "Deep-catalog PRF localization requires persisted target, identity, morphology, "
-                "nonstationary, deep-catalog, and official-PRF evidence."
+                "Deep-catalog PRF localization requires persisted deep-catalog and official-PRF evidence."
             )
-        target_meta = ((identity.get("tic") or {}).get("metadata") or {})
-        sectors = [
-            int(item["sector"])
-            for item in official_prf.get("calibrationDiagnostics") or []
-            if item.get("sector") is not None
-        ]
-        prf_bridge = {
-            "version": "openstar.tess-deep-catalog-prf-localization-bridge.v1",
-            "ticID": prepared.get("ticID", official_prf.get("targetTIC")),
-            "target": {"componentID": "target", "ticID": prepared.get("ticID")},
-            "targetSky": {"raDeg": target_meta.get("raDeg"),
-                          "decDeg": target_meta.get("decDeg")},
-            "sectors": sectors,
-            "referenceFamilyPeriodDays": morphology.get("resolvedPhysicalPeriodDays"),
-            "residualReferenceFrequency": official_prf.get(
-                "referenceFrequency", nonstationary.get("preferredFrequencyAtReference")),
-            "residualTimeReferenceDays": official_prf.get(
-                "timeReferenceDays", nonstationary.get("timeReferenceDays")),
-            "fractionalFrequencyDriftPerDay": official_prf.get(
-                "fractionalFrequencyDriftPerDay",
-                nonstationary.get("fractionalFrequencyDriftPerDay")),
-            "officialPRFCacheRoot": str(
-                Path(official_prf["projectPath"]).parent / "official-prf-cache"
-            ) if official_prf.get("projectPath") else None,
-            "officialSPOCPRFPreparation": official_prf,
-        }
         preparation = prepare_deep_catalog_guided_localization(
-            deep_catalog_summary=deep_catalog, prf_preparation=prf_bridge,
+            deep_catalog_summary=deep_catalog, prf_preparation=prf,
             output_dir=store.directory_for(investigation.id) / "artifacts",
             investigation_id=investigation.id,
         )
@@ -9016,11 +8982,7 @@ def build_engine(
                 _next_stage_id(request.id, "run-deep-catalog-guided-prf-localization"),
                 DEEP_CATALOG_PRF_RUN_HANDLER_ID, {}, request.id),
             input_hashes={"deepCatalogCounterpart": sha256_json(deep_catalog),
-                          "officialSPOCPRFPreparation": sha256_json(official_prf),
-                          "target": sha256_json(prepared),
-                          "catalogIdentity": sha256_json(identity),
-                          "morphology": sha256_json(morphology),
-                          "nonstationaryModel": sha256_json(nonstationary)},
+                          "officialPRFDeblendingPreparation": sha256_json(prf)},
             artifacts=(_artifact(Path(preparation["preparationPath"]), "application/json"),),
         )
 

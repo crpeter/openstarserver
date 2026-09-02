@@ -80,7 +80,9 @@ def prepare_deep_catalog_guided_localization(
     candidates = validate_deep_catalog_boundary(deep_catalog_summary)
     target_sky = prf_preparation.get("targetSky") or {}
     sectors = list(prf_preparation.get("sectors") or [])
-    official_prf = prf_preparation.get("officialSPOCPRFPreparation") or {}
+    harmonic_orders = tuple(
+        int(value) for value in prf_preparation.get("subtractedHarmonicOrders") or []
+    )
     required_numbers = (
         prf_preparation.get("referenceFamilyPeriodDays", prf_preparation.get("physicalPeriodDays")),
         prf_preparation.get("residualReferenceFrequency"),
@@ -95,12 +97,13 @@ def prepare_deep_catalog_guided_localization(
     if not (
         finite
         and prf_preparation.get("version")
-        == "openstar.tess-deep-catalog-prf-localization-bridge.v1"
-        and official_prf.get("version")
-        == "openstar.tess-official-spoc-prf-forward-modeling-preparation.v1"
+        == "openstar.tess-prf-deblending.v1"
+        and prf_preparation.get("modelSource")
+        == "official-public-SPOC-TESS-PRF-FITS"
         and sectors and len(sectors) == len(set(sectors))
         and all(int(sector) > 0 for sector in sectors)
         and prf_preparation.get("ticID") is not None
+        and harmonic_orders == HARMONIC_ORDERS
         and float(required_numbers[0]) > 0.0
         and float(required_numbers[1]) > 0.0
         and abs(float(required_numbers[3])) <= 1e-15
@@ -133,15 +136,17 @@ def prepare_deep_catalog_guided_localization(
         "residualReferenceFrequency": float(required_numbers[1]),
         "residualTimeReferenceDays": float(required_numbers[2]),
         "fractionalFrequencyDriftPerDay": float(required_numbers[3]),
-        "subtractedHarmonicOrders": list(HARMONIC_ORDERS),
+        "subtractedHarmonicOrders": list(harmonic_orders),
         "crossSectorPhaseUsed": False,
         "historicalResidualDriftExtrapolated": False,
         "catalogQueriesRepeated": False,
-        "officialPRFCacheRoot": prf_preparation.get("officialPRFCacheRoot"),
+        "officialPRFCacheRoot": str(
+            Path(prf_preparation["artifactRoot"]) / "official-prf-cache"
+        ),
         "physicalCycleResolved": False,
         "priorEvidence": {
             "deepCatalogCounterpart": copy.deepcopy(deep_catalog_summary),
-            "officialSPOCPRFPreparation": copy.deepcopy(prf_preparation),
+            "officialPRFDeblendingPreparation": copy.deepcopy(prf_preparation),
         },
     }
     _write_json(Path(result["preparationPath"]), result)

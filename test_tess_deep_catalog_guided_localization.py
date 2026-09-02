@@ -52,7 +52,9 @@ class DeepCatalogGuidedLocalizationTests(unittest.TestCase):
             "recommendedNextTest": "HIGH_RESOLUTION_RESIDUAL_SOURCE_LOCALIZATION",
         }
         self.prf = {
-            "version": "openstar.tess-deep-catalog-prf-localization-bridge.v1",
+            "version": "openstar.tess-prf-deblending.v1",
+            "artifactRoot": "/frozen/prf-deblending",
+            "modelSource": "official-public-SPOC-TESS-PRF-FITS",
             "ticID": 52244725,
             "target": {"componentID": "target"},
             "targetSky": {"raDeg": 100.0, "decDeg": -30.0},
@@ -61,9 +63,7 @@ class DeepCatalogGuidedLocalizationTests(unittest.TestCase):
             "residualReferenceFrequency": 1.0 / 3.259357526415564,
             "residualTimeReferenceDays": 1325.0,
             "fractionalFrequencyDriftPerDay": 0.0,
-            "officialSPOCPRFPreparation": {
-                "version": "openstar.tess-official-spoc-prf-forward-modeling-preparation.v1",
-            },
+            "subtractedHarmonicOrders": [1, 2, 3, 4],
         }
 
     def _prepare(self, directory):
