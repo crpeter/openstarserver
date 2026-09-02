@@ -455,7 +455,8 @@ def validate_recurrent_residual_nonstationary_boundary(
         and exact_harmonic is not None
         and exact_harmonic > 0.0
         and isinstance(frozen_paths, list)
-        and frozen_paths == source_paths
+        and isinstance(source_paths, list)
+        and sorted(frozen_paths) == sorted(source_paths)
         and len(frozen_paths) >= len(expected_sectors) + 1
         and data_reuse.get("downloadPerformed") is False
         and data_reuse.get("originalSectorFluxRead") is False
