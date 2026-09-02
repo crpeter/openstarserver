@@ -34,6 +34,10 @@ from workflows.tess.tess_transient_mode_validation import (
     build_method_contract as build_transient_mode_method_contract,
     validate_frozen_dataset_lineage as validate_transient_mode_frozen_lineage,
 )
+from workflows.tess.tess_recurrent_residual_long_baseline_confirmation import (
+    build_dataset_specs as build_recurrent_residual_dataset_specs,
+    build_method_contract as build_recurrent_residual_method_contract,
+)
 from workflows.tess.tess_mode_identification import (
     MULTIMODE_MODE_EVIDENCE_LINEAGE,
     V20_8_CONFIRMED_COHERENT_MODE_EVIDENCE_LINEAGE,
@@ -177,10 +181,11 @@ def parse_args():
         action="store_true",
         help=(
             "Append local, network-free leave-one-independent-sector-out "
-            "confirmation of the exact terminal unresolved v20.8 "
-            "LONG_BASELINE_TIME_FREQUENCY_CONFIRMATION boundary. This is "
-            "separate from --continue-long-baseline-frequency-confirmation "
-            "and --continue-nonstationary."
+            "confirmation of either the exact terminal unresolved v20.8 "
+            "boundary or the exact resolved-cycle v20.8.1 recurrent-residual "
+            "boundary. This is separate from "
+            "--continue-long-baseline-frequency-confirmation and "
+            "--continue-nonstationary."
         ),
     )
     recovery.add_argument(
@@ -885,7 +890,7 @@ def _can_continue_long_baseline_frequency_confirmation(investigation) -> None:
 def _can_continue_v20_8_long_baseline_time_frequency_confirmation(
     investigation,
 ) -> None:
-    """Validate the exact finalized unresolved v20.8 boundary."""
+    """Validate one exact terminal v20.8 long-baseline boundary."""
     if any(stage.status == "RUNNING" for stage in investigation.stages):
         raise RuntimeError(
             "Investigation contains a RUNNING stage. Use --resume before "
@@ -913,25 +918,78 @@ def _can_continue_v20_8_long_baseline_time_frequency_confirmation(
         and isinstance(stage.result, dict)
     ), None)
     latest = investigation.stages[-1] if investigation.stages else None
-    if summary_stage is None or not (
-        latest is not None
+    transient_stage = next((
+        stage for stage in reversed(investigation.stages)
+        if stage.handler_id == TRANSIENT_MODE_VALIDATION_HANDLER_ID
+        and stage.status == "COMPLETE"
+        and isinstance(stage.result, dict)
+    ), None)
+    if summary_stage is None or latest is None:
+        raise RuntimeError(
+            "The exact finalized v20.8 long-baseline boundary is required."
+        )
+
+    summary_index = investigation.stages.index(summary_stage)
+    direct_boundary = (
+        transient_stage is None
         and latest.handler_id == "openstar.tess.finalize"
         and latest.status == "COMPLETE"
         and latest.stop is True
         and latest.triggered_by_stage_id == summary_stage.id
         and latest.parameters.get("outputSuffix") == "v20.8"
         and isinstance(latest.result, dict)
-        and latest.result.get("timeFrequencyEvolution") == summary_stage.result
+        and latest.result.get("timeFrequencyEvolution")
+        == summary_stage.result
         and latest.result.get("recommendedNextTest")
         == "LONG_BASELINE_TIME_FREQUENCY_CONFIRMATION"
-    ):
-        raise RuntimeError(
-            "The exact finalized unresolved v20.8 boundary is required."
+        and tuple(investigation.stages[summary_index + 1:]) == (latest,)
+    )
+
+    prior_terminal = None
+    recurrent_boundary = False
+    if transient_stage is not None:
+        transient_index = investigation.stages.index(transient_stage)
+        if transient_index > 0:
+            prior_terminal = investigation.stages[transient_index - 1]
+        transient_hashes = (
+            transient_stage.provenance.input_hashes
+            if transient_stage.provenance else {}
         )
-    summary_index = investigation.stages.index(summary_stage)
-    if tuple(investigation.stages[summary_index + 1:]) != (latest,):
+        recurrent_boundary = (
+            prior_terminal is not None
+            and prior_terminal.handler_id == "openstar.tess.finalize"
+            and prior_terminal.status == "COMPLETE"
+            and prior_terminal.stop is True
+            and prior_terminal.triggered_by_stage_id == summary_stage.id
+            and prior_terminal.parameters.get("outputSuffix") == "v20.8"
+            and isinstance(prior_terminal.result, dict)
+            and prior_terminal.result.get("timeFrequencyEvolution")
+            == summary_stage.result
+            and prior_terminal.result.get("recommendedNextTest")
+            == "TRANSIENT_MODE_VALIDATION"
+            and transient_stage.triggered_by_stage_id == summary_stage.id
+            and transient_hashes.get("timeFrequencySummary")
+            == sha256_json(summary_stage.result)
+            and transient_hashes.get("methodContract")
+            == transient_stage.result.get("methodContractHash")
+            and latest.handler_id == "openstar.tess.finalize"
+            and latest.status == "COMPLETE"
+            and latest.stop is True
+            and latest.triggered_by_stage_id == transient_stage.id
+            and latest.parameters.get("outputSuffix")
+            == "v20.8.1-transient-mode-validation"
+            and isinstance(latest.result, dict)
+            and latest.result.get("transientModeValidation")
+            == transient_stage.result
+            and latest.result.get("recommendedNextTest")
+            == "LONG_BASELINE_TIME_FREQUENCY_CONFIRMATION"
+            and tuple(investigation.stages[summary_index + 1:])
+            == (prior_terminal, transient_stage, latest)
+        )
+
+    if not (direct_boundary or recurrent_boundary):
         raise RuntimeError(
-            "Later stages already consume the v20.8 time-frequency boundary."
+            "The exact finalized v20.8 long-baseline boundary is required."
         )
 
     interpretation_stage = next((
@@ -970,8 +1028,11 @@ def _can_continue_v20_8_long_baseline_time_frequency_confirmation(
         and isinstance(stage.result, dict)
     ), None)
     if any(stage is None for stage in (
-        interpretation_stage, run_stage, preparation_stage,
-        prepared_stage, morphology_stage,
+        interpretation_stage,
+        run_stage,
+        preparation_stage,
+        prepared_stage,
+        morphology_stage,
     )):
         raise RuntimeError(
             "The completed v20.8 prepare/run/interpret/morphology lineage "
@@ -1007,22 +1068,28 @@ def _can_continue_v20_8_long_baseline_time_frequency_confirmation(
             "physical-period and window-analysis lineage."
         )
 
-    # Preregister the deterministic contract before validation opens any
-    # frozen residual-window file containing flux values.
-    contract = build_v20_8_long_baseline_method_contract(
-        preparation=preparation_stage.result,
-        interpretation=interpretation_stage.result,
-        summary=summary_stage.result,
-    )
-    dataset_specs = build_v20_8_long_baseline_dataset_specs(
-        expected_tic_id=int(prepared_stage.result["ticID"]),
-        preparation=preparation_stage.result,
-    )
+    if recurrent_boundary:
+        contract = build_recurrent_residual_method_contract(
+            transient_validation=transient_stage.result,
+        )
+        dataset_specs = build_recurrent_residual_dataset_specs(
+            expected_tic_id=int(prepared_stage.result["ticID"]),
+            preparation=preparation_stage.result,
+        )
+    else:
+        contract = build_v20_8_long_baseline_method_contract(
+            preparation=preparation_stage.result,
+            interpretation=interpretation_stage.result,
+            summary=summary_stage.result,
+        )
+        dataset_specs = build_v20_8_long_baseline_dataset_specs(
+            expected_tic_id=int(prepared_stage.result["ticID"]),
+            preparation=preparation_stage.result,
+        )
     validate_v20_8_frozen_window_lineage(
         method_contract=contract,
         dataset_specs=dataset_specs,
     )
-
 
 def _can_continue_transient_mode_validation(investigation) -> None:
     """Validate the exact finalized resolved-cycle transient v20.8 boundary."""
@@ -3377,6 +3444,12 @@ def main():
             if stage.handler_id == "openstar.tess.time-frequency.summarize"
             and stage.status == "COMPLETE"
         )
+        transient_stage = next((
+            stage for stage in reversed(investigation.stages)
+            if stage.handler_id == TRANSIENT_MODE_VALIDATION_HANDLER_ID
+            and stage.status == "COMPLETE"
+        ), None)
+        trigger = transient_stage or summary_stage
         next_number = _next_stage_number(investigation)
         investigation = store.set_status(investigation, "RUNNING")
         initial_stage = StageRequest(
@@ -3387,7 +3460,7 @@ def main():
                 V20_8_LONG_BASELINE_TIME_FREQUENCY_CONFIRMATION_HANDLER_ID
             ),
             parameters={},
-            triggered_by_stage_id=summary_stage.id,
+            triggered_by_stage_id=trigger.id,
         )
     elif args.continue_confirmed_coherent_mode_identification:
         investigation = store.load(args.investigation_id)
