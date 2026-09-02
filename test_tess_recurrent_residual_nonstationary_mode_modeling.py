@@ -6,7 +6,7 @@ from dataclasses import asdict, replace
 from pathlib import Path
 from unittest import mock
 
-import test_tess_recurrent_residual_long_baseline_confirmation as confirmation_fixture
+import test_tess_transient_mode_validation as transient_fixture
 from openstar_investigation import InvestigationStage
 from openstar_workflow import StageRequest
 from run_tess_investigation import (
@@ -35,19 +35,81 @@ class RecurrentResidualNonstationaryContinuationTests(
     unittest.TestCase
 ):
     def _confirmation_terminal(self, root):
-        fixture = (
-            confirmation_fixture
-            .RecurrentResidualLongBaselineContinuationTests()
-        )
-        store, investigation = fixture._recurrent_terminal(root)
+        root = Path(root)
+        fixture = transient_fixture.TransientModeContinuationTests()
+        store, investigation = fixture._history(root)
+
+        # The source boundary needs at least two-thirds of its independent
+        # windows to contain recurrent structure before the next stage can
+        # classify nonstationarity.
+        for sector in (68, 69):
+            for window_index in (1, 2, 3):
+                dataset_id = f"sector-{sector}-window-{window_index}"
+                transient_fixture._write_window(
+                    root / f"{dataset_id}.json",
+                    dataset_id=dataset_id,
+                    sector=sector,
+                    role="independent-time-frequency-window",
+                    window_index=window_index,
+                    frequency=transient_fixture.TRANSIENT_FREQUENCY,
+                )
+
         investigation = store.set_status(investigation, "RUNNING")
         coordinator = mock.Mock()
         engine = build_engine(
             store, coordinator, poll_interval=0.0, timeout=None
         )
         engine.chain_stages = False
-        completed, finalize = engine.run_stage(
+        transient_completed, transient_finalize = engine.run_stage(
             investigation,
+            StageRequest(
+                "011-transient-mode-validation",
+                transient_fixture.HANDLER_ID,
+                {},
+                "009-summarize-time-frequency",
+            ),
+            software_id="integration",
+            software_version="1",
+        )
+        recurrent_terminal, transient_next = engine.run_stage(
+            transient_completed,
+            transient_finalize,
+            software_id="integration",
+            software_version="1",
+        )
+        self.assertIsNone(transient_next)
+        self.assertEqual(
+            transient_fixture.RECURRENT,
+            recurrent_terminal.stages[-2].result["classification"],
+        )
+
+        # Produce the exact modeled boundary under test: two independent
+        # sectors favor the exact harmonic and two favor the nearby coherent
+        # residual frequency. No model has three-sector support, while the
+        # persisted structured-window fraction is exactly sufficient.
+        frequencies = {
+            2: transient_fixture.HARMONIC_FREQUENCY,
+            28: transient_fixture.TRANSIENT_FREQUENCY,
+            68: transient_fixture.HARMONIC_FREQUENCY,
+            69: transient_fixture.TRANSIENT_FREQUENCY,
+        }
+        for sector, frequency in frequencies.items():
+            for window_index in (1, 2, 3):
+                dataset_id = f"sector-{sector}-window-{window_index}"
+                transient_fixture._write_window(
+                    root / f"{dataset_id}.json",
+                    dataset_id=dataset_id,
+                    sector=sector,
+                    role="independent-time-frequency-window",
+                    window_index=window_index,
+                    frequency=frequency,
+                )
+
+        recurrent_terminal = store.set_status(
+            recurrent_terminal, "RUNNING"
+        )
+        completed, finalize = engine.run_stage(
+            recurrent_terminal,
             StageRequest(
                 "013-long-baseline-time-frequency-confirmation",
                 CONFIRMATION_HANDLER_ID,
