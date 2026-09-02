@@ -155,6 +155,12 @@ from .tess_transient_mode_validation import (
     build_method_contract as build_transient_mode_method_contract,
     method_contract_hash as transient_mode_method_contract_hash,
 )
+from .tess_recurrent_residual_long_baseline_confirmation import (
+    METHOD_CONTRACT_ID as RECURRENT_RESIDUAL_METHOD_CONTRACT_ID,
+    analyze_recurrent_residual_long_baseline_confirmation,
+    build_dataset_specs as build_recurrent_residual_dataset_specs,
+    build_method_contract as build_recurrent_residual_method_contract,
+)
 from .tess_dynamic_harmonic import (
     compare_unresolved_family_dynamic_harmonics,
     model_dynamic_harmonics,
@@ -989,7 +995,7 @@ def long_baseline_frequency_confirmation_continuation(
 def v20_8_long_baseline_time_frequency_confirmation_continuation(
     summary: dict[str, Any], *, request_id: str
 ) -> StageRequest:
-    """Finalize this append-only v20.8 branch without auto-running advice."""
+    """Finalize one exact v20.8 long-baseline confirmation lineage."""
     if summary.get("classification") not in {
         "COHERENT_RESIDUAL_FREQUENCY_CONFIRMED",
         "HARMONIC_LOCKED_RESIDUAL_CONFIRMED",
@@ -1000,8 +1006,28 @@ def v20_8_long_baseline_time_frequency_confirmation_continuation(
         raise RuntimeError(
             "v20.8 long-baseline time-frequency classification is invalid."
         )
+    method_contract_id = summary.get("methodContractID")
+    if method_contract_id == (
+        "openstar.tess.v20-8-long-baseline-time-frequency-confirmation."
+        "leave-one-independent-sector-out.v1"
+    ):
+        output_suffix = (
+            "v20.8.1-long-baseline-time-frequency-confirmation"
+        )
+    elif method_contract_id == RECURRENT_RESIDUAL_METHOD_CONTRACT_ID:
+        output_suffix = (
+            "v20.8.2-recurrent-residual-long-baseline-confirmation"
+        )
+    else:
+        raise RuntimeError(
+            "v20.8 long-baseline method-contract lineage is invalid."
+        )
     if not (
-        summary.get("physicalMechanismResolved") is False
+        summary.get("methodContractHash")
+        == v20_8_long_baseline_method_contract_hash(
+            summary.get("methodContract") or {}
+        )
+        and summary.get("physicalMechanismResolved") is False
         and summary.get("claimLevelChanged") is False
         and summary.get("automaticDiscoveryClaim") is False
     ):
@@ -1012,14 +1038,9 @@ def v20_8_long_baseline_time_frequency_confirmation_continuation(
     return StageRequest(
         id=_next_stage_id(request_id, "finalize"),
         handler_id="openstar.tess.finalize",
-        parameters={
-            "outputSuffix": (
-                "v20.8.1-long-baseline-time-frequency-confirmation"
-            )
-        },
+        parameters={"outputSuffix": output_suffix},
         triggered_by_stage_id=request_id,
     )
-
 
 def transient_mode_validation_continuation(
     summary: dict[str, Any], *, request_id: str
@@ -5481,12 +5502,11 @@ def build_engine(
     def v20_8_long_baseline_time_frequency_confirmation_stage(
         investigation, request
     ):
-        """Confirm the exact unresolved terminal v20.8 residual boundary."""
+        """Confirm one exact terminal v20.8 residual boundary."""
         prepared = _result(investigation, "001-prepare-target")
         summary_stage = next((
-            stage for stage in investigation.stages
-            if stage.id == request.triggered_by_stage_id
-            and stage.handler_id == "openstar.tess.time-frequency.summarize"
+            stage for stage in reversed(investigation.stages)
+            if stage.handler_id == "openstar.tess.time-frequency.summarize"
             and stage.status == "COMPLETE"
             and isinstance(stage.result, dict)
         ), None)
@@ -5530,23 +5550,31 @@ def build_engine(
             investigation.stages[-2]
             if len(investigation.stages) >= 2 else None
         )
+        transient_stage = next((
+            stage for stage in investigation.stages
+            if stage.id == request.triggered_by_stage_id
+            and stage.handler_id == TRANSIENT_MODE_VALIDATION_HANDLER_ID
+            and stage.status == "COMPLETE"
+            and isinstance(stage.result, dict)
+        ), None)
         if any(stage is None for stage in (
-            summary_stage, interpretation_stage, run_stage, preparation_stage,
-            morphology_stage, terminal, current,
+            summary_stage,
+            interpretation_stage,
+            run_stage,
+            preparation_stage,
+            morphology_stage,
+            terminal,
+            current,
         )):
             raise RuntimeError(
                 "v20.8 long-baseline confirmation requires the exact completed "
                 "prepare/run/interpret/summarize lineage."
             )
+
         summary_index = investigation.stages.index(summary_stage)
-        if not (
-            current.id == request.id
-            and current.handler_id
-            == V20_8_LONG_BASELINE_TIME_FREQUENCY_CONFIRMATION_HANDLER_ID
-            and current.status == "RUNNING"
-            and terminal.handler_id == "openstar.tess.finalize"
-            and terminal.status == "COMPLETE"
-            and terminal.stop is True
+        direct_boundary = (
+            transient_stage is None
+            and request.triggered_by_stage_id == summary_stage.id
             and terminal.triggered_by_stage_id == summary_stage.id
             and terminal.parameters.get("outputSuffix") == "v20.8"
             and isinstance(terminal.result, dict)
@@ -5556,11 +5584,63 @@ def build_engine(
             == "LONG_BASELINE_TIME_FREQUENCY_CONFIRMATION"
             and tuple(investigation.stages[summary_index + 1:])
             == (terminal, current)
+        )
+
+        prior_terminal = None
+        recurrent_boundary = False
+        if transient_stage is not None:
+            transient_index = investigation.stages.index(transient_stage)
+            if transient_index > 0:
+                prior_terminal = investigation.stages[transient_index - 1]
+            transient_hashes = (
+                transient_stage.provenance.input_hashes
+                if transient_stage.provenance else {}
+            )
+            recurrent_boundary = (
+                prior_terminal is not None
+                and request.triggered_by_stage_id == transient_stage.id
+                and prior_terminal.handler_id == "openstar.tess.finalize"
+                and prior_terminal.status == "COMPLETE"
+                and prior_terminal.stop is True
+                and prior_terminal.triggered_by_stage_id == summary_stage.id
+                and prior_terminal.parameters.get("outputSuffix") == "v20.8"
+                and isinstance(prior_terminal.result, dict)
+                and prior_terminal.result.get("timeFrequencyEvolution")
+                == summary_stage.result
+                and prior_terminal.result.get("recommendedNextTest")
+                == "TRANSIENT_MODE_VALIDATION"
+                and transient_stage.triggered_by_stage_id == summary_stage.id
+                and transient_hashes.get("timeFrequencySummary")
+                == sha256_json(summary_stage.result)
+                and transient_hashes.get("methodContract")
+                == transient_stage.result.get("methodContractHash")
+                and terminal.triggered_by_stage_id == transient_stage.id
+                and terminal.parameters.get("outputSuffix")
+                == "v20.8.1-transient-mode-validation"
+                and isinstance(terminal.result, dict)
+                and terminal.result.get("transientModeValidation")
+                == transient_stage.result
+                and terminal.result.get("recommendedNextTest")
+                == "LONG_BASELINE_TIME_FREQUENCY_CONFIRMATION"
+                and tuple(investigation.stages[summary_index + 1:])
+                == (prior_terminal, transient_stage, terminal, current)
+            )
+
+        if not (
+            current.id == request.id
+            and current.handler_id
+            == V20_8_LONG_BASELINE_TIME_FREQUENCY_CONFIRMATION_HANDLER_ID
+            and current.status == "RUNNING"
+            and terminal.handler_id == "openstar.tess.finalize"
+            and terminal.status == "COMPLETE"
+            and terminal.stop is True
+            and (direct_boundary or recurrent_boundary)
         ):
             raise RuntimeError(
-                "v20.8 long-baseline confirmation requires the exact "
-                "terminal v20.8 finalization boundary."
+                "v20.8 long-baseline confirmation requires an exact "
+                "terminal v20.8 lineage."
             )
+
         interpretation_hashes = (
             interpretation_stage.provenance.input_hashes
             if interpretation_stage.provenance else {}
@@ -5590,19 +5670,39 @@ def build_engine(
                 "completed lineage."
             )
 
-        # Freeze and hash every scientific/modeling choice before any frozen
-        # residual-window file (and therefore any flux value) is opened.
-        contract = build_v20_8_long_baseline_method_contract(
-            preparation=preparation_stage.result,
-            interpretation=interpretation_stage.result,
-            summary=summary_stage.result,
-        )
+        if recurrent_boundary:
+            contract = build_recurrent_residual_method_contract(
+                transient_validation=transient_stage.result,
+            )
+            dataset_specs = build_recurrent_residual_dataset_specs(
+                expected_tic_id=int(prepared["ticID"]),
+                preparation=preparation_stage.result,
+            )
+            analyze = (
+                analyze_recurrent_residual_long_baseline_confirmation
+            )
+            artifact_name = (
+                "recurrent-residual-long-baseline-confirmation-v20.8.2.json"
+            )
+        else:
+            contract = build_v20_8_long_baseline_method_contract(
+                preparation=preparation_stage.result,
+                interpretation=interpretation_stage.result,
+                summary=summary_stage.result,
+            )
+            dataset_specs = build_v20_8_long_baseline_dataset_specs(
+                expected_tic_id=int(prepared["ticID"]),
+                preparation=preparation_stage.result,
+            )
+            analyze = (
+                analyze_v20_8_long_baseline_time_frequency_confirmation
+            )
+            artifact_name = (
+                "long-baseline-time-frequency-confirmation-v20.8.1.json"
+            )
+
         contract_hash = v20_8_long_baseline_method_contract_hash(contract)
-        dataset_specs = build_v20_8_long_baseline_dataset_specs(
-            expected_tic_id=int(prepared["ticID"]),
-            preparation=preparation_stage.result,
-        )
-        result = analyze_v20_8_long_baseline_time_frequency_confirmation(
+        result = analyze(
             method_contract=contract,
             dataset_specs=dataset_specs,
         )
@@ -5634,9 +5734,31 @@ def build_engine(
             store.directory_for(investigation.id)
             / "artifacts"
             / "long-baseline-time-frequency-confirmation"
-            / "long-baseline-time-frequency-confirmation-v20.8.1.json"
+            / artifact_name
         )
         _write_json(artifact_path, result)
+        input_hashes = {
+            "methodContract": contract_hash,
+            "morphology": sha256_json(morphology_stage.result),
+            "timeFrequencyPreparation": sha256_json(
+                preparation_stage.result
+            ),
+            "timeFrequencyProjectResult": sha256_json(run_stage.result),
+            "timeFrequencyInterpretation": sha256_json(
+                interpretation_stage.result
+            ),
+            "timeFrequencySummary": sha256_json(summary_stage.result),
+            **{
+                "frozenWindowDataset:"
+                f"{spec['role']}:{spec['sector']}:{spec['windowIndex']}":
+                sha256_file(spec["datasetPath"])
+                for spec in dataset_specs
+            },
+        }
+        if recurrent_boundary:
+            input_hashes["transientModeValidation"] = sha256_json(
+                transient_stage.result
+            )
         return StageOutcome(
             result=result,
             next_stage=(
@@ -5644,24 +5766,7 @@ def build_engine(
                     result, request_id=request.id
                 )
             ),
-            input_hashes={
-                "methodContract": contract_hash,
-                "morphology": sha256_json(morphology_stage.result),
-                "timeFrequencyPreparation": sha256_json(
-                    preparation_stage.result
-                ),
-                "timeFrequencyProjectResult": sha256_json(run_stage.result),
-                "timeFrequencyInterpretation": sha256_json(
-                    interpretation_stage.result
-                ),
-                "timeFrequencySummary": sha256_json(summary_stage.result),
-                **{
-                    "frozenWindowDataset:"
-                    f"{spec['role']}:{spec['sector']}:{spec['windowIndex']}":
-                    sha256_file(spec["datasetPath"])
-                    for spec in dataset_specs
-                },
-            },
+            input_hashes=input_hashes,
             artifacts=(_artifact(artifact_path, "application/json"),),
         )
 
