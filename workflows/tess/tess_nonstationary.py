@@ -583,6 +583,99 @@ def recurrent_residual_nonstationary_method_contract_hash(
     return sha256_json(contract)
 
 
+def validate_recurrent_residual_nonstationary_localization_boundary(
+    nonstationary_summary: dict[str, Any],
+    confirmation: dict[str, Any],
+) -> float:
+    """Validate the exact v20.9.3 boundary before pixel acquisition."""
+    if not isinstance(nonstationary_summary, dict):
+        raise RuntimeError(
+            "Recurrent-residual localization requires v20.9.3 modeling."
+        )
+    expected_contract = (
+        build_recurrent_residual_nonstationary_method_contract(
+            confirmation
+        )
+    )
+    expected_hash = (
+        recurrent_residual_nonstationary_method_contract_hash(
+            expected_contract
+        )
+    )
+    frequency = _float(
+        nonstationary_summary.get("preferredFrequencyAtReference")
+    )
+    period = _float(
+        nonstationary_summary.get("preferredPeriodAtReferenceDays")
+    )
+    drift = _float(
+        nonstationary_summary.get("fractionalFrequencyDriftPerDay")
+    )
+    time_reference = _float(
+        nonstationary_summary.get("timeReferenceDays")
+    )
+    preferred = nonstationary_summary.get("preferredModel") or {}
+    model_id = preferred.get("modelID")
+    expected_classification = {
+        "STATIONARY_GLOBAL_MODE": "STATIONARY_RESIDUAL_MODE",
+        "FREQUENCY_DRIFT_GLOBAL_MODE": "FREQUENCY_DRIFT_MODE",
+        "STATIONARY_SECTOR_EVOLVING_MODE": (
+            "AMPLITUDE_PHASE_EVOLVING_MODE"
+        ),
+        "DRIFT_SECTOR_EVOLVING_MODE": (
+            "NONSTATIONARY_DRIFT_WITH_SECTOR_EVOLUTION"
+        ),
+        "STATIONARY_SUPPORT_SECTORS_MODE": (
+            "TRANSIENT_SECTOR_LOCALIZED_MODE"
+        ),
+        "FREQUENCY_DRIFT_SUPPORT_SECTORS_MODE": (
+            "DRIFTING_TRANSIENT_MODE"
+        ),
+    }.get(model_id)
+    signal_sectors = {
+        _int(value)
+        for value in preferred.get("signalSectors") or []
+    }
+    if not (
+        nonstationary_summary.get("evidenceLineage")
+        == RECURRENT_RESIDUAL_NONSTATIONARY_EVIDENCE_LINEAGE
+        and nonstationary_summary.get("methodContract")
+        == expected_contract
+        and nonstationary_summary.get("methodContractID")
+        == RECURRENT_RESIDUAL_NONSTATIONARY_METHOD_CONTRACT_ID
+        and nonstationary_summary.get("methodContractHash")
+        == expected_hash
+        and nonstationary_summary.get("classification")
+        == expected_classification
+        and nonstationary_summary.get("recommendedNextTest")
+        == "RESIDUAL_MODE_PIXEL_LOCALIZATION"
+        and nonstationary_summary.get("physicalMechanismResolved")
+        is False
+        and nonstationary_summary.get("claimLevelChanged") is False
+        and frequency is not None
+        and frequency > 0.0
+        and period is not None
+        and period > 0.0
+        and math.isclose(
+            period,
+            1.0 / frequency,
+            rel_tol=1e-12,
+            abs_tol=1e-12,
+        )
+        and drift is not None
+        and time_reference is not None
+        and signal_sectors
+        and None not in signal_sectors
+    ):
+        raise RuntimeError(
+            "Recurrent-residual localization requires the exact persisted "
+            "v20.9.3 nonstationary-modeling boundary."
+        )
+    return float(
+        expected_contract["evidenceBoundary"]["establishedPeriodDays"]
+    )
+
+
 def confirmed_nonstationary_physical_period(
     confirmation: dict[str, Any],
     physical_cycle_evidence: dict[str, Any] | None,

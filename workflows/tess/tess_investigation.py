@@ -127,6 +127,7 @@ from .tess_nonstationary import (
     validate_confirmed_nonstationary_boundary,
     validate_confirmed_nonstationary_localization_boundary,
     validate_recurrent_residual_nonstationary_boundary,
+    validate_recurrent_residual_nonstationary_localization_boundary,
 )
 from .tess_mode_identification import (
     CONFIRMED_COHERENT_MODE_METHOD_CONTRACT_ID,
@@ -376,7 +377,7 @@ from .tess_multisector import (
 WORKFLOW_ID = "openstar.workflow.tess-investigation.v1"
 WORKFLOW_VERSION = "20.2"
 SOFTWARE_ID = "openstar.tess-investigation-plugin"
-SOFTWARE_VERSION = "20.43"
+SOFTWARE_VERSION = "20.44"
 ADAPTIVE_BLIND_TRANSIT_ADDITIONAL_SECTORS = 8
 EXHAUSTED_RESIDUAL_RUN_HANDLER_ID = (
     "openstar.tess.blind-transit-distributed.run"
@@ -7126,6 +7127,10 @@ def build_engine(
             investigation,
             LONG_BASELINE_FREQUENCY_CONFIRMATION_HANDLER_ID,
         )
+        recurrent_confirmation = _latest_result_for_handler(
+            investigation,
+            V20_8_LONG_BASELINE_TIME_FREQUENCY_CONFIRMATION_HANDLER_ID,
+        )
         source_localization = _latest_result_for_handler(
             investigation,
             "openstar.tess.source-localization.analyze",
@@ -7157,9 +7162,23 @@ def build_engine(
             and nonstationary.get("evidenceLineage")
             == CONFIRMED_NONSTATIONARY_EVIDENCE_LINEAGE
         )
-        if morphology is None:
+        recurrent_path = (
+            isinstance(nonstationary, dict)
+            and nonstationary.get("evidenceLineage")
+            == RECURRENT_RESIDUAL_NONSTATIONARY_EVIDENCE_LINEAGE
+        )
+        if recurrent_path and request.parameters != {
+            "evidenceLineage": (
+                RECURRENT_RESIDUAL_NONSTATIONARY_EVIDENCE_LINEAGE
+            )
+        }:
+            raise RuntimeError(
+                "Recurrent-residual localization requires its exact "
+                "v20.9.3 evidence-lineage request."
+            )
+        if morphology is None and not recurrent_path:
             raise RuntimeError("v20.10 requires morphology evidence.")
-        if (not mode_path and not confirmed_path
+        if (not mode_path and not confirmed_path and not recurrent_path
                 and not morphology.get("physicalCycleResolved")):
             raise RuntimeError("v20.10 requires the morphology-resolved physical period.")
         if not mode_path and (nonstationary is None or nonstationary.get("recommendedNextTest") != "RESIDUAL_MODE_PIXEL_LOCALIZATION"):
@@ -7195,6 +7214,15 @@ def build_engine(
                 nonstationary, confirmation, cycle
             )
             period_reference_kind = "AUTHORITATIVE_RESOLVED_PHYSICAL_CYCLE"
+        elif recurrent_path:
+            physical_period = (
+                validate_recurrent_residual_nonstationary_localization_boundary(
+                    nonstationary, recurrent_confirmation
+                )
+            )
+            period_reference_kind = (
+                "RECURRENT_RESIDUAL_RESOLVED_PHYSICAL_CYCLE"
+            )
         else:
             physical_period = float(morphology["resolvedPhysicalPeriodDays"])
         artifact_root = store.directory_for(investigation.id) / "artifacts"
@@ -7251,6 +7279,9 @@ def build_engine(
                 "dynamicHarmonicModeling": sha256_json(dynamic_harmonic),
                 "timeFrequencyEvolution": sha256_json(time_frequency),
                 "longBaselineFrequencyConfirmation": sha256_json(confirmation),
+                "recurrentResidualLongBaselineConfirmation": sha256_json(
+                    recurrent_confirmation
+                ),
                 "sourceLocalization": sha256_json(source_localization),
             },
             artifacts=tuple(artifacts),

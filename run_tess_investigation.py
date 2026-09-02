@@ -52,6 +52,7 @@ from workflows.tess.tess_nonstationary import (
     build_recurrent_residual_nonstationary_method_contract,
     validate_confirmed_nonstationary_localization_boundary,
     validate_recurrent_residual_nonstationary_boundary,
+    validate_recurrent_residual_nonstationary_localization_boundary,
 )
 from workflows.tess.tess_residual_external_evidence import (
     HANDLER_ID as RESIDUAL_EXTERNAL_EVIDENCE_HANDLER_ID,
@@ -228,7 +229,8 @@ def parse_args():
         "--continue-residual-mode-localization",
         action="store_true",
         help=(
-            "Append v20.10 distributed pixel localization of the v20.9 drifting residual mode. "
+            "Append v20.10 distributed pixel localization of the persisted "
+            "v20.9 residual mode, including the exact v20.9.3 recurrent-residual boundary. "
             "The workflow prewhitens and time-warps TESS pixel light curves, then exposes each "
             "usable pixel as an ordinary openstar.lomb-scargle.v1 dataset."
         ),
@@ -1695,6 +1697,84 @@ def _can_continue_residual_mode_localization(investigation) -> None:
             raise RuntimeError(
                 "Confirmed residual localization requires the exact finalized "
                 "v20.9.2 boundary."
+            )
+    elif (
+        nonstationary.get("evidenceLineage")
+        == RECURRENT_RESIDUAL_NONSTATIONARY_EVIDENCE_LINEAGE
+    ):
+        confirmation_stage = next((
+            stage for stage in reversed(investigation.stages)
+            if stage.handler_id
+            == V20_8_LONG_BASELINE_TIME_FREQUENCY_CONFIRMATION_HANDLER_ID
+            and stage.status == "COMPLETE"
+            and isinstance(stage.result, dict)
+        ), None)
+        prepare = next((
+            stage for stage in reversed(investigation.stages)
+            if stage.handler_id == "openstar.tess.nonstationary.prepare"
+            and stage.status == "COMPLETE"
+            and isinstance(stage.result, dict)
+        ), None)
+        run = next((
+            stage for stage in reversed(investigation.stages)
+            if stage.handler_id == "openstar.tess.nonstationary.run"
+            and stage.status == "COMPLETE"
+            and isinstance(stage.result, dict)
+        ), None)
+        interpreted = next((
+            stage for stage in reversed(investigation.stages)
+            if stage.handler_id == "openstar.tess.nonstationary.interpret"
+            and stage.status == "COMPLETE"
+            and isinstance(stage.result, dict)
+        ), None)
+        summary = next((
+            stage for stage in reversed(investigation.stages)
+            if stage.handler_id == "openstar.tess.nonstationary.summarize"
+            and stage.status == "COMPLETE"
+            and stage.result == nonstationary
+        ), None)
+        latest = investigation.stages[-1] if investigation.stages else None
+        if confirmation_stage is None:
+            raise RuntimeError(
+                "Recurrent-residual localization requires the completed "
+                "v20.8.2 confirmation."
+            )
+        validate_recurrent_residual_nonstationary_localization_boundary(
+            nonstationary, confirmation_stage.result
+        )
+        if not (
+            prepare is not None
+            and run is not None
+            and interpreted is not None
+            and summary is not None
+            and latest is not None
+            and prepare.parameters == {
+                "evidenceLineage": (
+                    RECURRENT_RESIDUAL_NONSTATIONARY_EVIDENCE_LINEAGE
+                )
+            }
+            and prepare.triggered_by_stage_id == confirmation_stage.id
+            and run.triggered_by_stage_id == prepare.id
+            and interpreted.triggered_by_stage_id == run.id
+            and summary.triggered_by_stage_id == interpreted.id
+            and latest.handler_id == "openstar.tess.finalize"
+            and latest.status == "COMPLETE"
+            and latest.stop is True
+            and latest.triggered_by_stage_id == summary.id
+            and latest.parameters.get("outputSuffix")
+            == "v20.9.3-recurrent-residual-nonstationary"
+            and isinstance(latest.result, dict)
+            and latest.result.get("nonstationaryModeling")
+            == nonstationary
+            and tuple(
+                investigation.stages[
+                    investigation.stages.index(prepare):
+                ]
+            ) == (prepare, run, interpreted, summary, latest)
+        ):
+            raise RuntimeError(
+                "Recurrent-residual localization requires the exact "
+                "finalized v20.9.3 append boundary."
             )
     if already_done:
         raise RuntimeError(
@@ -3717,12 +3797,34 @@ def main():
             )
         _can_continue_residual_mode_localization(investigation)
         last_stage_id = investigation.stages[-1].id if investigation.stages else None
+        nonstationary_stage = next((
+            stage for stage in reversed(investigation.stages)
+            if stage.handler_id == "openstar.tess.nonstationary.summarize"
+            and stage.status == "COMPLETE"
+        ), None)
+        recurrent_localization = (
+            nonstationary_stage is not None
+            and isinstance(nonstationary_stage.result, dict)
+            and nonstationary_stage.result.get("evidenceLineage")
+            == RECURRENT_RESIDUAL_NONSTATIONARY_EVIDENCE_LINEAGE
+        )
+        if recurrent_localization:
+            last_stage_id = nonstationary_stage.id
+        localization_parameters = (
+            {
+                "evidenceLineage": (
+                    RECURRENT_RESIDUAL_NONSTATIONARY_EVIDENCE_LINEAGE
+                )
+            }
+            if recurrent_localization
+            else {}
+        )
         next_number = _next_stage_number(investigation)
         investigation = store.set_status(investigation, "RUNNING")
         initial_stage = StageRequest(
             id=f"{next_number:03d}-prepare-residual-mode-localization",
             handler_id="openstar.tess.residual-mode-localization.prepare",
-            parameters={},
+            parameters=localization_parameters,
             triggered_by_stage_id=last_stage_id,
         )
     elif args.continue_residual_external_evidence:
@@ -4636,7 +4738,7 @@ def main():
         print("   original sector flux is not read")
         print("   no archive query or download is performed")
     elif args.continue_residual_mode_localization:
-        print("🎯 Continuing terminal investigation with v20.10 distributed residual-mode pixel localization")
+        print("🎯 Continuing the authenticated nonstationary boundary with v20.10 distributed residual-mode pixel localization")
         print(f"   stage: {initial_stage.id}")
         print(f"   handler: {initial_stage.handler_id}")
         print("   coordinator required")
