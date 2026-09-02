@@ -1144,11 +1144,11 @@ def build_nonstationary_project(
                 "fractionalFrequencyDriftPerDay": float(q),
                 "physicalFundamentalFrequency": physical_frequency,
                 "firstHarmonicFrequency": 2.0 * physical_frequency,
-                "inputObservable": (
-                    "frozen-v20.8-family-subtracted-residual-windows"
-                    if recurrent else "full-sector-family-subtracted-residual"
-                ),
             })
+            if recurrent:
+                science["inputObservable"] = (
+                    "frozen-v20.8-family-subtracted-residual-windows"
+                )
             template_dataset["science"] = science
             template_dataset["source"] = {
                 "mission": "TESS",
@@ -1248,10 +1248,11 @@ def build_nonstationary_project(
             sector_ids, dtype=np.int32
         ).tolist(),
         "sectorResiduals": sector_residuals,
-        "inputObservable": (
-            "FROZEN_V20_8_FAMILY_SUBTRACTED_RESIDUAL_FLUX"
-            if recurrent else "FULL_SECTOR_FAMILY_SUBTRACTED_RESIDUAL"
-        ),
+        **({
+            "inputObservable": (
+                "FROZEN_V20_8_FAMILY_SUBTRACTED_RESIDUAL_FLUX"
+            )
+        } if recurrent else {}),
     })
 
     work_units_per_dataset = math.ceil(
@@ -1305,7 +1306,7 @@ def build_nonstationary_project(
         "totalWorkUnits": (
             len(dataset_entries) * work_units_per_dataset
         ),
-        "originalSectorFluxRead": not recurrent,
+        **({"originalSectorFluxRead": False} if recurrent else {}),
     }
     if method_contract is not None:
         result.update({
