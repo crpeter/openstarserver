@@ -181,10 +181,12 @@ def _mode_result(classification):
 
 
 class ConfirmedCoherentModeFixture(unittest.TestCase):
-    def _history(self, root, *, status="COMPLETE"):
+    def _history(self, root, *, status="COMPLETE", resolved_cycle=False):
         root = Path(root)
         store = InvestigationStore(root / "investigations")
-        preparation, interpretation, summary = _evidence(root)
+        preparation, interpretation, summary = _evidence(
+            root, resolved_cycle=resolved_cycle
+        )
         confirmation_contract = build_confirmation_method_contract(
             preparation=preparation,
             interpretation=interpretation,
@@ -217,8 +219,10 @@ class ConfirmedCoherentModeFixture(unittest.TestCase):
             } for sector in INDEPENDENT_SECTORS]
         }
         morphology = {
-            "physicalCycleResolved": False,
-            "resolvedPhysicalPeriodDays": None,
+            "physicalCycleResolved": resolved_cycle,
+            "resolvedPhysicalPeriodDays": (
+                FAMILY_PERIOD_DAYS if resolved_cycle else None
+            ),
             "continuationEvidence": {
                 "timeFrequencyEvolutionWarranted": True,
                 "analysisReferencePeriodDays": FAMILY_PERIOD_DAYS,
@@ -433,6 +437,45 @@ class ConfirmedCoherentModeContractTests(ConfirmedCoherentModeFixture):
             with self.assertRaisesRegex(RuntimeError, "exact confirmed"):
                 validate_v20_8_confirmed_coherent_residual(confirmation)
 
+    def test_resolved_physical_cycle_confirmation_is_preserved(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            _, investigation, contract, _ = self._history(
+                temporary, resolved_cycle=True
+            )
+            confirmation = investigation.stages[-2].result
+        self.assertEqual(
+            {
+                "periodDays": FAMILY_PERIOD_DAYS,
+                "kind": "MORPHOLOGY_RESOLVED_PHYSICAL_PERIOD",
+                "physicalCycleResolved": True,
+            },
+            confirmation["methodContract"]["evidenceBoundary"][
+                "periodReference"
+            ],
+        )
+        self.assertEqual(
+            confirmation["methodContractHash"],
+            contract["evidenceBoundary"]["confirmationMethodContractHash"],
+        )
+
+    def test_inconsistent_resolved_period_reference_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            _, investigation, _, _ = self._history(
+                temporary, resolved_cycle=True
+            )
+            confirmation = copy.deepcopy(investigation.stages[-2].result)
+            period_reference = confirmation["methodContract"][
+                "evidenceBoundary"
+            ]["periodReference"]
+            period_reference["physicalCycleResolved"] = False
+            confirmation["methodContractHash"] = (
+                confirmation_method_contract_hash(
+                    confirmation["methodContract"]
+                )
+            )
+            with self.assertRaisesRegex(RuntimeError, "exact confirmed"):
+                validate_v20_8_confirmed_coherent_residual(confirmation)
+
     def test_insufficient_predictive_sector_support_fails_closed(self):
         with tempfile.TemporaryDirectory() as temporary:
             _, investigation, _, _ = self._history(temporary)
@@ -574,6 +617,40 @@ class ConfirmedCoherentModeContinuationTests(ConfirmedCoherentModeFixture):
                     investigation,
                     stages=investigation.stages + (existing,),
                 ))
+
+    def test_resolved_physical_cycle_boundary_repairs_append_only(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store, investigation, _, _ = self._history(
+                temporary, resolved_cycle=True
+            )
+            immutable = tuple(
+                json.dumps(asdict(stage), sort_keys=True)
+                for stage in investigation.stages
+            )
+            with mock.patch.object(
+                store, "verified_terminal_stage_ledger_hash",
+                return_value=True,
+            ), mock.patch(
+                "workflows.tess.tess_autonomy._verified_stage_json",
+                return_value=True,
+            ):
+                repaired = (
+                    _repair_v20_8_confirmed_coherent_mode_identification_terminal(
+                        store,
+                        investigation,
+                        investigation.metadata["controlState"],
+                    )
+                )
+        self.assertEqual("RUNNING", repaired.status)
+        self.assertEqual(immutable, tuple(
+            json.dumps(asdict(stage), sort_keys=True)
+            for stage in repaired.stages
+        ))
+        selected = repaired.metadata["controlState"]["selectedExperiment"]
+        self.assertEqual(
+            V20_8_CONFIRMED_COHERENT_MODE_EVIDENCE_LINEAGE,
+            selected["parameters"]["evidenceLineage"],
+        )
 
     def test_rejects_altered_confirmation_and_wrong_recommendation(self):
         for change in ("classification", "recommendedNextTest"):
