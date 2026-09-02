@@ -115,14 +115,18 @@ from .tess_time_frequency import (
 )
 from .tess_nonstationary import (
     CONFIRMED_NONSTATIONARY_EVIDENCE_LINEAGE,
+    RECURRENT_RESIDUAL_NONSTATIONARY_EVIDENCE_LINEAGE,
     build_confirmed_nonstationary_method_contract,
     build_nonstationary_project,
+    build_recurrent_residual_nonstationary_method_contract,
     confirmed_nonstationary_physical_period,
     confirmed_nonstationary_method_contract_hash,
     interpret_nonstationary_project,
+    recurrent_residual_nonstationary_method_contract_hash,
     summarize_nonstationary_modeling,
     validate_confirmed_nonstationary_boundary,
     validate_confirmed_nonstationary_localization_boundary,
+    validate_recurrent_residual_nonstationary_boundary,
 )
 from .tess_mode_identification import (
     CONFIRMED_COHERENT_MODE_METHOD_CONTRACT_ID,
@@ -372,7 +376,7 @@ from .tess_multisector import (
 WORKFLOW_ID = "openstar.workflow.tess-investigation.v1"
 WORKFLOW_VERSION = "20.2"
 SOFTWARE_ID = "openstar.tess-investigation-plugin"
-SOFTWARE_VERSION = "20.42"
+SOFTWARE_VERSION = "20.43"
 ADAPTIVE_BLIND_TRANSIT_ADDITIONAL_SECTORS = 8
 EXHAUSTED_RESIDUAL_RUN_HANDLER_ID = (
     "openstar.tess.blind-transit-distributed.run"
@@ -6691,6 +6695,10 @@ def build_engine(
             investigation,
             "openstar.tess.morphology.analyze",
         )
+        time_frequency_prepare = _latest_result_for_handler(
+            investigation,
+            "openstar.tess.time-frequency.prepare",
+        )
         time_frequency = _latest_result_for_handler(
             investigation,
             "openstar.tess.time-frequency.summarize",
@@ -6701,20 +6709,39 @@ def build_engine(
         )
         evidence_lineage = request.parameters.get("evidenceLineage")
         if independent_prepare is None:
-            raise RuntimeError("v20.9 requires the frozen independent-sector preparation.")
+            raise RuntimeError(
+                "v20.9 requires the frozen independent-sector preparation."
+            )
+
         confirmed_contract = None
+        recurrent_contract = None
         confirmation = None
+        recurrent_specs = None
         if evidence_lineage == CONFIRMED_NONSTATIONARY_EVIDENCE_LINEAGE:
             confirmation_stage = next((
                 stage for stage in reversed(investigation.stages)
-                if stage.handler_id == LONG_BASELINE_FREQUENCY_CONFIRMATION_HANDLER_ID
-                and stage.status == "COMPLETE" and isinstance(stage.result, dict)
+                if stage.handler_id
+                == LONG_BASELINE_FREQUENCY_CONFIRMATION_HANDLER_ID
+                and stage.status == "COMPLETE"
+                and isinstance(stage.result, dict)
             ), None)
-            if confirmation_stage is None or request.triggered_by_stage_id != confirmation_stage.id:
-                raise RuntimeError("Confirmed nonstationary modeling requires the triggering v20.9.1 confirmation stage.")
+            if (
+                confirmation_stage is None
+                or request.triggered_by_stage_id != confirmation_stage.id
+            ):
+                raise RuntimeError(
+                    "Confirmed nonstationary modeling requires the "
+                    "triggering v20.9.1 confirmation stage."
+                )
             confirmation = confirmation_stage.result
-            boundary = validate_confirmed_nonstationary_boundary(confirmation)
-            confirmed_contract = build_confirmed_nonstationary_method_contract(confirmation)
+            boundary = validate_confirmed_nonstationary_boundary(
+                confirmation
+            )
+            confirmed_contract = (
+                build_confirmed_nonstationary_method_contract(
+                    confirmation
+                )
+            )
             cycle = (
                 source_localization.get("physicalCycleEvidence")
                 if isinstance(source_localization, dict) else None
@@ -6722,21 +6749,113 @@ def build_engine(
             physical_period = confirmed_nonstationary_physical_period(
                 confirmation, cycle
             )
+        elif (
+            evidence_lineage
+            == RECURRENT_RESIDUAL_NONSTATIONARY_EVIDENCE_LINEAGE
+        ):
+            confirmation_stage = next((
+                stage for stage in reversed(investigation.stages)
+                if stage.handler_id
+                == V20_8_LONG_BASELINE_TIME_FREQUENCY_CONFIRMATION_HANDLER_ID
+                and stage.status == "COMPLETE"
+                and isinstance(stage.result, dict)
+            ), None)
+            if (
+                confirmation_stage is None
+                or request.triggered_by_stage_id != confirmation_stage.id
+                or time_frequency_prepare is None
+            ):
+                raise RuntimeError(
+                    "Recurrent-residual nonstationary modeling requires "
+                    "the triggering v20.8.2 confirmation stage and its "
+                    "frozen window preparation."
+                )
+            confirmation = confirmation_stage.result
+            boundary = (
+                validate_recurrent_residual_nonstationary_boundary(
+                    confirmation
+                )
+            )
+            recurrent_contract = (
+                build_recurrent_residual_nonstationary_method_contract(
+                    confirmation
+                )
+            )
+            physical_period = float(
+                boundary["establishedPeriodDays"]
+            )
+            recurrent_specs = (
+                build_v20_8_long_baseline_dataset_specs(
+                    expected_tic_id=int(prepared["ticID"]),
+                    preparation=time_frequency_prepare,
+                )
+            )
+            confirmation_hashes = (
+                confirmation_stage.provenance.input_hashes
+                if confirmation_stage.provenance else {}
+            )
+            for spec in recurrent_specs:
+                key = (
+                    "frozenWindowDataset:"
+                    f"{spec['role']}:{spec['sector']}:"
+                    f"{spec['windowIndex']}"
+                )
+                if (
+                    confirmation_hashes.get(key)
+                    != sha256_file(spec["datasetPath"])
+                ):
+                    raise RuntimeError(
+                        "A frozen v20.8.2 residual window has changed."
+                    )
         elif evidence_lineage is None:
-            if morphology is None or not morphology.get("physicalCycleResolved"):
-                raise RuntimeError("v20.9 requires a morphology-resolved physical period.")
-            if time_frequency is None or time_frequency.get("recommendedNextTest") != "LONG_BASELINE_NONSTATIONARY_MODE_MODELING":
-                raise RuntimeError("v20.9 requires v20.8 to recommend LONG_BASELINE_NONSTATIONARY_MODE_MODELING.")
+            if (
+                morphology is None
+                or not morphology.get("physicalCycleResolved")
+            ):
+                raise RuntimeError(
+                    "v20.9 requires a morphology-resolved physical period."
+                )
+            if (
+                time_frequency is None
+                or time_frequency.get("recommendedNextTest")
+                != "LONG_BASELINE_NONSTATIONARY_MODE_MODELING"
+            ):
+                raise RuntimeError(
+                    "v20.9 requires v20.8 to recommend "
+                    "LONG_BASELINE_NONSTATIONARY_MODE_MODELING."
+                )
             boundary = None
-            physical_period = float(morphology["resolvedPhysicalPeriodDays"])
+            physical_period = float(
+                morphology["resolvedPhysicalPeriodDays"]
+            )
         else:
-            raise RuntimeError("Unsupported nonstationary evidence lineage.")
+            raise RuntimeError(
+                "Unsupported nonstationary evidence lineage."
+            )
 
-        artifact_root = store.directory_for(investigation.id) / "artifacts"
+        artifact_root = (
+            store.directory_for(investigation.id) / "artifacts"
+        )
         print("🌀 Preparing generic long-baseline nonstationary work")
         print(f"   resolved physical period: {physical_period} days")
-        print("   subtracting the established fundamental + first harmonic per sector")
-        print("   creating ordinary Lomb-Scargle datasets over a deterministic frequency-drift grid")
+        if recurrent_contract is not None:
+            print(
+                "   reusing only frozen v20.8 family-subtracted "
+                "residual windows"
+            )
+            print(
+                "   assigning overlapping samples to their nearest "
+                "window center"
+            )
+        else:
+            print(
+                "   subtracting the established fundamental + first "
+                "harmonic per sector"
+            )
+        print(
+            "   creating ordinary Lomb-Scargle datasets over a "
+            "deterministic frequency-drift grid"
+        )
         spec = build_nonstationary_project(
             source_project_path=prepared["sourceProjectPath"],
             source_dataset_entry=prepared["sourceDatasetEntry"],
@@ -6744,18 +6863,29 @@ def build_engine(
             primary_sector=prepared.get("sector"),
             independent_spec=independent_prepare,
             physical_period_days=physical_period,
-            time_frequency_summary=time_frequency if confirmed_contract is None else None,
+            time_frequency_summary=(
+                time_frequency
+                if confirmed_contract is None
+                and recurrent_contract is None
+                else None
+            ),
             confirmed_method_contract=confirmed_contract,
+            recurrent_method_contract=recurrent_contract,
+            recurrent_dataset_specs=recurrent_specs,
             output_dir=artifact_root,
             investigation_id=investigation.id,
         )
         search = spec.get("frequencySearch") or {}
         grid = spec.get("driftGrid") or {}
         print(f"   generic workload: {spec.get('workloadID')}")
-        print(f"   residual center period: {spec.get('residualCenterPeriodDays')} days")
+        print(
+            "   residual center period: "
+            f"{spec.get('residualCenterPeriodDays')} days"
+        )
         print(
             "   frequency range: "
-            f"{search.get('minimumFrequency'):.6f} - {search.get('maximumFrequency'):.6f} cycles/day"
+            f"{search.get('minimumFrequency'):.6f} - "
+            f"{search.get('maximumFrequency'):.6f} cycles/day"
         )
         print(
             "   fractional drift grid: "
@@ -6763,8 +6893,14 @@ def build_engine(
             f"{grid.get('maximumFractionalFrequencyDriftPerDay')} /day "
             f"({grid.get('count')} candidates)"
         )
-        print(f"   model groups: {[item.get('groupID') for item in spec.get('groups') or []]}")
-        print(f"   distributed datasets: {len(spec.get('preparedDatasets') or [])}")
+        print(
+            "   model groups: "
+            f"{[item.get('groupID') for item in spec.get('groups') or []]}"
+        )
+        print(
+            "   distributed datasets: "
+            f"{len(spec.get('preparedDatasets') or [])}"
+        )
         print(f"   work units: {spec.get('totalWorkUnits')}")
 
         artifacts = [
@@ -6772,8 +6908,39 @@ def build_engine(
             for item in spec.get("preparedDatasets") or []
             if item.get("datasetPath")
         ]
-        artifacts.append(_artifact(Path(spec["projectPath"]), "application/json"))
-        artifacts.append(_artifact(Path(spec["analysisSeriesPath"]), "application/json"))
+        artifacts.append(
+            _artifact(Path(spec["projectPath"]), "application/json")
+        )
+        artifacts.append(
+            _artifact(Path(spec["analysisSeriesPath"]), "application/json")
+        )
+        contract_hashes = {}
+        if confirmed_contract is not None:
+            contract_hashes = {
+                "longBaselineFrequencyConfirmation": sha256_json(
+                    confirmation
+                ),
+                "methodContract": (
+                    confirmed_nonstationary_method_contract_hash(
+                        confirmed_contract
+                    )
+                ),
+                "sourceLocalization": sha256_json(source_localization),
+            }
+        elif recurrent_contract is not None:
+            contract_hashes = {
+                "recurrentResidualLongBaselineConfirmation": (
+                    sha256_json(confirmation)
+                ),
+                "methodContract": (
+                    recurrent_residual_nonstationary_method_contract_hash(
+                        recurrent_contract
+                    )
+                ),
+                "timeFrequencyPreparation": sha256_json(
+                    time_frequency_prepare
+                ),
+            }
         return StageOutcome(
             result=spec,
             next_stage=StageRequest(
@@ -6785,12 +6952,10 @@ def build_engine(
             input_hashes={
                 "morphology": sha256_json(morphology),
                 "timeFrequency": sha256_json(time_frequency),
-                "independentPreparation": sha256_json(independent_prepare),
-                **({
-                    "longBaselineFrequencyConfirmation": sha256_json(confirmation),
-                    "methodContract": confirmed_nonstationary_method_contract_hash(confirmed_contract),
-                    "sourceLocalization": sha256_json(source_localization),
-                } if confirmed_contract is not None else {}),
+                "independentPreparation": sha256_json(
+                    independent_prepare
+                ),
+                **contract_hashes,
             },
             artifacts=tuple(artifacts),
         )
@@ -6889,22 +7054,49 @@ def build_engine(
         print(f"   physical mechanism resolved: {summary.get('physicalMechanismResolved')}")
         print(f"   recommended next test: {summary.get('recommendedNextTest')}")
 
-        confirmed = preparation.get("evidenceLineage") == CONFIRMED_NONSTATIONARY_EVIDENCE_LINEAGE
+        evidence_lineage = preparation.get("evidenceLineage")
+        confirmed = (
+            evidence_lineage == CONFIRMED_NONSTATIONARY_EVIDENCE_LINEAGE
+        )
+        recurrent = (
+            evidence_lineage
+            == RECURRENT_RESIDUAL_NONSTATIONARY_EVIDENCE_LINEAGE
+        )
+        artifact_name = (
+            "nonstationary-v20.9.3-recurrent-residual.json"
+            if recurrent
+            else (
+                "nonstationary-v20.9.2-confirmed-boundary.json"
+                if confirmed
+                else "nonstationary-v20.9.json"
+            )
+        )
         artifact_path = (
             store.directory_for(investigation.id)
             / "artifacts"
             / "nonstationary"
-            / ("nonstationary-v20.9.2-confirmed-boundary.json" if confirmed else "nonstationary-v20.9.json")
+            / artifact_name
         )
         _write_json(artifact_path, summary)
+        terminal_suffix = (
+            "v20.9.3-recurrent-residual-nonstationary"
+            if recurrent
+            else "v20.9.2-confirmed-nonstationary"
+        )
         return StageOutcome(
             result=summary,
-            next_stage=(StageRequest(
-                id=_next_stage_id(request.id, "finalize"),
-                handler_id="openstar.tess.finalize",
-                parameters={"outputSuffix": "v20.9.2-confirmed-nonstationary"},
-                triggered_by_stage_id=request.id,
-            ) if confirmed else nonstationary_continuation(summary, request_id=request.id)),
+            next_stage=(
+                StageRequest(
+                    id=_next_stage_id(request.id, "finalize"),
+                    handler_id="openstar.tess.finalize",
+                    parameters={"outputSuffix": terminal_suffix},
+                    triggered_by_stage_id=request.id,
+                )
+                if confirmed or recurrent
+                else nonstationary_continuation(
+                    summary, request_id=request.id
+                )
+            ),
             input_hashes={
                 "preparation": sha256_json(preparation),
                 "interpretation": sha256_json(interpreted),
