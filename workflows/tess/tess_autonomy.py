@@ -2486,6 +2486,65 @@ def _repair_deep_catalog_counterpart_terminal(
     )
 
 
+def _repair_deep_catalog_finalize_handoff(
+    store: InvestigationStore,
+    investigation: Investigation,
+    control: dict,
+) -> Investigation | None:
+    """Resume the exact deep-catalog analysis-to-finalize handoff."""
+    if not (
+        investigation.status in {"COMPLETE", "HUMAN_REVIEW_REQUIRED"}
+        and control.get("schedulerAction") == "INVESTIGATION_COMPLETE"
+        and control.get("selectedExperiment") in (None, {})
+        and investigation.stages
+    ):
+        return None
+    latest = investigation.stages[-1]
+    result = latest.result if isinstance(latest.result, dict) else {}
+    expected_recommendations = {
+        "DEEP_CATALOG_COUNTERPART_IDENTIFIED": (
+            "DEEP_CATALOG_GUIDED_SOURCE_LOCALIZATION"
+        ),
+        "AMBIGUOUS_DEEP_CATALOG_COUNTERPARTS": (
+            "HIGH_RESOLUTION_RESIDUAL_SOURCE_LOCALIZATION"
+        ),
+        "NO_DEEP_CATALOG_COUNTERPART": "DEDICATED_HIGH_RESOLUTION_IMAGING",
+    }
+    classification = result.get("classification")
+    expected_next = {
+        "id": _continuation_stage_id(latest, "finalize"),
+        "handler_id": "openstar.tess.finalize",
+        "parameters": {"outputSuffix": "deep-catalog-counterpart"},
+        "triggered_by_stage_id": latest.id,
+    }
+    if not (
+        latest.handler_id == _DEEP_CATALOG_COUNTERPART_HANDLER
+        and latest.status == "COMPLETE"
+        and latest.stop is False
+        and latest.next_stage == expected_next
+        and result.get("version")
+        == "openstar.tess-deep-catalog-counterpart-identification.v1"
+        and classification in expected_recommendations
+        and result.get("recommendedNextTest")
+        == expected_recommendations[classification]
+        and result.get("physicalMechanismResolved") is False
+        and result.get("claimLevelChanged") is False
+        and result.get("variabilityConfirmed") is False
+    ):
+        return None
+    request = _request_from_persisted(expected_next)
+    return store.set_control_state(
+        investigation,
+        status="RUNNING",
+        control_state={
+            "branchAssessments": [],
+            "selectedExperiment": asdict(request),
+            "schedulerAction": "RUN_EXPERIMENT",
+            "recovery": "TESS_DEEP_CATALOG_FINALIZE_HANDOFF",
+        },
+    )
+
+
 def _repair_confirmed_residual_localization_terminal(
     store: InvestigationStore, investigation: Investigation, control: dict
 ) -> Investigation | None:
@@ -4684,6 +4743,12 @@ def repair_obsolete_terminal_wait(
     if deep_catalog_repair is not None:
         return deep_catalog_repair
 
+    deep_catalog_finalize_repair = _repair_deep_catalog_finalize_handoff(
+        store, investigation, control
+    )
+    if deep_catalog_finalize_repair is not None:
+        return deep_catalog_finalize_repair
+
     period_repair = _repair_promoted_period_characterization_terminal(
         store, investigation, control
     )
@@ -5278,6 +5343,19 @@ def plan_tess_branches(
             ),
         ),)
     if deep_catalog_identification is not None:
+        raw = deep_catalog_identification.next_stage
+        attempted_ids = {stage.id for stage in investigation.stages}
+        expected = {
+            "id": _continuation_stage_id(deep_catalog_identification, "finalize"),
+            "handler_id": "openstar.tess.finalize",
+            "parameters": {"outputSuffix": "deep-catalog-counterpart"},
+            "triggered_by_stage_id": deep_catalog_identification.id,
+        }
+        if raw == expected and expected["id"] not in attempted_ids:
+            return (ScientificBranch(
+                id=f"finalize-after-{deep_catalog_identification.id}",
+                experiment=_request_from_persisted(raw),
+            ),)
         return ()
     # A completed stage 056 is authoritative over the stage-053 continuation.
     # Recreate its direct candidate-validation request after restart, exactly once.

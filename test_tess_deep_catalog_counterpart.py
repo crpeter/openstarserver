@@ -39,6 +39,20 @@ class DeepCatalogCounterpartTests(unittest.TestCase):
         }
 
     @staticmethod
+    def _deep_result():
+        return {
+            "version": "openstar.tess-deep-catalog-counterpart-identification.v1",
+            "classification": "AMBIGUOUS_DEEP_CATALOG_COUNTERPARTS",
+            "counterpartIdentified": False,
+            "preferredCandidate": None,
+            "plausibleCatalogCandidates": [{"catalogIDs": {"nscDR2ObjectID": "1"}}],
+            "variabilityConfirmed": False,
+            "physicalMechanismResolved": False,
+            "claimLevelChanged": False,
+            "recommendedNextTest": "HIGH_RESOLUTION_RESIDUAL_SOURCE_LOCALIZATION",
+        }
+
+    @staticmethod
     def _skymapper(_position):
         return [{
             "object_id": "42", "raj2000": "100.00010", "dej2000": "-30.00000",
@@ -174,11 +188,62 @@ class DeepCatalogCounterpartTests(unittest.TestCase):
 
             completed = InvestigationStage(
                 "022-deep-catalog-counterpart", HANDLER_ID, "COMPLETE", catalog.id, {},
-                result={"classification": "NO_DEEP_CATALOG_COUNTERPART"}, stop=True,
+                result=self._deep_result(),
+                next_stage={
+                    "id": "023-finalize",
+                    "handler_id": "openstar.tess.finalize",
+                    "parameters": {"outputSuffix": "deep-catalog-counterpart"},
+                    "triggered_by_stage_id": "022-deep-catalog-counterpart",
+                },
             )
             attempted = replace(
                 investigation, stages=investigation.stages + (completed,))
-            self.assertEqual((), plan_tess_branches(attempted, target))
+            finalize = plan_tess_branches(attempted, target)
+            self.assertEqual(1, len(finalize))
+            self.assertEqual("openstar.tess.finalize",
+                             finalize[0].experiment.handler_id)
+
+            final = InvestigationStage(
+                "023-finalize", "openstar.tess.finalize", "COMPLETE",
+                completed.id, {"outputSuffix": "deep-catalog-counterpart"},
+                result={}, stop=True,
+            )
+            finalized = replace(attempted, stages=attempted.stages + (final,))
+            self.assertEqual((), plan_tess_branches(finalized, target))
+
+    def test_completed_deep_stage_repairs_finalize_handoff_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = InvestigationStore(Path(directory))
+            investigation = store.create(
+                "deep-finalize-repair", "openstar.workflow.tess-investigation.v1", "20.2")
+            deep = InvestigationStage(
+                "022-deep-catalog-counterpart", HANDLER_ID, "COMPLETE", "020-catalog", {},
+                result=self._deep_result(),
+                next_stage={
+                    "id": "023-finalize",
+                    "handler_id": "openstar.tess.finalize",
+                    "parameters": {"outputSuffix": "deep-catalog-counterpart"},
+                    "triggered_by_stage_id": "022-deep-catalog-counterpart",
+                },
+            )
+            metadata = dict(investigation.metadata)
+            metadata["controlState"] = {
+                "schedulerAction": "INVESTIGATION_COMPLETE",
+                "selectedExperiment": None,
+            }
+            investigation = replace(
+                investigation, status="COMPLETE", stages=(deep,), metadata=metadata)
+
+            repaired = repair_obsolete_terminal_wait(store, investigation)
+            selected = repaired.metadata["controlState"]["selectedExperiment"]
+            self.assertEqual("RUNNING", repaired.status)
+            self.assertEqual("openstar.tess.finalize", selected["handler_id"])
+            self.assertEqual("023-finalize", selected["id"])
+            self.assertEqual(
+                "TESS_DEEP_CATALOG_FINALIZE_HANDOFF",
+                repaired.metadata["controlState"]["recovery"],
+            )
+            self.assertEqual(repaired, repair_obsolete_terminal_wait(store, repaired))
 
 
 if __name__ == "__main__":
