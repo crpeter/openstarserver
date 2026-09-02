@@ -148,6 +148,13 @@ from .tess_v20_8_long_baseline_time_frequency_confirmation import (
     build_method_contract as build_v20_8_long_baseline_method_contract,
     method_contract_hash as v20_8_long_baseline_method_contract_hash,
 )
+from .tess_transient_mode_validation import (
+    HANDLER_ID as TRANSIENT_MODE_VALIDATION_HANDLER_ID,
+    analyze_transient_mode_validation,
+    build_dataset_specs as build_transient_mode_dataset_specs,
+    build_method_contract as build_transient_mode_method_contract,
+    method_contract_hash as transient_mode_method_contract_hash,
+)
 from .tess_dynamic_harmonic import (
     compare_unresolved_family_dynamic_harmonics,
     model_dynamic_harmonics,
@@ -1014,6 +1021,41 @@ def v20_8_long_baseline_time_frequency_confirmation_continuation(
     )
 
 
+def transient_mode_validation_continuation(
+    summary: dict[str, Any], *, request_id: str
+) -> StageRequest:
+    """Finalize the append-only transient validation and preserve its advice."""
+    if summary.get("classification") not in {
+        "TRANSIENT_INDEPENDENT_FREQUENCY_SUPPORTED",
+        "TRANSIENT_HARMONIC_STRUCTURE_SUPPORTED",
+        "RESIDUAL_STRUCTURE_RECURRENT_ACROSS_BASELINE",
+        "TRANSIENT_MODE_VALIDATION_INCONCLUSIVE",
+    }:
+        raise RuntimeError("Transient-mode validation classification is invalid.")
+    if not (
+        summary.get("methodContractID")
+        == (
+            "openstar.tess.transient-mode-validation."
+            "leave-one-detection-sector-out.v1"
+        )
+        and summary.get("methodContractHash")
+        == transient_mode_method_contract_hash(summary.get("methodContract") or {})
+        and summary.get("physicalMechanismResolved") is False
+        and summary.get("claimLevelChanged") is False
+        and summary.get("automaticDiscoveryClaim") is False
+    ):
+        raise RuntimeError(
+            "Transient-mode validation cannot resolve the mechanism or "
+            "upgrade the claim."
+        )
+    return StageRequest(
+        id=_next_stage_id(request_id, "finalize"),
+        handler_id="openstar.tess.finalize",
+        parameters={"outputSuffix": "v20.8.1-transient-mode-validation"},
+        triggered_by_stage_id=request_id,
+    )
+
+
 def target_residual_mechanism_continuation(summary: dict[str, Any], *,
         request_id: str) -> StageRequest:
     """Route a newly computed v20.14 result without target-specific evidence."""
@@ -1838,6 +1880,64 @@ def _render_report(conclusion: dict[str, Any]) -> str:
                 f"support={fold.get('support')}, "
                 "failureOrInsufficiencyReasons="
                 f"{fold.get('failureOrInsufficiencyReasons')}"
+            )
+
+    transient_validation = conclusion.get("transientModeValidation")
+    if transient_validation is not None:
+        lines.extend([
+            "",
+            "## Transient residual-mode validation",
+            "",
+            f"- Method contract: {transient_validation.get('methodContractID')}",
+            "- Method contract hash: "
+            f"{transient_validation.get('methodContractHash')}",
+            "- Leave-one-transient-detection-sector-out validation: True",
+            "- Control windows used for selection: False",
+            "- Exact tested harmonic frequency: "
+            f"{transient_validation.get('exactHarmonicFrequencyCyclesPerDay')} "
+            "cycles/day",
+            "- Learned transient frequency from all detection windows: "
+            f"{transient_validation.get('allDetectionWindowLearnedFrequencyCyclesPerDay')} "
+            "cycles/day",
+            "- Long-baseline frequency resolution: "
+            f"{transient_validation.get('longBaselineFrequencyResolutionCyclesPerDay')} "
+            "cycles/day",
+            "- Aggregate predictive decision: "
+            f"{transient_validation.get('aggregateDecision')}",
+            f"- Classification: {transient_validation.get('classification')}",
+            "- Physical mechanism resolved: "
+            f"{transient_validation.get('physicalMechanismResolved')}",
+            f"- Claim level changed: {transient_validation.get('claimLevelChanged')}",
+            "- Recommended next test: "
+            f"{transient_validation.get('recommendedNextTest')}",
+            "",
+            "### Held-out transient detection sectors",
+            "",
+        ])
+        for fold in transient_validation.get("perDetectionSectorEvidence") or []:
+            lines.append(
+                "- Held-out sector "
+                f"{fold.get('heldOutSector')}: "
+                f"training={fold.get('trainingDetectionSectors')}, "
+                "learnedTransientFrequency="
+                f"{fold.get('learnedTransientFrequencyCyclesPerDay')}, "
+                f"exactHarmonicFrequency={fold.get('exactHarmonicFrequencyCyclesPerDay')}, "
+                f"separation={fold.get('frequencySeparationCyclesPerDay')}, "
+                f"predictiveBIC={fold.get('predictiveBIC')}, "
+                f"deltas={fold.get('predictiveBICDeltas')}, "
+                f"support={fold.get('support')}, "
+                "failureOrInsufficiencyReasons="
+                f"{fold.get('failureOrInsufficiencyReasons')}"
+            )
+        lines.extend(["", "### Untouched control windows", ""])
+        for item in transient_validation.get("perControlWindowEvidence") or []:
+            lines.append(
+                f"- Sector {item.get('sector')} window {item.get('windowIndex')}: "
+                f"role={item.get('role')}, predictiveBIC={item.get('predictiveBIC')}, "
+                f"deltas={item.get('predictiveBICDeltas')}, "
+                f"support={item.get('support')}, "
+                "failureOrInsufficiencyReasons="
+                f"{item.get('failureOrInsufficiencyReasons')}"
             )
 
     nonstationary = conclusion.get("nonstationaryModeling")
@@ -5547,6 +5647,209 @@ def build_engine(
             input_hashes={
                 "methodContract": contract_hash,
                 "morphology": sha256_json(morphology_stage.result),
+                "timeFrequencyPreparation": sha256_json(
+                    preparation_stage.result
+                ),
+                "timeFrequencyProjectResult": sha256_json(run_stage.result),
+                "timeFrequencyInterpretation": sha256_json(
+                    interpretation_stage.result
+                ),
+                "timeFrequencySummary": sha256_json(summary_stage.result),
+                **{
+                    "frozenWindowDataset:"
+                    f"{spec['role']}:{spec['sector']}:{spec['windowIndex']}":
+                    sha256_file(spec["datasetPath"])
+                    for spec in dataset_specs
+                },
+            },
+            artifacts=(_artifact(artifact_path, "application/json"),),
+        )
+
+    def transient_mode_validation_stage(investigation, request):
+        """Validate the exact finalized resolved-cycle transient boundary."""
+        prepared = _result(investigation, "001-prepare-target")
+        summary_stage = next((
+            stage for stage in investigation.stages
+            if stage.id == request.triggered_by_stage_id
+            and stage.handler_id == "openstar.tess.time-frequency.summarize"
+            and stage.status == "COMPLETE"
+            and isinstance(stage.result, dict)
+        ), None)
+        interpretation_stage = next((
+            stage for stage in investigation.stages
+            if summary_stage is not None
+            and stage.id == summary_stage.triggered_by_stage_id
+            and stage.handler_id == "openstar.tess.time-frequency.interpret"
+            and stage.status == "COMPLETE"
+            and isinstance(stage.result, dict)
+        ), None)
+        run_stage = next((
+            stage for stage in investigation.stages
+            if interpretation_stage is not None
+            and stage.id == interpretation_stage.triggered_by_stage_id
+            and stage.handler_id == "openstar.tess.time-frequency.run"
+            and stage.status == "COMPLETE"
+            and isinstance(stage.result, dict)
+        ), None)
+        preparation_stage = next((
+            stage for stage in investigation.stages
+            if run_stage is not None
+            and stage.id == run_stage.triggered_by_stage_id
+            and stage.handler_id == "openstar.tess.time-frequency.prepare"
+            and stage.status == "COMPLETE"
+            and isinstance(stage.result, dict)
+        ), None)
+        summary_index = (
+            investigation.stages.index(summary_stage)
+            if summary_stage is not None else 0
+        )
+        morphology_stage = next((
+            stage for stage in reversed(investigation.stages[:summary_index])
+            if stage.handler_id == "openstar.tess.morphology.analyze"
+            and stage.status == "COMPLETE"
+            and isinstance(stage.result, dict)
+        ), None)
+        binary_stage = next((
+            stage for stage in reversed(investigation.stages[:summary_index])
+            if stage.handler_id == "openstar.tess.binary-confirmation.analyze"
+            and stage.status == "COMPLETE"
+            and isinstance(stage.result, dict)
+        ), None)
+        current = investigation.stages[-1] if investigation.stages else None
+        terminal = (
+            investigation.stages[-2]
+            if len(investigation.stages) >= 2 else None
+        )
+        if any(stage is None for stage in (
+            summary_stage,
+            interpretation_stage,
+            run_stage,
+            preparation_stage,
+            morphology_stage,
+            binary_stage,
+            terminal,
+            current,
+        )):
+            raise RuntimeError(
+                "Transient-mode validation requires the exact completed "
+                "morphology/binary/prepare/run/interpret/summarize lineage."
+            )
+        if not (
+            current.id == request.id
+            and current.handler_id == TRANSIENT_MODE_VALIDATION_HANDLER_ID
+            and current.status == "RUNNING"
+            and terminal.handler_id == "openstar.tess.finalize"
+            and terminal.status == "COMPLETE"
+            and terminal.stop is True
+            and terminal.triggered_by_stage_id == summary_stage.id
+            and terminal.parameters.get("outputSuffix") == "v20.8"
+            and isinstance(terminal.result, dict)
+            and terminal.result.get("timeFrequencyEvolution")
+            == summary_stage.result
+            and terminal.result.get("binaryConfirmation")
+            == binary_stage.result
+            and terminal.result.get("recommendedNextTest")
+            == "TRANSIENT_MODE_VALIDATION"
+            and tuple(investigation.stages[summary_index + 1:])
+            == (terminal, current)
+        ):
+            raise RuntimeError(
+                "Transient-mode validation requires the exact terminal "
+                "v20.8 finalization boundary."
+            )
+
+        interpretation_hashes = (
+            interpretation_stage.provenance.input_hashes
+            if interpretation_stage.provenance else {}
+        )
+        preparation_hashes = (
+            preparation_stage.provenance.input_hashes
+            if preparation_stage.provenance else {}
+        )
+        summary_hashes = (
+            summary_stage.provenance.input_hashes
+            if summary_stage.provenance else {}
+        )
+        if not (
+            interpretation_hashes.get("preparation")
+            == sha256_json(preparation_stage.result)
+            and interpretation_hashes.get("projectResult")
+            == sha256_json(run_stage.result)
+            and preparation_hashes.get("morphology")
+            == sha256_json(morphology_stage.result)
+            and summary_hashes.get("morphology")
+            == sha256_json(morphology_stage.result)
+            and summary_hashes.get("timeFrequencyInterpretation")
+            == sha256_json(interpretation_stage.result)
+        ):
+            raise RuntimeError(
+                "Transient-mode provenance no longer matches the completed "
+                "physical-period and time-frequency lineage."
+            )
+
+        # Every scientific and modeling choice is frozen and hashed before
+        # validation opens any family-subtracted window containing flux.
+        contract = build_transient_mode_method_contract(
+            morphology=morphology_stage.result,
+            binary_confirmation=binary_stage.result,
+            preparation=preparation_stage.result,
+            interpretation=interpretation_stage.result,
+            summary=summary_stage.result,
+        )
+        contract_hash = transient_mode_method_contract_hash(contract)
+        dataset_specs = build_transient_mode_dataset_specs(
+            expected_tic_id=int(prepared["ticID"]),
+            preparation=preparation_stage.result,
+        )
+        result = analyze_transient_mode_validation(
+            method_contract=contract,
+            dataset_specs=dataset_specs,
+        )
+        if not (
+            result.get("methodContractHash") == contract_hash
+            and result.get("physicalMechanismResolved") is False
+            and result.get("claimLevelChanged") is False
+            and result.get("automaticDiscoveryClaim") is False
+        ):
+            raise RuntimeError(
+                "Transient-mode validation violated its frozen contract."
+            )
+
+        print("🫧 Transient residual-mode validation")
+        print(f"   method contract: {result.get('methodContractID')}")
+        print(f"   method hash: {result.get('methodContractHash')}")
+        for fold in result.get("perDetectionSectorEvidence") or []:
+            print(
+                f"   held-out detection sector {fold.get('heldOutSector')}: "
+                f"support={fold.get('support')}, "
+                "learned frequency="
+                f"{fold.get('learnedTransientFrequencyCyclesPerDay')}"
+            )
+        aggregate = result.get("aggregateDecision") or {}
+        print(
+            "   recurrent structured sectors: "
+            f"{aggregate.get('recurrentStructuredSectors')}"
+        )
+        print(f"   classification: {result.get('classification')}")
+        print("   physical mechanism resolved: False")
+        print(f"   recommended next test: {result.get('recommendedNextTest')}")
+
+        artifact_path = (
+            store.directory_for(investigation.id)
+            / "artifacts"
+            / "transient-mode-validation"
+            / "transient-mode-validation-v20.8.1.json"
+        )
+        _write_json(artifact_path, result)
+        return StageOutcome(
+            result=result,
+            next_stage=transient_mode_validation_continuation(
+                result, request_id=request.id
+            ),
+            input_hashes={
+                "methodContract": contract_hash,
+                "morphology": sha256_json(morphology_stage.result),
+                "binaryConfirmation": sha256_json(binary_stage.result),
                 "timeFrequencyPreparation": sha256_json(
                     preparation_stage.result
                 ),
@@ -11723,6 +12026,10 @@ def build_engine(
                 V20_8_LONG_BASELINE_TIME_FREQUENCY_CONFIRMATION_HANDLER_ID,
             )
         )
+        transient_mode_validation = _latest_result_for_handler(
+            investigation,
+            TRANSIENT_MODE_VALIDATION_HANDLER_ID,
+        )
         nonstationary_modeling = _latest_result_for_handler(
             investigation,
             "openstar.tess.nonstationary.summarize",
@@ -13167,6 +13474,10 @@ def build_engine(
             recommended_next_test = mode_identification.get("recommendedNextTest")
         elif nonstationary_modeling is not None:
             recommended_next_test = nonstationary_modeling.get("recommendedNextTest")
+        elif transient_mode_validation is not None:
+            recommended_next_test = transient_mode_validation.get(
+                "recommendedNextTest"
+            )
         elif time_frequency_evolution is not None:
             recommended_next_test = time_frequency_evolution.get("recommendedNextTest")
         elif multimode_decomposition is not None:
@@ -13256,6 +13567,7 @@ def build_engine(
             "longBaselineTimeFrequencyConfirmation": (
                 v20_8_long_baseline_time_frequency_confirmation
             ),
+            "transientModeValidation": transient_mode_validation,
             "nonstationaryModeling": nonstationary_modeling,
             "modeIdentification": mode_identification,
             "longBaselineFrequencyConfirmation": (
@@ -13394,6 +13706,16 @@ def build_engine(
                 "   recommended next test: "
                 f"{v20_8_long_baseline_time_frequency_confirmation.get('recommendedNextTest')}"
             )
+        if transient_mode_validation is not None:
+            print(
+                "   transient residual-mode validation: "
+                f"{transient_mode_validation.get('classification')}"
+            )
+            print("   physical mechanism resolved: False")
+            print(
+                "   recommended next test: "
+                f"{transient_mode_validation.get('recommendedNextTest')}"
+            )
         if mode_identification is not None:
             print(
                 "   mode identification: "
@@ -13417,7 +13739,10 @@ def build_engine(
             print(f"   fractional frequency drift/day: {nonstationary_modeling.get('fractionalFrequencyDriftPerDay')}")
             if residual_mode_localization is None:
                 print(f"   recommended next test: {nonstationary_modeling.get('recommendedNextTest')}")
-        elif v20_8_long_baseline_time_frequency_confirmation is not None:
+        elif (
+            v20_8_long_baseline_time_frequency_confirmation is not None
+            or transient_mode_validation is not None
+        ):
             pass
         elif time_frequency_evolution is not None:
             residual = time_frequency_evolution.get("residualEvolution") or {}
@@ -13897,6 +14222,10 @@ def build_engine(
     engine.register_handler(
         V20_8_LONG_BASELINE_TIME_FREQUENCY_CONFIRMATION_HANDLER_ID,
         v20_8_long_baseline_time_frequency_confirmation_stage,
+    )
+    engine.register_handler(
+        TRANSIENT_MODE_VALIDATION_HANDLER_ID,
+        transient_mode_validation_stage,
     )
     engine.register_handler(
         "openstar.tess.nonstationary.prepare",

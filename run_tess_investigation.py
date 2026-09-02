@@ -28,6 +28,12 @@ from workflows.tess.tess_v20_8_long_baseline_time_frequency_confirmation import 
     method_contract_hash as v20_8_confirmation_method_contract_hash,
     validate_frozen_window_lineage as validate_v20_8_frozen_window_lineage,
 )
+from workflows.tess.tess_transient_mode_validation import (
+    HANDLER_ID as TRANSIENT_MODE_VALIDATION_HANDLER_ID,
+    build_dataset_specs as build_transient_mode_dataset_specs,
+    build_method_contract as build_transient_mode_method_contract,
+    validate_frozen_dataset_lineage as validate_transient_mode_frozen_lineage,
+)
 from workflows.tess.tess_mode_identification import (
     MULTIMODE_MODE_EVIDENCE_LINEAGE,
     V20_8_CONFIRMED_COHERENT_MODE_EVIDENCE_LINEAGE,
@@ -184,6 +190,15 @@ def parse_args():
             "Append local, network-free full-sector mode identification "
             "from the exact finalized v20.8.1 "
             "COHERENT_RESIDUAL_FREQUENCY_CONFIRMED boundary."
+        ),
+    )
+    recovery.add_argument(
+        "--continue-transient-mode-validation",
+        action="store_true",
+        help=(
+            "Append local, network-free leave-one-detection-sector-out "
+            "validation from the exact finalized resolved-cycle v20.8 "
+            "TRANSIENT_RESIDUAL_MODE boundary."
         ),
     )
     recovery.add_argument(
@@ -1004,6 +1019,152 @@ def _can_continue_v20_8_long_baseline_time_frequency_confirmation(
         preparation=preparation_stage.result,
     )
     validate_v20_8_frozen_window_lineage(
+        method_contract=contract,
+        dataset_specs=dataset_specs,
+    )
+
+
+def _can_continue_transient_mode_validation(investigation) -> None:
+    """Validate the exact finalized resolved-cycle transient v20.8 boundary."""
+    if any(stage.status == "RUNNING" for stage in investigation.stages):
+        raise RuntimeError(
+            "Investigation contains a RUNNING stage. Use --resume before "
+            "transient-mode validation."
+        )
+    if investigation.status not in {"COMPLETE", "HUMAN_REVIEW_REQUIRED"}:
+        raise RuntimeError(
+            "--continue-transient-mode-validation requires a terminal "
+            "investigation."
+        )
+    if any(
+        stage.handler_id == TRANSIENT_MODE_VALIDATION_HANDLER_ID
+        for stage in investigation.stages
+    ):
+        raise RuntimeError(
+            "Investigation already contains transient-mode validation."
+        )
+
+    summary = next((
+        stage for stage in reversed(investigation.stages)
+        if stage.handler_id == "openstar.tess.time-frequency.summarize"
+        and stage.status == "COMPLETE"
+        and isinstance(stage.result, dict)
+    ), None)
+    latest = investigation.stages[-1] if investigation.stages else None
+    binary = next((
+        stage for stage in reversed(investigation.stages)
+        if stage.handler_id == "openstar.tess.binary-confirmation.analyze"
+        and stage.status == "COMPLETE"
+        and isinstance(stage.result, dict)
+    ), None)
+    if summary is None or binary is None or latest is None or not (
+        latest.handler_id == "openstar.tess.finalize"
+        and latest.status == "COMPLETE"
+        and latest.stop is True
+        and latest.triggered_by_stage_id == summary.id
+        and latest.parameters.get("outputSuffix") == "v20.8"
+        and isinstance(latest.result, dict)
+        and latest.result.get("timeFrequencyEvolution") == summary.result
+        and latest.result.get("binaryConfirmation") == binary.result
+        and latest.result.get("recommendedNextTest")
+        == "TRANSIENT_MODE_VALIDATION"
+    ):
+        raise RuntimeError(
+            "The exact finalized resolved-cycle transient v20.8 boundary "
+            "is required."
+        )
+    summary_index = investigation.stages.index(summary)
+    if tuple(investigation.stages[summary_index + 1:]) != (latest,):
+        raise RuntimeError(
+            "Later stages already consume the transient v20.8 boundary."
+        )
+
+    interpretation = next((
+        stage for stage in investigation.stages
+        if stage.id == summary.triggered_by_stage_id
+        and stage.handler_id == "openstar.tess.time-frequency.interpret"
+        and stage.status == "COMPLETE"
+        and isinstance(stage.result, dict)
+    ), None)
+    run = next((
+        stage for stage in investigation.stages
+        if interpretation is not None
+        and stage.id == interpretation.triggered_by_stage_id
+        and stage.handler_id == "openstar.tess.time-frequency.run"
+        and stage.status == "COMPLETE"
+        and isinstance(stage.result, dict)
+    ), None)
+    preparation = next((
+        stage for stage in investigation.stages
+        if run is not None
+        and stage.id == run.triggered_by_stage_id
+        and stage.handler_id == "openstar.tess.time-frequency.prepare"
+        and stage.status == "COMPLETE"
+        and isinstance(stage.result, dict)
+    ), None)
+    prepared = next((
+        stage for stage in investigation.stages
+        if stage.id == "001-prepare-target"
+        and stage.status == "COMPLETE"
+        and isinstance(stage.result, dict)
+    ), None)
+    morphology = next((
+        stage for stage in reversed(investigation.stages[:summary_index])
+        if stage.handler_id == "openstar.tess.morphology.analyze"
+        and stage.status == "COMPLETE"
+        and isinstance(stage.result, dict)
+    ), None)
+    if any(stage is None for stage in (
+        interpretation,
+        run,
+        preparation,
+        prepared,
+        morphology,
+    )):
+        raise RuntimeError(
+            "The completed transient morphology/binary/prepare/run/interpret/"
+            "summarize lineage is incomplete."
+        )
+
+    interpretation_hashes = (
+        interpretation.provenance.input_hashes
+        if interpretation.provenance else {}
+    )
+    preparation_hashes = (
+        preparation.provenance.input_hashes if preparation.provenance else {}
+    )
+    summary_hashes = summary.provenance.input_hashes if summary.provenance else {}
+    if not (
+        interpretation_hashes.get("preparation")
+        == sha256_json(preparation.result)
+        and interpretation_hashes.get("projectResult")
+        == sha256_json(run.result)
+        and preparation_hashes.get("morphology")
+        == sha256_json(morphology.result)
+        and summary_hashes.get("morphology")
+        == sha256_json(morphology.result)
+        and summary_hashes.get("timeFrequencyInterpretation")
+        == sha256_json(interpretation.result)
+    ):
+        raise RuntimeError(
+            "Transient v20.8 provenance does not match the authoritative "
+            "physical-period and window-analysis lineage."
+        )
+
+    # Freeze the deterministic method before the validator opens any window
+    # dataset containing family-subtracted flux.
+    contract = build_transient_mode_method_contract(
+        morphology=morphology.result,
+        binary_confirmation=binary.result,
+        preparation=preparation.result,
+        interpretation=interpretation.result,
+        summary=summary.result,
+    )
+    dataset_specs = build_transient_mode_dataset_specs(
+        expected_tic_id=int(prepared.result["ticID"]),
+        preparation=preparation.result,
+    )
+    validate_transient_mode_frozen_lineage(
         method_contract=contract,
         dataset_specs=dataset_specs,
     )
@@ -2999,6 +3160,7 @@ def main():
         or args.continue_long_baseline_frequency_confirmation
         or args.continue_v20_8_long_baseline_time_frequency_confirmation
         or args.continue_confirmed_coherent_mode_identification
+        or args.continue_transient_mode_validation
         or args.continue_neighbor_catalog_pixel_response_review
     ):
         health = coordinator.health()
@@ -3252,6 +3414,27 @@ def main():
                 )
             },
             triggered_by_stage_id=confirmation.id,
+        )
+    elif args.continue_transient_mode_validation:
+        investigation = store.load(args.investigation_id)
+        if investigation.workflow_id != WORKFLOW_ID:
+            raise RuntimeError(
+                "Cannot continue investigation with a different workflow: "
+                f"{investigation.workflow_id}"
+            )
+        _can_continue_transient_mode_validation(investigation)
+        summary = next(
+            stage for stage in reversed(investigation.stages)
+            if stage.handler_id == "openstar.tess.time-frequency.summarize"
+            and stage.status == "COMPLETE"
+        )
+        next_number = _next_stage_number(investigation)
+        investigation = store.set_status(investigation, "RUNNING")
+        initial_stage = StageRequest(
+            id=f"{next_number:03d}-transient-mode-validation",
+            handler_id=TRANSIENT_MODE_VALIDATION_HANDLER_ID,
+            parameters={},
+            triggered_by_stage_id=summary.id,
         )
     elif args.continue_confirmed_nonstationary_mode_modeling:
         investigation = store.load(args.investigation_id)
@@ -4067,6 +4250,7 @@ def main():
         or args.continue_long_baseline_frequency_confirmation
         or args.continue_v20_8_long_baseline_time_frequency_confirmation
         or args.continue_confirmed_coherent_mode_identification
+        or args.continue_transient_mode_validation
         or args.continue_neighbor_catalog_pixel_response_review
     ):
         print("Coordinator: not required for local/network non-distributed continuation")
@@ -4162,6 +4346,18 @@ def main():
         print("   no archive query or new data download is performed")
         print("   frozen primary and confirmed independent sectors are reused")
         print("   the deterministic method contract is frozen before flux is read")
+    elif args.continue_transient_mode_validation:
+        print(
+            "🫧 Continuing the resolved-cycle transient v20.8 boundary with "
+            "v20.8.1 transient-mode validation"
+        )
+        print(f"   stage: {initial_stage.id}")
+        print(f"   handler: {initial_stage.handler_id}")
+        print("   coordinator and distributed workers are not required")
+        print("   no archive query or new data download is performed")
+        print("   only frozen v20.8 family-subtracted windows are reused")
+        print("   original sector flux is not read")
+        print("   held-out detection and control windows cannot select frequency or phase")
     elif args.continue_confirmed_nonstationary_mode_modeling:
         print("🌀 Continuing the confirmed v20.9.1 boundary with v20.9.2 nonstationary modeling")
         print(f"   stage: {initial_stage.id}")
