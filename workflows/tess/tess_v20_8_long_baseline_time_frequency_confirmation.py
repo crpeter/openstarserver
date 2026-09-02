@@ -1,4 +1,4 @@
-"""Long-baseline confirmation of unresolved v20.8 residual variability.
+"""Long-baseline confirmation of v20.8 residual variability.
 
 This continuation is intentionally separate from the mode-identification
 harmonic-versus-mode confirmation and from v20.9 nonstationary modeling.  It
@@ -226,6 +226,10 @@ def validate_v20_8_boundary(
     except (TypeError, ValueError):
         raise RuntimeError("v20.8 accepted-window counts are invalid.") from None
 
+    period_reference_identity = (
+        period_reference.get("kind"),
+        period_reference.get("physicalCycleResolved"),
+    )
     exact = (
         preparation.get("available") is True
         and summary.get("classification") == "NONSTATIONARY_VARIABILITY"
@@ -235,9 +239,10 @@ def validate_v20_8_boundary(
         == "LONG_BASELINE_TIME_FREQUENCY_CONFIRMATION"
         and summary.get("physicalMechanismResolved") is False
         and summary.get("claimLevelChanged") is False
-        and period_reference.get("kind")
-        == "UNRESOLVED_FAMILY_ANALYSIS_REFERENCE"
-        and period_reference.get("physicalCycleResolved") is False
+        and period_reference_identity in {
+            ("UNRESOLVED_FAMILY_ANALYSIS_REFERENCE", False),
+            ("MORPHOLOGY_RESOLVED_PHYSICAL_PERIOD", True),
+        }
         and _close(period, preparation_period)
         and _close(period, summary_period)
         and _close(frequency, 1.0 / period)
@@ -254,7 +259,7 @@ def validate_v20_8_boundary(
     if not exact:
         raise RuntimeError(
             "Long-baseline time-frequency confirmation requires the exact "
-            "terminal unresolved v20.8 NONSTATIONARY_VARIABILITY boundary."
+            "terminal v20.8 NONSTATIONARY_VARIABILITY boundary."
         )
 
     residual_frequency = float(median(accepted_frequencies))
