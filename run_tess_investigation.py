@@ -47,8 +47,11 @@ from workflows.tess.tess_mode_identification import (
 )
 from workflows.tess.tess_nonstationary import (
     CONFIRMED_NONSTATIONARY_EVIDENCE_LINEAGE,
+    RECURRENT_RESIDUAL_NONSTATIONARY_EVIDENCE_LINEAGE,
     build_confirmed_nonstationary_method_contract,
+    build_recurrent_residual_nonstationary_method_contract,
     validate_confirmed_nonstationary_localization_boundary,
+    validate_recurrent_residual_nonstationary_boundary,
 )
 from workflows.tess.tess_residual_external_evidence import (
     HANDLER_ID as RESIDUAL_EXTERNAL_EVIDENCE_HANDLER_ID,
@@ -211,6 +214,15 @@ def parse_args():
         action="store_true",
         help=("Append v20.9.2 distributed nonstationary modeling from the exact "
               "completed v20.9.1 nonstationary/intermittent confirmation boundary."),
+    )
+    recovery.add_argument(
+        "--continue-recurrent-residual-nonstationary-mode-modeling",
+        action="store_true",
+        help=(
+            "Append v20.9.3 distributed nonstationary modeling from the "
+            "exact finalized v20.8.2 recurrent-residual confirmation "
+            "boundary using only frozen family-subtracted windows."
+        ),
     )
     recovery.add_argument(
         "--continue-residual-mode-localization",
@@ -1479,6 +1491,146 @@ def _can_continue_confirmed_nonstationary_mode_modeling(investigation) -> None:
     for path in (contract.get("evidenceBoundary") or {}).get("frozenDatasetPaths") or []:
         if not isinstance(path, str) or not Path(path).is_file():
             raise RuntimeError(f"Frozen confirmation dataset is missing: {path}")
+
+
+def _recurrent_residual_nonstationary_inputs(investigation):
+    if any(stage.status == "RUNNING" for stage in investigation.stages):
+        raise RuntimeError(
+            "Investigation contains a RUNNING stage. Use --resume first."
+        )
+    if investigation.status not in {
+        "COMPLETE", "HUMAN_REVIEW_REQUIRED"
+    }:
+        raise RuntimeError(
+            "Recurrent-residual nonstationary modeling requires a "
+            "terminal investigation."
+        )
+    if any(
+        stage.handler_id.startswith("openstar.tess.nonstationary.")
+        for stage in investigation.stages
+    ):
+        raise RuntimeError(
+            "Investigation already contains nonstationary modeling stages."
+        )
+
+    confirmation = next((
+        stage for stage in reversed(investigation.stages)
+        if stage.handler_id
+        == V20_8_LONG_BASELINE_TIME_FREQUENCY_CONFIRMATION_HANDLER_ID
+        and stage.status == "COMPLETE"
+        and isinstance(stage.result, dict)
+    ), None)
+    transient = next((
+        stage for stage in reversed(investigation.stages)
+        if stage.handler_id == TRANSIENT_MODE_VALIDATION_HANDLER_ID
+        and stage.status == "COMPLETE"
+        and isinstance(stage.result, dict)
+    ), None)
+    latest = investigation.stages[-1] if investigation.stages else None
+    if (
+        confirmation is None
+        or transient is None
+        or latest is None
+        or confirmation.triggered_by_stage_id != transient.id
+        or latest.handler_id != "openstar.tess.finalize"
+        or latest.status != "COMPLETE"
+        or latest.stop is not True
+        or latest.triggered_by_stage_id != confirmation.id
+        or latest.parameters.get("outputSuffix")
+        != "v20.8.2-recurrent-residual-long-baseline-confirmation"
+        or not isinstance(latest.result, dict)
+        or latest.result.get("longBaselineTimeFrequencyConfirmation")
+        != confirmation.result
+        or latest.result.get("recommendedNextTest")
+        != "LONG_BASELINE_NONSTATIONARY_MODE_MODELING"
+    ):
+        raise RuntimeError(
+            "The exact finalized v20.8.2 recurrent-residual "
+            "confirmation boundary is required."
+        )
+    confirmation_index = investigation.stages.index(confirmation)
+    if tuple(investigation.stages[confirmation_index + 1:]) != (latest,):
+        raise RuntimeError(
+            "Later stages already consume the recurrent-residual "
+            "confirmation boundary."
+        )
+
+    boundary = validate_recurrent_residual_nonstationary_boundary(
+        confirmation.result
+    )
+    contract = (
+        build_recurrent_residual_nonstationary_method_contract(
+            confirmation.result
+        )
+    )
+    prepared = next((
+        stage for stage in investigation.stages
+        if stage.id == "001-prepare-target"
+        and stage.status == "COMPLETE"
+        and isinstance(stage.result, dict)
+    ), None)
+    preparation = next((
+        stage for stage in reversed(investigation.stages)
+        if stage.handler_id == "openstar.tess.time-frequency.prepare"
+        and stage.status == "COMPLETE"
+        and isinstance(stage.result, dict)
+    ), None)
+    if prepared is None or preparation is None:
+        raise RuntimeError(
+            "The frozen v20.8 time-frequency preparation is missing."
+        )
+    specs = build_v20_8_long_baseline_dataset_specs(
+        expected_tic_id=int(prepared.result["ticID"]),
+        preparation=preparation.result,
+    )
+
+    confirmation_hashes = (
+        confirmation.provenance.input_hashes
+        if confirmation.provenance else {}
+    )
+    transient_hashes = (
+        transient.provenance.input_hashes
+        if transient.provenance else {}
+    )
+    if not (
+        confirmation_hashes.get("methodContract")
+        == confirmation.result.get("methodContractHash")
+        and confirmation_hashes.get("transientModeValidation")
+        == sha256_json(transient.result)
+        and transient_hashes.get("methodContract")
+        == transient.result.get("methodContractHash")
+        and sorted(boundary["frozenWindowDatasetPaths"])
+        == sorted(spec["datasetPath"] for spec in specs)
+    ):
+        raise RuntimeError(
+            "The v20.8.2 confirmation provenance no longer matches "
+            "its recurrent-residual lineage."
+        )
+
+    # The method contract is built before this validation opens any flux.
+    validate_v20_8_frozen_window_lineage(
+        method_contract=contract,
+        dataset_specs=specs,
+    )
+    for spec in specs:
+        key = (
+            "frozenWindowDataset:"
+            f"{spec['role']}:{spec['sector']}:{spec['windowIndex']}"
+        )
+        if (
+            confirmation_hashes.get(key)
+            != sha256_file(spec["datasetPath"])
+        ):
+            raise RuntimeError(
+                "A frozen v20.8.2 residual window has changed."
+            )
+    return confirmation, contract, specs
+
+
+def _can_continue_recurrent_residual_nonstationary_mode_modeling(
+    investigation,
+) -> None:
+    _recurrent_residual_nonstationary_inputs(investigation)
 
 
 def _can_continue_residual_mode_localization(investigation) -> None:
@@ -3525,6 +3677,37 @@ def main():
             parameters={"evidenceLineage": CONFIRMED_NONSTATIONARY_EVIDENCE_LINEAGE},
             triggered_by_stage_id=confirmation.id,
         )
+    elif args.continue_recurrent_residual_nonstationary_mode_modeling:
+        investigation = store.load(args.investigation_id)
+        if investigation.workflow_id != WORKFLOW_ID:
+            raise RuntimeError(
+                "Cannot continue investigation with a different workflow: "
+                f"{investigation.workflow_id}"
+            )
+        _can_continue_recurrent_residual_nonstationary_mode_modeling(
+            investigation
+        )
+        confirmation = next(
+            stage for stage in reversed(investigation.stages)
+            if stage.handler_id
+            == V20_8_LONG_BASELINE_TIME_FREQUENCY_CONFIRMATION_HANDLER_ID
+            and stage.status == "COMPLETE"
+        )
+        next_number = _next_stage_number(investigation)
+        investigation = store.set_status(investigation, "RUNNING")
+        initial_stage = StageRequest(
+            id=(
+                f"{next_number:03d}-prepare-recurrent-residual-"
+                "nonstationary"
+            ),
+            handler_id="openstar.tess.nonstationary.prepare",
+            parameters={
+                "evidenceLineage": (
+                    RECURRENT_RESIDUAL_NONSTATIONARY_EVIDENCE_LINEAGE
+                )
+            },
+            triggered_by_stage_id=confirmation.id,
+        )
     elif args.continue_residual_mode_localization:
         investigation = store.load(args.investigation_id)
         if investigation.workflow_id != WORKFLOW_ID:
@@ -4437,6 +4620,21 @@ def main():
         print(f"   handler: {initial_stage.handler_id}")
         print("   coordinator and a compatible generic worker are required")
         print("   frozen datasets are reused; no archive query or download is performed")
+    elif args.continue_recurrent_residual_nonstationary_mode_modeling:
+        print(
+            "🌀 Continuing the recurrent v20.8.2 boundary with "
+            "v20.9.3 nonstationary modeling"
+        )
+        print(f"   stage: {initial_stage.id}")
+        print(f"   handler: {initial_stage.handler_id}")
+        print(
+            "   coordinator and a compatible generic worker are required"
+        )
+        print(
+            "   only frozen family-subtracted residual windows are reused"
+        )
+        print("   original sector flux is not read")
+        print("   no archive query or download is performed")
     elif args.continue_residual_mode_localization:
         print("🎯 Continuing terminal investigation with v20.10 distributed residual-mode pixel localization")
         print(f"   stage: {initial_stage.id}")
