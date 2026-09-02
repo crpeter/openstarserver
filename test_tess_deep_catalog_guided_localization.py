@@ -63,7 +63,7 @@ class DeepCatalogGuidedLocalizationTests(unittest.TestCase):
             "residualReferenceFrequency": 1.0 / 3.259357526415564,
             "residualTimeReferenceDays": 1325.0,
             "fractionalFrequencyDriftPerDay": 0.0,
-            "subtractedHarmonicOrders": [1, 2, 3, 4],
+            "subtractedHarmonicOrders": [1, 2],
         }
 
     def _prepare(self, directory):
@@ -115,7 +115,7 @@ class DeepCatalogGuidedLocalizationTests(unittest.TestCase):
                     preparation, sector_inputs=[sector_input])
         kwargs = analyze.call_args.kwargs
         self.assertEqual(preparation["componentIDs"], kwargs["component_ids"])
-        self.assertEqual((1, 2, 3, 4), kwargs["harmonic_orders"])
+        self.assertEqual((1, 2), kwargs["harmonic_orders"])
         self.assertEqual(1.0 / 3.259357526415564, kwargs["candidate_frequency"])
         self.assertFalse(result["catalogQueriesRepeated"])
 

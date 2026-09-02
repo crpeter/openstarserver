@@ -14,7 +14,6 @@ from pathlib import Path
 from typing import Any
 
 from .tess_catalog_guided_localization import (
-    HARMONIC_ORDERS,
     _production_sector_inputs,
     _write_json,
     analyze_generalized_catalog_guided_sector,
@@ -103,7 +102,9 @@ def prepare_deep_catalog_guided_localization(
         and sectors and len(sectors) == len(set(sectors))
         and all(int(sector) > 0 for sector in sectors)
         and prf_preparation.get("ticID") is not None
-        and harmonic_orders == HARMONIC_ORDERS
+        and harmonic_orders
+        and len(harmonic_orders) == len(set(harmonic_orders))
+        and all(order > 0 for order in harmonic_orders)
         and float(required_numbers[0]) > 0.0
         and float(required_numbers[1]) > 0.0
         and abs(float(required_numbers[3])) <= 1e-15
