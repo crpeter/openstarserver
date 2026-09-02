@@ -3814,6 +3814,92 @@ def _repair_binary_confirmation_time_origin_failure(
     )
 
 
+def _repair_residual_phase_difference_imaging_terminal_handoff(
+    store: InvestigationStore, investigation: Investigation, control: dict
+) -> Investigation | None:
+    """Reopen the exact prepare-to-run handoff hidden by the old planner."""
+    if not (
+        investigation.status == "COMPLETE"
+        and control == {
+            "branchAssessments": [],
+            "selectedExperiment": None,
+            "schedulerAction": "INVESTIGATION_COMPLETE",
+        }
+        and len(investigation.stages) >= 3
+        and not any(stage.status == "RUNNING" for stage in investigation.stages)
+    ):
+        return None
+
+    bridge = next((
+        stage for stage in reversed(investigation.stages[:-1])
+        if stage.id == "033-prepare-catalog-guided-source-localization"
+        and stage.handler_id
+        == "openstar.tess.catalog-guided-source-localization.prepare"
+        and stage.status == "COMPLETE"
+    ), None)
+    localization = next((
+        stage for stage in reversed(investigation.stages[:-1])
+        if stage.id == "035-interpret-catalog-guided-source-localization"
+        and stage.handler_id
+        == "openstar.tess.catalog-guided-source-localization.interpret"
+        and stage.status == "COMPLETE"
+    ), None)
+    preparation = investigation.stages[-1]
+    expected_run = {
+        "id": "037-run-residual-phase-difference-imaging",
+        "handler_id": "openstar.tess.residual-phase-difference-imaging.run",
+        "parameters": {},
+        "triggered_by_stage_id": "036-prepare-residual-phase-difference-imaging",
+    }
+    if not (
+        bridge is not None
+        and localization is not None
+        and preparation.id == "036-prepare-residual-phase-difference-imaging"
+        and preparation.handler_id
+        == "openstar.tess.residual-phase-difference-imaging.prepare"
+        and preparation.status == "COMPLETE"
+        and preparation.triggered_by_stage_id == localization.id
+        and preparation.stop is False
+        and preparation.next_stage == expected_run
+        and not any(stage.id == expected_run["id"] for stage in investigation.stages)
+        and store.verified_terminal_stage_ledger_hash(investigation.id, bridge)
+        and store.verified_terminal_stage_ledger_hash(investigation.id, localization)
+        and store.verified_terminal_stage_ledger_hash(investigation.id, preparation)
+        and _verified_stage_json(preparation, "preparation.json")
+    ):
+        return None
+
+    result = preparation.result or {}
+    localization_result = localization.result or {}
+    hashes = preparation.provenance.input_hashes if preparation.provenance else {}
+    if not (
+        result.get("version")
+        == "openstar.tess-residual-phase-difference-imaging-preparation.v1"
+        and result.get("execution")
+        == "coordinator-local-difference-image-centroiding"
+        and result.get("physicalCycleResolved") is False
+        and localization_result.get("classification") == "UNRESOLVED"
+        and localization_result.get("sourceAttributionResolved") is False
+        and localization_result.get("recommendedNextTest")
+        == "ADDITIONAL_SOURCE_LOCALIZATION_DATA"
+        and hashes.get("catalogGuidedPreparation") == sha256_json(bridge.result)
+        and hashes.get("catalogGuidedInterpretation")
+        == sha256_json(localization.result)
+    ):
+        return None
+
+    return store.set_control_state(
+        investigation,
+        status="RUNNING",
+        control_state={
+            "branchAssessments": [],
+            "selectedExperiment": expected_run,
+            "schedulerAction": "RUN_EXPERIMENT",
+            "recovery": "TESS_RESIDUAL_PHASE_DIFFERENCE_IMAGING_HANDOFF",
+        },
+    )
+
+
 def repair_obsolete_terminal_wait(
     store: InvestigationStore,
     investigation: Investigation,
@@ -3963,6 +4049,14 @@ def repair_obsolete_terminal_wait(
     )
     if binary_confirmation_repair is not None:
         return binary_confirmation_repair
+
+    phase_difference_handoff = (
+        _repair_residual_phase_difference_imaging_terminal_handoff(
+            store, investigation, control
+        )
+    )
+    if phase_difference_handoff is not None:
+        return phase_difference_handoff
 
     catalog_repair = _repair_catalog_timeout_terminal(store, investigation, control)
     if catalog_repair is not None:
@@ -4731,7 +4825,16 @@ def plan_tess_branches(
                     handler_id="openstar.tess.offset-source-variability.prepare",
                     parameters={}, triggered_by_stage_id=catalog_guided_localization.id),
             ),)
-        return ()
+        # A completed prepare or run stage already owns the exact next step.
+        # Let the persisted-continuation adapter below reproduce that handoff;
+        # returning here would incorrectly mark the investigation complete
+        # between the three residual phase-difference imaging stages.
+        if not (
+            difference_image_started
+            and residual_phase_difference_image is None
+            and investigation.stages[-1].next_stage is not None
+        ):
+            return ()
     preferred = catalog_result.get("preferredCandidate") or {}
     preferred_ids = preferred.get("catalogIDs") or {}
     justified_preferred = (

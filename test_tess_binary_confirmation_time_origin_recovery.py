@@ -6,13 +6,18 @@ from pathlib import Path
 
 from openstar_investigation import (
     ArtifactReference,
+    Investigation,
     InvestigationStage,
     InvestigationStore,
     sha256_file,
+    sha256_json,
 )
+from openstar_targets import InvestigationTarget
 from workflows.tess.tess_autonomy import (
     WORKFLOW_ID,
     _repair_binary_confirmation_time_origin_failure,
+    _repair_residual_phase_difference_imaging_terminal_handoff,
+    plan_tess_branches,
     repair_obsolete_terminal_wait,
 )
 from workflows.tess.tess_binary_confirmation import (
@@ -306,6 +311,182 @@ class BinaryConfirmationTimeOriginRecoveryTests(unittest.TestCase):
             _repair_binary_confirmation_time_origin_failure(
                 self.store, investigation, control
             )
+        )
+
+    def test_phase_difference_prepare_preserves_its_persisted_run(self):
+        localization = InvestigationStage(
+            id="035-interpret-catalog-guided-source-localization",
+            handler_id="openstar.tess.catalog-guided-source-localization.interpret",
+            status="COMPLETE",
+            triggered_by_stage_id="034-run-catalog-guided-source-localization",
+            parameters={},
+            result={
+                "classification": "UNRESOLVED",
+                "sourceAttributionResolved": False,
+                "recommendedNextTest": "ADDITIONAL_SOURCE_LOCALIZATION_DATA",
+            },
+        )
+        persisted_run = {
+            "id": "037-run-residual-phase-difference-imaging",
+            "handler_id": "openstar.tess.residual-phase-difference-imaging.run",
+            "parameters": {},
+            "triggered_by_stage_id": "036-prepare-residual-phase-difference-imaging",
+        }
+        preparation = InvestigationStage(
+            id="036-prepare-residual-phase-difference-imaging",
+            handler_id="openstar.tess.residual-phase-difference-imaging.prepare",
+            status="COMPLETE",
+            triggered_by_stage_id=localization.id,
+            parameters={},
+            result={},
+            next_stage=persisted_run,
+        )
+        investigation = Investigation(
+            id="tess-discovery-sector-1-tic-29495621",
+            workflow_id=WORKFLOW_ID,
+            workflow_version="20.2",
+            status="COMPLETE",
+            created_at="2026-09-01T00:00:00+00:00",
+            updated_at="2026-09-01T00:00:00+00:00",
+            metadata={},
+            stages=(localization, preparation),
+        )
+        target = InvestigationTarget(
+            id="tess-sector-1-tic-29495621",
+            investigation_id=investigation.id,
+            workflow_id=WORKFLOW_ID,
+            workflow_version="20.2",
+        )
+
+        branches = plan_tess_branches(investigation, target)
+
+        self.assertEqual(1, len(branches))
+        self.assertEqual(
+            persisted_run["id"], branches[0].experiment.id
+        )
+        self.assertEqual(
+            persisted_run["handler_id"], branches[0].experiment.handler_id
+        )
+
+    def test_terminal_phase_difference_prepare_reopens_append_only(self):
+        investigation = self.store.create(
+            "tess-discovery-sector-1-tic-29495621",
+            WORKFLOW_ID,
+            "20.2",
+        )
+
+        def append_complete(stage_id, handler_id, result, *, triggered_by,
+                            input_hashes=None, artifacts=(), next_stage=None):
+            nonlocal investigation
+            running = InvestigationStage(
+                id=stage_id,
+                handler_id=handler_id,
+                status="RUNNING",
+                triggered_by_stage_id=triggered_by,
+                parameters={},
+            )
+            investigation = self.store.append_running_stage(
+                investigation, running
+            )
+            terminal = self.store.build_terminal_stage(
+                stage_id=stage_id,
+                handler_id=handler_id,
+                status="COMPLETE",
+                triggered_by_stage_id=triggered_by,
+                parameters={},
+                result=result,
+                error=None,
+                software_id="openstar.tess-ranked-followup-runner",
+                software_version="1",
+                input_hashes=input_hashes or {},
+                artifacts=artifacts,
+                started_at=running.started_at,
+                next_stage=next_stage,
+            )
+            investigation = self.store.complete_current_stage(
+                investigation, terminal
+            )
+
+        bridge = {"version": "catalog-guided-preparation-v1"}
+        localization = {
+            "classification": "UNRESOLVED",
+            "sourceAttributionResolved": False,
+            "recommendedNextTest": "ADDITIONAL_SOURCE_LOCALIZATION_DATA",
+        }
+        append_complete(
+            "033-prepare-catalog-guided-source-localization",
+            "openstar.tess.catalog-guided-source-localization.prepare",
+            bridge,
+            triggered_by="032-catalog-counterpart",
+        )
+        append_complete(
+            "035-interpret-catalog-guided-source-localization",
+            "openstar.tess.catalog-guided-source-localization.interpret",
+            localization,
+            triggered_by="034-run-catalog-guided-source-localization",
+        )
+
+        preparation_path = self.root / "preparation.json"
+        preparation = {
+            "version": (
+                "openstar.tess-residual-phase-difference-imaging-"
+                "preparation.v1"
+            ),
+            "execution": "coordinator-local-difference-image-centroiding",
+            "physicalCycleResolved": False,
+            "preparationPath": str(preparation_path),
+        }
+        self._write(preparation_path, preparation)
+        artifact = ArtifactReference(
+            path=str(preparation_path),
+            sha256=sha256_file(preparation_path),
+            media_type="application/json",
+        )
+        persisted_run = {
+            "id": "037-run-residual-phase-difference-imaging",
+            "handler_id": "openstar.tess.residual-phase-difference-imaging.run",
+            "parameters": {},
+            "triggered_by_stage_id": "036-prepare-residual-phase-difference-imaging",
+        }
+        append_complete(
+            "036-prepare-residual-phase-difference-imaging",
+            "openstar.tess.residual-phase-difference-imaging.prepare",
+            preparation,
+            triggered_by="035-interpret-catalog-guided-source-localization",
+            input_hashes={
+                "catalogGuidedPreparation": sha256_json(bridge),
+                "catalogGuidedInterpretation": sha256_json(localization),
+            },
+            artifacts=(artifact,),
+            next_stage=persisted_run,
+        )
+        investigation = self.store.set_control_state(
+            investigation,
+            status="COMPLETE",
+            control_state={
+                "branchAssessments": [],
+                "selectedExperiment": None,
+                "schedulerAction": "INVESTIGATION_COMPLETE",
+            },
+        )
+        original_stages = investigation.stages
+
+        repaired = _repair_residual_phase_difference_imaging_terminal_handoff(
+            self.store,
+            investigation,
+            investigation.metadata["controlState"],
+        )
+
+        self.assertIsNotNone(repaired)
+        self.assertEqual(original_stages, repaired.stages)
+        self.assertEqual("RUNNING", repaired.status)
+        self.assertEqual(
+            persisted_run,
+            repaired.metadata["controlState"]["selectedExperiment"],
+        )
+        self.assertEqual(
+            repaired,
+            repair_obsolete_terminal_wait(self.store, repaired),
         )
 
     def test_recovery_rejects_wrong_morphology_and_missing_ledger(self):
