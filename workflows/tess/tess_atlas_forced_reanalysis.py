@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import math
+import re
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
@@ -24,11 +26,63 @@ from .tess_atlas_forced_photometry import (
     _parse_atlas_output,
     _parse_float,
     _parse_int,
+    _frozen_sources,
+    SIGNED_REANALYSIS,
 )
 
 MIN_BAND_NIGHTS = 20
 MIN_BAND_BASELINE_DAYS = 30.0
 MAX_NIGHTLY_ERROR_MULTIPLIER = 3.0
+
+
+def current_atlas_signed_reanalysis_ready(summary: dict[str, Any]) -> bool:
+    """Validate the current persisted ATLAS handoff without querying the archive."""
+    try:
+        if (
+            summary.get("version") != "openstar.tess-atlas-forced-photometry.v1"
+            or summary.get("classification") != "ATLAS_NO_QUALIFYING_FORCED_PHOTOMETRY_TIME_SERIES"
+            or summary.get("recommendedNextTest") != SIGNED_REANALYSIS
+            or summary.get("physicalMechanismResolved") is not False
+            or summary.get("claimLevelChanged") is not False
+            or summary.get("useReducedTargetImages") is not True
+            or summary.get("differenceImagingUsed") is not False
+            or summary.get("tessDriftExtrapolated") is not False
+            or (summary.get("sourcePair") or {}).get("version") != "openstar.current-source-pair.v1"
+        ):
+            return False
+        sources, _ = _frozen_sources(summary)
+        if len({source["gaiaDR3SourceID"] for source in sources}) != 2:
+            return False
+        search = (summary.get("distributedValidation") or {}).get("frequencySearch") or {}
+        minimum, maximum, step = (float(search[key]) for key in (
+            "minimumFrequency", "maximumFrequency", "frequencyStep"))
+        count, per_work = (search[key] for key in ("totalFrequencies", "frequenciesPerWorkUnit"))
+        if (
+            not all(math.isfinite(value) for value in (minimum, maximum, step))
+            or not 0 < minimum < maximum or step <= 0
+            or type(count) is not int or count < 2
+            or type(per_work) is not int or per_work <= 0
+            or not math.isclose(minimum + step * (count - 1), maximum, rel_tol=1e-7)
+        ):
+            return False
+        records = summary.get("sourceRecords") or []
+        definitions = summary.get("sourceDefinitions") or []
+        if len(records) != 2 or len(definitions) != 2:
+            return False
+        roles = {source["sourceRole"] for source in sources}
+        if any({item["sourceRole"] for item in items} != roles for items in (records, definitions)):
+            return False
+        for source in sources:
+            for items in (records, definitions):
+                item = next(item for item in items if item["sourceRole"] == source["sourceRole"])
+                if any(item.get(key) != source[key] for key in ("gaiaDR3SourceID", "raDeg", "decDeg")):
+                    return False
+            record = next(item for item in records if item["sourceRole"] == source["sourceRole"])
+            if not record.get("rawPath") or not re.fullmatch(r"[0-9a-f]{64}", record.get("rawSha256") or ""):
+                return False
+        return True
+    except (KeyError, TypeError, ValueError, OverflowError, RuntimeError, AttributeError):
+        return False
 
 
 def _clean_signed_forced_rows(
@@ -383,8 +437,10 @@ def build_atlas_forced_photometry_reanalysis_project(
             "from v20.24."
         )
 
-    root = Path(output_dir) / "atlas-forced-photometry-reanalysis"
-    root.mkdir(parents=True, exist_ok=True)
+    if ((atlas_v20_24_summary.get("sourcePair") or {}).get("version")
+            == "openstar.current-source-pair.v1"
+            and not current_atlas_signed_reanalysis_ready(atlas_v20_24_summary)):
+        raise RuntimeError("ATLAS signed reanalysis requires complete frozen current-source evidence.")
 
     prepared_series: list[dict[str, Any]] = []
     dataset_entries: list[dict[str, Any]] = []
@@ -395,6 +451,21 @@ def build_atlas_forced_photometry_reanalysis_project(
         raise RuntimeError(
             "v20.25 cannot find the v20.24 ATLAS source records/raw artifact paths."
         )
+
+    # Verify every raw input before creating any reanalysis artifacts.
+    raw_inputs = []
+    for record in v20_24_records:
+        raw_path = Path(str(record.get("rawPath") or ""))
+        if not raw_path.is_file():
+            raise RuntimeError(f"v20.25 raw ATLAS artifact is missing: {raw_path}")
+        raw_bytes = raw_path.read_bytes()
+        digest = hashlib.sha256(raw_bytes).hexdigest()
+        if record.get("rawSha256") is not None and record["rawSha256"] != digest:
+            raise RuntimeError(f"v20.25 raw ATLAS artifact hash mismatch: {raw_path}")
+        raw_inputs.append((record, raw_bytes, digest))
+
+    root = Path(output_dir) / "atlas-forced-photometry-reanalysis"
+    root.mkdir(parents=True, exist_ok=True)
 
     print(
         "   reusing immutable v20.24 ATLAS raw target-image photometry artifacts",
@@ -409,7 +480,7 @@ def build_atlas_forced_photometry_reanalysis_project(
         flush=True,
     )
 
-    for record in v20_24_records:
+    for record, raw_bytes, digest in raw_inputs:
         role = str(record.get("sourceRole") or "")
         source_id = _int(record.get("gaiaDR3SourceID"))
         raw_path_text = str(record.get("rawPath") or "").strip()
@@ -420,13 +491,7 @@ def build_atlas_forced_photometry_reanalysis_project(
             )
 
         raw_path = Path(raw_path_text)
-        if not raw_path.exists():
-            raise RuntimeError(
-                f"v20.25 raw ATLAS artifact is missing: {raw_path}. "
-                "Do not silently re-query or substitute new archive data."
-            )
-
-        text = raw_path.read_text(encoding="utf-8")
+        text = raw_bytes.decode("utf-8")
         raw_rows = _parse_atlas_output(text)
         clean_rows, quality = _clean_signed_forced_rows(raw_rows)
         band_series, band_diagnostics = _nightly_signed_series(clean_rows)
@@ -436,6 +501,7 @@ def build_atlas_forced_photometry_reanalysis_project(
             "gaiaDR3SourceID": int(source_id),
             "gaiaGMag": record.get("gaiaGMag"),
             "rawPath": str(raw_path.resolve()),
+            "rawSha256": digest,
             "rawFileReusedFromV20_24": True,
             "rawRowCount": int(quality["rawRows"]),
             "acceptedSignedRowCount": int(quality["acceptedSignedRows"]),

@@ -19,6 +19,7 @@ from openstar_path_relocation import (
 )
 from openstar_targets import InvestigationTarget
 from openstar_workflow import StageRequest, WorkflowEngine
+from .tess_atlas_forced_reanalysis import current_atlas_signed_reanalysis_ready
 from .tess_localization_evidence import (
     frozen_confirmed_mode_localization_preparation_family,
     frozen_confirmed_mode_prf_preparation_family,
@@ -5739,7 +5740,7 @@ def plan_tess_branches(
                     handler_id="openstar.tess.atlas-forced-photometry-reanalysis.prepare",
                     parameters={}, triggered_by_stage_id=atlas.id,
                 ),
-                required_stage_ids=(
+                required_stage_ids=() if current_atlas_signed_reanalysis_ready(atlas.result or {}) else (
                     "openstar.capability.current-atlas-signed-reanalysis-adapter",
                 ),
             ),
