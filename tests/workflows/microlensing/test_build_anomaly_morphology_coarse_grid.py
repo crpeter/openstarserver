@@ -37,6 +37,9 @@ from workflows.microlensing.build_anomaly_morphology_coarse_grid import (
     _stable_json_bytes,
     build_anomaly_morphology_coarse_grid,
 )
+from workflows.microlensing.coarse_grid import (
+    COARSE_GRID_CONTRACT_ID as SOURCE_COARSE_GRID_CONTRACT_ID,
+)
 from workflows.microlensing.prepare_anomaly_morphology import (
     ARTIFACT_MANIFEST_SCHEMA_ID,
     ARTIFACT_MANIFEST_VERSION,
@@ -402,16 +405,30 @@ class CoarseMorphologyFixture(unittest.TestCase):
             )
         parent_hashes = {
             "ancestryArtifactHashes": {
-                "coarseInvestigationSHA256": sha256_bytes(
-                    b"generic-coarse-investigation"
-                ),
-                "projectArtifacts": {
-                    "coarseProjectSHA256": sha256_bytes(
-                        b"generic-coarse-project"
+                "coarse": {
+                    "buildManifestSHA256": sha256_bytes(
+                        b"generic-coarse-build-manifest"
                     ),
-                    "residualPreparationSHA256": sha256_bytes(
-                        b"generic-residual-preparation"
+                    "contractFileSHA256": sha256_bytes(
+                        b"generic-coarse-contract-file"
                     ),
+                    "contractID": SOURCE_COARSE_GRID_CONTRACT_ID,
+                    "contractSHA256": sha256_bytes(
+                        b"generic-coarse-contract"
+                    ),
+                    "datasetSHA256": sha256_bytes(b"generic-coarse-dataset"),
+                    "projectSHA256": sha256_bytes(b"generic-coarse-project"),
+                    "stageLedgerSHA256s": {
+                        "001-prepare-project": sha256_bytes(
+                            b"generic-coarse-prepare-ledger"
+                        ),
+                        "002-run-project": sha256_bytes(
+                            b"generic-coarse-run-ledger"
+                        ),
+                        "003-interpret-project": sha256_bytes(
+                            b"generic-coarse-interpret-ledger"
+                        ),
+                    },
                 },
             },
             "residualGridProjectSHA256": sha256_bytes(b"generic-grid-project"),
@@ -752,9 +769,13 @@ class CoarseMorphologySuccessTests(CoarseMorphologyFixture):
 
         assert_sorted_mappings(manifest["parentHashes"])
         assert_sorted_mappings(manifest["parentIDs"])
-        self.assertIn(
-            "ancestryArtifactHashes",
-            manifest["parentHashes"],
+        self.assertIn("ancestryArtifactHashes", manifest["parentHashes"])
+        coarse_lineage = manifest["parentHashes"]["ancestryArtifactHashes"][
+            "coarse"
+        ]
+        self.assertEqual(
+            SOURCE_COARSE_GRID_CONTRACT_ID,
+            coarse_lineage["contractID"],
         )
         self.assertIn("ancestryProjectIDs", manifest["parentIDs"])
 
@@ -822,8 +843,8 @@ class CoarseMorphologyRejectionTests(CoarseMorphologyFixture):
                 "parentHashes",
                 (
                     "ancestryArtifactHashes",
-                    "projectArtifacts",
-                    "coarseProjectSHA256",
+                    "coarse",
+                    "projectSHA256",
                 ),
                 "not-a-sha256",
                 "lowercase SHA-256",
@@ -838,7 +859,11 @@ class CoarseMorphologyRejectionTests(CoarseMorphologyFixture):
             (
                 "empty-mapping",
                 "parentHashes",
-                ("ancestryArtifactHashes", "projectArtifacts"),
+                (
+                    "ancestryArtifactHashes",
+                    "coarse",
+                    "stageLedgerSHA256s",
+                ),
                 {},
                 "nonempty mapping",
             ),
@@ -860,12 +885,54 @@ class CoarseMorphologyRejectionTests(CoarseMorphologyFixture):
                 self._refresh_preparation_manifest()
                 self.assert_rejected(pattern, name=name)
 
+    def test_typed_coarse_contract_metadata_is_allowed_only_at_exact_path(self):
+        cases = (
+            (
+                "wrong-contract-id",
+                ("ancestryArtifactHashes", "coarse", "contractID"),
+                "openstar.microlensing-coarse-grid.wrong",
+                "canonical coarse-grid contract ID",
+            ),
+            (
+                "non-hash-ordinary-leaf",
+                ("ancestryArtifactHashes", "coarse", "projectSHA256"),
+                SOURCE_COARSE_GRID_CONTRACT_ID,
+                "lowercase SHA-256",
+            ),
+            (
+                "unexpected-contract-id-path",
+                ("ancestryArtifactHashes", "unexpected"),
+                {"contractID": SOURCE_COARSE_GRID_CONTRACT_ID},
+                "lowercase SHA-256",
+            ),
+            (
+                "invalid-stage-ledger-hash",
+                (
+                    "ancestryArtifactHashes",
+                    "coarse",
+                    "stageLedgerSHA256s",
+                    "002-run-project",
+                ),
+                "not-a-stage-ledger-sha256",
+                "lowercase SHA-256",
+            ),
+        )
+        for name, path, invalid_value, pattern in cases:
+            with self.subTest(name=name):
+                self._publish_preparation()
+                target = self.source_preparation["parentHashes"]
+                for key in path[:-1]:
+                    target = target[key]
+                target[path[-1]] = invalid_value
+                self._refresh_preparation_manifest()
+                self.assert_rejected(pattern, name=name)
+
     def test_preparation_manifest_nested_lineage_disagreement_is_rejected(self):
         manifest_hashes = json.loads(
             json.dumps(self.source_manifest["parentHashes"])
         )
-        manifest_hashes["ancestryArtifactHashes"]["projectArtifacts"][
-            "coarseProjectSHA256"
+        manifest_hashes["ancestryArtifactHashes"]["coarse"][
+            "projectSHA256"
         ] = "f" * 64
         self.source_manifest["parentHashes"] = manifest_hashes
         write_json(

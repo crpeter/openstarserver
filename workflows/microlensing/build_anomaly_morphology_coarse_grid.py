@@ -30,6 +30,7 @@ from openstar_workloads.plugins.morphology_grid import (
     WORKLOAD_ID,
 )
 from workflows.microlensing.coarse_grid import (
+    COARSE_GRID_CONTRACT_ID as SOURCE_COARSE_GRID_CONTRACT_ID,
     CoarseGridBuildError,
     _assert_identity_free,
     _atomic_write_bytes,
@@ -462,6 +463,7 @@ def _verify_parent_mapping(
     field_name: str,
     *,
     hashes: bool,
+    path: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     if not isinstance(value, Mapping) or not value:
         raise _fail(f"{field_name} must be a nonempty mapping")
@@ -469,11 +471,24 @@ def _verify_parent_mapping(
     result: dict[str, Any] = {}
     for name in sorted(names):
         item = value[name]
-        if isinstance(item, Mapping):
+        item_path = (*path, name)
+        if hashes and item_path == (
+            "ancestryArtifactHashes",
+            "coarse",
+            "contractID",
+        ):
+            if item != SOURCE_COARSE_GRID_CONTRACT_ID:
+                raise _fail(
+                    f"{field_name}.{name} must equal the canonical "
+                    "coarse-grid contract ID"
+                )
+            result[name] = item
+        elif isinstance(item, Mapping):
             result[name] = _verify_parent_mapping(
                 item,
                 f"{field_name}.{name}",
                 hashes=hashes,
+                path=item_path,
             )
         elif hashes:
             result[name] = _sha256_string(item, f"{field_name}.{name}")
