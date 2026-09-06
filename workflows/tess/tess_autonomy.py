@@ -21,6 +21,7 @@ from openstar_targets import InvestigationTarget
 from openstar_workflow import StageRequest, WorkflowEngine
 from .tess_localization_evidence import (
     frozen_confirmed_mode_localization_preparation_family,
+    frozen_confirmed_mode_prf_preparation_family,
     frozen_residual_localization_family,
 )
 from .tess_mode_identification import (
@@ -4620,6 +4621,129 @@ def _repair_resolved_family_multisource_failure(
     )
 
 
+def _repair_confirmed_mode_offset_variability_failure(
+    store: InvestigationStore, investigation: Investigation, control: dict
+) -> Investigation | None:
+    """Append a retry for the obsolete v20.14 confirmed-mode PRF gate."""
+    if investigation.status != "FAILED" or not investigation.stages:
+        return None
+    failed = investigation.stages[-1]
+    expected_error = (
+        "RuntimeError: v20.14 requires either resolved "
+        "morphology/nonstationary evidence or the persisted unresolved "
+        "family/residual PRF bridge."
+    )
+    selected = control.get("selectedExperiment")
+    expected_selected = asdict(StageRequest(
+        failed.id, failed.handler_id, dict(failed.parameters),
+        failed.triggered_by_stage_id,
+    ))
+    if not (
+        failed.status == "FAILED"
+        and failed.handler_id == "openstar.tess.offset-source-variability.prepare"
+        and failed.failure_classification == "NON_RETRYABLE"
+        and failed.error == expected_error
+        and control.get("schedulerAction")
+        in ("RUN_EXPERIMENT", "INVESTIGATION_FAILED")
+        and isinstance(selected, dict)
+        and selected == expected_selected
+    ):
+        return None
+
+    morphology = _latest_complete(investigation, "openstar.tess.morphology.analyze")
+    mode = _latest_complete(investigation, "openstar.tess.mode-identification.analyze")
+    localization_prepare = _latest_complete(
+        investigation, "openstar.tess.residual-mode-localization.prepare"
+    )
+    multisource_prepare = _latest_complete(
+        investigation, "openstar.tess.multi-source-residual.prepare"
+    )
+    multisource_run = _latest_complete(
+        investigation, "openstar.tess.multi-source-residual.run"
+    )
+    multisource = _latest_complete(
+        investigation, "openstar.tess.multi-source-residual.interpret"
+    )
+    prf_prepare = _latest_complete(
+        investigation, "openstar.tess.official-spoc-prf-forward-modeling.prepare"
+    )
+    prf_run = _latest_complete(
+        investigation, "openstar.tess.official-spoc-prf-forward-modeling.run"
+    )
+    prf = _latest_complete(
+        investigation, "openstar.tess.official-spoc-prf-forward-modeling.interpret"
+    )
+    catalog = _latest_complete(
+        investigation, "openstar.tess.catalog-counterpart-identification.analyze"
+    )
+    family = frozen_confirmed_mode_prf_preparation_family(
+        morphology.result if morphology else None,
+        mode.result if mode else None,
+        localization_prepare.result if localization_prepare else None,
+        multisource_prepare.result if multisource_prepare else None,
+        prf_prepare.result if prf_prepare else None,
+    )
+    multisource_result = (multisource.result or {}) if multisource else {}
+    prf_result = (prf.result or {}) if prf else {}
+    catalog_result = (catalog.result or {}) if catalog else {}
+    candidate = catalog_result.get("preferredCandidate") or {}
+    ids = candidate.get("catalogIDs") or {}
+    justified_candidate = (
+        candidate.get("raDeg") is not None
+        and candidate.get("decDeg") is not None
+        and (ids.get("ticID") is not None
+             or ids.get("gaiaDR3SourceID") is not None)
+    )
+    valid_lineage = bool(
+        multisource_prepare and multisource_run and multisource
+        and prf_prepare and prf_run and prf and catalog
+        and multisource_run.triggered_by_stage_id == multisource_prepare.id
+        and multisource.triggered_by_stage_id == multisource_run.id
+        and prf_prepare.triggered_by_stage_id == multisource.id
+        and prf_run.triggered_by_stage_id == prf_prepare.id
+        and prf.triggered_by_stage_id == prf_run.id
+        and catalog.triggered_by_stage_id == prf.id
+        and failed.triggered_by_stage_id == catalog.id
+    )
+    if not (
+        family is not None
+        and valid_lineage
+        and multisource_result.get("classification")
+        == "MULTI_SOURCE_DECOMPOSITION_UNRESOLVED"
+        and multisource_result.get("physicalMechanismResolved") is False
+        and multisource_result.get("recommendedNextTest")
+        == "PIXEL_RESPONSE_FUNCTION_DEBLENDING"
+        and prf_result.get("physicalMechanismResolved") is False
+        and prf_result.get("recommendedNextTest")
+        == "CATALOG_COUNTERPART_IDENTIFICATION"
+        and catalog_result.get("physicalMechanismResolved") is False
+        and catalog_result.get("recommendedNextTest")
+        == "INDEPENDENT_COUNTERPART_PHOTOMETRIC_VARIABILITY_VALIDATION"
+        and justified_candidate
+    ):
+        return None
+    prefixes = [
+        int(stage.id.partition("-")[0]) for stage in investigation.stages
+        if stage.id.partition("-")[0].isdigit()
+    ]
+    retry = StageRequest(
+        id=f"{max(prefixes, default=0) + 1:03d}-prepare-offset-source-variability",
+        handler_id=failed.handler_id,
+        parameters=dict(failed.parameters),
+        triggered_by_stage_id=failed.id,
+    )
+    return store.set_control_state(
+        investigation,
+        status="RUNNING",
+        control_state={
+            "branchAssessments": [],
+            "selectedExperiment": asdict(retry),
+            "schedulerAction": "RUN_EXPERIMENT",
+            "recovery": "TESS_CONFIRMED_MODE_OFFSET_VARIABILITY_COMPATIBILITY_RETRY",
+        },
+    )
+
+
 def _repair_closed_file_independent_prepare(
     store: InvestigationStore, investigation: Investigation
 ) -> Investigation | None:
@@ -5114,6 +5238,12 @@ def repair_obsolete_terminal_wait(
     )
     if multisource_repair is not None:
         return multisource_repair
+
+    offset_variability_repair = _repair_confirmed_mode_offset_variability_failure(
+        store, investigation, control
+    )
+    if offset_variability_repair is not None:
+        return offset_variability_repair
 
     independent_repair = _repair_shifted_stage_lookup_independent_prepare(
         store, investigation

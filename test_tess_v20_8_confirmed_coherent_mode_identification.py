@@ -28,6 +28,7 @@ from test_tess_v20_8_long_baseline_time_frequency_confirmation import (
 from workflows.tess.tess_autonomy import (
     WORKFLOW_ID,
     WORKFLOW_VERSION,
+    _repair_confirmed_mode_offset_variability_failure,
     _repair_resolved_family_multisource_failure,
     _repair_unresolved_dynamic_localization_review_failure,
     _repair_v20_8_confirmed_coherent_mode_localization_terminal,
@@ -990,6 +991,150 @@ class ConfirmedCoherentModeContinuationTests(ConfirmedCoherentModeFixture):
                 multisource_investigation.metadata["controlState"],
             )
 
+            adapter = "frozen_confirmed_mode_localization_preparation_family"
+            family_provenance = {
+                "physicalCycleResolved": True,
+                "sourceEvidence": {
+                    "adapter": adapter,
+                    "referenceKind": "MORPHOLOGY_RESOLVED_PHYSICAL_PERIOD",
+                },
+            }
+            residual_provenance = {
+                "referenceFrequency": candidate["frequencyCyclesPerDay"],
+                "fractionalFrequencyDriftPerDay": 0.0,
+                "timeReferenceDays": 0.0,
+                "signalSectors": candidate["supportingSectors"],
+                "sourceEvidence": {"adapter": adapter},
+            }
+            multisource_preparation = {
+                "available": True,
+                "workloadID": "openstar.lomb-scargle.v1",
+                "referenceFamilyPeriodDays": physical_period,
+                "subtractedHarmonicOrders": [1, 2],
+                "physicalCycleResolved": True,
+                "referenceFrequency": candidate["frequencyCyclesPerDay"],
+                "fractionalFrequencyDriftPerDay": 0.0,
+                "timeReferenceDays": 0.0,
+                "familyModelProvenance": family_provenance,
+                "residualModelProvenance": residual_provenance,
+            }
+            prf_preparation = {
+                "version": "openstar.tess-prf-deblending.v1",
+                "modelSource": "official-public-SPOC-TESS-PRF-FITS",
+                "referenceFamilyPeriodDays": physical_period,
+                "subtractedHarmonicOrders": [1, 2],
+                "physicalCycleResolved": True,
+                "residualReferenceFrequency": candidate[
+                    "frequencyCyclesPerDay"
+                ],
+                "residualTimeReferenceDays": 0.0,
+                "fractionalFrequencyDriftPerDay": 0.0,
+                "sectors": sorted(candidate["supportingSectors"]),
+                "familyModelProvenance": family_provenance,
+                "residualModelProvenance": residual_provenance,
+            }
+            completed_tail = (
+                InvestigationStage(
+                    "031-prepare-multi-source-residual",
+                    "openstar.tess.multi-source-residual.prepare",
+                    "COMPLETE", multisource_failure.id, {},
+                    result=multisource_preparation,
+                ),
+                InvestigationStage(
+                    "032-run-multi-source-residual",
+                    "openstar.tess.multi-source-residual.run",
+                    "COMPLETE", "031-prepare-multi-source-residual", {},
+                    result={"status": "COMPLETE"},
+                ),
+                InvestigationStage(
+                    "033-interpret-multi-source-residual",
+                    "openstar.tess.multi-source-residual.interpret",
+                    "COMPLETE", "032-run-multi-source-residual", {},
+                    result={
+                        "classification": "MULTI_SOURCE_DECOMPOSITION_UNRESOLVED",
+                        "physicalMechanismResolved": False,
+                        "recommendedNextTest": "PIXEL_RESPONSE_FUNCTION_DEBLENDING",
+                    },
+                ),
+                InvestigationStage(
+                    "034-prepare-prf-deblending",
+                    "openstar.tess.official-spoc-prf-forward-modeling.prepare",
+                    "COMPLETE", "033-interpret-multi-source-residual", {},
+                    result=prf_preparation,
+                ),
+                InvestigationStage(
+                    "035-run-prf-deblending",
+                    "openstar.tess.official-spoc-prf-forward-modeling.run",
+                    "COMPLETE", "034-prepare-prf-deblending", {},
+                    result={"status": "COMPLETE"},
+                ),
+                InvestigationStage(
+                    "036-interpret-prf-deblending",
+                    "openstar.tess.official-spoc-prf-forward-modeling.interpret",
+                    "COMPLETE", "035-run-prf-deblending", {},
+                    result={
+                        "physicalMechanismResolved": False,
+                        "recommendedNextTest": "CATALOG_COUNTERPART_IDENTIFICATION",
+                    },
+                ),
+                InvestigationStage(
+                    "037-catalog-counterpart",
+                    "openstar.tess.catalog-counterpart-identification.analyze",
+                    "COMPLETE", "036-interpret-prf-deblending", {},
+                    result={
+                        "preferredCandidate": {
+                            "raDeg": 1.0,
+                            "decDeg": 2.0,
+                            "catalogIDs": {"gaiaDR3SourceID": 123},
+                        },
+                        "physicalMechanismResolved": False,
+                        "recommendedNextTest": (
+                            "INDEPENDENT_COUNTERPART_PHOTOMETRIC_VARIABILITY_VALIDATION"
+                        ),
+                    },
+                ),
+            )
+            offset_failure = InvestigationStage(
+                "038-prepare-offset-source-variability",
+                "openstar.tess.offset-source-variability.prepare",
+                "FAILED", "037-catalog-counterpart", {},
+                error=(
+                    "RuntimeError: v20.14 requires either resolved "
+                    "morphology/nonstationary evidence or the persisted unresolved "
+                    "family/residual PRF bridge."
+                ),
+                failure_classification="NON_RETRYABLE",
+            )
+            offset_investigation = replace(
+                multisource_investigation,
+                status="FAILED",
+                stages=(multisource_investigation.stages + completed_tail
+                        + (offset_failure,)),
+                metadata={
+                    **multisource_investigation.metadata,
+                    "controlState": {
+                        "schedulerAction": "RUN_EXPERIMENT",
+                        "selectedExperiment": asdict(StageRequest(
+                            offset_failure.id,
+                            offset_failure.handler_id,
+                            offset_failure.parameters,
+                            offset_failure.triggered_by_stage_id,
+                        )),
+                    },
+                },
+            )
+            offset_immutable = offset_investigation.stages
+            offset_repair = _repair_confirmed_mode_offset_variability_failure(
+                store,
+                offset_investigation,
+                offset_investigation.metadata["controlState"],
+            )
+            offset_repeated = _repair_confirmed_mode_offset_variability_failure(
+                store,
+                offset_repair,
+                offset_repair.metadata["controlState"],
+            )
+
         self.assertEqual("RUNNING", repaired.status)
         self.assertEqual(immutable, repaired.stages)
         selected = repaired.metadata["controlState"]["selectedExperiment"]
@@ -1016,6 +1161,16 @@ class ConfirmedCoherentModeContinuationTests(ConfirmedCoherentModeFixture):
         self.assertEqual(
             multisource_failure.id, multisource["triggered_by_stage_id"]
         )
+        self.assertEqual("RUNNING", offset_repair.status)
+        self.assertEqual(offset_immutable, offset_repair.stages)
+        offset = offset_repair.metadata["controlState"]["selectedExperiment"]
+        self.assertEqual("039-prepare-offset-source-variability", offset["id"])
+        self.assertEqual(
+            "openstar.tess.offset-source-variability.prepare",
+            offset["handler_id"],
+        )
+        self.assertEqual(offset_failure.id, offset["triggered_by_stage_id"])
+        self.assertIsNone(offset_repeated)
 
     def test_rejects_altered_confirmation_and_wrong_recommendation(self):
         for change in ("classification", "recommendedNextTest"):

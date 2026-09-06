@@ -404,6 +404,115 @@ class CatalogCounterpartTest(unittest.TestCase):
                 investigation, stages=investigation.stages + (completed,))
             self.assertEqual((), plan_tess_branches(after_validation, target))
 
+    def test_confirmed_mode_prf_bridge_prepares_offset_variability(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = InvestigationStore(root / "investigations")
+            investigation = store.create("confirmed-prf", "test", "1")
+            source_project = root / "source.json"
+            source_project.write_text("{}", encoding="utf-8")
+            output_project = root / "offset-project.json"
+            output_project.write_text("{}", encoding="utf-8")
+            frequency = 0.3376509037744195
+            period = 10.189984554424221
+            prf_preparation = {
+                "referenceFamilyPeriodDays": period,
+                "subtractedHarmonicOrders": [1, 2],
+                "residualReferenceFrequency": frequency,
+                "residualTimeReferenceDays": 2500.0,
+                "fractionalFrequencyDriftPerDay": 0.0,
+                "sectors": [2, 3, 97, 98],
+                "version": "openstar.tess-prf-deblending.v1",
+            }
+            stages = (
+                InvestigationStage(
+                    "001-prepare-target", "openstar.tess.prepare-target",
+                    "COMPLETE", None, {}, result={
+                        "sourceProjectPath": str(source_project),
+                        "sourceDatasetEntry": {}, "ticID": 42, "sector": 1,
+                    },
+                ),
+                InvestigationStage(
+                    "002-identity", "openstar.tess.catalog-identity",
+                    "COMPLETE", "001-prepare-target", {}, result={}),
+                InvestigationStage(
+                    "003-independent", "openstar.tess.independent.prepare",
+                    "COMPLETE", "002-identity", {}, result={}),
+                InvestigationStage(
+                    "004-morphology", "openstar.tess.morphology.analyze",
+                    "COMPLETE", "003-independent", {}, result={
+                        "physicalCycleResolved": True,
+                        "resolvedPhysicalPeriodDays": period,
+                    }),
+                InvestigationStage(
+                    "005-mode", "openstar.tess.mode-identification.analyze",
+                    "COMPLETE", "004-morphology", {}, result={}),
+                InvestigationStage(
+                    "006-localization-prepare",
+                    "openstar.tess.residual-mode-localization.prepare",
+                    "COMPLETE", "005-mode", {}, result={}),
+                InvestigationStage(
+                    "007-multisource-prepare",
+                    "openstar.tess.multi-source-residual.prepare",
+                    "COMPLETE", "006-localization-prepare", {}, result={}),
+                InvestigationStage(
+                    "008-multisource", "openstar.tess.multi-source-residual.interpret",
+                    "COMPLETE", "007-multisource-prepare", {}, result={
+                        "bestOffsetComponentID": "offset-3",
+                    }),
+                InvestigationStage(
+                    "009-prf-prepare",
+                    "openstar.tess.official-spoc-prf-forward-modeling.prepare",
+                    "COMPLETE", "008-multisource", {}, result=prf_preparation),
+                InvestigationStage(
+                    "010-catalog",
+                    "openstar.tess.catalog-counterpart-identification.analyze",
+                    "COMPLETE", "009-prf-prepare", {},
+                    result=self._new_catalog_result()),
+            )
+            investigation = replace(
+                investigation, status="RUNNING", stages=stages
+            )
+            store.save(investigation)
+            engine = build_engine(
+                store, coordinator=mock.Mock(), poll_interval=0.0, timeout=1.0
+            )
+            engine.chain_stages = False
+            spec = {
+                "projectPath": str(output_project),
+                "preparedSeries": [],
+                "workloadID": "openstar.lomb-scargle.v1",
+                "referencePeriodDays": 1.0 / frequency,
+                "totalWorkUnits": 4,
+            }
+            with mock.patch(
+                "workflows.tess.tess_investigation."
+                "frozen_confirmed_mode_prf_preparation_family",
+                return_value=(period, (1, 2), {},
+                              "MORPHOLOGY_RESOLVED_PHYSICAL_PERIOD"),
+            ), mock.patch(
+                "workflows.tess.tess_investigation."
+                "build_offset_source_variability_project",
+                return_value=spec,
+            ) as build_project:
+                completed, _ = engine.run_stage(
+                    investigation,
+                    StageRequest(
+                        "011-prepare-offset-source-variability",
+                        "openstar.tess.offset-source-variability.prepare", {},
+                        "010-catalog",
+                    ),
+                    software_id="test", software_version="1",
+                )
+
+            self.assertEqual("COMPLETE", completed.stages[-1].status)
+            kwargs = build_project.call_args.kwargs
+            self.assertEqual(period, kwargs["reference_family_period_days"])
+            self.assertEqual([1, 2], kwargs["harmonic_orders"])
+            self.assertTrue(kwargs["physical_cycle_resolved"])
+            self.assertEqual(frequency, kwargs["residual_reference_frequency"])
+            self.assertEqual([2, 3, 97, 98], kwargs["frozen_sectors"])
+
     def test_finalize_reports_persisted_catalog_evidence_after_prf(self):
         catalog = {
             "classification": "PLAUSIBLE_NEARBY_CATALOG_COUNTERPARTS",

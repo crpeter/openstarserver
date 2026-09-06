@@ -18,6 +18,7 @@ from openstar_workflow import RetryableExecutionError, StageRequest
 from workflows.tess.tess_investigation import build_engine
 from workflows.tess.tess_localization_evidence import (
     frozen_confirmed_mode_localization_preparation_family,
+    frozen_confirmed_mode_prf_preparation_family,
     frozen_residual_localization_family,
 )
 from workflows.tess.tess_mode_identification import (
@@ -162,6 +163,69 @@ class FrozenResidualLocalizationFamilyTests(unittest.TestCase):
                 morphology, mode, changed
             )
         )
+
+        source_evidence = {
+            "adapter": "frozen_confirmed_mode_localization_preparation_family",
+            "referenceKind": "MORPHOLOGY_RESOLVED_PHYSICAL_PERIOD",
+        }
+        family_provenance = {
+            "physicalCycleResolved": True,
+            "sourceEvidence": source_evidence,
+        }
+        residual_provenance = {
+            "referenceFrequency": frequency,
+            "fractionalFrequencyDriftPerDay": 0.0,
+            "timeReferenceDays": 0.0,
+            "signalSectors": sectors,
+            "sourceEvidence": {
+                "adapter": (
+                    "frozen_confirmed_mode_localization_preparation_family"
+                ),
+            },
+        }
+        multisource_preparation = {
+            "available": True,
+            "workloadID": "openstar.lomb-scargle.v1",
+            "referenceFamilyPeriodDays": physical_period,
+            "subtractedHarmonicOrders": [1, 2],
+            "physicalCycleResolved": True,
+            "referenceFrequency": frequency,
+            "fractionalFrequencyDriftPerDay": 0.0,
+            "timeReferenceDays": 0.0,
+            "familyModelProvenance": family_provenance,
+            "residualModelProvenance": residual_provenance,
+        }
+        prf_preparation = {
+            "version": "openstar.tess-prf-deblending.v1",
+            "modelSource": "official-public-SPOC-TESS-PRF-FITS",
+            "referenceFamilyPeriodDays": physical_period,
+            "subtractedHarmonicOrders": [1, 2],
+            "physicalCycleResolved": True,
+            "residualReferenceFrequency": frequency,
+            "residualTimeReferenceDays": 0.0,
+            "fractionalFrequencyDriftPerDay": 0.0,
+            "sectors": sectors,
+            "familyModelProvenance": family_provenance,
+            "residualModelProvenance": residual_provenance,
+        }
+        transported = frozen_confirmed_mode_prf_preparation_family(
+            morphology,
+            mode,
+            preparation,
+            multisource_preparation,
+            prf_preparation,
+        )
+        self.assertEqual(adapted, transported)
+
+        changed_prf = dict(prf_preparation)
+        changed_prf["residualReferenceFrequency"] = frequency * 1.01
+        self.assertIsNone(frozen_confirmed_mode_prf_preparation_family(
+            morphology,
+            mode,
+            preparation,
+            multisource_preparation,
+            changed_prf,
+        ))
 
     def test_actual_review_prepare_rejects_mismatched_resolved_family(self):
         temporary = tempfile.TemporaryDirectory()
