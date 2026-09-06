@@ -7910,6 +7910,16 @@ def build_engine(
             and stage.handler_id == "openstar.tess.mode-identification.analyze"
         ), None)
         mode = (mode_stage.result or {}) if mode_stage else None
+        localization_preparation_stage = next((
+            stage for stage in reversed(investigation.stages)
+            if stage.status == "COMPLETE"
+            and stage.handler_id
+                == "openstar.tess.residual-mode-localization.prepare"
+        ), None)
+        localization_preparation = (
+            (localization_preparation_stage.result or {})
+            if localization_preparation_stage is not None else None
+        )
         nonstationary_stage = next((
             stage for stage in reversed(investigation.stages)
             if stage.status == "COMPLETE"
@@ -7933,6 +7943,7 @@ def build_engine(
         resolved_period = (morphology or {}).get("resolvedPhysicalPeriodDays")
         harmonic_orders = (1, 2)
         family_context = None
+        family_adapter = None
         physical_cycle_resolved = bool((morphology or {}).get("physicalCycleResolved"))
         adapter_backed_family = not physical_cycle_resolved
         # Preserve the historical resolved + v20.9 route byte-for-byte at the
@@ -7942,6 +7953,18 @@ def build_engine(
             family_context = frozen_residual_localization_family(
                 morphology, dynamic, time_frequency_prepare, time_frequency, mode,
             )
+            family_adapter = "frozen_residual_localization_family"
+            if family_context is None:
+                family_context = (
+                    frozen_confirmed_mode_localization_preparation_family(
+                        morphology,
+                        mode,
+                        localization_preparation,
+                    )
+                )
+                family_adapter = (
+                    "frozen_confirmed_mode_localization_preparation_family"
+                )
             if family_context is None:
                 raise RuntimeError(
                     "v20.12 requires either a morphology-resolved physical period or "
@@ -7967,12 +7990,17 @@ def build_engine(
         # mode-identification evidence.  Adapt that durable evidence to the
         # historical shape consumed by the v20.12 project builder.
         if adapter_backed_family:
-            evidence_stages = (
+            evidence_stages = [
                 stage for stage in (
-                    morphology_stage, dynamic_stage, time_frequency_prepare_stage,
-                    time_frequency_stage, mode_stage,
+                    morphology_stage, dynamic_stage,
+                    time_frequency_prepare_stage, time_frequency_stage,
+                    mode_stage,
                 ) if stage is not None
-            )
+            ]
+            if family_adapter == (
+                "frozen_confirmed_mode_localization_preparation_family"
+            ):
+                evidence_stages.append(localization_preparation_stage)
             residual_model = dict(residual_model)
             residual_model_evidence = {
                 "sources": [
@@ -7980,7 +8008,7 @@ def build_engine(
                      "resultHash": sha256_json(stage.result or {})}
                     for stage in evidence_stages
                 ],
-                "adapter": "frozen_residual_localization_family",
+                "adapter": family_adapter,
             }
         elif nonstationary is not None:
             residual_model = dict(nonstationary)
@@ -8008,9 +8036,19 @@ def build_engine(
                               time_frequency_stage, mode_stage)
                 if stage is not None
             ]
+            if family_adapter == (
+                "frozen_confirmed_mode_localization_preparation_family"
+            ):
+                family_sources.append({
+                    "stageID": localization_preparation_stage.id,
+                    "handlerID": localization_preparation_stage.handler_id,
+                    "resultHash": sha256_json(
+                        localization_preparation_stage.result or {}
+                    ),
+                })
             family_evidence = {
                 "sources": family_sources,
-                "adapter": "frozen_residual_localization_family",
+                "adapter": family_adapter,
                 "referenceKind": reference_kind,
             }
         if physical_cycle_resolved and not adapter_backed_family:

@@ -4503,9 +4503,13 @@ def _repair_resolved_family_multisource_failure(
     if (failed.status != "FAILED"
             or failed.handler_id != "openstar.tess.multi-source-residual.prepare"
             or failed.failure_classification != "NON_RETRYABLE"
-            or failed.error != (
-                "RuntimeError: v20.12 requires the completed v20.9 nonstationary model."
-            )):
+            or failed.error not in {
+                "RuntimeError: v20.12 requires the completed v20.9 "
+                "nonstationary model.",
+                "RuntimeError: v20.12 requires either a morphology-resolved "
+                "physical period or an established unresolved dynamic harmonic "
+                "family.",
+            }):
         return None
     selected = control.get("selectedExperiment")
     expected_selected = asdict(StageRequest(
@@ -4548,14 +4552,42 @@ def _repair_resolved_family_multisource_failure(
         tf_summary.result if tf_summary else None,
         mode.result if mode else None,
     )
+    if family is None:
+        family = frozen_confirmed_mode_localization_preparation_family(
+            morphology.result if morphology else None,
+            mode.result if mode else None,
+            localization_prepare.result if localization_prepare else None,
+        )
     review_result = (review.result or {}) if review else {}
     cross = review_result.get("crossTime") or {}
+    failed_review_prepare = next((
+        stage for stage in reversed(investigation.stages)
+        if stage.status == "FAILED"
+        and stage.handler_id
+            == "openstar.tess.residual-mode-localization-review.prepare"
+        and stage.failure_classification == "NON_RETRYABLE"
+        and stage.error in {
+            "RuntimeError: v20.11 requires the completed v20.9 "
+            "nonstationary model.",
+            "RuntimeError: v20.11 requires the morphology-resolved physical "
+            "period.",
+        }
+    ), None)
+    direct_review_lineage = bool(
+        review_prepare and localization
+        and review_prepare.triggered_by_stage_id == localization.id
+    )
+    repaired_review_lineage = bool(
+        review_prepare and localization and failed_review_prepare
+        and failed_review_prepare.triggered_by_stage_id == localization.id
+        and review_prepare.triggered_by_stage_id == failed_review_prepare.id
+    )
     valid_lineage = bool(
         localization_prepare and localization_run and localization
         and review_prepare and review_run and review
         and localization_run.triggered_by_stage_id == localization_prepare.id
         and localization.triggered_by_stage_id == localization_run.id
-        and review_prepare.triggered_by_stage_id == localization.id
+        and (direct_review_lineage or repaired_review_lineage)
         and review_run.triggered_by_stage_id == review_prepare.id
         and review.triggered_by_stage_id == review_run.id
         and failed.triggered_by_stage_id == review.id

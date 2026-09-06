@@ -28,6 +28,7 @@ from test_tess_v20_8_long_baseline_time_frequency_confirmation import (
 from workflows.tess.tess_autonomy import (
     WORKFLOW_ID,
     WORKFLOW_VERSION,
+    _repair_resolved_family_multisource_failure,
     _repair_unresolved_dynamic_localization_review_failure,
     _repair_v20_8_confirmed_coherent_mode_localization_terminal,
     _repair_v20_8_confirmed_coherent_mode_identification_terminal,
@@ -914,6 +915,81 @@ class ConfirmedCoherentModeContinuationTests(ConfirmedCoherentModeFixture):
                 )
             )
 
+            review_prepare = InvestigationStage(
+                "027-prepare-residual-mode-localization-review",
+                "openstar.tess.residual-mode-localization-review.prepare",
+                "COMPLETE",
+                failed.id,
+                {},
+                result={"available": True},
+            )
+            review_run = InvestigationStage(
+                "028-run-residual-mode-localization-review",
+                "openstar.tess.residual-mode-localization-review.run",
+                "COMPLETE",
+                review_prepare.id,
+                {"projectPath": "/frozen/review-project.json"},
+                result={"status": "COMPLETE"},
+            )
+            review = InvestigationStage(
+                "029-interpret-residual-mode-localization-review",
+                "openstar.tess.residual-mode-localization-review.interpret",
+                "COMPLETE",
+                review_run.id,
+                {},
+                result={
+                    "crossTime": {
+                        "classification": (
+                            "RESIDUAL_MODE_SOURCE_SWITCHING_OR_BLEND"
+                        ),
+                        "residualModeOrigin": "TIME_VARIABLE_OR_BLENDED",
+                    },
+                    "recommendedNextTest": (
+                        "MULTI_SOURCE_RESIDUAL_DECOMPOSITION"
+                    ),
+                },
+            )
+            multisource_failure = InvestigationStage(
+                "030-prepare-multi-source-residual",
+                "openstar.tess.multi-source-residual.prepare",
+                "FAILED",
+                review.id,
+                {},
+                error=(
+                    "RuntimeError: v20.12 requires either a "
+                    "morphology-resolved physical period or an established "
+                    "unresolved dynamic harmonic family."
+                ),
+                failure_classification="NON_RETRYABLE",
+            )
+            multisource_investigation = replace(
+                investigation,
+                status="FAILED",
+                stages=investigation.stages + (
+                    review_prepare,
+                    review_run,
+                    review,
+                    multisource_failure,
+                ),
+                metadata={
+                    **investigation.metadata,
+                    "controlState": {
+                        "schedulerAction": "RUN_EXPERIMENT",
+                        "selectedExperiment": asdict(StageRequest(
+                            multisource_failure.id,
+                            multisource_failure.handler_id,
+                            multisource_failure.parameters,
+                            multisource_failure.triggered_by_stage_id,
+                        )),
+                    },
+                },
+            )
+            multisource_repair = _repair_resolved_family_multisource_failure(
+                store,
+                multisource_investigation,
+                multisource_investigation.metadata["controlState"],
+            )
+
         self.assertEqual("RUNNING", repaired.status)
         self.assertEqual(immutable, repaired.stages)
         selected = repaired.metadata["controlState"]["selectedExperiment"]
@@ -927,6 +1003,19 @@ class ConfirmedCoherentModeContinuationTests(ConfirmedCoherentModeFixture):
         self.assertEqual({}, selected["parameters"])
         self.assertEqual(failed.id, selected["triggered_by_stage_id"])
         self.assertIsNone(repeated)
+        multisource = multisource_repair.metadata[
+            "controlState"
+        ]["selectedExperiment"]
+        self.assertEqual(
+            "031-prepare-multi-source-residual", multisource["id"]
+        )
+        self.assertEqual(
+            "openstar.tess.multi-source-residual.prepare",
+            multisource["handler_id"],
+        )
+        self.assertEqual(
+            multisource_failure.id, multisource["triggered_by_stage_id"]
+        )
 
     def test_rejects_altered_confirmation_and_wrong_recommendation(self):
         for change in ("classification", "recommendedNextTest"):
