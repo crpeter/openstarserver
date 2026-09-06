@@ -3,6 +3,13 @@ from __future__ import annotations
 import math
 from typing import Any
 
+from .tess_mode_identification import (
+    CONFIRMED_COHERENT_MODE_METHOD_CONTRACT_ID,
+    CONFIRMED_COHERENT_MODE_RESULT_VERSION,
+    V20_8_CONFIRMED_COHERENT_MODE_EVIDENCE_LINEAGE,
+    confirmed_coherent_mode_method_contract_hash,
+)
+
 
 def frozen_residual_localization_family(
     morphology: dict[str, Any] | None,
@@ -123,3 +130,143 @@ def frozen_residual_localization_family(
         "evidenceSource": {"path": path},
     }
     return physical_period, orders, model, reference_kind
+
+
+def frozen_confirmed_mode_localization_preparation_family(
+    morphology: dict[str, Any] | None,
+    mode: dict[str, Any] | None,
+    preparation: dict[str, Any] | None,
+) -> tuple[float, tuple[int, ...], dict[str, Any], str] | None:
+    """Reuse the exact model already consumed by a completed v20.10 fit."""
+    if not all((morphology, mode, preparation)):
+        return None
+    method_contract = (mode or {}).get("methodContract") or {}
+    boundary = method_contract.get("evidenceBoundary") or {}
+    comparison = method_contract.get("modelComparison") or {}
+    candidate = (mode or {}).get("modeCandidate") or {}
+    period_reference = (preparation or {}).get("periodReference") or {}
+    try:
+        physical_period = float(preparation["physicalPeriodDays"])
+        morphology_period = float(morphology["resolvedPhysicalPeriodDays"])
+        established_period = float(boundary["establishedPeriodDays"])
+        family_period = float(
+            mode["establishedPeriodFamily"]["referencePeriodDays"]
+        )
+        frequency = float(preparation["residualFrequencyAtReference"])
+        residual_period = float(
+            preparation["residualPeriodAtReferenceDays"]
+        )
+        candidate_frequency = float(candidate["frequencyCyclesPerDay"])
+        candidate_period = float(candidate["periodDays"])
+        drift = float(preparation["fractionalFrequencyDriftPerDay"])
+        time_reference = float(preparation["timeReferenceDays"])
+        orders = tuple(
+            int(value) for value in preparation["subtractedHarmonicOrders"]
+        )
+        sectors = tuple(int(value) for value in preparation["signalSectors"])
+        candidate_sectors = tuple(
+            int(value) for value in candidate["supportingSectors"]
+        )
+        period_reference_period = float(period_reference["periodDays"])
+        total_work_units = int(preparation["totalWorkUnits"])
+    except (KeyError, TypeError, ValueError, ZeroDivisionError):
+        return None
+
+    positive = (
+        physical_period,
+        morphology_period,
+        established_period,
+        family_period,
+        frequency,
+        residual_period,
+        candidate_frequency,
+        candidate_period,
+        period_reference_period,
+    )
+    exact = (
+        morphology.get("physicalCycleResolved") is True
+        and mode.get("version") == CONFIRMED_COHERENT_MODE_RESULT_VERSION
+        and mode.get("evidenceLineage")
+        == V20_8_CONFIRMED_COHERENT_MODE_EVIDENCE_LINEAGE
+        and mode.get("classification") == "INDEPENDENT_STABLE_MODE"
+        and mode.get("independentModeEvidenceSurvived") is True
+        and mode.get("physicalMechanismResolved") is False
+        and mode.get("pulsationMechanismResolved") is False
+        and mode.get("claimLevelChanged") is False
+        and mode.get("automaticDiscoveryClaim") is False
+        and mode.get("recommendedNextTest")
+        == "RESIDUAL_MODE_PIXEL_LOCALIZATION"
+        and mode.get("methodContractID")
+        == CONFIRMED_COHERENT_MODE_METHOD_CONTRACT_ID
+        and method_contract.get("methodContractID")
+        == CONFIRMED_COHERENT_MODE_METHOD_CONTRACT_ID
+        and mode.get("methodContractHash")
+        == confirmed_coherent_mode_method_contract_hash(method_contract)
+        and comparison.get("familyHarmonicOrders") == [1, 2]
+        and preparation.get("available") is True
+        and preparation.get("physicalMechanismResolved") is False
+        and preparation.get("workloadID") == "openstar.lomb-scargle.v1"
+        and isinstance(preparation.get("projectPath"), str)
+        and bool(preparation.get("projectPath"))
+        and isinstance(preparation.get("preparedPixels"), list)
+        and bool(preparation.get("preparedPixels"))
+        and total_work_units > 0
+        and period_reference.get("kind")
+        == "MORPHOLOGY_RESOLVED_PHYSICAL_PERIOD"
+        and period_reference.get("physicalCycleResolved") is True
+        and all(math.isfinite(value) and value > 0.0 for value in positive)
+        and math.isfinite(drift)
+        and math.isfinite(time_reference)
+        and orders == (1, 2)
+        and sectors
+        and len(set(sectors)) == len(sectors)
+        and sectors == candidate_sectors
+        and math.isclose(
+            physical_period, morphology_period, rel_tol=1e-9, abs_tol=1e-12
+        )
+        and math.isclose(
+            physical_period, established_period, rel_tol=1e-9, abs_tol=1e-12
+        )
+        and math.isclose(
+            physical_period, family_period, rel_tol=1e-9, abs_tol=1e-12
+        )
+        and math.isclose(
+            physical_period,
+            period_reference_period,
+            rel_tol=1e-9,
+            abs_tol=1e-12,
+        )
+        and math.isclose(
+            frequency, candidate_frequency, rel_tol=1e-12, abs_tol=1e-15
+        )
+        and math.isclose(
+            residual_period,
+            candidate_period,
+            rel_tol=1e-12,
+            abs_tol=1e-15,
+        )
+        and math.isclose(
+            residual_period,
+            1.0 / frequency,
+            rel_tol=1e-12,
+            abs_tol=1e-15,
+        )
+    )
+    if not exact:
+        return None
+
+    model = {
+        "preferredFrequencyAtReference": frequency,
+        "preferredPeriodAtReferenceDays": residual_period,
+        "fractionalFrequencyDriftPerDay": drift,
+        "timeReferenceDays": time_reference,
+        "preferredModel": {"signalSectors": list(sectors)},
+        "recommendedNextTest": "RESIDUAL_MODE_PIXEL_LOCALIZATION",
+        "evidenceLineage": mode["evidenceLineage"],
+        "methodContractID": mode["methodContractID"],
+        "methodContractHash": mode["methodContractHash"],
+        "evidenceSource": {
+            "path": "CONFIRMED_MODE_COMPLETED_LOCALIZATION_PREPARATION"
+        },
+    }
+    return physical_period, orders, model, period_reference["kind"]

@@ -9,7 +9,10 @@ from functools import wraps
 from pathlib import Path
 from typing import Any
 
-from .tess_localization_evidence import frozen_residual_localization_family
+from .tess_localization_evidence import (
+    frozen_confirmed_mode_localization_preparation_family,
+    frozen_residual_localization_family,
+)
 
 from openstar_coordinator_client import OpenStarCoordinatorClient
 from openstar_investigation import (
@@ -7697,10 +7700,22 @@ def build_engine(
         mode_identification = _latest_result_for_handler(
             investigation, "openstar.tess.mode-identification.analyze",
         )
+        localization_preparation = _latest_result_for_handler(
+            investigation,
+            "openstar.tess.residual-mode-localization.prepare",
+        )
         family_context = frozen_residual_localization_family(
             morphology, dynamic_harmonic, time_frequency_prepare, time_frequency,
             mode_identification,
         )
+        if family_context is None:
+            family_context = (
+                frozen_confirmed_mode_localization_preparation_family(
+                    morphology,
+                    mode_identification,
+                    localization_preparation,
+                )
+            )
         residual_localization = _latest_result_for_handler(
             investigation,
             "openstar.tess.residual-mode-localization.interpret",

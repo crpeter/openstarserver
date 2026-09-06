@@ -17,7 +17,14 @@ from openstar_targets import InvestigationTarget
 from openstar_workflow import RetryableExecutionError, StageRequest
 from workflows.tess.tess_investigation import build_engine
 from workflows.tess.tess_localization_evidence import (
+    frozen_confirmed_mode_localization_preparation_family,
     frozen_residual_localization_family,
+)
+from workflows.tess.tess_mode_identification import (
+    CONFIRMED_COHERENT_MODE_METHOD_CONTRACT_ID,
+    CONFIRMED_COHERENT_MODE_RESULT_VERSION,
+    V20_8_CONFIRMED_COHERENT_MODE_EVIDENCE_LINEAGE,
+    confirmed_coherent_mode_method_contract_hash,
 )
 from workflows.tess.tess_residual_localization import build_residual_mode_pixel_project
 from workflows.tess.tess_residual_localization_review import (
@@ -72,6 +79,89 @@ class FrozenResidualLocalizationFamilyTests(unittest.TestCase):
         self.assertIsNone(frozen_residual_localization_family(
             morphology, None, tf_prepare, tf_summary, mode
         ))
+
+    def test_confirmed_mode_reuses_completed_localization_preparation(self):
+        physical_period = 10.189984554424221
+        frequency = 0.3376509037744195
+        sectors = [2, 3, 97, 98]
+        contract = {
+            "methodContractID": CONFIRMED_COHERENT_MODE_METHOD_CONTRACT_ID,
+            "evidenceBoundary": {
+                "establishedPeriodDays": physical_period,
+            },
+            "modelComparison": {"familyHarmonicOrders": [1, 2]},
+        }
+        mode = {
+            "version": CONFIRMED_COHERENT_MODE_RESULT_VERSION,
+            "evidenceLineage": (
+                V20_8_CONFIRMED_COHERENT_MODE_EVIDENCE_LINEAGE
+            ),
+            "classification": "INDEPENDENT_STABLE_MODE",
+            "independentModeEvidenceSurvived": True,
+            "physicalMechanismResolved": False,
+            "pulsationMechanismResolved": False,
+            "claimLevelChanged": False,
+            "automaticDiscoveryClaim": False,
+            "recommendedNextTest": "RESIDUAL_MODE_PIXEL_LOCALIZATION",
+            "methodContractID": CONFIRMED_COHERENT_MODE_METHOD_CONTRACT_ID,
+            "methodContractHash": (
+                confirmed_coherent_mode_method_contract_hash(contract)
+            ),
+            "methodContract": contract,
+            "establishedPeriodFamily": {
+                "referencePeriodDays": physical_period,
+            },
+            "modeCandidate": {
+                "frequencyCyclesPerDay": frequency,
+                "periodDays": 1.0 / frequency,
+                "supportingSectors": sectors,
+            },
+        }
+        morphology = {
+            "physicalCycleResolved": True,
+            "resolvedPhysicalPeriodDays": physical_period,
+        }
+        preparation = {
+            "available": True,
+            "projectPath": "/frozen/pixel-project.json",
+            "workloadID": "openstar.lomb-scargle.v1",
+            "physicalPeriodDays": physical_period,
+            "subtractedHarmonicOrders": [1, 2],
+            "residualFrequencyAtReference": frequency,
+            "residualPeriodAtReferenceDays": 1.0 / frequency,
+            "fractionalFrequencyDriftPerDay": 0.0,
+            "timeReferenceDays": 0.0,
+            "signalSectors": sectors,
+            "preparedPixels": [{"datasetID": "pixel-1"}],
+            "totalWorkUnits": 64,
+            "periodReference": {
+                "periodDays": physical_period,
+                "kind": "MORPHOLOGY_RESOLVED_PHYSICAL_PERIOD",
+                "physicalCycleResolved": True,
+            },
+            "physicalMechanismResolved": False,
+        }
+
+        adapted = frozen_confirmed_mode_localization_preparation_family(
+            morphology, mode, preparation
+        )
+
+        self.assertIsNotNone(adapted)
+        self.assertEqual(physical_period, adapted[0])
+        self.assertEqual((1, 2), adapted[1])
+        self.assertEqual(frequency, adapted[2]["preferredFrequencyAtReference"])
+        self.assertEqual(0.0, adapted[2]["timeReferenceDays"])
+        self.assertEqual(
+            "MORPHOLOGY_RESOLVED_PHYSICAL_PERIOD", adapted[3]
+        )
+
+        changed = dict(preparation)
+        changed["signalSectors"] = [2, 3, 97]
+        self.assertIsNone(
+            frozen_confirmed_mode_localization_preparation_family(
+                morphology, mode, changed
+            )
+        )
 
     def test_actual_review_prepare_rejects_mismatched_resolved_family(self):
         temporary = tempfile.TemporaryDirectory()

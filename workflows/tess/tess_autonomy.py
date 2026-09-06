@@ -19,7 +19,10 @@ from openstar_path_relocation import (
 )
 from openstar_targets import InvestigationTarget
 from openstar_workflow import StageRequest, WorkflowEngine
-from .tess_localization_evidence import frozen_residual_localization_family
+from .tess_localization_evidence import (
+    frozen_confirmed_mode_localization_preparation_family,
+    frozen_residual_localization_family,
+)
 from .tess_mode_identification import (
     CONFIRMED_COHERENT_MODE_METHOD_CONTRACT_ID,
     CONFIRMED_COHERENT_MODE_RESULT_VERSION,
@@ -4269,6 +4272,9 @@ def _repair_unresolved_dynamic_localization_review_failure(
     localization = _latest_complete(
         investigation, "openstar.tess.residual-mode-localization.interpret"
     )
+    localization_prepare = _latest_complete(
+        investigation, "openstar.tess.residual-mode-localization.prepare"
+    )
     mode_result = (mode.result or {}) if mode else {}
     localization_result = (localization.result or {}) if localization else {}
     family_context = frozen_residual_localization_family(
@@ -4278,15 +4284,18 @@ def _repair_unresolved_dynamic_localization_review_failure(
         tf_summary.result if tf_summary else None,
         mode_result if mode else None,
     )
+    if family_context is None:
+        family_context = frozen_confirmed_mode_localization_preparation_family(
+            morphology.result if morphology else None,
+            mode_result if mode else None,
+            localization_prepare.result if localization_prepare else None,
+        )
     if not (family_context is not None
             and localization
             and localization_result.get("recommendedNextTest")
                  == "RESIDUAL_MODE_SOURCE_LOCALIZATION_REVIEW"):
         return None
     orders = list(family_context[1])
-    localization_prepare = _latest_complete(
-        investigation, "openstar.tess.residual-mode-localization.prepare"
-    )
     subtracted = ((localization_prepare.result or {}).get("subtractedHarmonicOrders")
                   if localization_prepare else None)
     rerun_localization = list(subtracted or [1, 2]) != orders

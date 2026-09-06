@@ -28,6 +28,7 @@ from test_tess_v20_8_long_baseline_time_frequency_confirmation import (
 from workflows.tess.tess_autonomy import (
     WORKFLOW_ID,
     WORKFLOW_VERSION,
+    _repair_unresolved_dynamic_localization_review_failure,
     _repair_v20_8_confirmed_coherent_mode_localization_terminal,
     _repair_v20_8_confirmed_coherent_mode_identification_terminal,
 )
@@ -802,6 +803,130 @@ class ConfirmedCoherentModeContinuationTests(ConfirmedCoherentModeFixture):
                     )
                 )
         self.assertIsNone(repaired)
+
+    def test_failed_review_repairs_from_completed_confirmed_localization(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store, investigation = self._finalized_mode_history(
+                temporary, resolved_cycle=True
+            )
+            mode = investigation.stages[-2].result
+            candidate = mode["modeCandidate"]
+            physical_period = mode["establishedPeriodFamily"][
+                "referencePeriodDays"
+            ]
+            localization_preparation = {
+                "available": True,
+                "projectPath": str(Path(temporary) / "pixel-project.json"),
+                "workloadID": "openstar.lomb-scargle.v1",
+                "physicalPeriodDays": physical_period,
+                "subtractedHarmonicOrders": [1, 2],
+                "residualFrequencyAtReference": candidate[
+                    "frequencyCyclesPerDay"
+                ],
+                "residualPeriodAtReferenceDays": candidate["periodDays"],
+                "fractionalFrequencyDriftPerDay": 0.0,
+                "timeReferenceDays": 0.0,
+                "signalSectors": candidate["supportingSectors"],
+                "preparedPixels": [{"datasetID": "pixel-1"}],
+                "totalWorkUnits": 64,
+                "periodReference": {
+                    "periodDays": physical_period,
+                    "kind": "MORPHOLOGY_RESOLVED_PHYSICAL_PERIOD",
+                    "physicalCycleResolved": True,
+                },
+                "physicalMechanismResolved": False,
+            }
+            prepare = InvestigationStage(
+                "023-prepare-residual-mode-localization",
+                "openstar.tess.residual-mode-localization.prepare",
+                "COMPLETE",
+                "020-mode-identification",
+                {},
+                result=localization_preparation,
+            )
+            run = InvestigationStage(
+                "024-run-residual-mode-localization",
+                "openstar.tess.residual-mode-localization.run",
+                "COMPLETE",
+                prepare.id,
+                {"projectPath": localization_preparation["projectPath"]},
+                result={"status": "COMPLETE"},
+            )
+            interpretation = InvestigationStage(
+                "025-interpret-residual-mode-localization",
+                "openstar.tess.residual-mode-localization.interpret",
+                "COMPLETE",
+                run.id,
+                {},
+                result={
+                    "recommendedNextTest": (
+                        "RESIDUAL_MODE_SOURCE_LOCALIZATION_REVIEW"
+                    ),
+                    "physicalMechanismResolved": False,
+                },
+            )
+            failed = InvestigationStage(
+                "026-prepare-residual-mode-localization-review",
+                "openstar.tess.residual-mode-localization-review.prepare",
+                "FAILED",
+                interpretation.id,
+                {},
+                error=(
+                    "RuntimeError: v20.11 requires the completed v20.9 "
+                    "nonstationary model."
+                ),
+                failure_classification="NON_RETRYABLE",
+            )
+            investigation = replace(
+                investigation,
+                status="FAILED",
+                stages=investigation.stages + (
+                    prepare, run, interpretation, failed
+                ),
+                metadata={
+                    **investigation.metadata,
+                    "controlState": {
+                        "schedulerAction": "RUN_EXPERIMENT",
+                        "selectedExperiment": asdict(StageRequest(
+                            failed.id,
+                            failed.handler_id,
+                            failed.parameters,
+                            failed.triggered_by_stage_id,
+                        )),
+                    },
+                },
+            )
+            store.save(investigation)
+            immutable = investigation.stages
+
+            repaired = (
+                _repair_unresolved_dynamic_localization_review_failure(
+                    store,
+                    investigation,
+                    investigation.metadata["controlState"],
+                )
+            )
+            repeated = (
+                _repair_unresolved_dynamic_localization_review_failure(
+                    store,
+                    repaired,
+                    repaired.metadata["controlState"],
+                )
+            )
+
+        self.assertEqual("RUNNING", repaired.status)
+        self.assertEqual(immutable, repaired.stages)
+        selected = repaired.metadata["controlState"]["selectedExperiment"]
+        self.assertEqual(
+            "027-prepare-residual-mode-localization-review", selected["id"]
+        )
+        self.assertEqual(
+            "openstar.tess.residual-mode-localization-review.prepare",
+            selected["handler_id"],
+        )
+        self.assertEqual({}, selected["parameters"])
+        self.assertEqual(failed.id, selected["triggered_by_stage_id"])
+        self.assertIsNone(repeated)
 
     def test_rejects_altered_confirmation_and_wrong_recommendation(self):
         for change in ("classification", "recommendedNextTest"):
