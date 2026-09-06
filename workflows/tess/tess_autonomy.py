@@ -19,11 +19,18 @@ from openstar_path_relocation import (
 )
 from openstar_targets import InvestigationTarget
 from openstar_workflow import StageRequest, WorkflowEngine
-from .tess_localization_evidence import frozen_residual_localization_family
+from .tess_localization_evidence import (
+    frozen_confirmed_mode_localization_preparation_family,
+    frozen_confirmed_mode_prf_preparation_family,
+    frozen_residual_localization_family,
+)
 from .tess_mode_identification import (
+    CONFIRMED_COHERENT_MODE_METHOD_CONTRACT_ID,
+    CONFIRMED_COHERENT_MODE_RESULT_VERSION,
     MULTIMODE_MODE_EVIDENCE_LINEAGE,
     V20_8_CONFIRMED_COHERENT_MODE_EVIDENCE_LINEAGE,
     build_confirmed_coherent_mode_method_contract,
+    confirmed_coherent_mode_method_contract_hash,
     validate_confirmed_coherent_mode_dataset_lineage,
     validate_v20_8_confirmed_coherent_residual,
     validated_multimode_mode_evidence,
@@ -2013,6 +2020,250 @@ def _repair_v20_8_confirmed_coherent_mode_identification_terminal(
             "schedulerAction": "RUN_EXPERIMENT",
             "recovery": (
                 "TESS_V20_8_CONFIRMED_COHERENT_MODE_IDENTIFICATION"
+            ),
+        },
+    )
+
+
+def _repair_v20_8_confirmed_coherent_mode_localization_terminal(
+    store: InvestigationStore,
+    investigation: Investigation,
+    control: dict,
+) -> Investigation | None:
+    """Append pixel localization only at the verified positive v20.8.2 boundary."""
+    if not (
+        investigation.status in {"COMPLETE", "HUMAN_REVIEW_REQUIRED"}
+        and control.get("schedulerAction") == "INVESTIGATION_COMPLETE"
+        and control.get("selectedExperiment") in (None, {})
+        and not any(
+            stage.status == "RUNNING" for stage in investigation.stages
+        )
+        and not any(
+            stage.handler_id.startswith(
+                "openstar.tess.residual-mode-localization."
+            )
+            for stage in investigation.stages
+        )
+    ):
+        return None
+
+    mode = _latest_complete(
+        investigation, "openstar.tess.mode-identification.analyze"
+    )
+    confirmation = _latest_complete(
+        investigation,
+        V20_8_LONG_BASELINE_TIME_FREQUENCY_CONFIRMATION_HANDLER_ID,
+    )
+    independent = _latest_complete(
+        investigation, "openstar.tess.independent.prepare"
+    )
+    prepared = next((
+        stage for stage in investigation.stages
+        if stage.id == "001-prepare-target"
+        and stage.status == "COMPLETE"
+        and isinstance(stage.result, dict)
+    ), None)
+    latest = investigation.stages[-1] if investigation.stages else None
+    if any(
+        stage is None
+        for stage in (mode, confirmation, independent, prepared, latest)
+    ) or not all(
+        isinstance(stage.result, dict)
+        for stage in (mode, confirmation, independent, prepared, latest)
+    ):
+        return None
+
+    result = mode.result or {}
+    final_result = latest.result or {}
+    if not (
+        mode.triggered_by_stage_id == confirmation.id
+        and mode.parameters == {
+            "evidenceLineage": (
+                V20_8_CONFIRMED_COHERENT_MODE_EVIDENCE_LINEAGE
+            )
+        }
+        and result.get("version")
+        == CONFIRMED_COHERENT_MODE_RESULT_VERSION
+        and result.get("evidenceLineage")
+        == V20_8_CONFIRMED_COHERENT_MODE_EVIDENCE_LINEAGE
+        and result.get("classification") == "INDEPENDENT_STABLE_MODE"
+        and result.get("independentModeEvidenceSurvived") is True
+        and isinstance(result.get("modeCandidate"), dict)
+        and result.get("physicalMechanismResolved") is False
+        and result.get("pulsationMechanismResolved") is False
+        and result.get("claimLevelChanged") is False
+        and result.get("automaticDiscoveryClaim") is False
+        and result.get("recommendedNextTest")
+        == "RESIDUAL_MODE_PIXEL_LOCALIZATION"
+        and result.get("methodContractID")
+        == CONFIRMED_COHERENT_MODE_METHOD_CONTRACT_ID
+        and result.get("methodContractHash")
+        == confirmed_coherent_mode_method_contract_hash(
+            result.get("methodContract") or {}
+        )
+        and latest.handler_id == "openstar.tess.finalize"
+        and latest.status == "COMPLETE"
+        and latest.stop is True
+        and latest.triggered_by_stage_id == mode.id
+        and latest.parameters == {
+            "outputSuffix": (
+                "v20.8.2-confirmed-coherent-mode-identification"
+            )
+        }
+        and final_result.get("modeIdentification") == result
+        and final_result.get("recommendedNextTest")
+        == "RESIDUAL_MODE_PIXEL_LOCALIZATION"
+    ):
+        return None
+    mode_index = investigation.stages.index(mode)
+    if tuple(investigation.stages[mode_index + 1:]) != (latest,):
+        return None
+
+    try:
+        evidence = validate_v20_8_confirmed_coherent_residual(
+            confirmation.result
+        )
+        prepared_by_sector = {}
+        for item in independent.result.get("preparedSectors") or []:
+            if not isinstance(item, dict) or item.get("sector") is None:
+                continue
+            sector = int(item["sector"])
+            if sector in prepared_by_sector:
+                return None
+            prepared_by_sector[sector] = item
+        if not set(evidence["independentSectors"]).issubset(
+            prepared_by_sector
+        ):
+            return None
+        dataset_specs = [{
+            "datasetID": prepared.result["datasetID"],
+            "datasetPath": prepared.result["datasetPath"],
+            "ticID": prepared.result["ticID"],
+            "sector": prepared.result["sector"],
+            "role": "PRIMARY",
+        }]
+        dataset_specs.extend({
+            "datasetID": prepared_by_sector[sector]["datasetID"],
+            "datasetPath": prepared_by_sector[sector]["datasetPath"],
+            "ticID": prepared.result["ticID"],
+            "sector": sector,
+            "role": "INDEPENDENT",
+        } for sector in evidence["independentSectors"])
+        expected_contract = build_confirmed_coherent_mode_method_contract(
+            confirmation=confirmation.result,
+            dataset_specs=dataset_specs,
+        )
+        if result.get("methodContract") != expected_contract:
+            return None
+        validate_confirmed_coherent_mode_dataset_lineage(
+            method_contract=expected_contract,
+            dataset_specs=dataset_specs,
+        )
+        candidate = result["modeCandidate"]
+        residual = result["residualCandidate"]
+        frequency = float(candidate["frequencyCyclesPerDay"])
+        period = float(candidate["periodDays"])
+        if not (
+            math.isfinite(frequency)
+            and frequency > 0.0
+            and math.isfinite(period)
+            and period > 0.0
+            and math.isclose(
+                frequency,
+                1.0 / period,
+                rel_tol=1e-12,
+                abs_tol=1e-15,
+            )
+            and math.isclose(
+                frequency,
+                float(residual["refinedFrequencyCyclesPerDay"]),
+                rel_tol=1e-12,
+                abs_tol=1e-15,
+            )
+            and math.isclose(
+                period,
+                float(residual["refinedPeriodDays"]),
+                rel_tol=1e-12,
+                abs_tol=1e-15,
+            )
+            and candidate.get("supportingSectors")
+            == evidence["independentSectors"]
+            and (result.get("independentSectorSupport") or {}).get(
+                "sectors"
+            ) == evidence["independentSectors"]
+            and math.isclose(
+                float(
+                    result["establishedPeriodFamily"][
+                        "referencePeriodDays"
+                    ]
+                ),
+                float(
+                    expected_contract["evidenceBoundary"][
+                        "establishedPeriodDays"
+                    ]
+                ),
+                rel_tol=1e-12,
+                abs_tol=1e-15,
+            )
+        ):
+            return None
+    except (KeyError, OSError, RuntimeError, TypeError, ValueError):
+        return None
+
+    hashes = mode.provenance.input_hashes if mode.provenance else {}
+    try:
+        verified = (
+            hashes.get("longBaselineTimeFrequencyConfirmation")
+            == sha256_json(confirmation.result)
+            and hashes.get("confirmedCoherentModeMethodContract")
+            == result["methodContractHash"]
+            and hashes.get("primaryPreparation")
+            == sha256_json(prepared.result)
+            and all(
+                hashes.get(
+                    f"frozenDataset:{spec['role']}:{spec['sector']}"
+                ) == sha256_file(spec["datasetPath"])
+                for spec in dataset_specs
+            )
+            and all(
+                store.verified_terminal_stage_ledger_hash(
+                    investigation.id, stage
+                )
+                for stage in (
+                    prepared, independent, confirmation, mode, latest
+                )
+            )
+            and _verified_stage_json(
+                mode,
+                "mode-identification-v20.8.2-confirmed-coherent.json",
+            )
+            and _verified_stage_json(
+                latest,
+                "conclusion-v20.8.2-confirmed-coherent-mode-identification.json",
+            )
+        )
+    except (KeyError, OSError, TypeError, ValueError):
+        return None
+    if not verified:
+        return None
+
+    continuation = StageRequest(
+        id=_continuation_stage_id(
+            latest, "prepare-residual-mode-localization"
+        ),
+        handler_id="openstar.tess.residual-mode-localization.prepare",
+        parameters={},
+        triggered_by_stage_id=mode.id,
+    )
+    return store.set_control_state(
+        investigation,
+        status="RUNNING",
+        control_state={
+            "branchAssessments": [],
+            "selectedExperiment": asdict(continuation),
+            "schedulerAction": "RUN_EXPERIMENT",
+            "recovery": (
+                "TESS_V20_8_CONFIRMED_COHERENT_MODE_PIXEL_LOCALIZATION"
             ),
         },
     )
@@ -4022,6 +4273,9 @@ def _repair_unresolved_dynamic_localization_review_failure(
     localization = _latest_complete(
         investigation, "openstar.tess.residual-mode-localization.interpret"
     )
+    localization_prepare = _latest_complete(
+        investigation, "openstar.tess.residual-mode-localization.prepare"
+    )
     mode_result = (mode.result or {}) if mode else {}
     localization_result = (localization.result or {}) if localization else {}
     family_context = frozen_residual_localization_family(
@@ -4031,15 +4285,18 @@ def _repair_unresolved_dynamic_localization_review_failure(
         tf_summary.result if tf_summary else None,
         mode_result if mode else None,
     )
+    if family_context is None:
+        family_context = frozen_confirmed_mode_localization_preparation_family(
+            morphology.result if morphology else None,
+            mode_result if mode else None,
+            localization_prepare.result if localization_prepare else None,
+        )
     if not (family_context is not None
             and localization
             and localization_result.get("recommendedNextTest")
                  == "RESIDUAL_MODE_SOURCE_LOCALIZATION_REVIEW"):
         return None
     orders = list(family_context[1])
-    localization_prepare = _latest_complete(
-        investigation, "openstar.tess.residual-mode-localization.prepare"
-    )
     subtracted = ((localization_prepare.result or {}).get("subtractedHarmonicOrders")
                   if localization_prepare else None)
     rerun_localization = list(subtracted or [1, 2]) != orders
@@ -4247,9 +4504,13 @@ def _repair_resolved_family_multisource_failure(
     if (failed.status != "FAILED"
             or failed.handler_id != "openstar.tess.multi-source-residual.prepare"
             or failed.failure_classification != "NON_RETRYABLE"
-            or failed.error != (
-                "RuntimeError: v20.12 requires the completed v20.9 nonstationary model."
-            )):
+            or failed.error not in {
+                "RuntimeError: v20.12 requires the completed v20.9 "
+                "nonstationary model.",
+                "RuntimeError: v20.12 requires either a morphology-resolved "
+                "physical period or an established unresolved dynamic harmonic "
+                "family.",
+            }):
         return None
     selected = control.get("selectedExperiment")
     expected_selected = asdict(StageRequest(
@@ -4292,14 +4553,42 @@ def _repair_resolved_family_multisource_failure(
         tf_summary.result if tf_summary else None,
         mode.result if mode else None,
     )
+    if family is None:
+        family = frozen_confirmed_mode_localization_preparation_family(
+            morphology.result if morphology else None,
+            mode.result if mode else None,
+            localization_prepare.result if localization_prepare else None,
+        )
     review_result = (review.result or {}) if review else {}
     cross = review_result.get("crossTime") or {}
+    failed_review_prepare = next((
+        stage for stage in reversed(investigation.stages)
+        if stage.status == "FAILED"
+        and stage.handler_id
+            == "openstar.tess.residual-mode-localization-review.prepare"
+        and stage.failure_classification == "NON_RETRYABLE"
+        and stage.error in {
+            "RuntimeError: v20.11 requires the completed v20.9 "
+            "nonstationary model.",
+            "RuntimeError: v20.11 requires the morphology-resolved physical "
+            "period.",
+        }
+    ), None)
+    direct_review_lineage = bool(
+        review_prepare and localization
+        and review_prepare.triggered_by_stage_id == localization.id
+    )
+    repaired_review_lineage = bool(
+        review_prepare and localization and failed_review_prepare
+        and failed_review_prepare.triggered_by_stage_id == localization.id
+        and review_prepare.triggered_by_stage_id == failed_review_prepare.id
+    )
     valid_lineage = bool(
         localization_prepare and localization_run and localization
         and review_prepare and review_run and review
         and localization_run.triggered_by_stage_id == localization_prepare.id
         and localization.triggered_by_stage_id == localization_run.id
-        and review_prepare.triggered_by_stage_id == localization.id
+        and (direct_review_lineage or repaired_review_lineage)
         and review_run.triggered_by_stage_id == review_prepare.id
         and review.triggered_by_stage_id == review_run.id
         and failed.triggered_by_stage_id == review.id
@@ -4329,6 +4618,129 @@ def _repair_resolved_family_multisource_failure(
         control_state={"branchAssessments": [], "selectedExperiment": asdict(retry),
                        "schedulerAction": "RUN_EXPERIMENT",
                        "recovery": "TESS_RESOLVED_FAMILY_MULTISOURCE_COMPATIBILITY_RETRY"},
+    )
+
+
+def _repair_confirmed_mode_offset_variability_failure(
+    store: InvestigationStore, investigation: Investigation, control: dict
+) -> Investigation | None:
+    """Append a retry for the obsolete v20.14 confirmed-mode PRF gate."""
+    if investigation.status != "FAILED" or not investigation.stages:
+        return None
+    failed = investigation.stages[-1]
+    expected_error = (
+        "RuntimeError: v20.14 requires either resolved "
+        "morphology/nonstationary evidence or the persisted unresolved "
+        "family/residual PRF bridge."
+    )
+    selected = control.get("selectedExperiment")
+    expected_selected = asdict(StageRequest(
+        failed.id, failed.handler_id, dict(failed.parameters),
+        failed.triggered_by_stage_id,
+    ))
+    if not (
+        failed.status == "FAILED"
+        and failed.handler_id == "openstar.tess.offset-source-variability.prepare"
+        and failed.failure_classification == "NON_RETRYABLE"
+        and failed.error == expected_error
+        and control.get("schedulerAction")
+        in ("RUN_EXPERIMENT", "INVESTIGATION_FAILED")
+        and isinstance(selected, dict)
+        and selected == expected_selected
+    ):
+        return None
+
+    morphology = _latest_complete(investigation, "openstar.tess.morphology.analyze")
+    mode = _latest_complete(investigation, "openstar.tess.mode-identification.analyze")
+    localization_prepare = _latest_complete(
+        investigation, "openstar.tess.residual-mode-localization.prepare"
+    )
+    multisource_prepare = _latest_complete(
+        investigation, "openstar.tess.multi-source-residual.prepare"
+    )
+    multisource_run = _latest_complete(
+        investigation, "openstar.tess.multi-source-residual.run"
+    )
+    multisource = _latest_complete(
+        investigation, "openstar.tess.multi-source-residual.interpret"
+    )
+    prf_prepare = _latest_complete(
+        investigation, "openstar.tess.official-spoc-prf-forward-modeling.prepare"
+    )
+    prf_run = _latest_complete(
+        investigation, "openstar.tess.official-spoc-prf-forward-modeling.run"
+    )
+    prf = _latest_complete(
+        investigation, "openstar.tess.official-spoc-prf-forward-modeling.interpret"
+    )
+    catalog = _latest_complete(
+        investigation, "openstar.tess.catalog-counterpart-identification.analyze"
+    )
+    family = frozen_confirmed_mode_prf_preparation_family(
+        morphology.result if morphology else None,
+        mode.result if mode else None,
+        localization_prepare.result if localization_prepare else None,
+        multisource_prepare.result if multisource_prepare else None,
+        prf_prepare.result if prf_prepare else None,
+    )
+    multisource_result = (multisource.result or {}) if multisource else {}
+    prf_result = (prf.result or {}) if prf else {}
+    catalog_result = (catalog.result or {}) if catalog else {}
+    candidate = catalog_result.get("preferredCandidate") or {}
+    ids = candidate.get("catalogIDs") or {}
+    justified_candidate = (
+        candidate.get("raDeg") is not None
+        and candidate.get("decDeg") is not None
+        and (ids.get("ticID") is not None
+             or ids.get("gaiaDR3SourceID") is not None)
+    )
+    valid_lineage = bool(
+        multisource_prepare and multisource_run and multisource
+        and prf_prepare and prf_run and prf and catalog
+        and multisource_run.triggered_by_stage_id == multisource_prepare.id
+        and multisource.triggered_by_stage_id == multisource_run.id
+        and prf_prepare.triggered_by_stage_id == multisource.id
+        and prf_run.triggered_by_stage_id == prf_prepare.id
+        and prf.triggered_by_stage_id == prf_run.id
+        and catalog.triggered_by_stage_id == prf.id
+        and failed.triggered_by_stage_id == catalog.id
+    )
+    if not (
+        family is not None
+        and valid_lineage
+        and multisource_result.get("classification")
+        == "MULTI_SOURCE_DECOMPOSITION_UNRESOLVED"
+        and multisource_result.get("physicalMechanismResolved") is False
+        and multisource_result.get("recommendedNextTest")
+        == "PIXEL_RESPONSE_FUNCTION_DEBLENDING"
+        and prf_result.get("physicalMechanismResolved") is False
+        and prf_result.get("recommendedNextTest")
+        == "CATALOG_COUNTERPART_IDENTIFICATION"
+        and catalog_result.get("physicalMechanismResolved") is False
+        and catalog_result.get("recommendedNextTest")
+        == "INDEPENDENT_COUNTERPART_PHOTOMETRIC_VARIABILITY_VALIDATION"
+        and justified_candidate
+    ):
+        return None
+    prefixes = [
+        int(stage.id.partition("-")[0]) for stage in investigation.stages
+        if stage.id.partition("-")[0].isdigit()
+    ]
+    retry = StageRequest(
+        id=f"{max(prefixes, default=0) + 1:03d}-prepare-offset-source-variability",
+        handler_id=failed.handler_id,
+        parameters=dict(failed.parameters),
+        triggered_by_stage_id=failed.id,
+    )
+    return store.set_control_state(
+        investigation,
+        status="RUNNING",
+        control_state={
+            "branchAssessments": [],
+            "selectedExperiment": asdict(retry),
+            "schedulerAction": "RUN_EXPERIMENT",
+            "recovery": "TESS_CONFIRMED_MODE_OFFSET_VARIABILITY_COMPATIBILITY_RETRY",
+        },
     )
 
 
@@ -4827,6 +5239,12 @@ def repair_obsolete_terminal_wait(
     if multisource_repair is not None:
         return multisource_repair
 
+    offset_variability_repair = _repair_confirmed_mode_offset_variability_failure(
+        store, investigation, control
+    )
+    if offset_variability_repair is not None:
+        return offset_variability_repair
+
     independent_repair = _repair_shifted_stage_lookup_independent_prepare(
         store, investigation
     )
@@ -4936,6 +5354,14 @@ def repair_obsolete_terminal_wait(
     )
     if v20_8_mode_repair is not None:
         return v20_8_mode_repair
+
+    v20_8_mode_localization_repair = (
+        _repair_v20_8_confirmed_coherent_mode_localization_terminal(
+            store, investigation, control
+        )
+    )
+    if v20_8_mode_localization_repair is not None:
+        return v20_8_mode_localization_repair
 
     long_baseline_repair = \
         _repair_long_baseline_frequency_confirmation_terminal(

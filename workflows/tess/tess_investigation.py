@@ -9,7 +9,11 @@ from functools import wraps
 from pathlib import Path
 from typing import Any
 
-from .tess_localization_evidence import frozen_residual_localization_family
+from .tess_localization_evidence import (
+    frozen_confirmed_mode_localization_preparation_family,
+    frozen_confirmed_mode_prf_preparation_family,
+    frozen_residual_localization_family,
+)
 
 from openstar_coordinator_client import OpenStarCoordinatorClient
 from openstar_investigation import (
@@ -148,6 +152,7 @@ from .tess_long_baseline_frequency_confirmation import (
 )
 from .tess_v20_8_long_baseline_time_frequency_confirmation import (
     HANDLER_ID as V20_8_LONG_BASELINE_TIME_FREQUENCY_CONFIRMATION_HANDLER_ID,
+    METHOD_CONTRACT_ID as V20_8_LONG_BASELINE_METHOD_CONTRACT_ID,
     analyze_long_baseline_time_frequency_confirmation as analyze_v20_8_long_baseline_time_frequency_confirmation,
     build_dataset_specs as build_v20_8_long_baseline_dataset_specs,
     build_method_contract as build_v20_8_long_baseline_method_contract,
@@ -1024,10 +1029,7 @@ def v20_8_long_baseline_time_frequency_confirmation_continuation(
             "v20.8 long-baseline time-frequency classification is invalid."
         )
     method_contract_id = summary.get("methodContractID")
-    if method_contract_id == (
-        "openstar.tess.v20-8-long-baseline-time-frequency-confirmation."
-        "leave-one-independent-sector-out.v1"
-    ):
+    if method_contract_id == V20_8_LONG_BASELINE_METHOD_CONTRACT_ID:
         output_suffix = (
             "v20.8.1-long-baseline-time-frequency-confirmation"
         )
@@ -6299,9 +6301,18 @@ def build_engine(
         if confirmed_contract is not None:
             print(f"   method contract: {result.get('methodContractID')}")
             print(f"   method hash: {result.get('methodContractHash')}")
+            period_reference = (
+                (confirmation_stage.result.get("methodContract") or {})
+                .get("evidenceBoundary", {})
+                .get("periodReference", {})
+            )
+            period_label = (
+                "established physical period"
+                if period_reference.get("physicalCycleResolved") is True
+                else "established unresolved family reference"
+            )
             print(
-                "   established unresolved family reference: "
-                f"{established_period} days"
+                f"   {period_label}: {established_period} days"
             )
         else:
             print(f"   established physical period: {established_period} days")
@@ -7690,10 +7701,22 @@ def build_engine(
         mode_identification = _latest_result_for_handler(
             investigation, "openstar.tess.mode-identification.analyze",
         )
+        localization_preparation = _latest_result_for_handler(
+            investigation,
+            "openstar.tess.residual-mode-localization.prepare",
+        )
         family_context = frozen_residual_localization_family(
             morphology, dynamic_harmonic, time_frequency_prepare, time_frequency,
             mode_identification,
         )
+        if family_context is None:
+            family_context = (
+                frozen_confirmed_mode_localization_preparation_family(
+                    morphology,
+                    mode_identification,
+                    localization_preparation,
+                )
+            )
         residual_localization = _latest_result_for_handler(
             investigation,
             "openstar.tess.residual-mode-localization.interpret",
@@ -7888,6 +7911,16 @@ def build_engine(
             and stage.handler_id == "openstar.tess.mode-identification.analyze"
         ), None)
         mode = (mode_stage.result or {}) if mode_stage else None
+        localization_preparation_stage = next((
+            stage for stage in reversed(investigation.stages)
+            if stage.status == "COMPLETE"
+            and stage.handler_id
+                == "openstar.tess.residual-mode-localization.prepare"
+        ), None)
+        localization_preparation = (
+            (localization_preparation_stage.result or {})
+            if localization_preparation_stage is not None else None
+        )
         nonstationary_stage = next((
             stage for stage in reversed(investigation.stages)
             if stage.status == "COMPLETE"
@@ -7911,6 +7944,7 @@ def build_engine(
         resolved_period = (morphology or {}).get("resolvedPhysicalPeriodDays")
         harmonic_orders = (1, 2)
         family_context = None
+        family_adapter = None
         physical_cycle_resolved = bool((morphology or {}).get("physicalCycleResolved"))
         adapter_backed_family = not physical_cycle_resolved
         # Preserve the historical resolved + v20.9 route byte-for-byte at the
@@ -7920,6 +7954,18 @@ def build_engine(
             family_context = frozen_residual_localization_family(
                 morphology, dynamic, time_frequency_prepare, time_frequency, mode,
             )
+            family_adapter = "frozen_residual_localization_family"
+            if family_context is None:
+                family_context = (
+                    frozen_confirmed_mode_localization_preparation_family(
+                        morphology,
+                        mode,
+                        localization_preparation,
+                    )
+                )
+                family_adapter = (
+                    "frozen_confirmed_mode_localization_preparation_family"
+                )
             if family_context is None:
                 raise RuntimeError(
                     "v20.12 requires either a morphology-resolved physical period or "
@@ -7945,12 +7991,17 @@ def build_engine(
         # mode-identification evidence.  Adapt that durable evidence to the
         # historical shape consumed by the v20.12 project builder.
         if adapter_backed_family:
-            evidence_stages = (
+            evidence_stages = [
                 stage for stage in (
-                    morphology_stage, dynamic_stage, time_frequency_prepare_stage,
-                    time_frequency_stage, mode_stage,
+                    morphology_stage, dynamic_stage,
+                    time_frequency_prepare_stage, time_frequency_stage,
+                    mode_stage,
                 ) if stage is not None
-            )
+            ]
+            if family_adapter == (
+                "frozen_confirmed_mode_localization_preparation_family"
+            ):
+                evidence_stages.append(localization_preparation_stage)
             residual_model = dict(residual_model)
             residual_model_evidence = {
                 "sources": [
@@ -7958,7 +8009,7 @@ def build_engine(
                      "resultHash": sha256_json(stage.result or {})}
                     for stage in evidence_stages
                 ],
-                "adapter": "frozen_residual_localization_family",
+                "adapter": family_adapter,
             }
         elif nonstationary is not None:
             residual_model = dict(nonstationary)
@@ -7986,9 +8037,19 @@ def build_engine(
                               time_frequency_stage, mode_stage)
                 if stage is not None
             ]
+            if family_adapter == (
+                "frozen_confirmed_mode_localization_preparation_family"
+            ):
+                family_sources.append({
+                    "stageID": localization_preparation_stage.id,
+                    "handlerID": localization_preparation_stage.handler_id,
+                    "resultHash": sha256_json(
+                        localization_preparation_stage.result or {}
+                    ),
+                })
             family_evidence = {
                 "sources": family_sources,
-                "adapter": "frozen_residual_localization_family",
+                "adapter": family_adapter,
                 "referenceKind": reference_kind,
             }
         if physical_cycle_resolved and not adapter_backed_family:
@@ -9600,12 +9661,18 @@ def build_engine(
         identity = _latest_result_for_handler(investigation, "openstar.tess.catalog-identity")
         independent_prepare = _latest_result_for_handler(investigation, "openstar.tess.independent.prepare")
         morphology = _latest_result_for_handler(investigation, "openstar.tess.morphology.analyze")
+        mode = _latest_result_for_handler(
+            investigation, "openstar.tess.mode-identification.analyze")
+        localization_prepare = _latest_result_for_handler(
+            investigation, "openstar.tess.residual-mode-localization.prepare")
         nonstationary = _latest_result_for_handler(investigation, "openstar.tess.nonstationary.summarize")
         catalog_guided_prepare = _latest_result_for_handler(
             investigation, "openstar.tess.catalog-guided-source-localization.prepare")
         official_prf_prepare = _latest_result_for_handler(
             investigation, "openstar.tess.official-spoc-prf-forward-modeling.prepare")
         multisource = _latest_result_for_handler(investigation, "openstar.tess.multi-source-residual.interpret")
+        multisource_prepare = _latest_result_for_handler(
+            investigation, "openstar.tess.multi-source-residual.prepare")
         residual_phase_localization = _latest_result_for_handler(
             investigation, "openstar.tess.residual-phase-difference-imaging.interpret")
         temporal_source_model = _latest_result_for_handler(
@@ -9632,12 +9699,20 @@ def build_engine(
             and dynamic_bridge.get("residualReferenceFrequency") is not None
             and dynamic_bridge.get("residualTimeReferenceDays") is not None
             and dynamic_bridge.get("fractionalFrequencyDriftPerDay") is not None)
+        confirmed_prf_family = frozen_confirmed_mode_prf_preparation_family(
+            morphology,
+            mode,
+            localization_prepare,
+            multisource_prepare,
+            official_prf_prepare,
+        )
+        confirmed_mode_route = confirmed_prf_family is not None
         historical_route = bool(
             morphology and morphology.get("physicalCycleResolved") and nonstationary)
-        if not historical_route and not unresolved_dynamic_route:
+        if not historical_route and not unresolved_dynamic_route and not confirmed_mode_route:
             raise RuntimeError(
                 "v20.14 requires either resolved morphology/nonstationary evidence or the "
-                "persisted unresolved family/residual PRF bridge.")
+                "persisted unresolved or confirmed-mode family/residual PRF bridge.")
         if multisource is None or offset_source is None:
             raise RuntimeError("v20.14 requires completed decomposition and catalog results.")
         if offset_source.get("recommendedNextTest") not in {
@@ -9657,11 +9732,13 @@ def build_engine(
         print(f"   counterpart Gaia DR3: {ids.get('gaiaDR3SourceID')}")
         print(f"   offset component: {multisource.get('bestOffsetComponentID')}")
         print("   simultaneously deblending target-control and catalog-counterpart residual series per sector")
-        family_period = (float(dynamic_bridge["referenceFamilyPeriodDays"])
-                         if unresolved_dynamic_route
+        persisted_bridge_route = unresolved_dynamic_route or confirmed_mode_route
+        selected_bridge = official_prf_prepare if confirmed_mode_route else dynamic_bridge
+        family_period = (float(selected_bridge["referenceFamilyPeriodDays"])
+                         if persisted_bridge_route
                          else float(morphology["resolvedPhysicalPeriodDays"]))
-        harmonic_orders = ([int(value) for value in dynamic_bridge["subtractedHarmonicOrders"]]
-                           if unresolved_dynamic_route else None)
+        harmonic_orders = ([int(value) for value in selected_bridge["subtractedHarmonicOrders"]]
+                           if persisted_bridge_route else None)
         print(f"   persisted {family_period}-day family is removed before distributed residual searches")
         print(f"   physical cycle resolved: {not unresolved_dynamic_route}")
         spec = build_offset_source_variability_project(
@@ -9678,23 +9755,23 @@ def build_engine(
             physical_period_days=(float(morphology["resolvedPhysicalPeriodDays"])
                                   if historical_route else None),
             nonstationary_summary=nonstationary if historical_route else None,
-            reference_family_period_days=family_period if unresolved_dynamic_route else None,
+            reference_family_period_days=family_period if persisted_bridge_route else None,
             harmonic_orders=harmonic_orders,
-            physical_cycle_resolved=False if unresolved_dynamic_route else True,
-            residual_reference_frequency=(dynamic_bridge["residualReferenceFrequency"]
-                                          if unresolved_dynamic_route else None),
-            residual_time_reference_days=(dynamic_bridge["residualTimeReferenceDays"]
-                                          if unresolved_dynamic_route else None),
+            physical_cycle_resolved=not unresolved_dynamic_route,
+            residual_reference_frequency=(selected_bridge["residualReferenceFrequency"]
+                                          if persisted_bridge_route else None),
+            residual_time_reference_days=(selected_bridge["residualTimeReferenceDays"]
+                                          if persisted_bridge_route else None),
             fractional_frequency_drift_per_day=(
-                dynamic_bridge["fractionalFrequencyDriftPerDay"]
-                if unresolved_dynamic_route else None),
-            frozen_sectors=(list(dynamic_bridge.get("sectors") or [])
-                            if unresolved_dynamic_route else None),
+                selected_bridge["fractionalFrequencyDriftPerDay"]
+                if persisted_bridge_route else None),
+            frozen_sectors=(list(selected_bridge.get("sectors") or [])
+                            if persisted_bridge_route else None),
             family_residual_provenance=(
-                {"bridgeVersion": dynamic_bridge.get("version"),
-                 "preparationPath": dynamic_bridge.get("preparationPath"),
-                 "priorEvidence": dynamic_bridge.get("priorEvidence")}
-                if unresolved_dynamic_route else None),
+                {"bridgeVersion": selected_bridge.get("version"),
+                 "preparationPath": selected_bridge.get("preparationPath"),
+                 "priorEvidence": selected_bridge.get("priorEvidence")}
+                if persisted_bridge_route else None),
         )
         print(f"   generic workload: {spec.get('workloadID')}")
         print(f"   reference residual period: {spec.get('referencePeriodDays')} days")
