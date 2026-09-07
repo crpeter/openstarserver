@@ -834,3 +834,76 @@ python -m unittest tests.workflows.microlensing.test_build_supported_anomaly_mor
 
 Tests, builds, downloads, servers, coordinators and workloads were not run as
 part of this implementation.
+
+## Validate the completed supported morphology investigation
+
+The offline validator verifies the original PR171 preparation, PR177 coarse
+project and completed investigation, PR186 validation report, and the complete
+PR187 supported project. It reconstructs the supported project, all four
+datasets and the hashed build manifest against the verified coarse domain,
+including numerical arrays, axes, indexing, shard sizes and provenance. It then
+checks the actual supported investigation identities, canonical stage order,
+immutable ledgers, terminal result, dataset mapping and complete accounting.
+It uses project-prefixed counters for project coverage and checks every dataset
+and the sums; unprefixed run counters describe the final dataset.
+
+Run the focused test locally from the repository root:
+
+```bash
+python -m unittest tests.workflows.microlensing.test_validate_supported_anomaly_morphology_grid -v
+```
+
+Complete command for the existing local artifacts (the output must be new):
+
+```bash
+python -m workflows.microlensing.validate_supported_anomaly_morphology_grid \
+  --morphology-root /Users/petercody/Documents/OpenStarScience/microlensing/recovery-a-anomaly-morphology-pr171-v1 \
+  --coarse-project-root /Users/petercody/Documents/OpenStarScience/microlensing/recovery-a-anomaly-morphology-coarse-pr177-v1 \
+  --coarse-investigation-record /Users/petercody/Documents/OpenStarScience/microlensing/recovery-a-anomaly-morphology-coarse-run-v3/microlensing-recovery-a-anomaly-morphology-coarse-v3/investigation.json \
+  --coarse-validation-root /Users/petercody/Documents/OpenStarScience/microlensing/recovery-a-anomaly-morphology-validation-pr186-v1 \
+  --supported-project-root /Users/petercody/Documents/OpenStarScience/microlensing/recovery-a-supported-morphology-pr187-v1 \
+  --supported-investigation-record /Users/petercody/Documents/OpenStarScience/microlensing/recovery-a-supported-morphology-run-v1/microlensing-recovery-a-supported-morphology-v1/investigation.json \
+  --output-root /Users/petercody/Documents/OpenStarScience/microlensing/recovery-a-supported-morphology-validation-v1
+```
+
+Three files publish atomically:
+
+- `supported-anomaly-morphology-validation.json`: versioned report, input hashes,
+  provenance, all four searches, candidate accounting, support counts and nearest
+  distances, amplitude signs, axis indices/boundaries, numerical ranking,
+  independent joint statistics, every interpretation gate and its inputs and
+  thresholds, classification, limitations and deterministic next test.
+- `supported-anomaly-morphology-validation.md`: short readable summary.
+- `artifact-manifest.json`: versioned manifest with input and output hashes.
+
+Each non-null saved supported winner is reproduced numerically through the
+supported workload's identity-checking adapter. Its exact index/parameter mapping,
+fits and information criteria must agree under the published tolerances, and
+its support is independently checked using separate exponentials, inclusive
+2-effective-width boundaries and positive weights. Zero fitted amplitudes still
+require geometric support. Unsupported accepted winners fail validation.
+Complete searches with zero eligible candidates and null winners remain valid
+completed searches with unresolved interpretation.
+
+The report reuses the frozen PR186 interpretation rules. Strictly negative
+components cannot be replaced by zero amplitudes, and combined improvement
+cannot hide a series that fails the per-series improvement gate. Independent
+joint BIC/AICc are computed once from summed WRSS, summed nominal parameter
+counts and combined positive-weight sample count, not by summing separate
+BIC/AICc values. Numerical ranking remains separate from gated preference.
+
+This is an accepted-winner and accounting-consistency audit. It reproduces only
+the four original saved winners plus each non-null supported winner. It does not
+enumerate the grid, recompute shards, independently reproduce every rejection
+count, or independently prove global optimality. Eligibility is not measured
+duration, convergence, cross-series replication or planetary evidence. Searched
+boundary warnings remain; fixed axes are not searched boundaries. The report
+always retains `planetaryInterpretationResolved: false` and
+`discoveryClaim: false`.
+
+Canonical JSON, exact artifact sets, hashes, stage ledgers and path/symlink
+protections fail closed. Existing output directories are rejected and inputs
+remain unchanged. Tests and real-artifact execution were not run during
+implementation; the Mac artifacts were unavailable in the implementation
+environment. The reported 441/441 work units and 28,078 / 0 / 23,251 / 4,827
+candidate counts are reference observations, not implementation constants.
