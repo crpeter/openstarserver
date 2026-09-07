@@ -124,10 +124,18 @@ class SupportedBuilderTests(fixtures.MorphologyValidationFixture):
                 manifest["inputHashes"][key] = value
                 fixtures.write_json(path, manifest)
                 self.reject_supported("validation manifest")
+        manifest = copy.deepcopy(original)
+        report_hash = manifest["outputSHA256s"][validation.RESULT_RELATIVE_PATH]
+        manifest["outputSHA256s"][validation.RESULT_RELATIVE_PATH] = (
+            ("1" if report_hash[0] == "0" else "0") + report_hash[1:]
+        )
+        fixtures.write_json(path, manifest)
+        self.reject_supported("^validation manifest does not reconstruct exactly$")
+
         fixtures.write_json(path, original)
         report_path = self.validation_root / validation.RESULT_RELATIVE_PATH
         report_path.write_bytes(report_path.read_bytes() + b"\n")
-        self.reject_supported("validation manifest")
+        self.reject_supported("^validation report is not canonical stable JSON$")
 
     def test_source_arrays_are_verified_before_publication(self):
         project = fixtures.read_json(self.coarse / "project.json")
