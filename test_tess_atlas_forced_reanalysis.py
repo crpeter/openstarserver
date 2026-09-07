@@ -95,7 +95,7 @@ class CurrentATLASSignedReanalysisTests(unittest.TestCase):
         self.assertFalse(_awaiting_atlas_signed_reanalysis_adapter(completed))
 
     def test_signed_rows_reused_with_frozen_grid_and_exact_source_ids(self):
-        original = {item["rawPath"]: Path(item["rawPath"]).read_bytes() for item in self.summary["sourceRecords"]}
+        original = {str(Path(item["rawPath"]).resolve()): Path(item["rawPath"]).read_bytes() for item in self.summary["sourceRecords"]}
         result = self.build()
         self.assertEqual(12, result["totalWorkUnits"])
         self.assertFalse(result["rawArchiveRequeried"])
