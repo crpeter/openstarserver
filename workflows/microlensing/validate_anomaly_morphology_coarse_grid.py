@@ -29,7 +29,7 @@ from workflows.microlensing.build_anomaly_morphology_coarse_grid import (
     _nonempty_string, _regular_directory, _reject_symlink_components,
     _safe_sum, _sha256_bytes, _stable_json_bytes,
 )
-from workflows.microlensing.coarse_grid import _assert_identity_free, _atomic_write_bytes
+from workflows.microlensing.coarse_grid import CoarseGridBuildError, _assert_identity_free, _atomic_write_bytes
 from workflows.microlensing.refine_grid import (
     PREPARE_HANDLER_ID, PROJECT_RUN_HANDLER_ID, SMOKE_WORKFLOW_ID,
     TERMINAL_CHECK_HANDLER_ID, RefinementGridBuildError,

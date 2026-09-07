@@ -384,6 +384,24 @@ class SupportAndMetricTests(unittest.TestCase):
 
 
 class MalformedInputTests(MorphologyValidationFixture):
+    def test_investigation_identity_rejection_preserves_public_exception(self):
+        record = read_json(self.investigation)
+        # software_id permits nonempty strings; the identity scan must reject
+        # this token after the real stage-shape, hash, and ledger checks pass.
+        record["stages"][1]["provenance"]["software_id"] = "openstar.workflow-engine.OGLE"
+        write_record(self.investigation, record)
+        record_bytes = self.investigation.read_bytes()
+        with patch.object(validation, "_assert_identity_free", wraps=validation._assert_identity_free) as scan:
+            with self.assertRaisesRegex(
+                validation.AnomalyMorphologyCoarseGridValidationError,
+                "coarse-grid output would contain source identity or provenance",
+            ) as raised:
+                self.report("identity-rejected")
+        scan.assert_called_with((record_bytes,))
+        self.assertIsInstance(raised.exception.__cause__, validation.CoarseGridBuildError)
+        self.assertFalse((self.root / "identity-rejected").exists())
+        self.assertFalse(list(self.root.glob(".identity-rejected.*")))
+
     def test_bad_coverage_and_counter_scopes_with_rehashed_ledgers(self):
         original = read_json(self.investigation)
         mutations = (
