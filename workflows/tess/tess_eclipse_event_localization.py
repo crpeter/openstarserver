@@ -143,7 +143,10 @@ def _catalog_pixels(item: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _event_jackknife(cube: np.ndarray, valid: np.ndarray, inside: np.ndarray,
-                     control: np.ndarray, cycles: np.ndarray) -> tuple[float, list[dict[str, Any]]]:
+                     control: np.ndarray, cycles: np.ndarray, *,
+                     image_measurement=None) -> tuple[float, list[dict[str, Any]]]:
+    if image_measurement is None:
+        image_measurement = _centroid_from_frames
     labels = sorted(set(int(value) for value in cycles[inside]))
     centroids = []
     for omitted in labels:
@@ -152,7 +155,7 @@ def _event_jackknife(cube: np.ndarray, valid: np.ndarray, inside: np.ndarray,
         keep_out = np.flatnonzero(control & (cycles != omitted))
         if len(keep_in) < 2 or len(keep_out) < 2:
             continue
-        image = _centroid_from_frames(cube, valid, keep_out, keep_in)
+        image = image_measurement(cube, valid, keep_out, keep_in)
         centroids.append({"omittedCycle": omitted, "centroidX": image["centroidX"],
                           "centroidY": image["centroidY"]})
     if len(centroids) < 2:
@@ -167,7 +170,14 @@ def _event_jackknife(cube: np.ndarray, valid: np.ndarray, inside: np.ndarray,
 
 
 def measure_eclipse_sector(item: dict[str, Any], frozen: dict[str, Any],
-                           ephemeris: dict[str, Any]) -> dict[str, Any]:
+                           ephemeris: dict[str, Any], *,
+                           centroid_method: str = "legacy-v1") -> dict[str, Any]:
+    image_measurement = _centroid_from_frames
+    if centroid_method == "common-support-v2":
+        from .tess_eclipse_common_support import common_support_image
+        image_measurement = common_support_image
+    elif centroid_method != "legacy-v1":
+        raise ValueError("Unknown eclipse centroid method")
     sector, role = int(frozen["sector"]), str(frozen["role"])
     period = float(ephemeris["refinedPeriodDays"])
     epoch = float(frozen["eventEpoch"])
@@ -200,8 +210,9 @@ def measure_eclipse_sector(item: dict[str, Any], frozen: dict[str, Any],
     if np.count_nonzero(inside) < MIN_BIN_CADENCES or np.count_nonzero(control) < MIN_BIN_CADENCES or event_count < MIN_EVENTS:
         raise EclipseLocalizationDataUnavailable("inadequate frozen eclipse/control-window coverage")
     try:
-        image = _centroid_from_frames(corrected, valid, np.flatnonzero(control), np.flatnonzero(inside))
-        uncertainty, jackknife = _event_jackknife(corrected, valid, inside, control, cycles)
+        image = image_measurement(corrected, valid, np.flatnonzero(control), np.flatnonzero(inside))
+        uncertainty, jackknife = _event_jackknife(
+            corrected, valid, inside, control, cycles, image_measurement=image_measurement)
     except RuntimeError as error:
         raise _translate_scientific_runtime(error) from error
     catalog = _catalog_pixels(item)
@@ -330,6 +341,15 @@ def localize_eclipse_events(*, binary_confirmation: dict[str, Any], identity: di
                                    "reason": f"NoPixelCoverageError: {error}"})
                 continue
             raise
+    return summarize_eclipse_results(
+        results=results, rejections=rejections, binary_confirmation=binary_confirmation,
+        identity=identity, frozen_catalog=frozen_catalog)
+
+
+def summarize_eclipse_results(*, results, rejections, binary_confirmation, identity,
+                              frozen_catalog, result_version=RESULT_VERSION):
+    """Apply the unchanged cross-sector policy to independently measured sectors."""
+    ephemeris = binary_confirmation["linearEphemeris"]
     independent = [item for item in results if item["role"] == "INDEPENDENT" and item["usable"]]
     groups: dict[str, list[dict[str, Any]]] = {}
     off_catalog = []
@@ -369,7 +389,7 @@ def localize_eclipse_events(*, binary_confirmation: dict[str, Any], identity: di
         classification = "INSUFFICIENT_OR_AMBIGUOUS_LOCALIZATION"
     resolved = classification in {"TARGET_CONSISTENT_ECLIPSE_SOURCE", "OFF_TARGET_CATALOG_CANDIDATE_ECLIPSE_SOURCE",
                                   "CONSISTENTLY_OFF_TARGET_ECLIPSE_SOURCE"}
-    return {"resultVersion": RESULT_VERSION, "classification": classification,
+    return {"resultVersion": result_version, "classification": classification,
             "sourceAttributionResolved": resolved, "attributedCatalogHypothesis": winner if resolved else None,
             "usableIndependentSectorCount": len(independent), "requiredIndependentSectorCount": MIN_INDEPENDENT_SECTORS,
             "primarySectorCanSatisfyReplication": False, "sectorResults": results, "sectorRejections": rejections,
