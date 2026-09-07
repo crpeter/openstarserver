@@ -670,3 +670,107 @@ python run_investigation.py \
   --coordinator http://127.0.0.1:8080 \
   --store /path/to/investigations
 ```
+
+## Verify the completed bounded morphology coarse investigation
+
+After the four-search investigation above is complete, build a deterministic
+report in a **new** output directory. This command reads the saved artifacts
+and reproduces only their four accepted winners; it does not run a grid search,
+contact the coordinator, choose a replacement winner, or execute a follow-up.
+
+```bash
+python -m workflows.microlensing.validate_anomaly_morphology_coarse_grid \
+  --morphology-root /path/to/microlensing-recovery-a-morphology \
+  --coarse-project-root /path/to/microlensing-recovery-a-morphology-coarse \
+  --coarse-investigation-record /path/to/investigations/generic-morphology-coarse-investigation/investigation.json \
+  --output-root /path/to/microlensing-recovery-a-morphology-coarse-validation
+```
+
+The verifier checks preparation and coarse contracts, source arrays and hashes,
+recursive typed ancestry (including `coarse.contractID` metadata), exact producer
+reconstruction, investigation identity and terminal state, immutable stage
+ledgers, and all four datasets' coverage and contribution counts. Project totals
+use `projectCompletedWorkUnits` and `projectTotalWorkUnits`; unprefixed run
+counters must agree with the final dataset. Every accepted grid index must map
+to its recorded geometry, reproduce under the existing numerical tolerances,
+and agree with the duplicated winner summary fields.
+
+Publication creates two versioned JSON files:
+
+- `anomaly-morphology-coarse-validation.json`: numerical results, support,
+  boundaries, comparison gates, classification, and follow-up recommendation.
+- `artifact-manifest.json`: result hash, input artifact and immutable ledger
+  hashes, and inherited typed ancestry. Inputs are preserved; existing output
+  directories, symlinks, and outputs nested inside input roots are rejected.
+
+Read the actual report fields with:
+
+```bash
+python - /path/to/microlensing-recovery-a-morphology-coarse-validation <<'PY'
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+result = json.loads((root / "anomaly-morphology-coarse-validation.json").read_text())
+print("classification:", result["overallClassification"])
+print("model preference:", result["modelPreference"])
+print("unsupported searches:", result["unsupportedSearchCount"])
+print("project work units:", result["projectCompletedWorkUnits"], "/", result["projectTotalWorkUnits"])
+print("planetary interpretation resolved:", result["planetaryInterpretationResolved"])
+print("discovery claim:", result["discoveryClaim"])
+for search in result["searches"]:
+    print("\n", search["datasetID"], "accepted index:", search["acceptedWinner"]["gridIndex"])
+    print("searched boundaries:", search["searchedBoundaryAxes"], "fixed axes:", search["fixedAxes"])
+    for component in search["components"]:
+        print(component["component"], "center:", component["center"], "effective width:", component["effectiveWidth"])
+        for support in component["seriesSupport"]:
+            print(support["genericSeriesID"],
+                  "within two widths:", support["positiveWeightSamplesWithinTwoEffectiveWidths"],
+                  "nearest distance / width:", support["nearestPositiveWeightDistanceInEffectiveWidths"],
+                  "supported:", support["supportRequirementMet"])
+print("\nIndependent aggregate:")
+print(json.dumps(result["independentAggregate"], indent=2))
+print("\nModel comparisons:")
+print(json.dumps(result["modelComparisons"], indent=2))
+print("\nRecommended next test:", result["recommendedNextTest"])
+print(result["recommendation"])
+PY
+```
+
+Support uses `effectiveWidth = exp(logScale) * exp(logShape)` in that order.
+Only positive-weight observations count, and the two-width threshold is
+inclusive. For an ordered doublet, the positive center is derived as
+`negativeCenter + separation`. Each component records support separately for
+every applicable series. An axis with one value is `FIXED`, never a searched
+boundary. Searched width boundaries remain unresolved and do not establish a
+measured duration.
+
+`independentAggregate` adds the accepted per-series WRSS and positive-weight N
+in canonical series order, retains nominal k even for zero amplitudes, then
+computes global BIC and AICc once. It never sums per-series information criteria;
+AICc is null with `correctedAkaikeInformationCriterionDefined = false` when
+`N <= k + 1`. `modelComparisons` retains global and per-series improvements,
+signs, exact frozen threshold gates, and support gates. Center dispersions and
+the timing-consistency gate are in `independentAggregate`.
+
+Insufficient support is a valid completed report. If any accepted search has an
+unsupported component, `overallClassification` is
+`UNRESOLVED_OBSERVATIONAL_SUPPORT`, `modelPreference` is null, and
+`modelPreferenceResolved` is false. When all four accepted searches have this
+problem, `unsupportedSearchCount` is 4. Numerical comparisons remain available.
+The recommendation is `SUPPORT_AWARE_BLIND_ANOMALY_MORPHOLOGY_SEARCH`, which
+requires a separately predeclared follow-up accounting for positive-weight
+observations in every applicable series. This verifier neither creates nor
+executes it, and it does not alter workload validity rules.
+
+The saved winners do **not** establish that no supported candidate exists in
+the grid; no unverified runner-up is promoted. Even when support and comparison
+gates pass, these remain generic morphology results with
+`planetaryInterpretationResolved = false` and `discoveryClaim = false`.
+
+The repository owner can run the focused suite locally:
+
+```bash
+python -m unittest tests.workflows.microlensing.test_validate_anomaly_morphology_coarse_grid
+```
