@@ -986,6 +986,9 @@ def _persisted_archive_continuation(investigation: Investigation):
         "openstar.tess.atlas-forced-photometry.prepare",
         "openstar.tess.atlas-forced-photometry.collect",
         "openstar.tess.atlas-forced-photometry.run",
+        "openstar.tess.atlas-forced-photometry-reanalysis.prepare",
+        "openstar.tess.atlas-forced-photometry-reanalysis.run",
+        "openstar.tess.atlas-forced-photometry-reanalysis.interpret",
     }
     for stage in reversed(investigation.stages):
         if stage.handler_id not in archive_handlers or stage.status != "COMPLETE":
@@ -1005,6 +1008,37 @@ def _persisted_archive_continuation(investigation: Investigation):
             or raw.get("triggered_by_stage_id") != stage.id
         ):
             continue
+
+        if stage.handler_id.startswith("openstar.tess.atlas-forced-photometry-reanalysis."):
+            # These late archive stages must precede the earlier Gaia terminal
+            # boundary. Replay only their latest, exact, unattempted handoff.
+            if stage is not investigation.stages[-1] or stage.stop:
+                continue
+            result = stage.result if isinstance(stage.result, dict) else {}
+            phase = stage.handler_id.rsplit(".", 1)[-1]
+            if phase == "prepare":
+                project_path = result.get("projectPath")
+                if result.get("available") is True and isinstance(project_path, str) and project_path:
+                    suffix = "run-atlas-forced-photometry-reanalysis"
+                    expected_handler = "openstar.tess.atlas-forced-photometry-reanalysis.run"
+                    expected_parameters = {"projectPath": project_path}
+                elif result.get("available") is False and not project_path:
+                    suffix = "interpret-atlas-forced-photometry-reanalysis"
+                    expected_handler = "openstar.tess.atlas-forced-photometry-reanalysis.interpret"
+                    expected_parameters = {"distributedRunExpected": False}
+                else:
+                    continue
+            elif phase == "run":
+                suffix = "interpret-atlas-forced-photometry-reanalysis"
+                expected_handler = "openstar.tess.atlas-forced-photometry-reanalysis.interpret"
+                expected_parameters = {"distributedRunExpected": True}
+            else:
+                suffix = "finalize"
+                expected_handler = "openstar.tess.finalize"
+                expected_parameters = {"outputSuffix": "v20.25"}
+            if (continuation_id != _continuation_stage_id(stage, suffix)
+                    or handler_id != expected_handler or parameters != expected_parameters):
+                continue
 
         # Collection is an asynchronous archive boundary.  Resume only the exact
         # immutable continuation that the collector produced, and ensure its

@@ -3,7 +3,9 @@ import hashlib
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from openstar_investigation import Investigation, InvestigationStage, InvestigationStore, sha256_json
@@ -11,7 +13,9 @@ from openstar_targets import InvestigationTarget
 from openstar_workflow import StageRequest
 from workflows.tess import tess_atlas_forced_photometry as atlas
 from workflows.tess import tess_atlas_forced_reanalysis as reanalysis
-from workflows.tess.tess_autonomy import plan_tess_branches, repair_obsolete_terminal_wait
+from workflows.tess.tess_autonomy import (
+    _persisted_archive_continuation, plan_tess_branches, repair_obsolete_terminal_wait,
+)
 from workflows.tess.tess_investigation import build_engine
 
 
@@ -56,6 +60,9 @@ class CurrentATLASSignedReanalysisTests(unittest.TestCase):
     def investigation(self):
         prepared = InvestigationStage("001-prepare-target", "openstar.tess.prepare-target",
             "COMPLETE", None, {}, result={"sourceProjectID": "p", "datasetID": "d", "ticID": 123})
+        gaia = InvestigationStage("043-interpret-gaia",
+            "openstar.tess.gaia-source-resolved-counterpart-photometry.interpret",
+            "COMPLETE", None, {}, result={})
         interpreted = InvestigationStage("057-interpret-atlas-forced-photometry",
             "openstar.tess.atlas-forced-photometry.interpret", "COMPLETE", None, {},
             result=copy.deepcopy(self.summary), stop=True)
@@ -63,7 +70,7 @@ class CurrentATLASSignedReanalysisTests(unittest.TestCase):
             "BLOCKED", "now", "now", {"datasetID": "d", "controlState": {
                 "schedulerAction": "WAIT_FOR_PREREQUISITES",
                 "missingPrerequisites": ["openstar.capability.current-atlas-signed-reanalysis-adapter"]}},
-            (prepared, interpreted))
+            (prepared, gaia, interpreted))
 
     def test_exact_blocked_handoff_reopens_once_and_uses_registered_prepare(self):
         inv = self.investigation()
@@ -93,6 +100,63 @@ class CurrentATLASSignedReanalysisTests(unittest.TestCase):
         self.assertEqual("openstar.tess.atlas-forced-photometry-reanalysis.run", stage.next_stage["handler_id"])
         from workflows.tess.tess_autonomy import _awaiting_atlas_signed_reanalysis_adapter
         self.assertFalse(_awaiting_atlas_signed_reanalysis_adapter(completed))
+
+        # Reproduce the real premature COMPLETE state after preparation, with
+        # the earlier Gaia result still present in the investigation history.
+        premature = replace(completed, status="COMPLETE", metadata={**completed.metadata,
+            "controlState": {"schedulerAction": "INVESTIGATION_COMPLETE"}})
+        store.save(premature)
+        resumed = repair_obsolete_terminal_wait(store, premature)
+        self.assertEqual("RUNNING", resumed.status)
+        self.assertEqual(premature.stages, resumed.stages)
+        self.assertEqual(stage.next_stage, resumed.metadata["controlState"]["selectedExperiment"])
+        self.assertEqual(resumed, repair_obsolete_terminal_wait(store, resumed))
+
+        coordinator = mock.Mock()
+        coordinator.run_project.return_value = SimpleNamespace(
+            status={"datasets": []}, node_contributions={}, project_id=stage.result["projectID"])
+        engine = build_engine(store, coordinator, poll_interval=0, timeout=1)
+        engine.chain_stages = False
+        for expected_handler in ("openstar.tess.atlas-forced-photometry-reanalysis.run",
+                                 "openstar.tess.atlas-forced-photometry-reanalysis.interpret"):
+            planned = plan_tess_branches(resumed, target)[0].experiment
+            self.assertEqual(expected_handler, planned.handler_id)
+            self.assertEqual(resumed.stages[-1].next_stage, {
+                "id": planned.id, "handler_id": planned.handler_id,
+                "parameters": planned.parameters, "triggered_by_stage_id": planned.triggered_by_stage_id})
+            resumed = engine.run(resumed, planned, software_id="test", software_version="1")
+            self.assertEqual("COMPLETE", resumed.stages[-1].status, resumed.stages[-1].error)
+        coordinator.run_project.assert_called_once_with(stage.result["projectPath"], poll_interval=0, timeout=1)
+        finalizer = plan_tess_branches(resumed, target)[0].experiment
+        self.assertEqual("openstar.tess.finalize", finalizer.handler_id)
+        self.assertEqual({"outputSuffix": "v20.25"}, finalizer.parameters)
+
+    def test_reanalysis_continuation_rejects_changed_or_attempted_handoffs(self):
+        inv = self.investigation()
+        handoff = {"id": "059-run-atlas-forced-photometry-reanalysis",
+                   "handler_id": "openstar.tess.atlas-forced-photometry-reanalysis.run",
+                   "parameters": {"projectPath": "/frozen/project.json"},
+                   "triggered_by_stage_id": "058-prepare-atlas-forced-photometry-reanalysis"}
+        prepared = InvestigationStage(handoff["triggered_by_stage_id"],
+            "openstar.tess.atlas-forced-photometry-reanalysis.prepare", "COMPLETE",
+            inv.stages[-1].id, {}, result={"available": True, "projectPath": "/frozen/project.json"},
+            next_stage=handoff)
+        inv = replace(inv, status="COMPLETE", stages=inv.stages + (prepared,),
+                      metadata={"controlState": {"schedulerAction": "INVESTIGATION_COMPLETE"}})
+        self.assertIsNotNone(_persisted_archive_continuation(inv))
+        for key, value in (("id", "099-wrong"), ("handler_id", "openstar.tess.finalize"),
+                           ("parameters", {"projectPath": "/different.json"}),
+                           ("triggered_by_stage_id", "wrong")):
+            with self.subTest(field=key):
+                broken = replace(inv, stages=inv.stages[:-1] + (
+                    replace(prepared, next_stage={**handoff, key: value}),))
+                self.assertIsNone(_persisted_archive_continuation(broken))
+        for status in ("COMPLETE", "FAILED", "RUNNING"):
+            attempted = InvestigationStage(handoff["id"], handoff["handler_id"], status,
+                                          prepared.id, handoff["parameters"])
+            self.assertIsNone(_persisted_archive_continuation(replace(inv, stages=inv.stages + (attempted,))))
+        later = InvestigationStage("060-finalize", "openstar.tess.finalize", "COMPLETE", None, {}, stop=True)
+        self.assertIsNone(_persisted_archive_continuation(replace(inv, stages=inv.stages + (later,))))
 
     def test_signed_rows_reused_with_frozen_grid_and_exact_source_ids(self):
         original = {str(Path(item["rawPath"]).resolve()): Path(item["rawPath"]).read_bytes() for item in self.summary["sourceRecords"]}
@@ -170,13 +234,15 @@ class CurrentATLASSignedReanalysisTests(unittest.TestCase):
         request = StageRequest(**repaired.metadata["controlState"]["selectedExperiment"])
         prepared = engine.run(repaired, request, software_id="test", software_version="1")
         self.assertEqual("COMPLETE", prepared.stages[-1].status, prepared.stages[-1].error)
-        request = StageRequest(**prepared.stages[-1].next_stage)
+        target = InvestigationTarget("d", inv.id, inv.workflow_id, inv.workflow_version)
+        request = plan_tess_branches(prepared, target)[0].experiment
         self.assertEqual("openstar.tess.atlas-forced-photometry-reanalysis.interpret", request.handler_id)
         interpreted = engine.run(prepared, request, software_id="test", software_version="1")
         stage = interpreted.stages[-1]
         self.assertEqual("COMPLETE", stage.status, stage.error)
         self.assertEqual("openstar.tess.finalize", stage.next_stage["handler_id"])
         self.assertEqual({"outputSuffix": "v20.25"}, stage.next_stage["parameters"])
+        self.assertEqual("openstar.tess.finalize", plan_tess_branches(interpreted, target)[0].experiment.handler_id)
 
 
 if __name__ == "__main__":
