@@ -774,3 +774,63 @@ The repository owner can run the focused suite locally:
 ```bash
 python -m unittest tests.workflows.microlensing.test_validate_anomaly_morphology_coarse_grid
 ```
+
+## Build the supported morphology grid on the unchanged coarse domain
+
+The separately identified `openstar.supported-morphology-grid.v1` workload
+selects the best numerically valid candidate with a positive-weight observation
+within two effective widths of every component in every applicable series.
+Its [frozen wire contract and portable examples](../../openstar_workloads/plugins/supported_morphology_grid/README.md)
+are shared with the separately developed Apple implementation.
+
+Use the real PR171 preparation, PR177 bounded coarse project, completed v3
+investigation record, and PR186 validation report **and** artifact manifest:
+
+```bash
+python -m workflows.microlensing.build_supported_anomaly_morphology_grid \
+  --morphology-root /path/to/microlensing-recovery-a-morphology-preparation \
+  --coarse-project-root /path/to/microlensing-recovery-a-morphology-coarse \
+  --coarse-investigation-record /path/to/investigations/generic-morphology-coarse-v3/investigation.json \
+  --coarse-validation-root /path/to/microlensing-recovery-a-morphology-coarse-validation \
+  --project-id generic-supported-morphology \
+  --output-root /path/to/microlensing-recovery-a-supported-morphology
+```
+
+Replace the paths with existing verified artifacts and choose a new output
+directory. The builder reuses the preparation, typed ancestry, coarse artifact,
+investigation ledger, exact coverage and accepted-winner verifiers. It
+reconstructs the entire PR186 report and manifest, including hashes, support and
+metric fields; a classification alone is insufficient. Only the four saved
+winners are reproduced during source verification. No grid search, coordinator,
+resampling, normalization, refinement, widening or winner preselection occurs.
+
+All four original datasets retain their numerical arrays, sample-index
+provenance, axes, strict center-pair and mixed-radix indexing,
+`candidatesPerWorkUnit`, candidate counts and work-unit counts. Thus the real
+441-work-unit source remains a 441-work-unit project; the builder copies verified
+counts and does not hard-code 441 for miniature or other valid sources.
+
+Only project/dataset IDs, workload/schema/execution IDs and the required
+`supportPolicyID` change, with explicit provenance added for preparation,
+coarse artifacts, investigation/ledgers and validation artifacts. Old results
+are not republished under new identities. `project.json`, four dataset files,
+and a versioned `build-manifest.json` publish atomically. The manifest records
+output file SHA-256 values and `buildManifestSHA256`, defined over its canonical
+compact JSON body with that one digest field omitted. Existing output roots,
+symlinks and output paths inside input directories are rejected; inputs remain
+unchanged.
+
+A processed shard with no eligible candidates succeeds with a null winner.
+Complete grid coverage with no eligible candidates is COMPLETE with null
+winner summaries. Both rejection counts remain visible, and the result only
+establishes support and ranking for this searched grid.
+
+Run these focused tests locally:
+
+```bash
+python -m unittest discover -s tests/workloads/supported_morphology_grid -p 'test_*.py' -v
+python -m unittest tests.workflows.microlensing.test_build_supported_anomaly_morphology_grid -v
+```
+
+Tests, builds, downloads, servers, coordinators and workloads were not run as
+part of this implementation.
