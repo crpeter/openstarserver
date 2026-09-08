@@ -907,3 +907,81 @@ remain unchanged. Tests and real-artifact execution were not run during
 implementation; the Mac artifacts were unavailable in the implementation
 environment. The reported 441/441 work units and 28,078 / 0 / 23,251 / 4,827
 candidate counts are reference observations, not implementation constants.
+
+## Build the supported ordered-doublet diagnostic refinement
+
+`build_supported_doublet_refinement` verifies the complete PR171 / PR177 /
+PR186 / PR187 ancestry and saved supported investigation using the existing
+pure verification helpers. It reconstructs the PR190 report, Markdown and
+manifest, including their input/output hashes, before accepting its canonical
+ordered-doublet winner. The parent must have complete coverage, a non-null
+numerically reproduced and geometrically supported winner, separation at the
+lower searched boundary, interior negative center and both log scales, and
+both log shapes fixed. Incompatible artifacts fail explicitly.
+
+The builder publishes one supported-morphology ordered-doublet dataset with
+unchanged series, sample order, coordinates, values, inverse variances, fixed
+shape axes and shard size. It derives these axes mechanically:
+
+| Axis | Count | Step | Start | Retained parent index |
+| --- | ---: | --- | --- | ---: |
+| negativeCenter | 9 | parent step / 8 | accepted center − 4 new steps | 4 |
+| separation | 41 | accepted separation / 4 | new step | 3 |
+| negativeLogScale | 5 | parent step / 4 | accepted log scale − 2 new steps | 2 |
+| negativeLogShape | 1 | preserve parent representation | preserve parent value | 0 |
+| positiveLogScale | 5 | parent step / 4 | accepted log scale − 2 new steps | 2 |
+| positiveLogShape | 1 | preserve parent representation | preserve parent value | 0 |
+
+There are **9,225 candidates / 145 work units at 64 candidates per work unit**.
+The final shard starts at index 9,216 and has 9 candidates. The accepted parent
+parameters are retained at new mixed-radix index 4,187 within the published
+numerical tolerance. Separations remain strictly positive. Schema validation
+checks workload compatibility; neither candidate grids nor shards are executed.
+Only the bounded saved winners needed for source verification are reproduced.
+
+Run the focused tests locally from the repository root:
+
+```bash
+python -m unittest tests.workflows.microlensing.test_build_supported_doublet_refinement -v
+```
+
+Complete real-artifact command (the output directory must be new):
+
+```bash
+python -m workflows.microlensing.build_supported_doublet_refinement \
+  --morphology-root /Users/petercody/Documents/OpenStarScience/microlensing/recovery-a-anomaly-morphology-pr171-v1 \
+  --coarse-project-root /Users/petercody/Documents/OpenStarScience/microlensing/recovery-a-anomaly-morphology-coarse-pr177-v1 \
+  --coarse-investigation-record /Users/petercody/Documents/OpenStarScience/microlensing/recovery-a-anomaly-morphology-coarse-run-v3/microlensing-recovery-a-anomaly-morphology-coarse-v3/investigation.json \
+  --coarse-validation-root /Users/petercody/Documents/OpenStarScience/microlensing/recovery-a-anomaly-morphology-validation-pr186-v1 \
+  --supported-project-root /Users/petercody/Documents/OpenStarScience/microlensing/recovery-a-supported-morphology-pr187-v1 \
+  --supported-investigation-record /Users/petercody/Documents/OpenStarScience/microlensing/recovery-a-supported-morphology-run-v1/microlensing-recovery-a-supported-morphology-v1/investigation.json \
+  --supported-validation-root /Users/petercody/Documents/OpenStarScience/microlensing/recovery-a-supported-morphology-validation-pr190-v1 \
+  --project-id microlensing-recovery-a-supported-doublet-refinement-v1 \
+  --output-root /Users/petercody/Documents/OpenStarScience/microlensing/recovery-a-supported-doublet-refinement-v1
+```
+
+`project.json`, `datasets/ordered-doublet-refinement.json` and
+`build-manifest.json` publish atomically. The manifest uses
+`openstar.microlensing-supported-doublet-refinement-build.v1`, version `1.0`,
+with algorithm `openstar.microlensing-supported-doublet-local-refinement.v1`.
+It records the axis derivation, source winner/index, retained index/parameters,
+parent boundaries, all input hashes, lineage, output hashes, canonical manifest
+hash, exact counts and sample-candidate evaluation budget (all stored samples
+across both series × 9,225). Inherited contract references identify the parent
+artifacts; the manifest's axis derivation defines the new search domain.
+Existing output directories, unsafe paths, symlinks and blind-identity leakage
+are rejected. Inputs remain unchanged, including publication failures.
+
+This is a **local diagnostic search** for coarse spacing and the lower
+separation boundary, with additional search effort allocated only to the
+ordered model. The positive-pulse and two independent-pulse result references
+remain in the manifest for subsequent review; those searches are not rerun.
+The builder computes no new model preference and changes no signs, per-series
+improvement thresholds or geometric support rules. This search does not
+establish a global optimum or a newly balanced comparison across model classes,
+nor convergence, measured duration, replication or planetary evidence.
+`planetaryInterpretationResolved` and `discoveryClaim` remain false.
+
+Tests, builds, downloads, servers, coordinators, workloads and real-artifact
+execution were not run during implementation. The repository owner validates
+locally; the Mac artifacts are unavailable in the implementation environment.
