@@ -1085,3 +1085,84 @@ protections fail closed. Existing outputs are rejected and inputs remain
 unchanged. Tests, builds, downloads, servers, coordinators, workloads and
 real-artifact execution were not run during implementation; the repository
 owner validates locally and the Mac artifacts were unavailable here.
+
+## Predeclare the boundary and comparable-model follow-up
+
+`build_boundary_balanced_morphology_plan` verifies the complete PR194 report,
+Markdown, manifest and required ancestry through the existing pure helpers.
+It handles the verified three lower center/log-scale boundaries, interior
+separation, fixed shapes and passing ordered-over-positive historical gates.
+Only saved ancestry winners are reproduced. It publishes a plan, never a
+project, work payloads, candidate results or an automatically scheduled search.
+
+The versioned design extends each reached lower bound by one full span of its
+current axis and retains the upper bound. It retains the separation interval,
+then aligns timing on a common lattice no coarser than either current timing
+step. Every component uses the union of the extended log-scale intervals at a
+common step no coarser than either current width step. Each role's shape stays
+fixed. Up to 64 subdivisions of the smallest step are considered for lattice
+alignment; upper endpoints round outward. This is arithmetic on axes, not a
+model search. Samples, weights, ordering, shard size, support, amplitude
+constraints, objective and interpretation thresholds remain unchanged.
+
+The required design contains shared positive-only, shared ordered-doublet and
+one independent search per admitted series. Independent workers receive their
+actual single common center axis and lexicographic strict ordered center pairs.
+That axis covers every shared doublet pair and necessarily permits additional
+pairs: the plan reports that superset explicitly. Comparable access means
+shared timing coverage and resolution plus common width coverage and resolution;
+equal candidate counts do not define balance, and full parameter domains are
+not identical. Timing correspondence uses the published numerical tolerance;
+near an inclusive floating-point support boundary, eligibility still needs review.
+
+For common-center count C, shared negative-center count N, separation count S,
+and common log-scale count W, exact counts are C×W for positive-only, N×S×W²
+for the doublet, and C×(C−1)/2×W² for **each** independent search. Each cost is
+rounded up separately to work units using the preserved shard size. Sample-cost
+accounting includes all stored samples in the applicable series.
+
+The cap is **30,000 proposed candidates**. If the required design exceeds it,
+`BUDGET_CONFLICT` publishes all required axes and costs, an empty proposed-search
+list and zero allocated candidates. It does not silently coarsen resolution,
+trim a model's domain or execute only part of the comparison. This conflict is
+specific to the predeclared resolution, not a claim that every possible design
+is infeasible. A different resolution or budget requires a separately reviewed
+plan. Otherwise all four searches are predeclared for review, still without
+execution authorization. Remaining boundaries, unresolved sampling, incomplete
+coverage or exhausted budget remain unresolved; repeated refinement is never
+automatically scheduled. Model preference and scientific claims stay unresolved.
+
+Run locally from the repository root:
+
+```bash
+python -m unittest tests.workflows.microlensing.test_build_boundary_balanced_morphology_plan -v
+```
+
+```bash
+python -m workflows.microlensing.build_boundary_balanced_morphology_plan \
+  --morphology-root /Users/petercody/Documents/OpenStarScience/microlensing/recovery-a-anomaly-morphology-pr171-v1 \
+  --coarse-project-root /Users/petercody/Documents/OpenStarScience/microlensing/recovery-a-anomaly-morphology-coarse-pr177-v1 \
+  --coarse-investigation-record /Users/petercody/Documents/OpenStarScience/microlensing/recovery-a-anomaly-morphology-coarse-run-v3/microlensing-recovery-a-anomaly-morphology-coarse-v3/investigation.json \
+  --coarse-validation-root /Users/petercody/Documents/OpenStarScience/microlensing/recovery-a-anomaly-morphology-validation-pr186-v1 \
+  --supported-project-root /Users/petercody/Documents/OpenStarScience/microlensing/recovery-a-supported-morphology-pr187-v1 \
+  --supported-investigation-record /Users/petercody/Documents/OpenStarScience/microlensing/recovery-a-supported-morphology-run-v1/microlensing-recovery-a-supported-morphology-v1/investigation.json \
+  --supported-validation-root /Users/petercody/Documents/OpenStarScience/microlensing/recovery-a-supported-morphology-validation-pr190-v1 \
+  --refinement-project-root /Users/petercody/Documents/OpenStarScience/microlensing/recovery-a-supported-doublet-refinement-v1 \
+  --refinement-investigation-record /Users/petercody/Documents/OpenStarScience/microlensing/recovery-a-supported-doublet-refinement-run-v1/microlensing-recovery-a-supported-doublet-refinement-v1/investigation.json \
+  --refinement-validation-root /Users/petercody/Documents/OpenStarScience/microlensing/recovery-a-supported-doublet-refinement-validation-v1 \
+  --output-root /Users/petercody/Documents/OpenStarScience/microlensing/recovery-a-boundary-balanced-morphology-plan-v1
+```
+
+The new output directory receives `boundary-balanced-morphology-plan.json`,
+`boundary-balanced-morphology-plan.md` and `artifact-manifest.json` atomically.
+The plan identity is `openstar.microlensing-boundary-balanced-morphology-plan.v1`
+(version `1.0`); the artifact identity appends `-artifacts` before `.v1`.
+Canonical JSON, complete hashes, lineage, blind identities and path/symlink
+protections fail closed. Inputs and existing output directories are preserved.
+A budget conflict is a successful planning result requiring review, not an
+instruction to launch the unfunded required design.
+
+Tests, builds, workloads, servers, coordinators, downloads and real-artifact
+execution were not run during implementation. The Mac artifacts are unavailable
+here; their exact required costs are computed by the local command, not inferred
+from the reported WRSS or hardcoded into the planner.
