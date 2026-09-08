@@ -985,3 +985,96 @@ nor convergence, measured duration, replication or planetary evidence.
 Tests, builds, downloads, servers, coordinators, workloads and real-artifact
 execution were not run during implementation. The repository owner validates
 locally; the Mac artifacts are unavailable in the implementation environment.
+
+## Validate the completed supported doublet refinement
+
+The offline `validate_supported_doublet_refinement` command verifies the
+original ancestry and PR190 report through PR192's pure verification helpers.
+It reconstructs the exact PR192 project, dataset and manifest in memory,
+including axis derivation, parent inclusion, unchanged samples and weights,
+fixed shapes, identities, retained comparison references, hashes, shard counts
+and sample-candidate evaluation budget. It invokes no builder and publishes
+no temporary parent artifacts.
+
+The actual refinement project-smoke investigation must have its canonical
+three stages, immutable ledgers and hashes, matching project paths and input
+provenance, successful terminal result, and exactly one canonical dataset.
+Project and dataset counters must show complete coverage with zero assigned,
+pending or failed work. Contributions must agree, and strict safe-integer
+accounting must satisfy invalid + support-rejected + eligible = completed.
+The winner comes only from that dataset's canonical payload; every duplicated
+summary field must agree.
+
+Only the saved ancestry winners and the accepted refinement winner are
+numerically reproduced, using published tolerances. Its original grid index,
+exact parameter mapping, per-series fits, WRSS, sample/parameter counts and
+information criteria are checked. Both components must independently satisfy
+the frozen geometric support rule in every series, even at zero amplitude:
+separate `exp(logScale) * exp(logShape)`, inclusive two-width distances, and
+positive weights only. Reports retain component centers, effective widths,
+support counts, nearest distances in effective widths, amplitude signs and
+all axis indices/bounds. Fixed axes are separate from searched boundaries.
+
+Run this focused test command locally from the repository root:
+
+```bash
+python -m unittest tests.workflows.microlensing.test_validate_supported_doublet_refinement -v
+```
+
+Complete real-artifact validation command (the output must be new):
+
+```bash
+python -m workflows.microlensing.validate_supported_doublet_refinement \
+  --morphology-root /Users/petercody/Documents/OpenStarScience/microlensing/recovery-a-anomaly-morphology-pr171-v1 \
+  --coarse-project-root /Users/petercody/Documents/OpenStarScience/microlensing/recovery-a-anomaly-morphology-coarse-pr177-v1 \
+  --coarse-investigation-record /Users/petercody/Documents/OpenStarScience/microlensing/recovery-a-anomaly-morphology-coarse-run-v3/microlensing-recovery-a-anomaly-morphology-coarse-v3/investigation.json \
+  --coarse-validation-root /Users/petercody/Documents/OpenStarScience/microlensing/recovery-a-anomaly-morphology-validation-pr186-v1 \
+  --supported-project-root /Users/petercody/Documents/OpenStarScience/microlensing/recovery-a-supported-morphology-pr187-v1 \
+  --supported-investigation-record /Users/petercody/Documents/OpenStarScience/microlensing/recovery-a-supported-morphology-run-v1/microlensing-recovery-a-supported-morphology-v1/investigation.json \
+  --supported-validation-root /Users/petercody/Documents/OpenStarScience/microlensing/recovery-a-supported-morphology-validation-pr190-v1 \
+  --refinement-project-root /Users/petercody/Documents/OpenStarScience/microlensing/recovery-a-supported-doublet-refinement-v1 \
+  --refinement-investigation-record /Users/petercody/Documents/OpenStarScience/microlensing/recovery-a-supported-doublet-refinement-run-v1/microlensing-recovery-a-supported-doublet-refinement-v1/investigation.json \
+  --output-root /Users/petercody/Documents/OpenStarScience/microlensing/recovery-a-supported-doublet-refinement-validation-v1
+```
+
+The command atomically publishes:
+
+- `supported-doublet-refinement-validation.json`, with report identity
+  `openstar.microlensing-supported-doublet-refinement-validation.v1`, version
+  `1.0`, complete input hashes, lineage, accounting, reproduced winner, support,
+  boundaries, comparisons, limits and deterministic next-step recommendation.
+- `supported-doublet-refinement-validation.md`, a brief readable summary.
+- `artifact-manifest.json`, with identity
+  `openstar.microlensing-supported-doublet-refinement-validation-artifacts.v1`,
+  version `1.0`, input hashes, output hashes and provenance.
+
+The original PR190 report is preserved unchanged inside the new JSON report.
+Refined-versus-previous ordered WRSS is reported globally and per series, with
+numerical change gates using the published tolerance. Comparisons with saved
+positive-only and joint independent results reuse every frozen PR186/PR190
+threshold and retain every gate's inputs, threshold, evaluated state and
+pass/fail. Zero negative amplitude fails a strictly negative sign requirement;
+global improvement cannot conceal failure of the per-series improvement gate.
+Joint independent BIC/AICc use combined WRSS, sample count and parameter count,
+never sums of separate information criteria.
+
+Comparisons against unrefined alternatives are **historical-baseline
+diagnostics**: only the doublet received additional search effort. Passing raw
+gates does not establish a newly balanced comparison. `modelPreference` stays
+null and `balancedModelComparisonEstablished` stays false. Planetary
+interpretation, discovery, global optimum, convergence and measured-duration
+claims remain false. A searched boundary explicitly leaves convergence
+unresolved; an interior winner alone also cannot establish convergence.
+
+A structurally complete zero-eligible/null-winner result is valid but unresolved,
+with comparisons unevaluated. Recommendations distinguish null winners,
+missing historical winners, failed gates and searched boundaries; no follow-up
+project is built or launched. Accepted winners were reproduced and rejection
+counts were checked for consistency; rejection decisions across the entire
+grid were not independently recomputed. This does not prove global optimality.
+
+Canonical JSON, exact artifact sets, identity isolation and path/symlink
+protections fail closed. Existing outputs are rejected and inputs remain
+unchanged. Tests, builds, downloads, servers, coordinators, workloads and
+real-artifact execution were not run during implementation; the repository
+owner validates locally and the Mac artifacts were unavailable here.
