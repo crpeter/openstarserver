@@ -1627,14 +1627,26 @@ def _render_report(conclusion: dict[str, Any]) -> str:
             f"- Supporting sectors: {independent.get('supportingSectorCount')}",
             f"- Required supporting sectors: {independent.get('requiredSupportingSectorCount')}",
         ])
+        contradiction_plan = independent.get("contradictionPlan") or {}
+        if contradiction_plan:
+            lines.append(
+                f"- Next action: {contradiction_plan.get('action')} "
+                f"({contradiction_plan.get('reason')})"
+            )
         for item in independent.get("sectorResults") or []:
             coverage = item.get("cycleCoverage") or {}
             lines.append(
                 "- Sector "
                 f"{item.get('sector')}: period={item.get('candidatePeriodDays')} d, "
                 f"cycles={coverage.get('observedCycles')}, "
-                f"support={item.get('supportsTarget')}"
+                f"support={item.get('supportsTarget')}, "
+                f"classification={item.get('recurrenceClassification')}"
             )
+            uncertainty = item.get("candidateFrequencyUncertaintyDiagnostics") or {}
+            if uncertainty.get("unavailableReason"):
+                lines.append(
+                    f"  - Frequency interval unavailable: {uncertainty['unavailableReason']}"
+                )
 
     broad = conclusion.get("independentBroadVerification")
     if broad is not None:
@@ -3560,6 +3572,11 @@ def build_engine(
                     triggered_by_stage_id=request.id,
                 )
         else:
+            if contradiction_plan["action"] == "FREQUENCY_UNCERTAINTY_FOLLOWUP":
+                # Preserve the unresolved claim and the frozen search evidence.
+                # The finalizer carries this explicit recommendation forward;
+                # a broad low-frequency search cannot repair a missing interval.
+                interpreted["recommendedNextTest"] = contradiction_plan["recommendedNextTest"]
             next_stage = StageRequest(
                 id=_next_stage_id(request.id, "finalize"),
                 handler_id="openstar.tess.finalize",
