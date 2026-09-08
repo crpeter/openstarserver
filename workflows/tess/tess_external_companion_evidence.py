@@ -19,6 +19,7 @@ from openstar_investigation import sha256_json
 
 
 LOCALIZATION_VERSION = "openstar.tess-eclipse-event-source-localization.v1"
+COMMON_SUPPORT_LOCALIZATION_VERSION = "openstar.tess-eclipse-event-source-localization.v2"
 REVIEW_VERSION = "openstar.tess-source-attribution-review.v1"
 FREEZE_VERSION = "openstar.nasa-exoplanet-archive-companion-evidence-freeze.v1"
 RESULT_VERSION = "openstar.external-companion-evidence.v1"
@@ -42,8 +43,19 @@ class ExternalEvidenceTransientError(RuntimeError):
     pass
 
 
-def localization_gate(value: dict[str, Any]) -> bool:
-    return (value.get("resultVersion") == LOCALIZATION_VERSION
+def localization_gate(value: dict[str, Any], *, allow_common_support_v2: bool = False) -> bool:
+    version_allowed = value.get("resultVersion") == LOCALIZATION_VERSION
+    if allow_common_support_v2 is True and value.get("resultVersion") == COMMON_SUPPORT_LOCALIZATION_VERSION:
+        from .tess_eclipse_common_support import _method_contract
+        contract = _method_contract()
+        version_allowed = (value.get("status") == "REANALYSIS_REQUIRES_REVIEW"
+                           and value.get("methodContract") == contract
+                           and value.get("methodContractSHA256") == sha256_json(contract)
+                           and value.get("investigationModified") is False
+                           and value.get("claimLevelChanged") is False
+                           and value.get("discoveryClaim") is False
+                           and value.get("catalogQueriesRepeated") is False)
+    return (version_allowed
             and value.get("sourceAttributionResolved") is True
             and value.get("classification") in {
                 "TARGET_CONSISTENT_ECLIPSE_SOURCE",
@@ -102,9 +114,11 @@ def canonical_gaia_dr3_id(value: Any) -> str:
     return f"Gaia DR3 {number}"
 
 
-def review_source_attribution(localization: dict[str, Any]) -> dict[str, Any]:
-    if not localization_gate(localization):
-        raise ValueError("exact localization-v1 source-attribution gate is not satisfied")
+def review_source_attribution(localization: dict[str, Any], *,
+                              allow_common_support_v2: bool = False) -> dict[str, Any]:
+    """Review unchanged spatial rules; v2 callers must first verify its recorded lineage."""
+    if not localization_gate(localization, allow_common_support_v2=allow_common_support_v2):
+        raise ValueError("exact source-attribution localization gate is not satisfied")
     attributed = localization.get("attributedCatalogHypothesis")
     support, conflicts, ambiguous = [], [], []
     seen_sectors: set[Any] = set()
@@ -163,7 +177,7 @@ def review_source_attribution(localization: dict[str, Any]) -> dict[str, Any]:
         classification = "TARGET_SOURCE_ATTRIBUTION_REVIEW_PASSED"
     else:
         classification = "OFF_TARGET_CATALOG_ATTRIBUTION_REVIEW_PASSED"
-    return {"resultVersion": REVIEW_VERSION, "classification": classification,
+    result = {"resultVersion": REVIEW_VERSION, "classification": classification,
             "sourceAttributionReviewPassed": classification.endswith("REVIEW_PASSED"),
             "supportingIndependentSectors": support, "supportingIndependentSectorCount": len(support),
             "ambiguousIndependentSectors": ambiguous, "conflictingIndependentSectors": conflicts,
@@ -177,6 +191,9 @@ def review_source_attribution(localization: dict[str, Any]) -> dict[str, Any]:
             "recommendedNextTest": ("EXTERNAL_COMPANION_EVIDENCE_FREEZE" if classification.endswith("REVIEW_PASSED")
                                     else "CATALOG_IDENTITY_FOLLOWUP" if off_catalog
                                     else "ADDITIONAL_SPATIAL_EVIDENCE")}
+    if localization["resultVersion"] == COMMON_SUPPORT_LOCALIZATION_VERSION:
+        result["sourceLocalizationVersion"] = COMMON_SUPPORT_LOCALIZATION_VERSION
+    return result
 
 
 def build_tap_query(tic_id: str) -> tuple[str, str]:

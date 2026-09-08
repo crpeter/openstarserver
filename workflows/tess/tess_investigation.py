@@ -609,6 +609,18 @@ def _latest_result_for_handler(
     return None
 
 
+def _eclipse_localization_for_evidence(store, investigation):
+    if not any(stage.handler_id in {"openstar.tess.eclipse-common-support.accept",
+                                    "openstar.tess.eclipse-common-support.finalize"}
+               for stage in investigation.stages):
+        return _latest_result_for_handler(investigation, ECLIPSE_LOCALIZATION_HANDLER_ID), {}
+    from .tess_recorded_eclipse_evidence import verified_recorded_localization
+    recorded, lineage = verified_recorded_localization(store, investigation)
+    if recorded is not None:
+        return recorded, lineage
+    return _latest_result_for_handler(investigation, ECLIPSE_LOCALIZATION_HANDLER_ID), {}
+
+
 def _latest_blind_transit_result(
     investigation: Investigation,
 ) -> dict[str, Any] | None:
@@ -4805,8 +4817,11 @@ def build_engine(
         )
 
     def source_attribution_review_stage(investigation, request):
-        localization = _required_latest_result_for_handler(investigation, ECLIPSE_LOCALIZATION_HANDLER_ID)
-        result = review_source_attribution(localization)
+        localization, lineage = _eclipse_localization_for_evidence(store, investigation)
+        if localization is None:
+            raise RuntimeError("Source-attribution review requires completed localization")
+        result = (review_source_attribution(localization, allow_common_support_v2=True)
+                  if lineage else review_source_attribution(localization))
         path = (store.directory_for(investigation.id) / "artifacts" /
                 "external-companion-evidence" / "source-attribution-review-v1.json")
         _write_json(path, result)
@@ -4815,7 +4830,7 @@ def build_engine(
             next_stage=StageRequest(_next_stage_id(request.id, "event-depth-photometry-freeze" if proceed else "finalize"),
                 EVENT_DEPTH_FREEZE_HANDLER_ID if proceed else "openstar.tess.finalize",
                 {} if proceed else {"outputSuffix": "source-attribution-review-v1"}, request.id),
-            input_hashes={"sourceLocalization": sha256_json(localization)},
+            input_hashes={"sourceLocalization": sha256_json(localization), **lineage},
             artifacts=(_artifact(path, "application/json"),))
 
     def event_depth_photometry_freeze_stage(investigation, request):
@@ -4966,12 +4981,14 @@ def build_engine(
 
     def companion_evidence_synthesis_stage(investigation, request):
         binary = _required_latest_result_for_handler(investigation, "openstar.tess.binary-confirmation.analyze")
-        localization = _required_latest_result_for_handler(investigation, ECLIPSE_LOCALIZATION_HANDLER_ID)
+        localization, lineage = _eclipse_localization_for_evidence(store, investigation)
         review = _required_latest_result_for_handler(investigation, SOURCE_ATTRIBUTION_REVIEW_HANDLER_ID)
         frozen = _required_latest_result_for_handler(investigation, EXTERNAL_EVIDENCE_FREEZE_HANDLER_ID)
         external = _required_latest_result_for_handler(investigation, EXTERNAL_EVIDENCE_INTERPRET_HANDLER_ID)
         model = _latest_result_for_handler(investigation, JOINT_EVENT_PHASE_MODEL_HANDLER_ID)
-        result = synthesize_companion_evidence(binary, localization, review, frozen, external, model)
+        result = (synthesize_companion_evidence(binary, localization, review, frozen, external, model,
+                                                allow_common_support_v2=True) if lineage else
+                  synthesize_companion_evidence(binary, localization, review, frozen, external, model))
         path = (store.directory_for(investigation.id) / "artifacts" /
                 "companion-evidence-synthesis" / "companion-evidence-synthesis-v1.json")
         _write_json(path, result)
@@ -4983,7 +5000,7 @@ def build_engine(
         print("   physical mechanism still unresolved: True")
         print("   automatic discovery claim: False")
         print("   human scientific review recommended: True")
-        hashes = {"binaryConfirmation": sha256_json(binary), "sourceLocalization": sha256_json(localization),
+        hashes = {**lineage, "binaryConfirmation": sha256_json(binary), "sourceLocalization": sha256_json(localization),
                   "sourceAttributionReview": sha256_json(review), "externalEvidenceFreeze": sha256_json(frozen),
                   "externalCompanionEvidence": sha256_json(external),
                   **({"jointEventPhaseModel": validate_model_hash(model)} if model is not None else {})}
@@ -12604,9 +12621,7 @@ def build_engine(
             investigation,
             "openstar.tess.binary-confirmation.analyze",
         )
-        eclipse_event_localization = _latest_result_for_handler(
-            investigation, ECLIPSE_LOCALIZATION_HANDLER_ID,
-        )
+        eclipse_event_localization, eclipse_lineage = _eclipse_localization_for_evidence(store, investigation)
         source_attribution_review = _latest_result_for_handler(
             investigation, SOURCE_ATTRIBUTION_REVIEW_HANDLER_ID,
         )
@@ -14283,6 +14298,8 @@ def build_engine(
 
         output_dir = store.directory_for(investigation.id)
         suffix = str(request.parameters.get("outputSuffix") or "").strip()
+        if eclipse_lineage:
+            suffix = (suffix or "companion-evidence") + "-common-support-v2"
         if suffix:
             conclusion_path = output_dir / f"conclusion-{suffix}.json"
             report_path = output_dir / f"report-{suffix}.md"
@@ -14832,6 +14849,8 @@ def build_engine(
             input_hashes={
                 "primaryAnalysis": sha256_json(primary_analysis),
                 "planner": sha256_json(planner),
+                **({"sourceLocalization": sha256_json(eclipse_event_localization), **eclipse_lineage}
+                   if eclipse_lineage else {}),
             },
             project_ids=project_ids,
             artifacts=(
