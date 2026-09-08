@@ -451,6 +451,9 @@ class SupportedDoubletValidationTests(DiagnosticFixture):
         self.assertFalse(details["allPerSeriesDeltaWRSSPassed"]["passed"])
         self.assertFalse(details["allPerSeriesDeltaWRSSPassed"]["inputs"][0]["passed"])
         self.assertEqual(details["allPerSeriesDeltaWRSSPassed"]["threshold"], contract["decisionRules"]["preferOrderedDoubletOverPositivePulse"]["allPerSeriesDeltaWRSSAtLeast"])
+        self.assertEqual(validation._outcome(search, historical)[:2], (
+            "DIAGNOSTIC_GATES_NOT_PASSED", "REVIEW_FAILED_HISTORICAL_GATES_BEFORE_BALANCED_FOLLOWUP",
+        ))
         self.assertIsNone(report["modelPreference"])
         self.assertFalse(report["balancedModelComparisonEstablished"])
         # Even a passing historical ordered-over-positive rule is never promoted
@@ -465,6 +468,54 @@ class SupportedDoubletValidationTests(DiagnosticFixture):
         self.assertTrue(diagnostic["historicalBaselineComparisons"]["preferOrderedDoubletOverPositivePulse"]["passed"])
         self.assertIsNone(diagnostic["modelPreference"])
         self.assertFalse(diagnostic["balancedModelComparisonEstablished"])
+
+    def test_passing_ordered_condition_does_not_require_independent_rejection(self):
+        contract = artifacts.read_json(self.morphology / builder.coarse.PREPARATION_CONTRACT_RELATIVE_PATH)
+        cases = (
+            ((4, 3, 2, 0, 2, 0), "HISTORICAL_BASELINE_DIAGNOSTIC_COMPLETE", "PREDECLARE_BALANCED_MODEL_AND_STABILITY_CHECK"),
+            ((0, 3, 2, 0, 2, 0), "UNRESOLVED_SEARCHED_BOUNDARY", "PREDECLARE_BOUNDARY_AND_BALANCED_MODEL_FOLLOWUP"),
+        )
+        for ordinal, (indices, classification, next_test) in enumerate(cases):
+            with self.subTest(boundary=ordinal == 1):
+                self.set_refined_winner(self.candidate(indices))
+                report = self.audit(f"condition-{ordinal}")["result"]
+                baseline, search = copy.deepcopy(self.saved_report), copy.deepcopy(report["search"])
+                self.assertEqual(search["searchedBoundaryAxes"], ["negativeCenter"] if ordinal else [])
+                # Pure gate/report fixtures, not fabricated persisted winners.
+                # Keep the verified geometry and frozen thresholds, with clear
+                # ordered improvement and insufficient independent improvement.
+                for candidate, values in ((baseline["searches"][0]["acceptedWinner"], (100.0, 100.0)),
+                                          (search["acceptedWinner"], (1.0, 1.0))):
+                    for fit, wrss in zip(candidate["seriesFits"], values):
+                        fit["weightedResidualSumSquares"] = wrss
+                        fit["positiveAmplitude"], fit["positiveAmplitudeSign"] = 1.0, "positive"
+                        if "negativeAmplitude" in fit:
+                            fit["negativeAmplitude"], fit["negativeAmplitudeSign"] = -1.0, "negative"
+                    candidate.update(validation.legacy._information_criteria(
+                        sum(values), candidate["positiveWeightSampleCount"], candidate["nominalParameterCount"],
+                    ))
+                _, historical, _ = validation._comparisons(search, baseline, contract)
+                ordered = historical["preferOrderedDoubletOverPositivePulse"]
+                self.assertTrue(all(gate["evaluated"] and gate["passed"] for gate in ordered["gateDetails"].values()))
+                rejection = historical["rejectOrderedDoubletForIndependentPulses"]
+                for key in ("globalDeltaWRSSPassed", "globalDeltaBICPassed"):
+                    self.assertTrue(rejection["gateDetails"][key]["evaluated"])
+                    self.assertFalse(rejection["gateDetails"][key]["passed"])
+                original_gates = copy.deepcopy(historical)
+                record = artifacts.read_json(self.refinement_record)
+                diagnostic = validation._report(
+                    SimpleNamespace(project=artifacts.read_json(self.refinement_root / "project.json"), manifest=self.refinement_manifest),
+                    record, record["stages"][1]["result"], search, baseline, contract, report["inputHashes"],
+                )
+                self.assertEqual(diagnostic["overallClassification"], classification)
+                self.assertEqual(diagnostic["recommendedNextTest"], next_test)
+                self.assertEqual(diagnostic["historicalBaselineComparisons"], original_gates)
+                for key in ("globalDeltaWRSSPassed", "globalDeltaBICPassed"):
+                    self.assertIn(f"rejectOrderedDoubletForIndependentPulses.{key}", diagnostic["failedHistoricalGatePaths"])
+                for key, value in validation._CLAIMS.items():
+                    self.assertEqual(diagnostic[key], value)
+                self.assertEqual(diagnostic["convergenceStatus"], "UNRESOLVED")
+                self.assertIn("convergence remains unresolved" if ordinal else "does not prove convergence", diagnostic["boundaryStatement"])
 
 
 class ZeroAmplitudeTests(DiagnosticFixture):

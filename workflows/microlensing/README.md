@@ -1066,6 +1066,13 @@ interpretation, discovery, global optimum, convergence and measured-duration
 claims remain false. A searched boundary explicitly leaves convergence
 unresolved; an interior winner alone also cannot establish convergence.
 
+The two model-comparison rules are alternative conditions, not requirements
+that must both pass. When all ordered-over-positive gates pass, an unmet
+independent-over-doublet rejection condition remains visible in the raw gates
+but does not trigger failed-gate review. Searched boundaries still require
+boundary/balanced-model follow-up; otherwise historical diagnostics are
+complete, with convergence and balanced-comparison limits unchanged.
+
 A structurally complete zero-eligible/null-winner result is valid but unresolved,
 with comparisons unevaluated. Recommendations distinguish null winners,
 missing historical winners, failed gates and searched boundaries; no follow-up

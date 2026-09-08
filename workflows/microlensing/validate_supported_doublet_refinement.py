@@ -213,17 +213,22 @@ def _comparisons(search, baseline, contract):
 
 
 def _outcome(search, historical):
-    failed = [f"{name}.{key}" for name in ("preferOrderedDoubletOverPositivePulse", "rejectOrderedDoubletForIndependentPulses")
+    rules = ("preferOrderedDoubletOverPositivePulse", "rejectOrderedDoubletForIndependentPulses")
+    failed = [f"{name}.{key}" for name in rules
               for key, gate in historical[name]["gateDetails"].items() if gate["evaluated"] and not gate["passed"]]
+    # These are alternative model-comparison conditions, not two requirements
+    # that must both pass. Preserve all unmet gates without treating an unmet
+    # rejection condition as a problem when another complete condition is met.
+    comparison_condition_met = any(historical[name]["passed"] for name in rules)
     boundaries = search["searchedBoundaryAxes"]
     if search["acceptedWinner"] is None:
         classification, next_test = "UNRESOLVED_NO_ELIGIBLE_CANDIDATES", "REVIEW_SUPPORT_AND_ACCOUNTING_BEFORE_FURTHER_SEARCH"
-    elif not all(historical[name]["evaluated"] for name in ("preferOrderedDoubletOverPositivePulse", "rejectOrderedDoubletForIndependentPulses")):
+    elif not all(historical[name]["evaluated"] for name in rules):
         classification, next_test = "UNRESOLVED_MISSING_HISTORICAL_WINNER", "REVIEW_MISSING_HISTORICAL_BASELINE_BEFORE_COMPARISON"
     elif boundaries:
         classification = "UNRESOLVED_SEARCHED_BOUNDARY"
-        next_test = "REVIEW_FAILED_HISTORICAL_GATES_AND_SEARCHED_BOUNDARIES" if failed else "PREDECLARE_BOUNDARY_AND_BALANCED_MODEL_FOLLOWUP"
-    elif failed:
+        next_test = "PREDECLARE_BOUNDARY_AND_BALANCED_MODEL_FOLLOWUP" if comparison_condition_met else "REVIEW_FAILED_HISTORICAL_GATES_AND_SEARCHED_BOUNDARIES"
+    elif not comparison_condition_met:
         classification, next_test = "DIAGNOSTIC_GATES_NOT_PASSED", "REVIEW_FAILED_HISTORICAL_GATES_BEFORE_BALANCED_FOLLOWUP"
     else:
         classification, next_test = "HISTORICAL_BASELINE_DIAGNOSTIC_COMPLETE", "PREDECLARE_BALANCED_MODEL_AND_STABILITY_CHECK"
