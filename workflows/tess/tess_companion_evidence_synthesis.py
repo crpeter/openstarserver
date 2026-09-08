@@ -8,7 +8,7 @@ from openstar_investigation import sha256_json
 from .tess_external_companion_evidence import (
     FREEZE_VERSION, LOCALIZATION_VERSION, RESULT_VERSION as EXTERNAL_RESULT_VERSION,
     REVIEW_VERSION, canonical_gaia_dr3_id, canonical_tic_id,
-    interpret_external_evidence, review_source_attribution,
+    interpret_external_evidence, review_source_attribution, localization_gate,
 )
 from .tess_joint_event_phase_model import validate_model_hash
 
@@ -35,7 +35,8 @@ def synthesize_companion_evidence(binary_confirmation: dict[str, Any],
                                   source_review: dict[str, Any],
                                   frozen_external_response: dict[str, Any],
                                   external_result: dict[str, Any],
-                                  joint_event_phase_model: dict[str, Any] | None = None) -> dict[str, Any]:
+                                  joint_event_phase_model: dict[str, Any] | None = None, *,
+                                  allow_common_support_v2: bool = False) -> dict[str, Any]:
     """Validate and synthesize immutable evidence; never repairs an invalid chain."""
     artifacts = (binary_confirmation, localization, source_review,
                  frozen_external_response, external_result)
@@ -46,7 +47,9 @@ def synthesize_companion_evidence(binary_confirmation: dict[str, Any],
     independent = binary_confirmation.get("independentEvidence") or {}
     _require(independent.get("classification") == "REPLICATED_ECLIPSE_LIKE_EVENT_SUPPORTED",
              "binary confirmation is unresolved")
-    _require(localization.get("resultVersion") == LOCALIZATION_VERSION, "invalid localization version")
+    _require(localization.get("resultVersion") == LOCALIZATION_VERSION or
+             (allow_common_support_v2 is True and localization_gate(localization, allow_common_support_v2=True)),
+             "invalid localization version")
     _require(localization.get("sourceAttributionResolved") is True
              and localization.get("pixelDataChangedFrozenEventDefinition") is False,
              "localization did not preserve the frozen event")
@@ -62,7 +65,7 @@ def synthesize_companion_evidence(binary_confirmation: dict[str, Any],
     _require(source_review.get("resultVersion") == REVIEW_VERSION
              and source_review.get("sourceAttributionReviewPassed") is True,
              "source-attribution review did not pass")
-    expected_review = review_source_attribution(localization)
+    expected_review = review_source_attribution(localization, allow_common_support_v2=allow_common_support_v2)
     _require(sha256_json(source_review) == sha256_json(expected_review),
              "persisted source review is not the deterministic localization review")
     expected_review_class = ("TARGET_SOURCE_ATTRIBUTION_REVIEW_PASSED" if relationship == "TARGET_ASSOCIATED"
