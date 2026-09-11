@@ -37,6 +37,33 @@ filtering, normalization, Float32 representation, frequency grid, work-unit size
 sample hashes, and Astropy references. It does not enumerate independent sectors;
 the autonomous identity and independent-sector stages retain that responsibility.
 
+## Eclipse-localization diagnostic audit
+
+For a finalized `CROSS_SECTOR_SOURCE_DISAGREEMENT_OR_BLEND` result, use
+`run_openstar_tess_eclipse_localization_audit.py --state-dir STATE
+--investigation-id ID --output-file AUDIT.json`. Without `--execute`, this checks
+the frozen boundary, terminal ledgers, result hashes and referenced artifacts only.
+Add `--execute` to reacquire the original pixel products and write a separate
+diagnostic JSON outside the state directory. Existing output is refused. The
+investigation and its conclusions are never modified; no coordinator is needed.
+
+Every originally measured sector is audited, including conflicting sectors. The
+pixel input hash and reproduced difference image must match the frozen result.
+The audit retains the original event clock, durations, quality selection, cadence
+cap and background correction. It records out-of-event and positive-difference
+centroids in the same fixed three-pixel-radius aperture, the original centroid's
+offset from that diagnostic centroid, signed aperture flux loss, image-edge flux,
+and an empirical out-of-event image/gradient fit. Image arrays, parent hashes,
+method source hashes and runtime versions are included in the output.
+
+These measurements are diagnostics, not calibrated astrometry: crowding, positive
+clipping, background and saturation can bias them. The empirical fit is not a PRF
+fit. Frozen TIC magnitudes provide conditional target/candidate flux budgets under
+equal aperture throughput; missing or duplicate magnitudes remain unavailable.
+No source is excluded and no spatial or planetary claim is promoted. No catalog
+query or period search is repeated. A pixel hash mismatch requires investigation,
+not bypassing the integrity check.
+
 ## Fleet dashboard sidecar
 
 The optional dashboard is a separate process. It only performs `GET` requests against the
