@@ -41,6 +41,8 @@ if _real_numpy is None:
 
 from workflows.tess.tess_investigation import build_engine
 from workflows.tess.tess_investigation import _primary_harmonic_morphology_family
+from workflows.tess.tess_investigation import _confirmed_independent_morphology_family
+from workflows.tess.tess_investigation import _supplementary_broad_search_preserves_recurrence
 from workflows.tess.tess_investigation import time_frequency_continuation
 from workflows.tess.tess_investigation import nonstationary_continuation
 from workflows.tess.tess_investigation import dynamic_harmonic_continuation
@@ -236,14 +238,156 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
             self.assertEqual("full-characterization-independent-confirmation",
                              request.parameters["evidenceSource"])
 
-    def test_full_characterization_confirmation_without_family_uses_broad_search(self):
+    def test_full_characterization_1x_confirmation_executes_recurrence_morphology(self):
         with tempfile.TemporaryDirectory() as temporary:
-            _, investigation, engine, _, _, _ = self._independent_contradiction_fixture(
+            store, investigation, engine, _, spec, primary_path = self._independent_contradiction_fixture(
                 Path(temporary), relation="1x", recurrent=True,
                 investigation_goal="FULL_CHARACTERIZATION",
             )
-            _, request = self._run_independent_interpretation(investigation, engine)
-            self.assertEqual("openstar.tess.independent.broad.prepare", request.handler_id)
+            completed, request = self._run_independent_interpretation(investigation, engine)
+            recurrence = completed.stages[-1].result
+            self.assertEqual("openstar.tess.morphology.analyze", request.handler_id)
+            self.assertEqual("full-characterization-confirmed-recurrence",
+                             request.parameters["evidenceSource"])
+            unresolved = {
+                "sectorResults": [], "physicalCycleResolved": False,
+                "resolvedPhysicalPeriodDays": None,
+                "morphologyClass": "EVOLVING_OR_MIXED_MORPHOLOGY_UNRESOLVED",
+                "continuationEvidence": {"timeFrequencyEvolutionWarranted": False},
+            }
+            with mock.patch("workflows.tess.tess_investigation.analyze_morphology",
+                            return_value=unresolved) as analyze, mock.patch(
+                "workflows.tess.tess_investigation.morphology_event_screening_continuation",
+                return_value=False,
+            ):
+                completed, fallback = engine.run_stage(
+                    store.load(completed.id), request,
+                    software_id="integration", software_version="confirmed-recurrence",
+                )
+            period = recurrence["selectedPeriodDays"]
+            analyze.assert_called_once_with(
+                primary_dataset_path=str(primary_path), independent_spec=spec,
+                raw_period_days=period, possible_double_cycle_days=2.0 * period,
+            )
+            stage = completed.stages[-1]
+            self.assertFalse(stage.result["physicalCycleResolved"])
+            self.assertFalse(stage.result["periodFamilyEvidence"]["physicalCycleResolved"])
+            self.assertEqual(sha256_json(recurrence), stage.provenance.input_hashes[
+                "independentRecurrence"])
+            self.assertEqual(sha256_json(spec), stage.provenance.input_hashes[
+                "independentPreparation"])
+            self.assertEqual("openstar.tess.independent.broad.prepare", fallback.handler_id)
+
+    def test_confirmed_recurrence_family_rejects_inadequate_evidence(self):
+        valid = {
+            "investigationGoal": "FULL_CHARACTERIZATION",
+            "claimDecision": {"claim": "INDEPENDENT_PERIOD_ESTIMATE"},
+            "selectedSource": "independent-tess-sectors", "selectedPeriodDays": 4.0,
+            "targetPeriodDays": 4.0, "eligibleSectorCount": 4,
+            "supportingSectorCount": 3, "requiredSupportingSectorCount": 3,
+        }
+        self.assertEqual(8.0, _confirmed_independent_morphology_family(valid)[
+            "possibleDoubleCycleDays"])
+        for override in (
+            {"investigationGoal": None}, {"claimDecision": {"claim": "CANDIDATE_PERIOD"}},
+            {"selectedSource": "primary"}, {"selectedPeriodDays": float("nan")},
+            {"selectedPeriodDays": 0}, {"supportingSectorCount": 2},
+            {"eligibleSectorCount": 0}, {"requiredSupportingSectorCount": 2},
+        ):
+            with self.subTest(override=override):
+                self.assertIsNone(_confirmed_independent_morphology_family(valid | override))
+
+    def test_supplementary_broad_preservation_is_limited_to_empty_disjoint_search(self):
+        independent = {
+            "investigationGoal": "FULL_CHARACTERIZATION",
+            "claimDecision": {"claim": "INDEPENDENT_PERIOD_ESTIMATE"},
+            "selectedSource": "independent-tess-sectors", "selectedPeriodDays": 4.0,
+            "targetPeriodDays": 4.0, "eligibleSectorCount": 4,
+            "supportingSectorCount": 3, "requiredSupportingSectorCount": 3,
+        }
+        broad = {
+            "claimDecision": {"claim": "HUMAN_REVIEW_REQUIRED"},
+            "eligibleSectorCount": 0, "promotionEligible": False,
+            "bestCluster": None, "harmonicFamily": None,
+        }
+        preparation = {"frequencySearch": {"minimumFrequency": 0.04,
+                                            "maximumFrequency": 0.2}}
+        self.assertTrue(_supplementary_broad_search_preserves_recurrence(
+            independent, broad, preparation))
+        for override in ({"eligibleSectorCount": 1}, {"promotionEligible": True},
+                         {"bestCluster": {"count": 2}},
+                         {"claimDecision": {"claim": "INDEPENDENT_PERIOD_ESTIMATE"}}):
+            with self.subTest(override=override):
+                self.assertFalse(_supplementary_broad_search_preserves_recurrence(
+                    independent, broad | override, preparation))
+        for search in ({}, {"minimumFrequency": 0.04, "maximumFrequency": 0.25},
+                       {"minimumFrequency": 0.2, "maximumFrequency": 0.3},
+                       {"minimumFrequency": 0.2, "maximumFrequency": 0.04},
+                       {"minimumFrequency": float("nan"), "maximumFrequency": 0.2}):
+            with self.subTest(search=search):
+                self.assertFalse(_supplementary_broad_search_preserves_recurrence(
+                    independent, broad, {"frequencySearch": search}))
+        self.assertFalse(_supplementary_broad_search_preserves_recurrence(
+            independent | {"claimDecision": {"claim": "CANDIDATE_PERIOD"}},
+            broad, preparation))
+
+    def test_finalizer_preserves_confirmed_period_after_empty_supplementary_search(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store, investigation, engine, _, _, _ = self._independent_contradiction_fixture(
+                Path(temporary), relation="1x", recurrent=True,
+                investigation_goal="FULL_CHARACTERIZATION",
+            )
+            investigation = self._complete(
+                store, investigation, "007-planner", "openstar.tess.planner",
+                {"action": "INDEPENDENT_SECTOR_FOLLOWUP"},
+            )
+            investigation, _ = self._run_independent_interpretation(investigation, engine)
+            recurrence = investigation.stages[-1].result
+            broad_preparation = {"frequencySearch": {"minimumFrequency": 0.04,
+                                                     "maximumFrequency": 0.2}}
+            broad = {
+                "claimDecision": {"claim": "HUMAN_REVIEW_REQUIRED", "rationale": [
+                    "No stable family in supplementary search."]},
+                "eligibleSectorCount": 0, "promotionEligible": False,
+                "bestCluster": None, "harmonicFamily": None,
+                "selectedPeriodDays": None, "sectorResults": [],
+            }
+            # Reproduce the historical completed-stage sequence without
+            # executing searches or rewriting the earlier recurrence stage.
+            for stage_id, handler, result in (
+                ("009-broad-prepare", "openstar.tess.independent.broad.prepare", broad_preparation),
+                ("010-broad-run", "openstar.tess.independent.broad.run", {"datasets": []}),
+                ("011-broad-interpret", "openstar.tess.independent.broad.interpret", broad),
+            ):
+                investigation = self._complete(store, investigation, stage_id, handler, result)
+            original_bytes = {stage.id: store.stage_path_for(investigation.id, stage.id).read_bytes()
+                              for stage in investigation.stages}
+            finalized, _ = engine.run_stage(
+                store.load(investigation.id),
+                StageRequest("012-finalize", "openstar.tess.finalize", {}, "011-broad-interpret"),
+                software_id="integration", software_version="confirmed-recurrence",
+            )
+            stage = finalized.stages[-1]
+            result = stage.result
+            self.assertEqual("INDEPENDENT_PERIOD_ESTIMATE", result["claim"]["claim"])
+            self.assertEqual(4.0, result["periodEvidence"]["recurrentPhotometricPeriodDays"])
+            self.assertFalse(result["periodEvidence"]["physicalCycleResolved"])
+            self.assertIsNone(result["selectedPeriodDays"])
+            self.assertIsNone(result["periodEvidence"]["physicalPeriodDays"])
+            self.assertFalse(result["automaticDiscoveryClaim"])
+            self.assertEqual("FOLDED_LIGHT_CURVE_MORPHOLOGY", result["recommendedNextTest"])
+            self.assertEqual(broad, result["independentBroadVerification"])
+            self.assertEqual(recurrence, result["independentVerification"])
+            self.assertEqual(sha256_json(recurrence), stage.provenance.input_hashes[
+                "independentRecurrence"])
+            report = Path(result["reportPath"]).read_text()
+            self.assertIn("INDEPENDENT_PERIOD_ESTIMATE", report)
+            self.assertIn("does not supersede", report)
+            self.assertIn("FOLDED_LIGHT_CURVE_MORPHOLOGY", report)
+            self.assertIn("Physical period: **unresolved**", report)
+            self.assertEqual(result, json.loads(Path(result["conclusionPath"]).read_text()))
+            for stage_id, content in original_bytes.items():
+                self.assertEqual(content, store.stage_path_for(finalized.id, stage_id).read_bytes())
 
     def test_ordinary_confirmation_finalizes_and_inadequate_evidence_stays_unresolved(self):
         with tempfile.TemporaryDirectory() as temporary:

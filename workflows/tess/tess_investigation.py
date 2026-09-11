@@ -851,6 +851,70 @@ def _primary_harmonic_morphology_family(
     }
 
 
+def _confirmed_independent_morphology_family(
+    interpretation: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Use a confirmed photometric period as a P/2P question, not a solution."""
+    result = interpretation or {}
+    if (
+        result.get("investigationGoal") != "FULL_CHARACTERIZATION"
+        or (result.get("claimDecision") or {}).get("claim") != "INDEPENDENT_PERIOD_ESTIMATE"
+        or result.get("selectedSource") != "independent-tess-sectors"
+    ):
+        return None
+    try:
+        period = float(result["selectedPeriodDays"])
+        eligible = int(result["eligibleSectorCount"])
+        supporting = int(result["supportingSectorCount"])
+        required = int(result["requiredSupportingSectorCount"])
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return None
+    if (
+        not math.isfinite(period) or period <= 0 or not math.isfinite(2.0 * period)
+        or eligible <= 0 or required != eligible // 2 + 1
+        or not required <= supporting <= eligible
+    ):
+        return None
+    return {
+        "representativeRawPeriodDays": period,
+        "possibleDoubleCycleDays": 2.0 * period,
+        "physicalCycleResolved": False,
+        "evidenceSource": "authoritative-independent-recurrence",
+    }
+
+
+def _supplementary_broad_search_preserves_recurrence(
+    independent: dict[str, Any] | None,
+    broad: dict[str, Any] | None,
+    broad_preparation: dict[str, Any] | None,
+) -> bool:
+    """An empty search outside the confirmed frequency cannot supersede it."""
+    family = _confirmed_independent_morphology_family(independent)
+    if family is None or not broad or not broad_preparation:
+        return False
+    if (
+        (broad.get("claimDecision") or {}).get("claim") != "HUMAN_REVIEW_REQUIRED"
+        or broad.get("eligibleSectorCount") != 0
+        or broad.get("promotionEligible") is not False
+        or broad.get("bestCluster") is not None
+        or broad.get("harmonicFamily")
+    ):
+        return False
+    search = broad_preparation.get("frequencySearch") or {}
+    try:
+        minimum = float(search["minimumFrequency"])
+        maximum = float(search["maximumFrequency"])
+        target_period = float(independent["targetPeriodDays"])
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return False
+    if not all(math.isfinite(value) and value > 0
+               for value in (minimum, maximum, target_period)) or minimum >= maximum:
+        return False
+    frequencies = (1.0 / family["representativeRawPeriodDays"], 1.0 / target_period)
+    # Require the whole target-to-estimate interval to lie outside the search.
+    return max(frequencies) < minimum or min(frequencies) > maximum
+
+
 def time_frequency_continuation(summary: dict[str, Any], *, request_id: str) -> StageRequest:
     """Continue only the explicitly recommended, still-unresolved experiment."""
 
@@ -1512,7 +1576,12 @@ def _build_period_evidence(
         "KNOWN_PHENOMENON_EXPLAINED",
         "INDEPENDENT_PERIOD_ESTIMATE",
     }:
-        physical_cycle_resolved = selected_period is not None
+        physical_cycle_resolved = selected_period is not None and not (
+            claim == "INDEPENDENT_PERIOD_ESTIMATE"
+            and selected_source == "independent-tess-sectors"
+            and (independent_interpretation or {}).get("investigationGoal")
+            == "FULL_CHARACTERIZATION"
+        )
 
     if family_interpretation == "possible-double-wave-period-family":
         physical_cycle_resolved = False
@@ -1552,6 +1621,8 @@ def _render_report(conclusion: dict[str, Any]) -> str:
         f"- Target: {target.get('targetName') or target.get('datasetID')}",
         f"- Claim level: **{claim['claim']}**",
     ]
+    if conclusion.get("recommendedNextTest"):
+        lines.append(f"- Recommended next test: {conclusion['recommendedNextTest']}")
     period_evidence = conclusion.get("periodEvidence") or {}
     if period_evidence.get("recurrentPhotometricPeriodDays") is not None:
         lines.append(
@@ -3547,16 +3618,24 @@ def build_engine(
             )
         elif contradiction_plan["action"] == "BROAD_INDEPENDENT_SEARCH" or full_characterization_confirmed:
             primary_family = _primary_harmonic_morphology_family(primary_analysis)
+            confirmed_family = (
+                _confirmed_independent_morphology_family(interpreted)
+                if full_characterization_confirmed
+                and primary_analysis.get("preferredPhysicalPeriodRelation") == "1x"
+                else None
+            )
             morphology_already_completed = _latest_result_for_handler(
                 investigation, "openstar.tess.morphology.analyze"
             ) is not None
-            if primary_family is not None and not morphology_already_completed:
+            if (primary_family is not None or confirmed_family is not None) and not morphology_already_completed:
                 next_stage = StageRequest(
                     id=_next_stage_id(request.id, "morphology"),
                     handler_id="openstar.tess.morphology.analyze",
                     parameters={
                         "evidenceSource": (
-                            "full-characterization-independent-confirmation"
+                            "full-characterization-confirmed-recurrence"
+                            if confirmed_family is not None
+                            else "full-characterization-independent-confirmation"
                             if full_characterization_confirmed
                             else "primary-harmonic-contradiction"
                         ),
@@ -3804,6 +3883,14 @@ def build_engine(
         family = ((harmonic or broad or {}).get("harmonicFamily") or {})
         primary_analysis = None
         direct_primary_family = False
+        independent_recurrence = None
+        if request.parameters.get("evidenceSource") == "full-characterization-confirmed-recurrence":
+            independent_recurrence = _required_latest_result_for_handler(
+                investigation, "openstar.tess.independent.interpret"
+            )
+            family = _confirmed_independent_morphology_family(independent_recurrence)
+            if family is None:
+                raise RuntimeError("Direct recurrence morphology requires confirmed independent evidence.")
         if not family and request.parameters.get("evidenceSource") in {
             "primary-harmonic-contradiction",
             "full-characterization-independent-confirmation",
@@ -3835,6 +3922,8 @@ def build_engine(
             raw_period_days=float(raw_period),
             possible_double_cycle_days=float(double_period),
         )
+        if independent_recurrence is not None:
+            morphology = {**morphology, "periodFamilyEvidence": family}
 
         for item in morphology.get("sectorResults") or []:
             double_metrics = item.get("doubleWaveMetrics") or {}
@@ -3869,6 +3958,9 @@ def build_engine(
         }
         if direct_primary_family:
             input_hashes["primaryAnalysis"] = sha256_json(primary_analysis)
+            input_hashes["independentPreparation"] = sha256_json(independent_prepare)
+        if independent_recurrence is not None:
+            input_hashes["independentRecurrence"] = sha256_json(independent_recurrence)
             input_hashes["independentPreparation"] = sha256_json(independent_prepare)
         for item in independent_prepare.get("preparedSectors") or []:
             sector = item.get("sector")
@@ -12796,6 +12888,7 @@ def build_engine(
             investigation, "openstar.tess.target-residual-pixel-recurrence.interpret",
         )
 
+        preserved_independent_recurrence = False
         if (blind_transit_search or {}).get("classification") == (
             "REPLICATED_BLIND_TRANSIT_LIKE_CANDIDATE"
         ):
@@ -12810,6 +12903,21 @@ def build_engine(
             claim_decision = harmonic_family_interpretation["claimDecision"]
             selected_period = harmonic_family_interpretation.get("selectedPeriodDays")
             selected_source = harmonic_family_interpretation.get("selectedSource")
+        elif _supplementary_broad_search_preserves_recurrence(
+            independent_interpretation, broad_interpretation, broad_prepare
+        ):
+            preserved_independent_recurrence = True
+            claim_decision = {
+                **independent_interpretation["claimDecision"],
+                "rationale": [
+                    *(independent_interpretation["claimDecision"].get("rationale") or []),
+                    "The supplementary broad search found no eligible period family in a "
+                    "frequency range outside the independently confirmed periodicity. "
+                    "That result does not supersede the recorded recurrence evidence.",
+                ],
+            }
+            selected_period = independent_interpretation.get("selectedPeriodDays")
+            selected_source = independent_interpretation.get("selectedSource")
         elif broad_interpretation is not None:
             claim_decision = broad_interpretation["claimDecision"]
             selected_period = broad_interpretation.get("selectedPeriodDays")
@@ -14205,6 +14313,11 @@ def build_engine(
         # after a newer v20.13/v20.14 result superseded it.
         recommended_next_test = newest_authoritative_recommendation(
             investigation.stages[:-1], recommended_next_test)
+        if preserved_independent_recurrence and recommended_next_test is None:
+            recommended_next_test = (
+                "FOLDED_LIGHT_CURVE_MORPHOLOGY"
+                if morphology_interpretation is None else "HUMAN_SCIENTIFIC_REVIEW"
+            )
 
         conclusion = {
             "investigationID": investigation.id,
@@ -14849,6 +14962,11 @@ def build_engine(
             input_hashes={
                 "primaryAnalysis": sha256_json(primary_analysis),
                 "planner": sha256_json(planner),
+                **({
+                    "independentRecurrence": sha256_json(independent_interpretation),
+                    "supplementaryBroadPreparation": sha256_json(broad_prepare),
+                    "supplementaryBroadInterpretation": sha256_json(broad_interpretation),
+                } if preserved_independent_recurrence else {}),
             },
             project_ids=project_ids,
             artifacts=(
