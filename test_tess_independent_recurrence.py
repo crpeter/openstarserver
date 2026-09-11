@@ -1,6 +1,9 @@
 import unittest
 
-from workflows.tess.tess_hypotheses import interpret_independent_sectors
+from workflows.tess.tess_hypotheses import (
+    interpret_independent_sectors,
+    plan_independent_contradiction_resolution,
+)
 
 
 PRIMARY = 9.259243300072583
@@ -36,6 +39,68 @@ def interpretation(period, *, baseline=22.872, confidence_interval=None):
 
 
 class IndependentRecurrenceTests(unittest.TestCase):
+    def _mixed_interpretation(self, kinds):
+        target_frequency = 1.0 / PRIMARY
+        datasets = []
+        prepared = []
+        for sector, kind in enumerate(kinds, start=2):
+            frequency = target_frequency if kind != "alternate" else 0.15
+            dataset = {
+                "datasetID": str(sector), "periodStatus": "RELIABLE",
+                "periodConfidence": "high", "candidateFrequency": frequency,
+                "candidatePeriodDays": 1.0 / frequency,
+            }
+            if kind == "uncertain":
+                dataset["candidateFrequencyUncertaintyDiagnostics"] = {
+                    "trustworthy": False, "unavailableReason": "competitive straddler",
+                }
+            else:
+                dataset["candidateFrequencyConfidenceInterval"] = {
+                    "lower": frequency - 0.0001, "upper": frequency + 0.0001,
+                }
+            datasets.append(dataset)
+            prepared.append({"datasetID": str(sector), "sector": sector,
+                             "baselineDays": 100.0})
+        return interpret_independent_sectors(
+            target_period_days=PRIMARY, project_status={"datasets": datasets},
+            independent_spec={"preparedSectors": prepared, "frequencySearch": {
+                "minimumFrequency": 0.04, "maximumFrequency": 0.2,
+                "frequencyStep": 0.00001,
+            }},
+        )
+
+    def test_three_uncertain_sectors_request_uncertainty_followup(self):
+        result = self._mixed_interpretation(["support", "uncertain", "uncertain", "uncertain"])
+        plan = plan_independent_contradiction_resolution(result)
+        self.assertEqual("FREQUENCY_UNCERTAINTY_FOLLOWUP", plan["action"])
+        self.assertEqual(plan["action"], plan["recommendedNextTest"])
+        self.assertEqual(3, plan["uncertaintyLimitedSectorCount"])
+        self.assertEqual(0, plan["alternateReliableSectorCount"])
+        self.assertEqual(1, result["supportingSectorCount"])
+        self.assertEqual(3, result["requiredSupportingSectorCount"])
+        self.assertEqual("CANDIDATE_PERIOD", result["claimDecision"]["claim"])
+        self.assertEqual("competitive straddler", result["sectorResults"][1][
+            "candidateFrequencyUncertaintyDiagnostics"]["unavailableReason"])
+
+    def test_two_real_alternates_still_request_broad_search(self):
+        result = self._mixed_interpretation(["support", "alternate", "alternate", "uncertain"])
+        plan = plan_independent_contradiction_resolution(result)
+        self.assertEqual("BROAD_INDEPENDENT_SEARCH", plan["action"])
+        self.assertEqual(2, plan["alternateReliableSectorCount"])
+        self.assertEqual(1, plan["uncertaintyLimitedSectorCount"])
+
+    def test_one_alternate_does_not_turn_uncertainty_into_broad_evidence(self):
+        result = self._mixed_interpretation(["support", "alternate", "uncertain", "uncertain"])
+        self.assertEqual("FREQUENCY_UNCERTAINTY_FOLLOWUP",
+                         plan_independent_contradiction_resolution(result)["action"])
+
+    def test_confirmed_recurrence_preserves_stop_route(self):
+        result = self._mixed_interpretation(["support", "support", "support", "uncertain"])
+        plan = plan_independent_contradiction_resolution(result)
+        self.assertEqual("STOP", plan["action"])
+        self.assertEqual("targeted-independent-recurrence-confirmed", plan["reason"])
+        self.assertNotIn("recommendedNextTest", plan)
+
     def test_blind_a_periods_do_not_count_as_recurrence(self):
         result = interpretation(9.97870593974828)
         sector = result["sectorResults"][0]

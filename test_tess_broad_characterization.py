@@ -96,6 +96,7 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
     def _independent_contradiction_fixture(self, root, *, relation="2x",
                                            completed_morphology=False,
                                            recurrent=False,
+                                           uncertain=False,
                                            investigation_goal=None):
         store = InvestigationStore(root / "investigations")
         investigation = store.create("synthetic-harmonic-routing", WORKFLOW_ID,
@@ -138,9 +139,17 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
              }}
             for sector in (2, 3)
         ]}
+        if uncertain:
+            for dataset in run["datasets"]:
+                dataset.pop("candidateFrequencyConfidenceInterval")
+                dataset["candidateFrequencyUncertaintyDiagnostics"] = {
+                    "trustworthy": False,
+                    "unavailableReason": "competitive boundary-straddling chunk",
+                }
         stages = (
             ("001-prepare-target", "openstar.tess.prepare-target",
-             {"datasetPath": str(primary_path)}),
+             {"datasetPath": str(primary_path), "datasetID": "synthetic-primary",
+              "ticID": 123, "sector": 1}),
             ("004-hypotheses", "openstar.tess.hypotheses", analysis),
             ("005-independent-prepare", "openstar.tess.independent.prepare", independent),
             ("006-independent-run", "openstar.tess.independent.run", run),
@@ -173,6 +182,46 @@ class BroadIndependentCharacterizationTests(unittest.TestCase):
             _, request = self._run_independent_interpretation(investigation, engine)
             self.assertEqual("openstar.tess.morphology.analyze", request.handler_id)
             self.assertNotEqual("openstar.tess.independent.broad.prepare", request.handler_id)
+
+    def test_uncertainty_followup_survives_recording_finalization_and_report(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store, investigation, engine, _, _, _ = self._independent_contradiction_fixture(
+                Path(temporary), recurrent=True, uncertain=True,
+                investigation_goal="FULL_CHARACTERIZATION",
+            )
+            investigation = self._complete(
+                store, investigation, "007-planner", "openstar.tess.planner",
+                {"action": "INDEPENDENT_SECTOR_FOLLOWUP"},
+            )
+            original_stage_bytes = {
+                stage.id: store.stage_path_for(investigation.id, stage.id).read_bytes()
+                for stage in investigation.stages
+            }
+            completed, request = self._run_independent_interpretation(investigation, engine)
+            interpreted = completed.stages[-1].result
+            self.assertEqual("openstar.tess.finalize", request.handler_id)
+            self.assertEqual("FREQUENCY_UNCERTAINTY_FOLLOWUP", interpreted["recommendedNextTest"])
+            self.assertEqual(0, interpreted["supportingSectorCount"])
+            self.assertEqual("HUMAN_REVIEW_REQUIRED", interpreted["claimDecision"]["claim"])
+            self.assertEqual(interpreted, store.load(completed.id).stages[-1].result)
+
+            finalized, next_request = engine.run_stage(
+                store.load(completed.id), request,
+                software_id="integration", software_version="uncertainty-followup",
+            )
+            self.assertIsNone(next_request)
+            conclusion = finalized.stages[-1].result
+            self.assertEqual("FREQUENCY_UNCERTAINTY_FOLLOWUP", conclusion["recommendedNextTest"])
+            self.assertEqual("HUMAN_REVIEW_REQUIRED", conclusion["claim"]["claim"])
+            self.assertFalse(conclusion["periodEvidence"]["physicalCycleResolved"])
+            self.assertIsNone(conclusion["independentBroadVerification"])
+            self.assertEqual(conclusion, json.loads(Path(conclusion["conclusionPath"]).read_text()))
+            report = Path(conclusion["reportPath"]).read_text()
+            self.assertIn("FREQUENCY_UNCERTAINTY_FOLLOWUP", report)
+            self.assertIn("competitive boundary-straddling chunk", report)
+            for stage_id, original_bytes in original_stage_bytes.items():
+                self.assertEqual(original_bytes,
+                                 store.stage_path_for(finalized.id, stage_id).read_bytes())
 
     def test_full_characterization_confirmation_routes_to_morphology(self):
         with tempfile.TemporaryDirectory() as temporary:

@@ -315,6 +315,7 @@ def estimate_frequency_interval(
         "competingChunksRefined": 0,
         "powerScreenedChunkCount": 0,
         "boundaryStraddlingChunkCount": 0,
+        "powerScreenedBoundaryStraddlingChunkCount": 0,
     })
     if competing_mode_coverage is not None and not coverage_sufficient:
         diagnostics["unavailableReason"] = (
@@ -324,7 +325,7 @@ def estimate_frequency_interval(
 
     plausible_aliases = []
     worker_power_threshold = None
-    if competing_mode_coverage is not None:
+    if competing_mode_coverage is not None and not known_sigma:
         selected_worker_power = float(selected_worker_power)
         # Standard Lomb-Scargle power is 1 - RSS/RSS_null for the same
         # offset+sin+cos least-squares objective. Therefore this is exactly
@@ -341,20 +342,35 @@ def estimate_frequency_interval(
         if alternative is None:
             continue
         alternative = float(alternative)
-        if abs(alternative - frequency) < rayleigh:
-            if (
-                float(chunk["startFrequency"]) < frequency - rayleigh
-                or float(chunk["endFrequency"]) > frequency + rayleigh
-            ):
-                diagnostics["boundaryStraddlingChunkCount"] += 1
+        inside_local_peak = abs(alternative - frequency) < rayleigh
+        boundary_straddling = inside_local_peak and (
+            float(chunk["startFrequency"]) < frequency - rayleigh
+            or float(chunk["endFrequency"]) > frequency + rayleigh
+        )
+        if boundary_straddling:
+            diagnostics["boundaryStraddlingChunkCount"] += 1
+        # Apply the existing whole-chunk power screen before refusing a
+        # straddling chunk. Its winner bounds the searched grid on both sides
+        # of the exclusion boundary. Competitive straddlers remain unresolved.
+        # This power conversion assumes a profiled residual-noise scale;
+        # absolute measurement uncertainties require the RSS likelihood check.
+        if (
+            worker_power_threshold is not None
+            and (not inside_local_peak or boundary_straddling)
+            and float(chunk["power"]) < worker_power_threshold
+        ):
+            diagnostics["powerScreenedChunkCount"] += 1
+            if boundary_straddling:
+                diagnostics["powerScreenedBoundaryStraddlingChunkCount"] += 1
+            continue
+        if inside_local_peak:
+            if boundary_straddling:
+                diagnostics["unresolvedBoundaryStraddlingChunk"] = dict(chunk)
                 diagnostics["unavailableReason"] = (
                     "a chunk winner inside the local peak has unsearched-for-mode "
                     "coverage outside the Rayleigh exclusion region"
                 )
                 return None, diagnostics
-            continue
-        if float(chunk["power"]) < worker_power_threshold:
-            diagnostics["powerScreenedChunkCount"] += 1
             continue
         rss = evaluate_rss(alternative)
         if rss is not None and profile_statistic(rss) > _CHI_SQUARE_95_ONE_PARAMETER:

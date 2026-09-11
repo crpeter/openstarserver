@@ -778,6 +778,9 @@ def interpret_independent_sectors(
                 else None
             ),
             "frequencyIntervalContainsTarget": interval_contains_target,
+            "candidateFrequencyUncertaintyDiagnostics": dict(
+                dataset.get("candidateFrequencyUncertaintyDiagnostics") or {}
+            ),
             "frequencyIntervalWidth": frequency_interval_width,
             "frequencyIntervalResolved": frequency_interval_resolved,
             "harmonicOrAliasAccepted": False,
@@ -809,7 +812,7 @@ def interpret_independent_sectors(
         selected = target_period
         claim = decision(
             "HUMAN_REVIEW_REQUIRED",
-            "Independent TESS sector verification recovered a nearby reliable peak, but the available baseline could not resolve it from the target frequency and no statistical frequency confidence interval was available.",
+            "Independent TESS sector verification recovered a nearby reliable peak, but its frequency uncertainty did not establish recurrence at the target frequency.",
             "Resolution-limited sectors are inconclusive and do not count as affirmative recurrence evidence.",
         )
     else:
@@ -856,45 +859,65 @@ def plan_independent_contradiction_resolution(
     targeted_interpretation: dict[str, Any],
 ) -> dict[str, Any]:
     """
-    Decide whether a failed targeted independent check has enough usable
-    independent evidence to justify one target-independent broad search before
-    asking for human review.
+    Distinguish unresolved frequency uncertainty from reliable alternate
+    structure before choosing a target-independent broad search.
     """
     claim = ((targeted_interpretation.get("claimDecision") or {}).get("claim"))
     sector_results = targeted_interpretation.get("sectorResults") or []
-    reliable_count = sum(
-        1
-        for item in sector_results
+    reliable_results = [
+        item for item in sector_results
         if str(item.get("periodStatus") or "").upper() == "RELIABLE"
         and str(item.get("periodConfidence") or "none").lower() in {"high", "medium"}
         and _float(item.get("candidatePeriodDays")) is not None
-    )
+    ]
+    reliable_count = len(reliable_results)
     boundary_count = sum(1 for item in sector_results if item.get("boundaryHit"))
+    uncertainty_count = sum(
+        item.get("eligibleForRecurrence") is True
+        and item.get("recurrenceClassification") == "RESOLUTION_LIMITED"
+        for item in reliable_results
+    )
+    alternate_count = sum(
+        item.get("eligibleForRecurrence") is True
+        and item.get("recurrenceClassification") == "NONSUPPORTING"
+        for item in reliable_results
+    )
+    evidence_counts = {
+        "reliableSectorCount": reliable_count,
+        "boundaryHitCount": boundary_count,
+        "uncertaintyLimitedSectorCount": uncertainty_count,
+        "alternateReliableSectorCount": alternate_count,
+    }
 
     if claim == "INDEPENDENT_PERIOD_ESTIMATE":
         return {
             "action": "STOP",
             "reason": "targeted-independent-recurrence-confirmed",
-            "reliableSectorCount": reliable_count,
-            "boundaryHitCount": boundary_count,
+            **evidence_counts,
         }
 
-    if reliable_count >= 2:
+    if alternate_count >= 2:
         return {
             "action": "BROAD_INDEPENDENT_SEARCH",
             "reason": (
                 "targeted-candidate-not-recurrent-independent-sectors-contain-"
                 "alternate-reliable-structure"
             ),
-            "reliableSectorCount": reliable_count,
-            "boundaryHitCount": boundary_count,
+            **evidence_counts,
+        }
+
+    if uncertainty_count:
+        return {
+            "action": "FREQUENCY_UNCERTAINTY_FOLLOWUP",
+            "reason": "independent-frequency-uncertainty-unresolved",
+            "recommendedNextTest": "FREQUENCY_UNCERTAINTY_FOLLOWUP",
+            **evidence_counts,
         }
 
     return {
         "action": "STOP",
         "reason": "insufficient-independent-evidence-for-broad-contradiction-search",
-        "reliableSectorCount": reliable_count,
-        "boundaryHitCount": boundary_count,
+        **evidence_counts,
     }
 
 

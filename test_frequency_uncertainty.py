@@ -378,7 +378,7 @@ class FrequencyUncertaintyTests(unittest.TestCase):
         self.assertIsNone(interval)
         self.assertFalse(diagnostics["competingModeCoverageSufficient"])
 
-    def test_boundary_straddling_chunk_refuses_interval(self):
+    def test_competitive_boundary_straddling_chunk_refuses_interval(self):
         dataset = signal_dataset(frequency=0.108, baseline=300.0)
         rayleigh = 1.0 / 300.0
         interval, diagnostics = estimate_frequency_interval(
@@ -390,7 +390,7 @@ class FrequencyUncertaintyTests(unittest.TestCase):
                 "selectedPower": 0.99,
                 "chunks": [{
                     "frequency": 0.108 - rayleigh * 0.9,
-                    "power": 0.98,
+                    "power": 0.99,
                     "startFrequency": 0.108 - rayleigh * 1.05,
                     "endFrequency": 0.108 - rayleigh * 0.1,
                 }],
@@ -398,6 +398,84 @@ class FrequencyUncertaintyTests(unittest.TestCase):
         )
         self.assertIsNone(interval)
         self.assertEqual(1, diagnostics["boundaryStraddlingChunkCount"])
+        self.assertIn("outside the Rayleigh", diagnostics["unavailableReason"])
+
+    def test_weak_boundary_straddlers_preserve_the_local_interval(self):
+        dataset = signal_dataset(frequency=0.108, baseline=300.0)
+        expected, _ = estimate_frequency_interval(dataset, 0.108)
+        self.assertIsNotNone(expected)
+        rayleigh = 1.0 / 300.0
+        for side in (-1, 1):
+            with self.subTest(side=side):
+                bounds = sorted((0.108 + side * rayleigh * 1.05,
+                                 0.108 + side * rayleigh * 0.1))
+                interval, diagnostics = estimate_frequency_interval(
+                    dataset, 0.108, competing_mode_coverage={
+                        "complete": True, "objectiveMatches": True,
+                        "selectedPower": 0.99,
+                        "chunks": [{
+                            "frequency": 0.108 + side * rayleigh * 0.9,
+                            "power": 0.98,
+                            "startFrequency": bounds[0],
+                            "endFrequency": bounds[1],
+                        }],
+                    },
+                )
+                self.assertEqual(expected, interval)
+                self.assertTrue(diagnostics["trustworthy"])
+                self.assertEqual(1, diagnostics["boundaryStraddlingChunkCount"])
+                self.assertEqual(1, diagnostics["powerScreenedBoundaryStraddlingChunkCount"])
+                self.assertEqual(0, diagnostics["competingChunksRefined"])
+
+    def test_straddler_at_power_threshold_is_not_screened(self):
+        dataset = signal_dataset(frequency=0.108, baseline=300.0)
+        threshold = 1.0 - (1.0 - 0.99) * math.exp(
+            frequency_uncertainty._CHI_SQUARE_95_ONE_PARAMETER / len(dataset["times"])
+        )
+        rayleigh = 1.0 / 300.0
+        chunk = {
+            "frequency": 0.108 - rayleigh * 0.9, "power": threshold,
+            "startFrequency": 0.108 - rayleigh * 1.05,
+            "endFrequency": 0.108 - rayleigh * 0.1,
+        }
+        interval, diagnostics = estimate_frequency_interval(
+            dataset, 0.108, competing_mode_coverage={
+                "complete": True, "objectiveMatches": True,
+                "selectedPower": 0.99, "chunks": [chunk],
+            },
+        )
+        self.assertIsNone(interval)
+        self.assertEqual(0, diagnostics["powerScreenedBoundaryStraddlingChunkCount"])
+        self.assertEqual(chunk, diagnostics["unresolvedBoundaryStraddlingChunk"])
+
+    def test_weak_straddler_requires_valid_coverage_and_profiled_noise(self):
+        dataset = signal_dataset(frequency=0.108, baseline=300.0)
+        rayleigh = 1.0 / 300.0
+        coverage = {
+            "complete": True, "objectiveMatches": True, "selectedPower": 0.99,
+            "chunks": [{
+                "frequency": 0.108 - rayleigh * 0.9, "power": 0.98,
+                "startFrequency": 0.108 - rayleigh * 1.05,
+                "endFrequency": 0.108 - rayleigh * 0.1,
+            }],
+        }
+        for override in ({"complete": False}, {"objectiveMatches": False},
+                         {"selectedPower": float("nan")}):
+            with self.subTest(override=override):
+                interval, diagnostics = estimate_frequency_interval(
+                    dataset, 0.108, competing_mode_coverage=coverage | override,
+                )
+                self.assertIsNone(interval)
+                self.assertFalse(diagnostics["competingModeCoverageSufficient"])
+                self.assertEqual(0, diagnostics["powerScreenedChunkCount"])
+
+        dataset["measurementUncertainties"] = [0.08] * len(dataset["times"])
+        interval, diagnostics = estimate_frequency_interval(
+            dataset, 0.108, competing_mode_coverage=coverage,
+        )
+        self.assertIsNone(interval)
+        self.assertNotIn("workerPowerCompetitiveThreshold", diagnostics)
+        self.assertEqual(0, diagnostics["powerScreenedChunkCount"])
         self.assertIn("outside the Rayleigh", diagnostics["unavailableReason"])
 
     def test_independent_realization_can_support_and_different_one_does_not(self):
