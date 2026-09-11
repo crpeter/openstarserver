@@ -125,6 +125,21 @@ def _campaign_for_sector(sector: int) -> str:
     raise ValueError(f"Sector {sector} is not in the preregistered campaign map.")
 
 
+def _campaign_from_preparation(sector: int, preparation: dict[str, Any]) -> str:
+    """Resolve the campaign frozen by either the manual or reusable selector."""
+    campaigns = preparation.get("campaigns") or {}
+    if not campaigns:
+        # Historical/manual preparation fixtures predate the persisted map and
+        # retain the original fixed-sector campaign contract.
+        return _campaign_for_sector(sector)
+    matches = [name for name, sectors in campaigns.items()
+               if int(sector) in {int(value) for value in sectors}]
+    if len(matches) != 1:
+        raise ValueError(
+            f"Sector {sector} does not have exactly one frozen campaign assignment.")
+    return matches[0]
+
+
 def _boundary_stages(investigation: Investigation) -> tuple[Any, ...]:
     stages = investigation.stages
     if len(stages) == len(_BASE_HANDLERS) + 1:
@@ -635,7 +650,7 @@ def analyze_sector_flux_pair(item: dict[str, Any], preparation: dict[str, Any]) 
         classification = "TIME_DOMAIN_RECURRENCE_NOT_DETECTED"
     return {
         "sector": int(item["sector"]),
-        "campaign": _campaign_for_sector(int(item["sector"])),
+        "campaign": _campaign_from_preparation(int(item["sector"]),preparation),
         "classification": classification,
         "sapPdcsapAgreement": agreement,
         "sapPdcsapPeakLagDifferenceDays": lag_difference,

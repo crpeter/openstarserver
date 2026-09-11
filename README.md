@@ -252,3 +252,82 @@ reported without being repeatedly dispatched. RECOVERY_REQUIRED remains a
 fail-closed condition needing a human decision or a narrow workflow-specific
 recovery adapter with an explicit replay-safety contract. The heartbeat is
 observability only and is never used to reconstruct scientific state.
+
+## Autonomous period-family follow-up
+
+OpenStar admits period-family follow-up from verified persisted semantics, never a
+TIC identifier or stage count. An unresolved/source-ambiguous family may enter
+phase difference-image localization; target-supported unresolved families may
+enter untouched-sector time-domain evolution; replicated but clock-unresolved
+families may enter external long-baseline photometry. Historical COMPLETE or
+QUIESCENT investigations are not reopened by deployment. Their existing manual
+admission commands remain the explicit compatibility path.
+
+Sector selection starts with persisted official sector/product/cadence/epoch
+identity, rejects already consumed sectors, and freezes a deterministic
+one-per-epoch selection before flux access. Small phase imaging and time-domain
+model comparisons run coordinator-local. Only heavy frequency searches are sent
+to generic workers as `openstar.lomb-scargle.v1`; workers contain no TESS or
+survey logic.
+
+Exact duplicate product metadata is deduplicated canonically. Conflicting
+author, mission, cadence, or observation-epoch metadata for the same eligible
+sector fails closed as `CONFLICTING_PRODUCT_METADATA`; catalog input order can
+never decide the frozen epoch assignment. Selection never reads flux.
+
+External surveys are tried in preregistered priority order. The first provider
+passing coverage, season, band, quality, and persisted catalog-neighbor blending
+gates is frozen with its raw response and SHA-256 provenance. ASAS-SN Sky Patrol
+is the first adapter, but production fails closed as data unavailable unless its
+public transport is configured; tests are network-free. The external observable
+is blocked seasonal phase prediction inside the already frozen period-family
+window, not another Lomb–Scargle detection.
+
+**Detection is not source attribution, stable-clock resolution, a physical
+cycle, or a physical mechanism.** Results retain `HUMAN_REVIEW_REQUIRED` unless
+separate evidence justifies more.
+
+Read-only compatibility validation (use a copied fixture/state tree, **never the
+live science state**) is:
+
+```bash
+python -m pytest -q test_historical_stage_ledger.py \
+  test_tess_period_family_difference_image.py \
+  test_tess_period_family_time_domain_evolution.py
+```
+
+### ASAS-SN configuration and immutable external stages
+
+The optional official Sky Patrol distribution is named `skypatrol` and exposes
+the `pyasassn` import package. Its public `SkyPatrolClient()` constructor does
+not use OpenStar credentials. If the optional client is absent or has the wrong
+version, the run persists `PROVIDER_CONFIGURATION_UNAVAILABLE`; it does not
+reinterpret an operational condition as scientific insufficiency.
+
+Install the coordinator-only, pinned interface with
+`python -m pip install -r requirements-optional-asassn.txt`. OpenStar supports
+`skypatrol==0.6.21` for this adapter; it is not a worker dependency.
+
+External follow-up is an append-only prepare/run/interpret sequence. Preparation
+freezes the provider priority, family window, target identity, authoritative
+catalog-neighbor evidence, and the complete versioned analysis method. The
+method contract includes coverage gates, season definition, period grid,
+held-out-season procedure, predictive and null thresholds, stability and alias
+rules, uncertainty floors, and band agreement. Its hash is verified before a
+provider is constructed or any flux is analyzed. Run separately freezes and ledgers
+the provider coverage response, canonical raw response, cleaned measurements,
+quality-filter counts, and acquisition metadata. Interpret binds both stage
+results and preserves
+physical-cycle and physical-mechanism resolution as false. Recovery reuses
+byte-identical artifacts and rejects a mismatched frozen hash.
+
+Provider configuration, transient transport failure, operational unavailability,
+and malformed provider data remain operational outcomes. Only a successfully
+parsed provider response that fails the frozen measurement, baseline, season,
+phase-coverage, or band gates is `EXTERNAL_DATA_INSUFFICIENT`.
+
+Period-family admission performs semantic validation in addition to SHA-256
+verification. A matching hash proves immutability, while the shared validator
+separately requires supported versions, finite positive periods, an increasing
+acceptance window containing the frozen family, a supported observable, and
+unique positive integer sectors.
